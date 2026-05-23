@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worca-t/schemas/research.schema.json",
+  "title": "ResearchProjection",
+  "type": "object",
+  "required": ["title", "sections"],
+  "additionalProperties": true,
+  "properties": {
+    "title": { "type": "string", "minLength": 1 },
+    "detected_stack": { "type": ["string", "null"] },
+    "commands": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "summary_bullets": { "type": "array", "items": { "type": "string" } },
+    "sections": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/section" }
+    }
+  },
+  "$defs": {
+    "section": {
+      "type": "object",
+      "required": ["title", "level"],
+      "properties": {
+        "title": { "type": "string" },
+        "level": { "type": "integer" },
+        "content": { "type": "string" },
+        "bullets": { "type": "array", "items": { "type": "string" } },
+        "tables": { "type": "array" },
+        "children": { "type": "array", "items": { "$ref": "#/$defs/section" } }
+      }
+    }
+  }
+}

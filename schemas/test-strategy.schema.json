@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worca-t/schemas/test-strategy.schema.json",
+  "title": "TestStrategy",
+  "type": "object",
+  "required": ["title", "test_cases"],
+  "additionalProperties": true,
+  "properties": {
+    "title": { "type": "string", "minLength": 1 },
+    "scope": { "type": ["string", "null"] },
+    "objectives": { "type": "array", "items": { "type": "string" } },
+    "types": { "type": "array", "items": { "type": "string" } },
+    "risks": { "type": "array", "items": { "type": "string" } },
+    "test_cases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "title"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^TC-[A-Za-z0-9\\-_]+$" },
+          "title": { "type": "string" },
+          "priority": { "type": "string", "enum": ["P0", "P1", "P2", "P3", "UNKNOWN"] },
+          "type": { "type": ["string", "null"] },
+          "preconditions": { "type": "array", "items": { "type": "string" } },
+          "steps": { "type": "array", "items": { "type": "string" } },
+          "expected": { "type": ["string", "null"] },
+          "tags": { "type": "array", "items": { "type": "string" } },
+          "raw": { "type": "string" }
+        }
+      }
+    },
+    "edge_cases": { "type": "array", "items": { "type": "string" } },
+    "exit_criteria": { "type": "array", "items": { "type": "string" } }
+  }
+}

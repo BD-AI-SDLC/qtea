@@ -1,0 +1,108 @@
+[project]
+name = "worca-t"
+version = "0.1.2"
+description = "Worca-T - Fully autonomous QA SDLC orchestrator (Python + LLM hybrid)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Worca-T Maintainers" }]
+keywords = ["qa", "sdlc", "automation", "testing", "playwright", "allure", "llm", "claude"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = [
+    "anthropic>=0.40",
+    "typer>=0.12",
+    "rich>=13",
+    "pydantic>=2.7",
+    "jsonschema>=4.21",
+    "tenacity>=9",
+    "structlog>=24",
+    "httpx>=0.27",
+    "python-dotenv>=1",
+    "PyYAML>=6",
+    "nodeenv>=1.8",
+]
+
+[project.optional-dependencies]
+allure = ["allure-pytest>=2.13"]
+
+[project.scripts]
+worca-t = "worca_t.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/anomalyco/opencode"
+Issues = "https://github.com/anomalyco/opencode/issues"
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/worca_t"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"agents" = "worca_t/_resources/agents"
+"skills" = "worca_t/_resources/skills"
+"schemas" = "worca_t/_resources/schemas"
+"templates" = "worca_t/_resources/templates"
+"examples" = "worca_t/_resources/examples"
+".mcp.json" = "worca_t/_resources/.mcp.json"
+".env.example" = "worca_t/_resources/.env.example"
+"CLAUDE.md" = "worca_t/_resources/CLAUDE.md"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/worca_t",
+    "agents",
+    "skills",
+    "schemas",
+    "templates",
+    "examples",
+    ".mcp.json",
+    ".env.example",
+    "CLAUDE.md",
+    "README.md",
+    "CHANGELOG.md",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src"]
+extend-exclude = ["candidate_agents", ".worca-t"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "RUF", "SIM", "PL", "C4", "PTH"]
+ignore = ["S101", "PLR0913", "PLR2004", "PLR0912", "PLR0915", "S603", "S607", "S404"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S", "PLR", "B", "E501", "E702", "SIM105", "PLW2901", "RUF005"]
+"src/worca_t/report/html_renderer.py" = ["E501"]
+# Typer idiomatic patterns: Option() defaults + lazy imports inside command bodies.
+"src/worca_t/cli.py" = ["B008", "PLC0415"]
+"src/worca_t/logging_setup.py" = ["PLW0603"]
+# Best-effort cleanup paths.
+"src/worca_t/claude_runner.py" = ["SIM105", "S110"]
+"src/worca_t/mcp_manager.py" = ["SIM105", "S110"]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "pytest-mock>=3.12",
+    "ruff>=0.6",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+asyncio_mode = "auto"

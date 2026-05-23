@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worca-t/schemas/report-data.schema.json",
+  "title": "ReportData",
+  "type": "object",
+  "required": ["run_id", "generated_at", "run_results", "bug_reports", "summary"],
+  "additionalProperties": false,
+  "properties": {
+    "run_id": { "type": "string", "minLength": 1 },
+    "generated_at": { "type": "string" },
+    "plan": { "type": ["object", "null"] },
+    "strategy": { "type": ["object", "null"] },
+    "run_results": {
+      "type": "object",
+      "required": ["framework", "command", "started_at", "finished_at", "results"],
+      "additionalProperties": true,
+      "properties": {
+        "framework": { "type": "string" },
+        "command": { "type": "string" },
+        "started_at": { "type": "string" },
+        "finished_at": { "type": "string" },
+        "results": { "type": "array" }
+      }
+    },
+    "bug_reports": {
+      "type": "object",
+      "required": ["run_id", "generated_at", "summary", "bugs"],
+      "additionalProperties": true,
+      "properties": {
+        "run_id": { "type": "string" },
+        "generated_at": { "type": "string" },
+        "summary": { "type": "object" },
+        "bugs": { "type": "array" }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": ["total_tests", "passed", "failed", "skipped", "errors", "total_bugs", "pass_rate"],
+      "properties": {
+        "total_tests": { "type": "integer", "minimum": 0 },
+        "passed": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "integer", "minimum": 0 },
+        "errors": { "type": "integer", "minimum": 0 },
+        "total_bugs": { "type": "integer", "minimum": 0 },
+        "duration_s": { "type": ["number", "null"], "minimum": 0 },
+        "pass_rate": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    }
+  }
+}

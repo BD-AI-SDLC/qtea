@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worca-t.dev/schemas/bug-reports.schema.json",
+  "title": "Bug Reports",
+  "type": "object",
+  "required": ["run_id", "generated_at", "summary", "bugs"],
+  "properties": {
+    "run_id": { "type": "string", "minLength": 1 },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "summary": {
+      "type": "object",
+      "required": ["total_failures", "by_severity", "by_priority", "by_category"],
+      "properties": {
+        "total_failures": { "type": "integer", "minimum": 0 },
+        "by_severity": {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        },
+        "by_priority": {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        },
+        "by_category": {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "bugs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "test_id", "title", "severity", "priority", "category"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^BUG-.+-\\d+$" },
+          "test_id": { "type": "string", "minLength": 1 },
+          "title": { "type": "string", "minLength": 1 },
+          "severity": { "enum": ["critical", "major", "minor", "cosmetic"] },
+          "priority": { "enum": ["P0", "P1", "P2", "P3"] },
+          "category": {
+            "enum": [
+              "functional", "ui", "performance", "security",
+              "accessibility", "integration", "flaky", "environment"
+            ]
+          },
+          "component": { "type": "string" },
+          "requirement_id": { "type": "string" },
+          "rationale": { "type": "string" },
+          "impact": { "type": "object" },
+          "reproduction_steps": { "type": "array", "items": { "type": "string" } },
+          "expected": { "type": "string" },
+          "actual": { "type": "string" },
+          "root_cause_hypothesis": { "type": "string" },
+          "attachments": {
+            "type": "object",
+            "properties": {
+              "screenshots": { "type": "array", "items": { "type": "string" } },
+              "traces": { "type": "array", "items": { "type": "string" } },
+              "videos": { "type": "array", "items": { "type": "string" } },
+              "logs": { "type": "array", "items": { "type": "string" } }
+            }
+          },
+          "self_heal": {
+            "type": "object",
+            "properties": {
+              "attempted": { "type": "boolean" },
+              "success": { "type": "boolean" },
+              "channel": { "enum": ["playwright", "chrome-devtools", "none"] }
+            }
+          },
+          "related_test_cases": { "type": "array", "items": { "type": "string" } },
+          "recommended_action": {
+            "type": "object",
+            "properties": {
+              "immediate": { "type": "string" },
+              "short_term": { "type": "string" },
+              "long_term": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

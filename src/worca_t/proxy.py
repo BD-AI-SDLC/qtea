@@ -1,0 +1,79 @@
+"""Proxy detection + propagation to subprocesses.
+
+On Windows, also merges user-level registry environment variables so that
+credentials stored by ``claude login`` are available to child processes even
+when the parent shell was started before login.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from collections.abc import Mapping
+
+from worca_t.config import PROXY_ENV_KEYS, SECRET_ENV_KEYS
+
+
+def _windows_user_env() -> dict[str, str]:
+    """Read user-level env vars from HKEY_CURRENT_USER\\Environment.
+
+    Returns an empty dict on non-Windows or if the registry is unreadable.
+    """
+    if sys.platform != "win32":
+        return {}
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+            env: dict[str, str] = {}
+            idx = 0
+            while True:
+                try:
+                    name, value, _ = winreg.EnumValue(key, idx)
+                    env[name] = value
+                    idx += 1
+                except OSError:
+                    break
+            return env
+    except Exception:
+        return {}
+
+
+def detected_proxies() -> dict[str, str]:
+    """Return proxy-related env vars currently set in the process."""
+    return {k: os.environ[k] for k in PROXY_ENV_KEYS if k in os.environ}
+
+
+def with_proxy_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Build an env dict containing the current process env + proxy vars + extras.
+
+    Use this when constructing subprocesses to guarantee proxy + credential
+    propagation under corporate networks.
+
+    On Windows, user-level registry variables are merged first so that
+    credentials stored by ``claude login`` are picked up even when the current
+    process inherited an older environment.  Process-level vars take precedence.
+    """
+    # Start with registry vars (Windows only) so process env can override.
+    env = _windows_user_env()
+    env.update(os.environ)
+
+    # Ensure both upper- and lower-case proxy keys are mirrored if only one exists.
+    proxy_pairs = (
+        ("HTTP_PROXY", "http_proxy"),
+        ("HTTPS_PROXY", "https_proxy"),
+        ("NO_PROXY", "no_proxy"),
+    )
+    for upper, lower in proxy_pairs:
+        if upper in env and lower not in env:
+            env[lower] = env[upper]
+        elif lower in env and upper not in env:
+            env[upper] = env[lower]
+    if extra:
+        env.update({str(k): str(v) for k, v in extra.items()})
+    return env
+
+
+def mask_secrets(env: Mapping[str, str]) -> dict[str, str]:
+    """Return a copy of env with secret values redacted (for logging)."""
+    return {k: ("***REDACTED***" if k in SECRET_ENV_KEYS else v) for k, v in env.items()}

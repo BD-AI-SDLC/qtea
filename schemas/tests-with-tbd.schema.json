@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worca-t/schemas/tests-with-tbd.schema.json",
+  "title": "TestsWithTBD",
+  "type": "object",
+  "required": ["framework", "tests"],
+  "additionalProperties": true,
+  "properties": {
+    "framework": {
+      "type": "string",
+      "enum": [
+        "playwright-ts",
+        "playwright-py",
+        "pytest",
+        "cypress",
+        "selenium-java",
+        "selenium-py",
+        "robot",
+        "jest",
+        "vitest",
+        "mocha",
+        "wdio",
+        "unknown"
+      ]
+    },
+    "test_root": { "type": "string" },
+    "totals": {
+      "type": "object",
+      "properties": {
+        "files": { "type": "integer", "minimum": 0 },
+        "tests": { "type": "integer", "minimum": 0 },
+        "tbd_locators": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "files": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "tests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "file", "status"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "name": { "type": "string" },
+          "file": { "type": "string" },
+          "line": { "type": ["integer", "null"], "minimum": 1 },
+          "status": { "type": "string", "enum": ["pending", "ready", "skipped"] },
+          "tags": { "type": "array", "items": { "type": "string" } },
+          "tc_refs": { "type": "array", "items": { "type": "string" } },
+          "locator_candidates": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["raw", "strategy"],
+              "properties": {
+                "raw": { "type": "string" },
+                "strategy": {
+                  "type": "string",
+                  "enum": [
+                    "id",
+                    "data-testid",
+                    "role",
+                    "label",
+                    "text",
+                    "placeholder",
+                    "css",
+                    "tbd",
+                    "unknown"
+                  ]
+                },
+                "value": { "type": ["string", "null"] },
+                "line": { "type": ["integer", "null"] }
+              }
+            }
+          },
+          "tbd_markers": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["line", "raw"],
+              "properties": {
+                "line": { "type": "integer" },
+                "raw": { "type": "string" },
+                "context": { "type": ["string", "null"] }
+              }
+            }
+          }
+        }
+      }
+    },
+    "violations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["rule", "file", "line", "snippet"],
+        "properties": {
+          "rule": {
+            "type": "string",
+            "enum": ["xpath", "hard-wait", "page-content", "raw-secret"]
+          },
+          "file": { "type": "string" },
+          "line": { "type": "integer" },
+          "snippet": { "type": "string" }
+        }
+      }
+    }
+  }
+}

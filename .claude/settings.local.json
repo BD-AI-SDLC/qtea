@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.\\\\.venv\\\\Scripts\\\\python.exe -m pytest tests/ -q)",
+      "Bash(.\\\\.venv\\\\Scripts\\\\python.exe *)",
+      "Bash(.venv/Scripts/python.exe *)",
+      "Bash(xargs grep *)",
+      "Bash(grep -v \":0$\")",
+      "Bash(python -m ruff check src/worca_t --select=F401)",
+      "Bash(./.venv/Scripts/python.exe -m ruff check src/worca_t --select=F401)",
+      "Bash(python -m pytest tests/unit/test_core.py -v)",
+      "Bash(./.venv/Scripts/python.exe -m pytest tests/ -q)",
+      "Bash(uv sync *)",
+      "Bash(./.venv/Scripts/python.exe *)",
+      "Bash(python -m pip install -e . -q)",
+      "Bash(python3 *)",
+      "Bash(grep -rn \"worca-t\\\\|\\\\.worca\\\\|/tmp\\\\|C:\\\\\\\\\\\\\\\\\" /c/worca-t/src/worca_t --include=\"*.py\")",
+      "Bash(uv build *)",
+      "Bash(xargs -I {} basename {})",
+      "Bash(worca-t run *)",
+      "Bash(where claude *)",
+      "Bash(python *)",
+      "Bash(gcloud auth *)",
+      "Bash(xargs ls *)",
+      "Bash(C:/Users/ets1wz/AppData/Roaming/uv/tools/worca-t/Scripts/python.exe *)",
+      "Read(//c/Users/ets1wz/.worca-t/20260523-123142-588f2a/artifacts/step04/**)"
+    ]
+  }
+}

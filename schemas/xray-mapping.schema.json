@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worca-t/schemas/xray-mapping.schema.json",
+  "title": "XrayMapping",
+  "type": "object",
+  "required": ["status"],
+  "additionalProperties": false,
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["completed", "skipped", "warned", "failed"]
+    },
+    "reason": { "type": "string" },
+    "uploaded_at": { "type": "string" },
+    "project_key": { "type": "string" },
+    "mappings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["tc_id", "xray_key", "status"],
+        "properties": {
+          "tc_id": { "type": "string", "minLength": 1 },
+          "xray_key": { "type": ["string", "null"] },
+          "status": {
+            "type": "string",
+            "enum": ["created", "updated", "failed"]
+          },
+          "error": { "type": "string" }
+        }
+      }
+    }
+  }
+}

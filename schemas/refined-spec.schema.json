@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worca-t/schemas/refined-spec.schema.json",
+  "title": "RefinedSpec",
+  "type": "object",
+  "required": ["requirement_id", "title", "sections", "acceptance_criteria"],
+  "additionalProperties": true,
+  "properties": {
+    "requirement_id": {
+      "type": "string",
+      "pattern": "^REQ-[A-Za-z0-9][A-Za-z0-9\\-_]*$"
+    },
+    "title": { "type": "string", "minLength": 1 },
+    "sections": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/section" }
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "user_flows": { "type": ["object", "null"] },
+    "test_boundaries": { "type": ["object", "null"] },
+    "test_data": { "type": ["object", "null"] },
+    "environment": { "type": ["object", "null"] },
+    "technical_considerations": { "type": ["object", "null"] },
+    "edge_cases": { "type": ["object", "null"] },
+    "nfrs": { "type": ["object", "null"] },
+    "definition_of_ready": { "type": ["object", "null"] },
+    "readiness": { "type": "string", "enum": ["READY", "NOT_READY", "UNKNOWN"] }
+  },
+  "$defs": {
+    "section": {
+      "type": "object",
+      "required": ["title", "level"],
+      "properties": {
+        "title": { "type": "string" },
+        "level": { "type": "integer", "minimum": 0, "maximum": 6 },
+        "content": { "type": "string" },
+        "bullets": { "type": "array", "items": { "type": "string" } },
+        "tables": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "children": { "type": "array", "items": { "$ref": "#/$defs/section" } }
+      }
+    }
+  }
+}

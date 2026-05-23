@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worca-t/schemas/run-results.schema.json",
+  "title": "RunResults",
+  "type": "object",
+  "required": ["framework", "command", "started_at", "finished_at", "results"],
+  "additionalProperties": true,
+  "properties": {
+    "framework": { "type": "string" },
+    "command": { "type": "string" },
+    "cwd": { "type": "string" },
+    "started_at": { "type": "string" },
+    "finished_at": { "type": "string" },
+    "duration_s": { "type": "number", "minimum": 0 },
+    "exit_code": { "type": "integer" },
+    "totals": {
+      "type": "object",
+      "properties": {
+        "tests": { "type": "integer", "minimum": 0 },
+        "passed": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "integer", "minimum": 0 },
+        "errors": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "self_heal": {
+      "type": "object",
+      "properties": {
+        "attempts": { "type": "integer", "minimum": 0 },
+        "patches_applied": { "type": "integer", "minimum": 0 },
+        "patches_rejected": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "file", "status"],
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "file": { "type": "string" },
+          "status": { "type": "string", "enum": ["passed", "failed", "skipped", "error"] },
+          "duration_s": { "type": ["number", "null"], "minimum": 0 },
+          "message": { "type": ["string", "null"] },
+          "traceback": { "type": ["string", "null"] },
+          "stdout": { "type": ["string", "null"] },
+          "stderr": { "type": ["string", "null"] },
+          "attachments": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["path", "type"],
+              "properties": {
+                "path": { "type": "string" },
+                "type": { "type": "string", "enum": ["screenshot", "trace", "video", "log", "other"] }
+              }
+            }
+          },
+          "self_heal": {
+            "type": "object",
+            "properties": {
+              "attempted": { "type": "boolean" },
+              "applied": { "type": "boolean" },
+              "summary": { "type": ["string", "null"] }
+            }
+          }
+        }
+      }
+    }
+  }
+}

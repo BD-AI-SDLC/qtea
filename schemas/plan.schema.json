@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worca-t/schemas/plan.schema.json",
+  "title": "TestPlan",
+  "type": "object",
+  "required": ["title", "phases"],
+  "additionalProperties": true,
+  "properties": {
+    "title": { "type": "string", "minLength": 1 },
+    "overview": { "type": "string" },
+    "commands": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "phase_summary": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": { "type": "string" }
+      }
+    },
+    "phases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["number", "title"],
+        "properties": {
+          "number": { "type": "integer", "minimum": 1 },
+          "title": { "type": "string" },
+          "overview": { "type": "string" },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["title"],
+              "properties": {
+                "title": { "type": "string" },
+                "source": { "type": ["string", "null"] },
+                "test_file": { "type": ["string", "null"] },
+                "test_class": { "type": ["string", "null"] },
+                "methods": { "type": "array", "items": { "type": "string" } },
+                "raw": { "type": "string" }
+              }
+            }
+          },
+          "success_criteria": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worca-t/schemas/bug-candidates.schema.json",
+  "title": "BugCandidates",
+  "type": "object",
+  "required": ["candidates"],
+  "additionalProperties": true,
+  "properties": {
+    "candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "test_id", "title", "file"],
+        "properties": {
+          "id": { "type": "string" },
+          "test_id": { "type": "string" },
+          "title": { "type": "string" },
+          "file": { "type": "string" },
+          "status": { "type": "string", "enum": ["failed", "error"] },
+          "message": { "type": ["string", "null"] },
+          "traceback": { "type": ["string", "null"] },
+          "tc_refs": { "type": "array", "items": { "type": "string" } },
+          "attachments": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["path", "type"],
+              "properties": {
+                "path": { "type": "string" },
+                "type": { "type": "string" }
+              }
+            }
+          },
+          "first_seen": { "type": "string" }
+        }
+      }
+    }
+  }
+}

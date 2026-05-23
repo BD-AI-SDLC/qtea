@@ -1,2 +1,75 @@
 # worca-t
-Fully Autonomous QA SDLC
+
+> **W**ork**O**rchestrated **R**ealtime **C**laude **A**utonomous **T**esting.
+> Fully autonomous QA SDLC orchestrator. Python + LLM hybrid.
+
+`worca-t` turns a requirement (Jira ticket or local markdown spec) into a tested
+feature, executed tests, classified bugs, and a polished report - in 11
+deterministic, checkpointed steps.
+
+## Install
+
+```bash
+uv tool install <path-to-worca-t>
+worca-t --help
+```
+
+Runs on Windows / Linux / macOS / CI from any shell.
+
+## Quickstart
+
+```bash
+worca-t doctor                     # validate environment
+worca-t run --spec ./feature.md --sut ./my-app
+```
+
+## The pipeline
+
+| # | Step | Agent | Output |
+|---|---|---|---|
+| 1 | Intake | `jira-to-ai-spec` (or pure copy) | `spec.md` |
+| 2 | Refine | `refine-spec` | `refined-spec.{md,json}` |
+| 3 | Plan | `polyglot-test-planner` | `plan.{md,json}` |
+| 4 | Strategy | `test-manager` | `test-strategy.{md,json}` |
+| 5 | Xray | pure code | `xray-mapping.json` |
+| 6 | Research | `polyglot-test-researcher` | `research.{md,json}` |
+| 7 | TDD codegen | `ui-test-automation` | test files + `tests-with-tbd.json` |
+| 8 | Locators | `playwright-tester` | `locator-resolution.json` |
+| 9 | Run + heal | `polyglot-test-tester` + `polyglot-test-fixer` | `run-results.json` |
+| 10 | Bug class. | `bug-report-classifier` | `bug-reports.{md,json}` |
+| 11 | Report | pure code | `report/index.html` + Allure (when available) |
+
+See `GETTING_STARTED.md` for the full end-to-end walkthrough, or
+`agents/qa-orchestrator.instructions.md` for the operator reference manual.
+
+## Reporting
+
+`--report auto` (default) generates both Allure (when the `allure` CLI is
+installed) and a zero-dependency built-in HTML report. The built-in report is
+fully offline-viewable and always produced as a fallback.
+
+Force one or the other: `--report allure`, `--report builtin`, `--report both`.
+
+## Resume & debug
+
+```bash
+worca-t run --spec ./spec.md --sut ./app   # resumes from last checkpoint
+worca-t run --from-step 6 --spec ...       # skip steps 1-5
+worca-t run --only-step 11 --spec ...      # regenerate report only
+worca-t run --force --spec ...             # ignore all checkpoints
+worca-t run --debug --spec ...             # verbose debug agent from step 1
+worca-t run --fix --spec ...               # RCA + fix proposal on failure
+```
+
+## Status
+
+All 11 pipeline steps implemented. Core milestones complete:
+
+- **M0–M3** — skeleton, CLI, claude runner, intake, refine, plan, strategy.
+- **M4–M6** — TDD codegen, locator resolution, execute + self-heal.
+- **M7–M8** — bug classifier, Xray uploader, reporting (HTML + Allure).
+- **M9–M10** — retry/debug/fix flow, checkpoint hash invalidation.
+- **M11** — docs polish, markdown size enforcement.
+- **M12** — CI (GitHub Actions).
+
+See `CHANGELOG.md` for detailed per-milestone progress.
