@@ -53,7 +53,9 @@ Force one or the other: `--report allure`, `--report builtin`, `--report both`.
 ## Resume & debug
 
 ```bash
+worca-t list                               # show all workspaces (run-ids, status, last step)
 worca-t run --spec ./spec.md --sut ./app   # resumes from last checkpoint
+worca-t run --run-id <id> --spec ...       # resume a specific workspace by run-id
 worca-t run --from-step 6 --spec ...       # skip steps 1-5
 worca-t run --only-step 11 --spec ...      # regenerate report only
 worca-t run --force --spec ...             # ignore all checkpoints
