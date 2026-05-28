@@ -31,14 +31,18 @@ from worca_t.test_indexer import index_tests, resolve_framework, violations_summ
 log = get_logger(__name__)
 
 
-def _read_detected_stack(ctx: StepContext) -> str | None:
+def _read_research(ctx: StepContext) -> dict:
     research_json = ctx.workspace.step_dir(6) / "research.json"
     if not research_json.exists():
-        return None
+        return {}
     try:
-        return json.loads(research_json.read_text(encoding="utf-8")).get("detected_stack")
+        return json.loads(research_json.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return None
+        return {}
+
+
+def _read_detected_stack(ctx: StepContext) -> str | None:
+    return _read_research(ctx).get("detected_stack")
 
 
 def _select_skills(detected_stack: str | None) -> list[str]:
@@ -80,7 +84,9 @@ class CodegenStep(Step):
         if refined_md.exists():
             inputs["refined-spec.md"] = refined_md
 
-        detected_stack = _read_detected_stack(ctx)
+        research = _read_research(ctx)
+        detected_stack = research.get("detected_stack")
+        sut_env_keys = research.get("sut_env_keys") or []
 
         agents_root = package_resource_root() / "agents"
         skills_root = package_resource_root() / "skills"
@@ -94,6 +100,17 @@ class CodegenStep(Step):
                 extras.append(p)
 
         stack_hint = f"Detected stack: `{detected_stack}`. " if detected_stack else ""
+
+        env_hint = ""
+        if sut_env_keys:
+            joined = ", ".join(sut_env_keys)
+            env_hint = (
+                f" The SUT uses these environment variables: {joined}. "
+                f"Reference them in generated tests via process.env.<NAME> "
+                f"(or the framework equivalent such as os.environ). "
+                f"Never hardcode their values."
+            )
+
         result = run_agent(
             agent,
             workdir=wd,
@@ -110,12 +127,12 @@ class CodegenStep(Step):
                 f"`waitForTimeout`); NO `page.content()` - use AOM snapshots; "
                 f"no inline credentials. Mark unresolved selectors with the "
                 f"literal `TBD_LOCATOR` so the locator-resolution step can "
-                f"replace them."
+                f"replace them.{env_hint}"
             ),
             extra_paths=extras,
             timeout_s=self.timeout_s,
             step=7,
-            max_turns=60,
+            max_turns=40,
             claude_md=claude_md if claude_md.exists() else None,
         )
 

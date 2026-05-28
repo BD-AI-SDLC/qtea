@@ -13,6 +13,7 @@ Outputs (artifacts/step06/):
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -78,7 +79,13 @@ def _materialize_sut(src: str, dst: Path) -> None:
 
 
 def _run_scan_skill(sut: Path, out_path: Path) -> bool:
-    """Run skills/acquire-codebase-knowledge/scripts/scan.py against the SUT."""
+    """Run skills/acquire-codebase-knowledge/scripts/scan.py against the SUT.
+
+    The script is invoked with ``cwd=sut`` because it scans ``Path.cwd()`` and
+    accepts only ``--output`` (no positional target directory). Stdout of the
+    script is informational only — the real payload is written to ``out_path``
+    by the script itself.
+    """
     skill_root = package_resource_root() / "skills" / "acquire-codebase-knowledge"
     script = skill_root / "scripts" / "scan.py"
     if not script.exists():
@@ -86,20 +93,123 @@ def _run_scan_skill(sut: Path, out_path: Path) -> bool:
         return False
     try:
         result = subprocess.run(
-            [sys.executable, str(script), str(sut)],
+            [sys.executable, str(script), "--output", str(out_path)],
+            cwd=str(sut),
             capture_output=True,
             text=True,
             timeout=300,
             env=with_proxy_env(),
             check=False,
         )
-        out_path.write_text(result.stdout, encoding="utf-8")
         if result.returncode != 0:
-            (out_path.parent / "scan.stderr.log").write_text(result.stderr or "", encoding="utf-8")
-        return result.returncode == 0
+            (out_path.parent / "scan.stderr.log").write_text(
+                result.stderr or "", encoding="utf-8"
+            )
+            stderr_preview = (result.stderr or "").strip().splitlines()[:3]
+            log.warning(
+                "scan.skill_failed",
+                returncode=result.returncode,
+                stderr_preview=stderr_preview,
+            )
+            return False
+        return True
     except Exception as e:
         log.warning("scan.failed", error=str(e))
+        (out_path.parent / "scan.stderr.log").write_text(str(e), encoding="utf-8")
         return False
+
+
+_ENV_TEMPLATE_FILES = (
+    ".env.example", ".env.template", ".env.sample",
+    ".env.local", ".env.test", ".env.development", ".env.production",
+)
+
+_CYPRESS_ENV_FILES = ("cypress.env.json",)
+
+_JAVA_PROPS_FILES = (
+    "application.properties", "application-test.properties",
+    "src/main/resources/application.properties",
+    "src/test/resources/application-test.properties",
+)
+
+_JAVA_PROP_KEY = re.compile(r"^([A-Z][A-Z0-9_.]{1,80})\s*=", re.MULTILINE)
+
+_ENV_KEY_LINE = re.compile(r"^([A-Z][A-Z0-9_]{1,80})=", re.MULTILINE)
+
+_ENV_REF_PATTERNS = [
+    re.compile(r"process\.env\.([A-Z][A-Z0-9_]{1,80})"),
+    re.compile(r"process\.env\[(['\"])([A-Z][A-Z0-9_]{1,80})\1\]"),
+    re.compile(r"os\.environ(?:\.get)?\(\s*['\"]([A-Z][A-Z0-9_]{1,80})['\"]"),
+    re.compile(r"os\.environ\[['\"]([A-Z][A-Z0-9_]{1,80})['\"]\]"),
+    re.compile(r"os\.getenv\(\s*['\"]([A-Z][A-Z0-9_]{1,80})['\"]"),
+    re.compile(r"System\.getenv\(\s*['\"]([A-Z][A-Z0-9_]{1,80})['\"]"),
+    re.compile(r"ENV\[(['\"])([A-Z][A-Z0-9_]{1,80})\1\]"),
+    re.compile(r"ENV\.fetch\(\s*['\"]([A-Z][A-Z0-9_]{1,80})['\"]"),
+]
+
+_SUT_SOURCE_GLOBS = ("**/*.ts", "**/*.js", "**/*.tsx", "**/*.jsx",
+                     "**/*.py", "**/*.java", "**/*.rb", "**/*.cs")
+
+_INTERNAL_PREFIXES = ("WORCA_T_", "ANTHROPIC_", "CLAUDE", "NODE_", "npm_",
+                      "PATH", "HOME", "USER", "SHELL", "TERM", "LANG",
+                      "HOSTNAME", "PWD", "OLDPWD", "SHLVL", "TMPDIR")
+
+
+def _discover_sut_env_keys(sut_path: Path) -> list[str]:
+    """Scan the SUT for env var key names. Returns names only, never values."""
+    keys: set[str] = set()
+
+    # dotenv-style files (.env.example, .env.local, .env.test, etc.)
+    for name in _ENV_TEMPLATE_FILES:
+        candidate = sut_path / name
+        if candidate.exists():
+            try:
+                text = candidate.read_text(encoding="utf-8", errors="replace")
+                for m in _ENV_KEY_LINE.finditer(text):
+                    keys.add(m.group(1))
+            except OSError:
+                pass
+
+    # Cypress: cypress.env.json (top-level JSON keys)
+    for name in _CYPRESS_ENV_FILES:
+        candidate = sut_path / name
+        if candidate.exists():
+            try:
+                data = json.loads(candidate.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    keys.update(k for k in data if isinstance(k, str) and k == k.upper())
+            except (OSError, json.JSONDecodeError):
+                pass
+
+    # Java/Spring: application.properties / application-test.properties
+    for name in _JAVA_PROPS_FILES:
+        candidate = sut_path / name
+        if candidate.exists():
+            try:
+                text = candidate.read_text(encoding="utf-8", errors="replace")
+                for m in _JAVA_PROP_KEY.finditer(text):
+                    key = m.group(1).replace(".", "_").upper()
+                    keys.add(key)
+            except OSError:
+                pass
+
+    # Source code scan for env var references
+    for glob_pat in _SUT_SOURCE_GLOBS:
+        for src_file in sut_path.glob(glob_pat):
+            if not src_file.is_file() or src_file.stat().st_size > 512_000:
+                continue
+            if "node_modules" in src_file.parts or ".git" in src_file.parts:
+                continue
+            try:
+                text = src_file.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for pat in _ENV_REF_PATTERNS:
+                for m in pat.finditer(text):
+                    keys.add(m.group(m.lastindex))
+
+    return sorted(k for k in keys
+                  if not any(k.startswith(p) for p in _INTERNAL_PREFIXES))
 
 
 _FRAMEWORK_HINTS = (
@@ -137,17 +247,22 @@ def _extract_commands(md_text: str) -> dict[str, str]:
     return out
 
 
-def _project_research(md_text: str, scan_text: str | None) -> dict:
+def _project_research(
+    md_text: str, scan_text: str | None, *, sut_env_keys: list[str] | None = None,
+) -> dict:
     root = parse_markdown(md_text)
     title = root.children[0].title if root.children else "research"
     commands = _extract_commands(md_text)
-    return {
+    projection: dict = {
         "title": title,
         "detected_stack": _detect_stack(md_text + ("\n" + (scan_text or ""))),
         "commands": commands,
         "summary_bullets": extract_bullets(root.content),
         "sections": [section_to_dict(c) for c in root.children],
     }
+    if sut_env_keys:
+        projection["sut_env_keys"] = sut_env_keys
+    return projection
 
 
 class ResearchStep(Step):
@@ -171,9 +286,17 @@ class ResearchStep(Step):
                 error=f"sut materialize: {e}",
             )
 
-        # Pre-run scan skill (best-effort).
+        # Pre-run scan skill. Deterministic Python — if it fails it's a bug,
+        # not a flake. Hard-fail the step before burning an LLM call on an
+        # agent that would be working without its primary discovery seed.
         scan_out = wd / "scan.txt"
-        _run_scan_skill(ctx.workspace.sut, scan_out)
+        if not _run_scan_skill(ctx.workspace.sut, scan_out):
+            return StepResult(
+                success=False,
+                status="failed",
+                outputs=[],
+                error="scan skill failed; see step-06/scan.stderr.log",
+            )
         scan_text = scan_out.read_text(encoding="utf-8") if scan_out.exists() else None
 
         agents_root = package_resource_root() / "agents"
@@ -182,7 +305,7 @@ class ResearchStep(Step):
         claude_md = package_resource_root() / "CLAUDE.md"
 
         extras: list[Path] = []
-        for skill in ("acquire-codebase-knowledge", "context-map"):
+        for skill in ("acquire-codebase-knowledge", "context-map", "stack-catalog"):
             sp = skills_root / skill
             if sp.exists():
                 extras.append(sp)
@@ -194,15 +317,18 @@ class ResearchStep(Step):
             workdir=wd,
             inputs={},
             user_prompt=(
-                "Discover the repository under `./sut/`. Produce a research "
-                "document at `./research.md` following your prompt structure. "
-                "Include explicit Build / Test / Lint commands and a clearly "
-                "labelled detected stack."
+                "Follow the procedure in `./polyglot-test-researcher.prompt.md` "
+                "and the skill at `./acquire-codebase-knowledge/SKILL.md`. The "
+                "repository under test is in `./sut/`. A pre-computed "
+                "deterministic scan is at `./scan.txt` — read it first to seed "
+                "your discovery. Produce the Discovery Summary at "
+                "`./research.md` with explicit Build, Test, and Lint commands "
+                "and a clearly labelled detected stack."
             ),
             extra_paths=extras,
             timeout_s=self.timeout_s,
             step=6,
-            max_turns=40,
+            max_turns=25,
             claude_md=claude_md if claude_md.exists() else None,
         )
 
@@ -218,7 +344,13 @@ class ResearchStep(Step):
         md_dst = out_dir / "research.md"
         shutil.copy2(produced, md_dst)
 
-        projection = _project_research(md_dst.read_text(encoding="utf-8"), scan_text)
+        sut_env_keys = _discover_sut_env_keys(ctx.workspace.sut)
+        if sut_env_keys:
+            log.info("step06.sut_env_keys", count=len(sut_env_keys), keys=sut_env_keys)
+
+        projection = _project_research(
+            md_dst.read_text(encoding="utf-8"), scan_text, sut_env_keys=sut_env_keys,
+        )
         json_dst = out_dir / "research.json"
         json_dst.write_text(json.dumps(projection, indent=2, ensure_ascii=False), encoding="utf-8")
 

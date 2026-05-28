@@ -30,7 +30,8 @@ from worca_t.test_runner import (
 
 def test_resolve_command_prefers_detected(tmp_path: Path) -> None:
     cmd, parser = resolve_command("pytest", detected="pytest -k smoke", cwd=tmp_path)
-    assert cmd == "pytest -k smoke"
+    assert cmd.startswith("pytest -k smoke")
+    assert "--junitxml=" in cmd
     assert parser == "junit"
 
 
@@ -43,7 +44,8 @@ def test_resolve_command_uses_default(tmp_path: Path) -> None:
 
 def test_resolve_command_fallback_for_unknown(tmp_path: Path) -> None:
     cmd, parser = resolve_command("nodescript", detected=None, cwd=tmp_path)
-    assert cmd == "pytest --junitxml=worca-junit.xml"
+    expected = str((tmp_path / "worca-junit.xml").as_posix())
+    assert cmd == f"pytest --junitxml={expected}"
     assert parser == "junit"
 
 

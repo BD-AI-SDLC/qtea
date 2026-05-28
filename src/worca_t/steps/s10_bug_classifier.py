@@ -311,7 +311,7 @@ class BugClassifierStep(Step):
             extra_paths=[],
             timeout_s=self.timeout_s,
             step=10,
-            max_turns=60,
+            max_turns=20,
         )
 
         produced_json = wd / "bug-reports.json"

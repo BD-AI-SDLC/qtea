@@ -13,6 +13,11 @@
       "additionalProperties": { "type": "string" }
     },
     "summary_bullets": { "type": "array", "items": { "type": "string" } },
+    "sut_env_keys": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]+$" },
+      "description": "Environment variable names discovered from the SUT (keys only, never values)."
+    },
     "sections": {
       "type": "array",
       "items": { "$ref": "#/$defs/section" }

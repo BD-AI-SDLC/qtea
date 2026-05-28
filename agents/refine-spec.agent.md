@@ -1,20 +1,6 @@
----
-description: 'Refine a markdown specification for QA readiness: Acceptance Criteria, Test Boundaries, User Flows, Edge Cases, Data Requirements, NFRs, and Automation Feasibility'
-name: 'Refine Specification'
-tools: ['Read', 'Edit', 'Write', 'Glob', 'Grep']
----
-
 # Refine Specification
 
 Analyze a markdown requirement specification and enrich it so it is **test-plan ready** — a downstream test manager agent (Step 4) must be able to derive test cases without asking clarifying questions.
-
-## Usage
-
-```
-refine <path_to_requirement>
-```
-
-Example: `refine specs/LOGIN-1234.md`
 
 ## Input
 
@@ -24,6 +10,47 @@ A markdown requirement file. Sources:
 - Attached file in chat context
 
 Any readable markdown file with a requirement description is valid input.
+
+## Pre-clean Pass (run before Step 1)
+
+Some inputs are clean narrative specs. Others are raw Jira/Confluence exports
+where the actual requirement is buried under issue metadata, attachment lists,
+sub-task tables, issue-link graphs, Figma-link tables, and comment threads.
+Refining the noisy version directly poisons every downstream step.
+
+**Decide:** is the input "messy"? Treat it as messy when **two or more** of
+these signals are present:
+
+- A leading metadata table whose first row mentions things like *Issue
+  summary*, *Status*, *Project*, *Reporter*, *Assignee*, *Resolution*,
+  *Sprint*, *Story Points*, *Epic Link*.
+- Sections or table rows labelled *Attachments:*, *Issue links:*,
+  *Sub-tasks:*, *Comments*, *Zephyr*, or similar tracker-tool boilerplate.
+- The substantive requirement content (Description / Acceptance Criteria)
+  occupies less than ~25% of the file by line count.
+- More than a handful of image links, Figma links, or external URLs
+  embedded in tables rather than in prose.
+
+**If messy:** before doing anything else, reduce the file to *only* the
+substantive content:
+
+1. Extract the **Description** — whether it's a `## Description` heading or a
+   `**Description:**` row inside a metadata table. Keep the prose; drop
+   surrounding table chrome.
+2. Extract the **Acceptance Criteria** — same rule. The criteria are often a
+   single `**Acceptance Criteria:**` cell in a metadata table; lift the
+   contents out as a proper `## Acceptance Criteria` section with one bullet
+   per criterion.
+3. Discard everything else: issue summary tables, attachments, issue links,
+   sub-tasks, comments, UX-design tables of Figma links, image-only rows,
+   sprint/label/assignee metadata.
+4. Overwrite `./spec.md` with this cleaned version, then proceed to Step 1
+   below. The rest of the refinement runs on the cleaned text.
+
+**If clean:** skip this pass and go straight to Step 1.
+
+Be conservative: if you're not sure something is garbage, keep it. The goal
+is to remove tracker boilerplate, not to second-guess the author.
 
 ## Steps
 
@@ -119,7 +146,10 @@ The refined spec retains the original structure and appends/replaces sections:
 
 ## Rules
 
-- Never delete original content — only enrich.
+- Never delete original content — only enrich. **Exception:** during the
+  Pre-clean Pass above, tracker boilerplate (Jira/Confluence metadata,
+  attachment lists, issue links, sub-tasks, comments, Figma-link tables) may
+  and should be stripped so refinement runs on the substantive requirement.
 - Mark assumptions explicitly with `[ASSUMPTION]` tag.
 - Flag ambiguities with `[CLARIFICATION NEEDED]` tag for upstream resolution.
 - All acceptance criteria must use Given/When/Then and be tagged with automation feasibility.

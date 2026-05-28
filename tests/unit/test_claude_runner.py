@@ -156,6 +156,37 @@ def test_run_agent_missing_binary(tmp_path: Path, monkeypatch):
     assert "not found" in (result.error or "")
 
 
+def test_run_agent_stream_done_grace_period(tmp_path: Path, fake_claude_env):
+    """After a result event, the runner should force-kill after the grace period, not hang."""
+    events = [
+        {"type": "system", "subtype": "init"},
+        {"type": "result", "result": "all done"},
+    ]
+    # Process emits result then hangs for 120s (simulates Windows pipe-handle hang).
+    fake_claude_env(events, sleep_s=120)
+
+    agent = tmp_path / "hang.agent.md"
+    agent.write_text("---\nname: hang\n---\ntest", encoding="utf-8")
+    mcp = tmp_path / ".mcp.json"
+    mcp.write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
+
+    import time
+    start = time.monotonic()
+    result = run_agent(
+        agent,
+        workdir=tmp_path / "wd_grace",
+        inputs={},
+        user_prompt="hang test",
+        timeout_s=300,
+        max_turns=1,
+        mcp_source=mcp,
+    )
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 60, f"took {elapsed:.1f}s — grace period did not kick in"
+    assert result.final_text == "all done"
+
+
 def test_run_agent_missing_input_raises(tmp_path: Path, fake_claude_env):
     fake_claude_env([{"type": "result", "result": "ok"}])
     agent = tmp_path / "a.agent.md"; agent.write_text("x", encoding="utf-8")

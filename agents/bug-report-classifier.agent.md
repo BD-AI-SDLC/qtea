@@ -1,14 +1,3 @@
----
-name: bug-report-classifier
-description: |
-  Classifies test failures into structured bug reports for the worca-t pipeline
-  (Step 10). Reads run-results.json + test-strategy.json. Emits bug-reports.md
-  (human-readable) and bug-reports.json (machine-readable) using the canonical
-  bug-report-template.md and bug-classification-example.md.
-tools: [Read, Write, Glob, Grep]
-model: claude-sonnet-4-6
----
-
 # Bug Report Classifier Agent
 
 ## Mission

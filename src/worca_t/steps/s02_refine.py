@@ -93,11 +93,16 @@ class RefineStep(Step):
             user_prompt=(
                 "Read `./spec.md` and produce a refined specification at "
                 "`./refined-spec.md` following the structure in your agent "
-                "instructions. Ensure a `Requirement ID: REQ-<slug>` line is "
-                "present near the top."
+                "instructions. First run the Pre-clean Pass: if `./spec.md` "
+                "is a noisy Jira/Confluence export, strip it down to just the "
+                "Description and Acceptance Criteria (overwrite `./spec.md`) "
+                "before refining. If it's already a clean narrative spec, "
+                "skip the pre-clean. Ensure a `Requirement ID: REQ-<slug>` "
+                "line is present near the top of the refined spec."
             ),
             timeout_s=self.timeout_s,
             step=2,
+            max_turns=15,
             claude_md=claude_md if claude_md.exists() else None,
         )
 

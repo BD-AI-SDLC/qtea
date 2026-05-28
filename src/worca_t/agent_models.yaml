@@ -8,10 +8,10 @@ polyglot-test-researcher: claude-sonnet-4-6
 jira-to-ai-spec: claude-sonnet-4-6
 refine-spec: claude-sonnet-4-6
 polyglot-test-planner: claude-sonnet-4-6
-test-manager: claude-sonnet-4-6
 plan: claude-sonnet-4-6
 playwright-tester: claude-sonnet-4-6
 bug-report-classifier: claude-sonnet-4-6
+test-manager: claude-sonnet-4-6
 ui-test-automation: claude-opus-4-6
 qa-sdlc-orchestrator: claude-opus-4-6
 critical-thinking: claude-opus-4-6

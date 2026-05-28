@@ -25,6 +25,8 @@ htmlcov/
 
 # Worca-T runtime
 .worca-t/
+worca-junit.xml
+worca-t-reports/
 .env
 .env.local
 

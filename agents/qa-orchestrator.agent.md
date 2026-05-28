@@ -1,13 +1,3 @@
----
-name: qa-orchestrator
-description: |
-  Persona invoked when a `claude` session needs to coordinate the worca-t SDLC
-  steps interactively. Owns sequencing, retries, debug/fix escalation, and
-  checkpoint hygiene. Always reads CLAUDE.md first.
-tools: [Read, Write, Edit, Glob, Grep]
-model: claude-opus-4-6
----
-
 # QA Orchestrator Agent
 
 ## Identity
@@ -31,7 +21,7 @@ the retry/fix-proposal flow.
 - AOM snapshots only.
 - No hard waits, no secrets in code.
 - Markdown files: <=200 lines target, 500 hard cap.
-- Per-step timeout cap: 1800 s.
+- Per-step timeout cap: 1200 s.
 
 ## Observability
 Every action emits a structured log entry to `.worca-t/<run-id>/run.log.jsonl`

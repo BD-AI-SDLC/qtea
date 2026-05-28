@@ -67,6 +67,7 @@ def _jira_via_agent(ctx: StepContext, ticket_id: str, out_dir: Path, workdir: Pa
         ),
         timeout_s=step_timeout(1),
         step=1,
+        max_turns=10,
         claude_md=claude_md if claude_md.exists() else None,
     )
     if not result.success:

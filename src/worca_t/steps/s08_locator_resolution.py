@@ -250,7 +250,7 @@ class LocatorResolutionStep(Step):
             extra_paths=extras,
             timeout_s=self.timeout_s,
             step=8,
-            max_turns=80,
+            max_turns=60,
             claude_md=claude_md if claude_md.exists() else None,
         )
 
