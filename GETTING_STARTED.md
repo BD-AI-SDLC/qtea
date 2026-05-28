@@ -5,7 +5,7 @@
 ## Prerequisites
 
 | Tool | Required? | Check | Install |
-|------|-----------|-------|---------|
+| --- | --- | --- | --- |
 | Python 3.11+ | Yes | `python --version` | python.org or `uv python install 3.12` |
 | uv | Yes | `uv --version` | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | Claude Code CLI | Yes | `claude --version` | `npm install -g @anthropic-ai/claude-code` |
@@ -55,6 +55,12 @@ SUT_BASE_URL=http://localhost:3000
 **Minimum for a local run:** only `ANTHROPIC_API_KEY` is required. Jira
 and Xray credentials are optional — steps 1 and 5 auto-adapt.
 
+Alternatively, pass a custom env file at runtime:
+
+```bash
+worca-t run --spec ./spec.md --sut ./app --env-file /path/to/.env.prod
+```
+
 ## 3. Validate your setup
 
 ```bash
@@ -65,12 +71,19 @@ Expected output: all checks `OK` or `INFO`. Fix any `FAIL` items before
 proceeding. Common issues:
 
 | Check | Fix |
-|-------|-----|
+| --- | --- |
 | claude CLI: FAIL | Install Claude Code CLI or set `WORCA_T_CLAUDE_BIN=claude` |
 | npx: FAIL | Install Node.js (includes npx) |
 | ANTHROPIC_API_KEY: WARN | Add it to your `.env` file |
 | proxy: INFO | Safe to ignore if you're not behind a corporate proxy |
 | allure CLI: INFO | Optional — built-in HTML report is always generated |
+
+Doctor flags:
+
+| Flag | Purpose |
+| --- | --- |
+| `--probe-mcp` | Smoke-spawn each MCP server to verify they start |
+| `--json` | Emit results as JSON (useful for CI integration) |
 
 ## 4. Write your spec (or use Jira)
 
@@ -113,7 +126,7 @@ worca-t run --spec ./feature-spec.md --sut ./app --open-report
 
 The pipeline runs all 11 steps. You'll see console output like:
 
-```
+```text
 workspace .worca-t/20260523-143012-a1b2c3
 run_id    20260523-143012-a1b2c3
 >>> step 01 intake
@@ -125,11 +138,64 @@ step 02 ok  -> 2 outputs
 step 11 ok  -> 2 outputs
 ```
 
+All `run` flags:
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--spec` | required | `jira:KEY-123`, path to spec file, or URL |
+| `--sut` | required | Local path or git URL of the System Under Test |
+| `--run-id` | auto | Resume an existing workspace by its run-id |
+| `--from-step N` | — | Start from step N (skips already-completed steps) |
+| `--only-step N` | — | Run exactly one step |
+| `--skip-step N` | — | Skip step N (repeatable) |
+| `--force` | false | Ignore checkpoints and re-run everything |
+| `--parallelism N` | 1 | Number of parallel test workers (1–16) |
+| `--headless / --headed` | headless | Run browser tests headless or with a visible window |
+| `--debug` | false | Run with debug agent live from step 1 |
+| `--fix` | false | Generate a fix proposal after retry exhaustion |
+| `--strict-xray` | false | Fail the pipeline if Xray upload doesn't succeed |
+| `--report MODE` | auto | `auto \| builtin \| allure \| both` |
+| `--report-inline-images` | false | Embed screenshots as base64 in the HTML report |
+| `--open-report` | false | Open the report in your browser when the run finishes |
+| `--log-level LEVEL` | info | `info \| debug \| trace` |
+| `--env-file PATH` | — | Path to a `.env` file to load (values never appear in logs) |
+| `-w / --workspace PATH` | `~/.worca-t` | Override the workspace base directory |
+
+## 6. List and inspect workspaces
+
+```bash
+worca-t list
+```
+
+Shows all workspaces under `~/.worca-t`, newest first:
+
+```text
+ Workspaces under /home/you/.worca-t
+ run-id                    status    last  steps  started              spec
+ 20260523-143012-a1b2c3   finished  11    11     2026-05-23 14:30:12  feature-spec.md
+ 20260522-091500-b3c4d5   failed    7     7      2026-05-22 09:15:00  jira-PROJ-123
+```
+
+List flags:
+
+| Flag | Purpose |
+| --- | --- |
+| `--all / -a` | Include stale/empty workspaces (zero steps done) |
+| `--limit N` | Max workspaces to display (default 20, max 500) |
+| `--json` | Emit JSON instead of a table |
+| `-w / --workspace PATH` | Override workspace base directory |
+
+Use the `run-id` column with `--run-id` to resume a specific run:
+
+```bash
+worca-t run --spec ./spec.md --sut ./app --run-id 20260522-091500-b3c4d5
+```
+
 ## 7. Find your results
 
 All artifacts are under `.worca-t/<run-id>/artifacts/`:
 
-```
+```text
 .worca-t/<run-id>/
 ├── artifacts/
 │   ├── step01/   spec.md, jira-spec.md
@@ -215,7 +281,7 @@ worca-t run --spec ./spec.md --sut ./app --strict-xray
 ## 9. The 11 steps explained
 
 | # | Step | What it does |
-|---|------|-------------|
+| --- | --- | --- |
 | 1 | **Intake** | Fetches the spec from Jira, URL, or local file |
 | 2 | **Refine** | AI refines the spec into structured requirements |
 | 3 | **Plan** | AI creates a test plan with phases and success criteria |
