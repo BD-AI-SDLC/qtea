@@ -1,8 +1,3 @@
----
-description: 'Runs test commands for any language and reports results. Discovers test command from project files if not specified.'
-name: 'Polyglot Test Tester'
----
-
 # Tester Agent
 
 You run tests and report the results. You are polyglot - you work with any programming language.
@@ -11,18 +6,22 @@ You run tests and report the results. You are polyglot - you work with any progr
 
 Run the appropriate test command and report pass/fail with details.
 
+**Attention**: test automation opens a web browser, using base url, user credentials, and test data provided by the research agent. Make sure you have the necessary environment variables and configuration to run the tests successfully. Without them you won't be able to start the session, therefore this is a **MUST** have. If they are missing, don't start the session and report the missing variables. 
+
 ## Process
 
 ### 1. Discover Test Command
 
 If not provided, check in order:
-1. `.testagent/research.md` or `.testagent/plan.md` for Commands section
-2. Project files:
+1. Project files:
+   - `playwright.config.{ts,js}` → `npx playwright test`
+   - `cypress.config.{ts,js}` → `npx cypress run`
+   - `*.robot` / `robot.yaml` → `robot`
    - `*.csproj` with Test SDK → `dotnet test`
    - `package.json` → `npm test` or `npm run test`
    - `pyproject.toml` / `pytest.ini` → `pytest`
-   - `go.mod` → `go test ./...`
-   - `Cargo.toml` → `cargo test`
+   - `pom.xml` → `mvn test`
+   - `build.gradle` → `gradle test`
    - `Makefile` → `make test`
 
 ### 2. Run Test Command
@@ -30,10 +29,14 @@ If not provided, check in order:
 Execute the test command.
 
 For scoped tests (if specific files are mentioned):
+- **Playwright**: `npx playwright test path/to/test.spec.ts`
+- **Cypress**: `npx cypress run --spec "path/to/test.cy.ts"`
+- **Robot Framework**: `robot path/to/test.robot`
 - **C#**: `dotnet test --filter "FullyQualifiedName~ClassName"`
-- **TypeScript/Jest**: `npm test -- --testPathPattern=FileName`
+- **Jest**: `npm test -- --testPathPattern=FileName`
 - **Python/pytest**: `pytest path/to/test_file.py`
-- **Go**: `go test ./path/to/package`
+- **Java/Maven**: `mvn test -Dtest=ClassName`
+- **Java/Gradle**: `gradle test --tests ClassName`
 
 ### 3. Parse Output
 
@@ -72,14 +75,15 @@ Failures:
 
 | Language | Framework | Command |
 |----------|-----------|---------|
+| TypeScript | Playwright | `npx playwright test` |
+| TypeScript | Cypress | `npx cypress run` |
+| Python | Robot Framework | `robot` |
+| Python | pytest | `pytest` |
 | C# | MSTest/xUnit/NUnit | `dotnet test` |
 | TypeScript | Jest | `npm test` |
 | TypeScript | Vitest | `npm run test` |
-| Python | pytest | `pytest` |
-| Python | unittest | `python -m unittest` |
-| Go | testing | `go test ./...` |
-| Rust | cargo | `cargo test` |
-| Java | JUnit | `mvn test` or `gradle test` |
+| Java | JUnit/TestNG (Maven) | `mvn test` |
+| Java | JUnit/TestNG (Gradle) | `gradle test` |
 
 ## Important
 

@@ -23,7 +23,25 @@
       "Bash(gcloud auth *)",
       "Bash(xargs ls *)",
       "Bash(C:/Users/ets1wz/AppData/Roaming/uv/tools/worca-t/Scripts/python.exe *)",
-      "Read(//c/Users/ets1wz/.worca-t/20260523-123142-588f2a/artifacts/step04/**)"
+      "Read(//c/Users/ets1wz/.worca-t/20260523-123142-588f2a/artifacts/step04/**)",
+      "Bash(where worca-t *)",
+      "Bash(worca-t version *)",
+      "Bash(worca-t --help)",
+      "Bash(worca-t doctor *)",
+      "Bash(uv run *)",
+      "Bash(\"C:/Users/ets1wz/AppData/Roaming/uv/tools/worca-t/Scripts/python.exe\" -m pytest tests/unit/test_pipeline.py -x -q)",
+      "Bash(\"C:/Users/ets1wz/AppData/Roaming/uv/tools/worca-t/Scripts/python.exe\" -m pip install pytest --quiet)",
+      "Bash(\"C:/Users/ets1wz/AppData/Roaming/uv/tools/worca-t/Scripts/python.exe\" -c \"import pytest; print\\(pytest.__version__\\)\")",
+      "Read(//c/doc_to_markdown/**)",
+      "WebFetch(domain:playwright.dev)",
+      "Bash(tail -20 \"C:/Users/ets1wz/.worca-t/20260527-222541-93dd21/run.log.jsonl\" | python -c \" *)",
+      "Read(//c/Users/ets1wz/.worca-t/20260527-222541-93dd21/**)",
+      "Bash(wmic process *)",
+      "Bash(tasklist)",
+      "Bash(stat -c '%Y' \"C:/Users/ets1wz/.worca-t/20260527-222541-93dd21/step-06/transcript.jsonl\" 2>/dev/null; date +%s)",
+      "Read(//c/MAS/Production_ready/worca-t/**)",
+      "Bash(grep -v \"^$\")",
+      "Bash(PYTHONPATH=\"c:/MAS/Production_ready/worca-t/src\" python -m pytest tests/ -v -x)"
     ]
   }
 }

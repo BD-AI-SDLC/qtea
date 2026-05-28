@@ -60,7 +60,7 @@ For each step in `_select_steps()` (respecting `--from-step`, `--only-step`, `--
    - The correct model from the agent-model map.
    - The curated input bundle (files listed in section 3 below).
    - MCP servers from `.mcp.json` (Playwright, Chrome DevTools, Atlassian).
-   - A per-step timeout cap (see `config.py`; max **1800 seconds**).
+   - A per-step timeout cap (see `config.py`; max **1200 seconds**).
 4. Stream agent progress. Write each event to `run.log.jsonl` with fields:
    `run_id`, `step`, `agent`, `attempt`, `correlation_id`, `timestamp`.
 5. Mask secrets in all log output: `ANTHROPIC_API_KEY`, `ATLASSIAN_API_TOKEN`,
@@ -91,7 +91,7 @@ Attempt 1 fails  (steps/base.py MAX_ATTEMPTS=2)
         --> Attempt 2 fails:
               if --fix: invoke critical-thinking (claude-opus-4-6) for RCA
                         --> feed analysis to principal-software-engineer (claude-opus-4-6)
-                        --> produce fix-proposal.md  (NEVER auto-edit code)
+                        --> produce fix-proposal.md and auto-edit code (no auto-edits if --fix not set)
               else: ABORT pipeline, mark step "failed" in state.json
 ```
 
@@ -101,12 +101,9 @@ Attempt 1 fails  (steps/base.py MAX_ATTEMPTS=2)
    If `--debug` was set, `debug.agent.md` was already running from attempt 1.
 3. If attempt 2 also fails and `--fix` is set:
    a. Invoke `critical-thinking` (claude-opus-4-6) with the failure context.
-      It challenges assumptions and performs root-cause analysis.
-      It does NOT produce fixes -- only questions and analysis.
    b. Feed the critical-thinking output to `principal-software-engineer`
-      (claude-opus-4-6). It produces `fix-proposal.md` with engineering
-      recommendations. It NEVER auto-edits source code.
-   c. Write `fix-proposal.md` to `artifacts/stepNN/`.
+      (claude-opus-4-6).
+   c. Write `fix-proposal.md` to `artifacts/stepNN/`and auto-edit code.
 4. If attempt 2 fails and `--fix` is NOT set: mark step `"failed"`, abort.
 
 ---
@@ -166,7 +163,7 @@ traceability backbone -- they propagate through every downstream artifact.
 
 | Field | Value |
 |---|---|
-| Agent | `test-manager` (claude-sonnet-4-6) |
+| Agent | `test-manager` (claude-opus-4-6) |
 | Input | `artifacts/step03/plan.json` |
 | Output | `artifacts/step04/test-strategy.md`, `test-strategy.json` |
 | Schema | `schemas/test-strategy.schema.json` |
@@ -202,7 +199,7 @@ traceability backbone -- they propagate through every downstream artifact.
 
 | Field | Value |
 |---|---|
-| Agent | `polyglot-test-researcher` (claude-haiku-4-5) |
+| Agent | `polyglot-test-researcher` (claude-sonnet-4-6) |
 | Input | `--sut` (local path or git URL) |
 | Output | `artifacts/step06/research.md`, `research.json` |
 | Schema | `schemas/research.schema.json` |
@@ -269,7 +266,7 @@ null but do not fail.
 
 | Field | Value |
 |---|---|
-| Agents | `polyglot-test-tester` (claude-haiku-4-5) for execution, `polyglot-test-fixer` (claude-haiku-4-5) for self-heal |
+| Agents | `polyglot-test-tester` (claude-sonnet-4-6) for execution, `polyglot-test-fixer` (claude-sonnet-4-6) for self-heal |
 | Input | `artifacts/step07/tests-with-tbd.json` (TBDs resolved), `--sut` path, `--parallelism N`, `--headless\|--headed` |
 | Output | `artifacts/step09/run-results.json`, screenshots, traces, `bugs/*.md` candidates |
 | Schema | `schemas/run-results.schema.json` |

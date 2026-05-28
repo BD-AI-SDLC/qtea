@@ -176,17 +176,29 @@ jobs:
 - PII redaction in screenshots/videos.
 - GDPR compliance for test data storage.
 
-**Example — Python:**
+**Example — Python (Playwright):**
 ```python
+# conftest.py — pytest-playwright provides built-in fixtures:
+#   playwright (session), browser_type (session), browser (session),
+#   context (function), page (function).
+# Only override when you need custom launch or context options.
+
+@pytest.fixture(scope="session")
+def browser_type_launch_args():
+    return {"args": ["--disable-gpu"]}
+
+
 @pytest.fixture
-def test_user(api_client):
-    """Create isolated test user for this test only."""
-    user = api_client.create_user({
-        'email': f'test_{uuid4()}@example.com',
-        'name': fake.name()
-    })
-    yield user
-    api_client.delete_user(user.id)  # Cleanup
+def browser_context_args():
+    return {"viewport": {"width": 1280, "height": 720}}
+
+
+# Tests use the built-in page fixture — isolated per test automatically.
+def test_login(page: Page):
+    page.goto("/login")
+    page.get_by_label("Email").fill("user@example.com")
+    page.get_by_role("button", name="Sign in").click()
+    page.wait_for_url("**/dashboard")
 ```
 
 ### Accessibility Testing (WCAG Compliance)
@@ -196,16 +208,16 @@ def test_user(api_client):
 - Fail tests on critical violations (missing alt text, no keyboard nav).
 - Cover keyboard navigation, screen reader compatibility, color contrast, form label associations.
 
-**Example — Playwright:**
+**Example — Playwright (TS):**
 ```typescript
-import { injectAxe, checkA11y } from 'axe-playwright';
+import { AxeBuilder } from '@axe-core/playwright';
+
 test('should have no accessibility violations', async ({ page }) => {
   await page.goto('/dashboard');
-  await injectAxe(page);
-  await checkA11y(page, null, {
-    detailedReport: true,
-    detailedReportOptions: { html: true }
-  });
+  const results = await new AxeBuilder({ page })
+    .withTags(['wcag2aa'])
+    .analyze();
+  expect(results.violations).toEqual([]);
 });
 ```
 
@@ -223,6 +235,11 @@ export default defineConfig({
   workers: process.env.CI ? 4 : undefined,
   fullyParallel: true,
   retries: process.env.CI ? 2 : 0,
+  use: {
+    trace: 'on-first-retry',
+    screenshot: 'only-on-failure',
+    video: 'on-first-retry',
+  },
   reporter: [
     ['html'],
     ['junit', { outputFile: 'results.xml' }],
@@ -257,24 +274,7 @@ Handling browser-specific issues:
 
 ---
 
-## §8 — Context7 MCP Protocol
-
-- **Primary:** Query Context7 MCP for `framework@version` docs before generating any framework-specific call.
-- **Fallback:** Use embedded common patterns library (stable APIs).
-- **Last resort:** Generate with a `// ⚠️ Could not verify <framework> <version> API from Context7. Generated code uses <known-version> patterns. Please review.` comment.
-
-**Robot Framework specifics:** When Robot Framework is detected, query Context7 for `robotframework-browser` (keywords: `New Browser`, `New Page`, `Get Text`, `Click`, `Fill Text`) or `robotframework-seleniumlibrary` (keywords: `Open Browser`, `Click Element`, `Input Text`, `Page Should Contain`). Locator prefixes differ — see §2 above. Always verify keyword signatures from Context7 before generating `.robot` files.
-
----
-
-## §9 — Multi-Agent Coordination
-
-- **With `api-test-automation`:** call it to generate data-seeding scripts (e.g., "Create User via API") before running UI login tests.
-- **With `performance-test-agent`:** provide successful functional UI flows for conversion to load scenarios (Locust / k6).
-
----
-
-## §10 — Example Scenarios
+## §8 — Example Scenarios
 
 **Scenario A (Python):** User uploads `requirements.txt` with `pytest-playwright`.
 → Generate `conftest.py` with fixtures and `test_login.py` using synchronous or async Playwright based on existing code patterns.

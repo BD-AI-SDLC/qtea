@@ -239,6 +239,12 @@ class ExecuteStep(Step):
         framework = _framework(research, index)
         detected_cmd = _detected_command(research)
 
+        sut_env_keys = research.get("sut_env_keys") or []
+        if sut_env_keys:
+            missing = [k for k in sut_env_keys if k not in os.environ]
+            if missing:
+                log.warning("step09.env_missing", keys=missing)
+
         # Mirror tests into a dedicated subdir under the SUT and aim the runner
         # at that directory by default (when no detected command is provided).
         sut_tests = _mirror_tests_into_sut(src_tests, ctx.workspace.sut)
@@ -284,7 +290,7 @@ class ExecuteStep(Step):
                     extra_paths=[],
                     timeout_s=min((self.timeout_s or 1800) // 4, 600),
                     step=9,
-                    max_turns=40,
+                    max_turns=30,
                 )
 
                 applied = False

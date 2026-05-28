@@ -153,11 +153,11 @@ class PlanStep(Step):
             user_prompt=(
                 "Read the staged `./research.md` (and `./refined-spec.md` if "
                 "present) and produce a phased test implementation plan at "
-                "`./plan.md` following the structure in your agent prompt. "
-                "Include Build/Test/Lint commands explicitly."
+                "`./plan.md` following the structure in your agent prompt."
             ),
             timeout_s=self.timeout_s,
             step=3,
+            max_turns=15,
             claude_md=claude_md if claude_md.exists() else None,
         )
 

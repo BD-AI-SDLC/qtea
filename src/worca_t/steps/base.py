@@ -150,7 +150,47 @@ def _run_fix_proposal(step_num: int, ctx: StepContext, failure_context: str) -> 
 
 
 class Step(ABC):
-    """All pipeline steps subclass this."""
+    """All pipeline steps subclass this.
+
+    ## Workdir contract
+
+    Every step has two directories on the workspace, and the distinction
+    between them is load-bearing:
+
+      - ``out_dir()`` -> ``artifacts/stepNN/``: PUBLISHED outputs. The
+        hand-off surface to downstream steps. Written by the step on
+        success, read by later steps as their ``inputs``. Treat as
+        immutable once written.
+
+      - ``workdir()`` -> ``agent-work/stepNN/``: AGENT SCRATCHPAD. A
+        throwaway staging area where ``run_agent`` copies the agent
+        prompt, skills, prior-step outputs, and other ``extra_paths`` so
+        the ``claude`` CLI subprocess can see them at its cwd. Files
+        here have no semantic value beyond the current attempt.
+
+    INVARIANT: a step must NEVER read its own workdir as a source of
+    truth across attempts. Every input must be re-sourced from outside
+    the workdir on every attempt -- from package resources
+    (``package_resource_root()``), from ``ctx.sut_source``, from the
+    ``artifacts/`` directories of prior steps, etc. (Reading a file
+    within the same ``run()`` call that wrote it is fine; that is
+    within-attempt staging, not cross-attempt state.)
+
+    This invariant guarantees:
+
+      - Reruns and retries are deterministic regardless of any residue
+        left in the workdir by a prior attempt.
+      - Fixes to package resources (skills, agent prompts) are picked
+        up on the very next attempt with no cache invalidation needed.
+      - Workdir contents may be wiped at any time without affecting
+        correctness; the forensic audit trail lives in
+        ``workspace.debug/`` via ``_snapshot_debug_artifacts``.
+
+    Downstream-step idempotency markers (e.g. "skip if already posted")
+    belong in ``out_dir()``, not in ``workdir()``: the published
+    artifact directory is the only place where cross-attempt state has
+    meaning.
+    """
 
     number: int = 0
     name: str = ""
@@ -168,6 +208,11 @@ class Step(ABC):
 
     def execute(self, ctx: StepContext) -> StepResult:
         """Wraps `run()` with timing, state-record updates, retry, and fix-proposal."""
+        # Each attempt below re-invokes self.run(ctx) from scratch. run() is
+        # responsible for repopulating the workdir from external sources on
+        # every call; nothing in agent-work/stepNN/ survives semantically
+        # between attempts. See the Step docstring "Workdir contract" for
+        # the full invariant.
         record = ctx.state.steps.get(self.number) or StepRecord(step=self.number, name=self.name)
         ctx.state.steps[self.number] = record
 

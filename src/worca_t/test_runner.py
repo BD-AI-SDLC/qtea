@@ -179,11 +179,13 @@ def resolve_command(
     """Pick command + parser id. Prefer detected command from Step 6 when given."""
     if detected:
         parser = _DEFAULT_COMMANDS.get(framework, ("", "auto"))[1]
+        if parser == "junit" and "--junitxml" not in detected:
+            detected = f"{detected} --junitxml={(cwd / 'worca-junit.xml').as_posix()}"
         return detected, parser
     if framework in _DEFAULT_COMMANDS:
         template, parser = _DEFAULT_COMMANDS[framework]
         return _expand_command(template, cwd), parser
-    return "pytest --junitxml=worca-junit.xml", "junit"
+    return _expand_command("pytest --junitxml={junit}", cwd), "junit"
 
 
 def _expand_command(template: str, cwd: Path) -> str:

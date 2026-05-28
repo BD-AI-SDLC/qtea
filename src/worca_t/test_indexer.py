@@ -391,10 +391,39 @@ def _scan_tc_refs_and_tags(block: str) -> tuple[list[str], list[str]]:
     return list(dict.fromkeys(refs)), list(dict.fromkeys(tags))
 
 
+def _is_in_comment(file_text: str, match_start: int) -> bool:
+    """True if the match position is inside a single-line comment.
+
+    Walks back from ``match_start`` to the previous newline (or start of file)
+    and looks for an unescaped ``#`` (Python/YAML/Ruby/shell) or ``//``
+    (JS/TS/Java/Go/C-family) comment marker. We deliberately do not parse
+    string literals — the cost of treating ``"// not a comment"`` as a
+    comment is a missed-violation false negative on a contrived snippet,
+    while the cost of NOT doing this check is real false positives on
+    legitimate documentation comments that mention banned APIs by name
+    (e.g. the standard header ``# never use page.content()``).
+
+    Block comments (``/* ... */``, triple-quoted Python strings) are not
+    handled here; matches inside those will still flag. Acceptable tradeoff:
+    the upside is bounded (only the most common comment style is honored)
+    and the rules are intended to catch executable code, which is rarely
+    nested inside block comments.
+    """
+    line_start = file_text.rfind("\n", 0, match_start) + 1
+    prefix = file_text[line_start:match_start]
+    if "#" in prefix:
+        return True
+    if "//" in prefix:
+        return True
+    return False
+
+
 def _scan_violations(file_text: str, rel_path: str) -> list[Violation]:
     out: list[Violation] = []
     for rule, pat in _VIOLATION_PATTERNS:
         for m in pat.finditer(file_text):
+            if _is_in_comment(file_text, m.start()):
+                continue
             out.append(
                 Violation(
                     rule=rule,

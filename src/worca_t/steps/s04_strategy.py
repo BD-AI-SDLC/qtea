@@ -158,6 +158,9 @@ class StrategyStep(Step):
             p = docs_root / doc
             if p.exists():
                 extras.append(p)
+        schema = package_resource_root() / "schemas" / "test-strategy.schema.json"
+        if schema.exists():
+            extras.append(schema)
 
         result = run_agent(
             agent,
@@ -173,7 +176,7 @@ class StrategyStep(Step):
             extra_paths=extras,
             timeout_s=self.timeout_s,
             step=4,
-            max_turns=40,
+            max_turns=25,
             claude_md=claude_md if claude_md.exists() else None,
         )
 

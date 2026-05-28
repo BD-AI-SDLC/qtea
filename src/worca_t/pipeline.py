@@ -14,6 +14,7 @@ from pathlib import Path
 from rich.console import Console
 
 from worca_t.checkpoints import RunState, is_step_complete, load_state, outputs_match, save_state
+from worca_t.config import load_env
 from worca_t.logging_setup import configure_logging
 from worca_t.steps.base import Step, StepContext
 from worca_t.steps.s01_intake import IntakeStep
@@ -27,7 +28,7 @@ from worca_t.steps.s08_locator_resolution import LocatorResolutionStep
 from worca_t.steps.s09_execute import ExecuteStep
 from worca_t.steps.s10_bug_classifier import BugClassifierStep
 from worca_t.steps.s11_report import ReportStep
-from worca_t.workspace import Workspace, create_workspace, find_latest_workspace
+from worca_t.workspace import Workspace, create_workspace
 
 TOTAL_STEPS = 11
 
@@ -50,8 +51,8 @@ class PipelineOptions:
     report_inline_images: bool = False
     open_report: bool = False
     log_level: str = "info"
-    resume: bool = True
     run_id: str | None = None
+    env_file: Path | None = None
 
 
 def _build_registry() -> dict[int, Step]:
@@ -75,14 +76,68 @@ def _build_registry() -> dict[int, Step]:
 STEP_REGISTRY: dict[int, Step] = _build_registry()
 
 
-def _select_workspace(opts: PipelineOptions) -> Workspace:
-    if opts.resume and opts.run_id is None:
-        latest = find_latest_workspace(opts.workspace_base)
-        if latest is not None:
-            state = load_state(latest.state_file)
-            if state and state.finished_at is None:
-                return latest
-    return create_workspace(opts.workspace_base, run_id=opts.run_id)
+def _select_workspace(opts: PipelineOptions, console: Console | None = None) -> Workspace:
+    """Pick the workspace to operate against.
+
+    Resume is opt-in via ``--run-id``. Without it, every invocation gets a
+    fresh workspace — even if a prior in-progress run exists.
+
+    Precedence:
+      1. ``--run-id`` set -> resume that workspace (must already exist).
+      2. Otherwise        -> create a fresh workspace. ``--from-step`` without
+                              ``--run-id`` is an error, since there is nothing
+                              to resume into.
+    """
+    if opts.run_id is not None:
+        candidate = opts.workspace_base / opts.run_id
+        if not candidate.exists():
+            raise FileNotFoundError(
+                f"run-id '{opts.run_id}' not found under {opts.workspace_base}"
+            )
+        return Workspace(root=candidate.resolve(), run_id=opts.run_id)
+
+    if opts.from_step is not None:
+        raise RuntimeError(
+            f"--from-step {opts.from_step} requires --run-id to identify the "
+            "workspace to resume into. Pass --run-id <id> (see `worca-t list`)."
+        )
+
+    return create_workspace(opts.workspace_base, run_id=None)
+
+
+def _validate_resume_prerequisites(
+    state: RunState, from_step: int, console: Console
+) -> None:
+    """Ensure all steps before ``from_step`` have completed-or-skipped status.
+
+    Raises ``RuntimeError`` with an actionable message if any are missing,
+    so the user isn't stuck debugging an empty workdir on a downstream step.
+    """
+    missing: list[int] = []
+    for prior in range(1, from_step):
+        rec = state.steps.get(prior)
+        if not rec or rec.status not in ("completed", "skipped"):
+            missing.append(prior)
+    if missing:
+        listing = ", ".join(str(n) for n in missing)
+        raise RuntimeError(
+            f"cannot run --from-step {from_step}: prior step(s) [{listing}] "
+            "did not complete in this workspace. Re-run from an earlier step, "
+            "or use --run-id to target a different workspace."
+        )
+
+
+def _reset_steps_from(state: RunState, from_step: int) -> None:
+    """Drop checkpoint records for steps >= ``from_step`` so they re-execute.
+
+    Without this, ``is_step_complete`` would short-circuit the very step the
+    user asked to re-run if it had previously reached 'completed' / 'failed'.
+    """
+    for k in list(state.steps.keys()):
+        if k >= from_step:
+            del state.steps[k]
+    # Re-open the run so pipeline.end can stamp a new finished_at.
+    state.finished_at = None
 
 
 def _select_steps(opts: PipelineOptions) -> list[int]:
@@ -94,7 +149,21 @@ def _select_steps(opts: PipelineOptions) -> list[int]:
 
 def run_pipeline(opts: PipelineOptions, *, console: Console | None = None) -> int:
     console = console or Console()
-    ws = _select_workspace(opts)
+
+    if opts.env_file:
+        load_env(opts.env_file)
+    else:
+        sut_path = Path(opts.sut).expanduser().resolve()
+        if sut_path.is_dir():
+            sut_dotenv = sut_path / ".env"
+            if sut_dotenv.is_file():
+                load_env(sut_dotenv)
+
+    try:
+        ws = _select_workspace(opts, console=console)
+    except (FileNotFoundError, RuntimeError) as e:
+        (console or Console()).print(f"[red]workspace error:[/] {e}")
+        return 2
     log = configure_logging(level=opts.log_level, jsonl_path=ws.run_log, run_id=ws.run_id)
 
     state = load_state(ws.state_file) or RunState(
@@ -106,6 +175,17 @@ def run_pipeline(opts: PipelineOptions, *, console: Console | None = None) -> in
     # Refresh source pointers if user changed them.
     state.spec_source = opts.spec
     state.sut_source = opts.sut
+
+    # If user asked to re-enter mid-pipeline, validate prereqs and clear
+    # downstream checkpoints so the requested step actually re-executes.
+    if opts.from_step is not None:
+        try:
+            _validate_resume_prerequisites(state, opts.from_step, console)
+        except RuntimeError as e:
+            console.print(f"[red]resume error:[/] {e}")
+            return 2
+        _reset_steps_from(state, opts.from_step)
+        save_state(state, ws.state_file)
 
     log.info(
         "pipeline.start",

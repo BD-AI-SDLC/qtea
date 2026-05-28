@@ -47,7 +47,9 @@ class Workspace:
         return self.root / "doctor-report.md"
 
     def step_dir(self, step: int) -> Path:
-        return self.artifacts / f"step{step:02d}"
+        d = self.artifacts / f"step{step:02d}"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
     def step_workdir(self, step: int) -> Path:
         return self.root / f"step-{step:02d}"
@@ -55,8 +57,6 @@ class Workspace:
     def ensure_layout(self) -> None:
         for p in (self.artifacts, self.debug, self.sut):
             p.mkdir(parents=True, exist_ok=True)
-        for i in range(1, 12):
-            self.step_dir(i).mkdir(parents=True, exist_ok=True)
 
 
 def create_workspace(base: Path | None = None, run_id: str | None = None) -> Workspace:

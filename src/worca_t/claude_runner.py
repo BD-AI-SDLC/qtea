@@ -101,6 +101,12 @@ def _stage_resources(
     return agent_dst
 
 
+# Sanity threshold for an unusually large agent file (informational only —
+# system-prompt content is passed via --append-system-prompt-file, not on the
+# command line, so there is no real argv length pressure).
+_AGENT_PROMPT_WARN_BYTES = 30_000
+
+
 def _build_command(
     *,
     claude_bin: str,
@@ -110,7 +116,35 @@ def _build_command(
     max_turns: int | None,
     permission_mode: str,
 ) -> list[str]:
-    """Build the `claude` CLI argv."""
+    """Build the `claude` CLI argv.
+
+    The agent's markdown is delivered via ``--append-system-prompt-file`` so
+    its full contents reach the model. The previously used ``@filename``
+    syntax inside ``--append-system-prompt`` is NOT expanded by the Claude
+    CLI; it was being passed verbatim and silently producing a degenerate
+    system prompt. Inlining the file body on the command line was also
+    unsafe on Windows where long argv values can corrupt downstream
+    positional argument parsing in the Node-based CLI wrapper.
+    """
+    if not agent_path_in_workdir.exists():
+        raise RuntimeError(
+            f"agent file missing in workdir: {agent_path_in_workdir}"
+        )
+
+    try:
+        agent_size = agent_path_in_workdir.stat().st_size
+    except OSError as e:
+        raise RuntimeError(
+            f"failed to stat agent file: {agent_path_in_workdir} ({e})"
+        ) from e
+
+    if agent_size > _AGENT_PROMPT_WARN_BYTES:
+        log.warning(
+            "agent.system_prompt.large",
+            agent=agent_path_in_workdir.name,
+            bytes=agent_size,
+        )
+
     cmd: list[str] = [
         claude_bin,
         "--print",
@@ -119,8 +153,8 @@ def _build_command(
         "stream-json",
         "--input-format",
         "text",
-        "--append-system-prompt",
-        f"@{agent_path_in_workdir.name}",
+        "--append-system-prompt-file",
+        agent_path_in_workdir.name,
         "--mcp-config",
         ".mcp.json",
         "--permission-mode",
@@ -161,35 +195,41 @@ def _drain_stream(
     events: list[dict[str, Any]],
     final_text_holder: list[str],
     on_event: Any | None,
+    stream_done: threading.Event | None = None,
 ) -> None:
     """Read newline-delimited JSON from claude's stdout, persist + parse."""
-    for raw_line in iter(stream.readline, b""):
-        if not raw_line:
-            break
-        line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
-        if not line:
-            continue
-        transcript_fp.write(line + "\n")
-        transcript_fp.flush()
-        try:
-            evt = json.loads(line)
-        except json.JSONDecodeError:
-            evt = {"type": "raw", "text": line}
-        events.append(evt)
-        # Best-effort: capture final assistant text for downstream parsing.
-        etype = evt.get("type")
-        if etype == "result" and isinstance(evt.get("result"), str):
-            final_text_holder[0] = evt["result"]
-        elif etype == "assistant":
-            msg = evt.get("message") or {}
-            for block in msg.get("content", []) or []:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    final_text_holder[0] = block.get("text", "")
-        if on_event:
+    try:
+        for raw_line in iter(stream.readline, b""):
+            if not raw_line:
+                break
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+            if not line:
+                continue
+            transcript_fp.write(line + "\n")
+            transcript_fp.flush()
             try:
-                on_event(evt)
-            except Exception:
-                pass
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                evt = {"type": "raw", "text": line}
+            events.append(evt)
+            # Best-effort: capture final assistant text for downstream parsing.
+            etype = evt.get("type")
+            if etype == "result" and isinstance(evt.get("result"), str):
+                final_text_holder[0] = evt["result"]
+                if stream_done is not None:
+                    stream_done.set()
+            elif etype == "assistant":
+                msg = evt.get("message") or {}
+                for block in msg.get("content", []) or []:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        final_text_holder[0] = block.get("text", "")
+            if on_event:
+                try:
+                    on_event(evt)
+                except Exception:
+                    pass
+    except (OSError, ValueError):
+        pass
 
 
 def run_agent(
@@ -210,6 +250,15 @@ def run_agent(
     debug_live: bool = False,
 ) -> AgentResult:
     """Run a single agent via the `claude` CLI in an isolated workdir.
+
+    The ``workdir`` passed here is a staging-only directory. ``inputs``
+    and ``extra_paths`` are copied IN at the start of each call; the
+    agent's outputs land here and the caller is expected to move/copy
+    the relevant ones into ``artifacts/stepNN/`` for publication. No
+    file in the workdir should be assumed to persist meaningfully across
+    ``run_agent`` invocations -- callers must re-stage everything they
+    need on every call. See ``worca_t.steps.base.Step`` docstring for
+    the full workdir-vs-out_dir contract.
 
     Parameters
     ----------
@@ -257,7 +306,7 @@ def run_agent(
     for key in CLAUDE_SESSION_KEYS:
         env.pop(key, None)
 
-    safe_cmd = [*cmd[:6], "<system-prompt>", "...", "<user-prompt>"]
+    safe_cmd = [*cmd[:-1], "<user-prompt>"]
     relevant_env = {
         k: env[k]
         for k in env
@@ -323,23 +372,77 @@ def run_agent(
             creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
         )
 
+        stream_done = threading.Event()
+
         reader = threading.Thread(
             target=_drain_stream,
-            args=(proc.stdout, transcript_fp, events, final_text, on_event),
+            args=(proc.stdout, transcript_fp, events, final_text, on_event, stream_done),
             daemon=True,
         )
         reader.start()
 
+        # Grace period after the stream emits a 'result' event.  On Windows
+        # the cmd.exe wrapper may keep pipe handles open long after the
+        # Claude CLI exits; this avoids waiting indefinitely.
+        _POST_RESULT_GRACE_S = 30
+
         try:
-            exit_code = proc.wait(timeout=resolved_timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            error = f"timeout after {resolved_timeout}s"
-            log.error("agent.timeout", agent=agent_path.name, timeout_s=resolved_timeout)
-            _terminate_process(proc)
-            exit_code = proc.wait(timeout=10)
+            deadline = time.monotonic() + resolved_timeout
+            grace_deadline: float | None = None
+
+            while True:
+                rc = proc.poll()
+                if rc is not None:
+                    exit_code = rc
+                    break
+
+                now = time.monotonic()
+
+                if now >= deadline:
+                    timed_out = True
+                    error = f"timeout after {resolved_timeout}s"
+                    log.error("agent.timeout", agent=agent_path.name, timeout_s=resolved_timeout)
+                    _terminate_process(proc)
+                    try:
+                        exit_code = proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        exit_code = -9
+                    break
+
+                if stream_done.is_set():
+                    if grace_deadline is None:
+                        grace_deadline = now + _POST_RESULT_GRACE_S
+                        log.info(
+                            "agent.stream_done_process_alive",
+                            agent=agent_path.name,
+                            grace_s=_POST_RESULT_GRACE_S,
+                            pid=proc.pid,
+                        )
+                    elif now >= grace_deadline:
+                        log.warning(
+                            "agent.grace_period_expired",
+                            agent=agent_path.name,
+                            pid=proc.pid,
+                            grace_s=_POST_RESULT_GRACE_S,
+                        )
+                        _terminate_process(proc)
+                        try:
+                            exit_code = proc.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            exit_code = -9
+                        break
+
+                time.sleep(0.5)
+
         finally:
+            if proc.stdout is not None:
+                try:
+                    proc.stdout.close()
+                except OSError:
+                    pass
             reader.join(timeout=5)
+            if reader.is_alive():
+                log.warning("agent.reader_thread_stuck", agent=agent_path.name)
     except Exception as e:
         error = f"spawn error: {e}"
         log.error("agent.spawn_error", agent=agent_path.name, error=str(e))

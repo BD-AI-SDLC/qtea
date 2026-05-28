@@ -9,6 +9,7 @@ Analyze codebase → emit structured discovery summary + markdown research docum
 ## Authoritative Workflow
 
 The full step-by-step procedure (stack catalogs, regex signals, universal fallback recipe, output template, error matrix) lives in `agents/polyglot-test-researcher.prompt.md`. Read it on demand for any framework- or pattern-specific detail. This file holds only the persona + non-negotiable rules.
+**Attention**: environment variables file is needed, in order to pass it to the tester agent in step 9. Without this file, step 9 won't be able to run. If it's missing, report the missing file.
 
 ## Non-Negotiable Rules
 
@@ -46,22 +47,12 @@ The full step-by-step procedure (stack catalogs, regex signals, universal fallba
 | Subagent unavailable | Continue inline | `"Subagent {name} unavailable — performed inline."` |
 | Scan > 10 min | Partial results | `"Discovery timeout — returning partial results."` |
 
-## Performance Bounds
-
-| Codebase Size | Discovery Time |
-|---------------|----------------|
-| Small (<50 files) | 10–30 s |
-| Medium (50–200) | 30 s – 2 min |
-| Large (200–1000) | 2–6 min |
-
-Hard limits: total ≤ 10 min · max files 1000 · max single file 2 MB.
-
 ## Output Contract
 
 Two artifacts required:
 
 1. **Structured Discovery Summary** on stdout — exact block format in prompt.md §10. Machine-readable orchestrator handoff.
-2. **Research document** at `.testagent/research.md` — sections enumerated in prompt.md §11.
+2. **Research document** `research.md` — sections enumerated in prompt.md §11.
 
 Summary without doc = incomplete. Doc without summary = no machine hook.
 
@@ -71,3 +62,6 @@ Summary without doc = incomplete. Doc without summary = no machine hook.
 |---|---|---|
 | `skills/acquire-codebase-knowledge/SKILL.md` | Step 1 | Run `scripts/scan.py` (Python, deterministic) for 7 baseline docs as seed before LLM steps 2-11. |
 | `skills/context-map/SKILL.md` | Before emitting `research.md` | File-level dependency + risk map; downstream architect uses for `automation_cost` and `flake_risk`. |
+
+## Gurdrails
+Never expose any value of a key of environment variable.
