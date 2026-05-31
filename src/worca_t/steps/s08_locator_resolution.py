@@ -176,7 +176,7 @@ class LocatorResolutionStep(Step):
     name = "locator-resolution"
     timeout_s = step_timeout(8)
 
-    def run(self, ctx: StepContext) -> StepResult:
+    async def run(self, ctx: StepContext) -> StepResult:
         out_dir = self.out_dir(ctx.workspace)
         wd = self.workdir(ctx.workspace)
         wd.mkdir(parents=True, exist_ok=True)
@@ -237,12 +237,12 @@ class LocatorResolutionStep(Step):
         claude_md = package_resource_root() / "CLAUDE.md"
 
         extras: list[Path] = []
-        for skill in ("playwright-explore-website", "context-map"):
+        for skill in ("playwright-explore-website",):
             p = skills_root / skill
             if p.exists():
                 extras.append(p)
 
-        result = run_agent(
+        result = await run_agent(
             agent,
             workdir=wd,
             inputs={},

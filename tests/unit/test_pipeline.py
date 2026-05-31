@@ -10,18 +10,18 @@ from worca_t.steps.base import Step, StepContext, StepResult
 from worca_t.workspace import create_workspace
 
 
-def test_run_pipeline_completes_with_no_steps(tmp_path: Path, monkeypatch):
+async def test_run_pipeline_completes_with_no_steps(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(
         "worca_t.pipeline.STEP_REGISTRY", {},
     )
     opts = PipelineOptions(
         spec="x", sut=".", workspace_base=tmp_path / ".ws",
     )
-    rc = run_pipeline(opts)
+    rc = await run_pipeline(opts)
     assert rc == 0
 
 
-def test_run_pipeline_runs_only_step(tmp_path: Path, monkeypatch):
+async def test_run_pipeline_runs_only_step(tmp_path: Path, monkeypatch):
     call_log = []
 
     class _TrackStep(Step):
@@ -29,7 +29,7 @@ def test_run_pipeline_runs_only_step(tmp_path: Path, monkeypatch):
         name = "track"
         timeout_s = 10
 
-        def run(self, ctx: StepContext) -> StepResult:
+        async def run(self, ctx: StepContext) -> StepResult:
             call_log.append(self.number)
             return StepResult(success=True, status="completed", outputs=[])
 
@@ -38,18 +38,18 @@ def test_run_pipeline_runs_only_step(tmp_path: Path, monkeypatch):
         spec="x", sut=".", workspace_base=tmp_path / ".ws",
         only_step=1,
     )
-    rc = run_pipeline(opts)
+    rc = await run_pipeline(opts)
     assert rc == 0
     assert call_log == [1]
 
 
-def test_run_pipeline_stops_on_failure(tmp_path: Path, monkeypatch):
+async def test_run_pipeline_stops_on_failure(tmp_path: Path, monkeypatch):
     class _FailStep(Step):
         number = 1
         name = "fail"
         timeout_s = 10
 
-        def run(self, ctx: StepContext) -> StepResult:
+        async def run(self, ctx: StepContext) -> StepResult:
             return StepResult(success=False, status="failed", outputs=[], error="boom")
 
     monkeypatch.setattr("worca_t.pipeline.STEP_REGISTRY", {1: _FailStep()})
@@ -57,7 +57,7 @@ def test_run_pipeline_stops_on_failure(tmp_path: Path, monkeypatch):
         spec="x", sut=".", workspace_base=tmp_path / ".ws",
         only_step=1,
     )
-    rc = run_pipeline(opts)
+    rc = await run_pipeline(opts)
     assert rc == 1
 
 
@@ -107,7 +107,7 @@ def test_select_workspace_from_step_without_run_id_raises(tmp_path: Path):
         _select_workspace(opts)
 
 
-def test_run_pipeline_debug_sets_extras(tmp_path: Path, monkeypatch):
+async def test_run_pipeline_debug_sets_extras(tmp_path: Path, monkeypatch):
     captured_ctx = {}
 
     class _CaptureStep(Step):
@@ -115,7 +115,7 @@ def test_run_pipeline_debug_sets_extras(tmp_path: Path, monkeypatch):
         name = "capture"
         timeout_s = 10
 
-        def run(self, ctx: StepContext) -> StepResult:
+        async def run(self, ctx: StepContext) -> StepResult:
             captured_ctx["debug_live"] = ctx.extras.get("debug_live")
             return StepResult(success=True, status="completed", outputs=[])
 
@@ -124,5 +124,5 @@ def test_run_pipeline_debug_sets_extras(tmp_path: Path, monkeypatch):
         spec="x", sut=".", workspace_base=tmp_path / ".ws",
         only_step=1, debug=True,
     )
-    run_pipeline(opts)
+    await run_pipeline(opts)
     assert captured_ctx["debug_live"] is True

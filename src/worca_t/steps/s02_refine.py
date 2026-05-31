@@ -14,12 +14,11 @@ import json
 import re
 import shutil
 
-from worca_t.claude_runner import run_agent
 from worca_t.config import package_resource_root, step_timeout
 from worca_t.logging_setup import get_logger
 from worca_t.md_parser import extract_bullets, parse_markdown, section_to_dict, slugify
 from worca_t.schemas import is_valid
-from worca_t.steps.base import Step, StepContext, StepResult
+from worca_t.steps.base import Step, StepContext, StepResult, run_agent_with_hitl
 
 log = get_logger(__name__)
 
@@ -71,7 +70,7 @@ class RefineStep(Step):
     name = "refine"
     timeout_s = step_timeout(2)
 
-    def run(self, ctx: StepContext) -> StepResult:
+    async def run(self, ctx: StepContext) -> StepResult:
         out_dir = self.out_dir(ctx.workspace)
         wd = self.workdir(ctx.workspace)
         wd.mkdir(parents=True, exist_ok=True)
@@ -86,8 +85,9 @@ class RefineStep(Step):
         agent = agents_root / "refine-spec.agent.md"
         claude_md = package_resource_root() / "CLAUDE.md"
 
-        result = run_agent(
-            agent,
+        result = await run_agent_with_hitl(
+            ctx=ctx,
+            agent_path=agent,
             workdir=wd,
             inputs={"spec.md": spec_in},
             user_prompt=(
@@ -100,6 +100,8 @@ class RefineStep(Step):
                 "skip the pre-clean. Ensure a `Requirement ID: REQ-<slug>` "
                 "line is present near the top of the refined spec."
             ),
+            output_filename="refined-spec.md",
+            agent_label="refine-spec",
             timeout_s=self.timeout_s,
             step=2,
             max_turns=15,

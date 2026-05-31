@@ -20,7 +20,7 @@ from worca_t.steps.s09_execute import (
 from worca_t.test_runner import TestRunEntry
 from worca_t.workspace import create_workspace
 
-from ._fake_claude import install_on_path, write_fake_claude
+from ._fake_claude import install_fake_query
 
 # ---------------------------------------------------------------------------
 # Pure helpers
@@ -187,31 +187,31 @@ def _seed_minimal_inputs(ctx: StepContext, *, command: str, framework: str = "py
     ctx.workspace.sut.mkdir(parents=True, exist_ok=True)
 
 
-def test_step09_requires_step78_outputs(tmp_path: Path):
+async def test_step09_requires_step78_outputs(tmp_path: Path):
     ctx = _ctx(tmp_path)
-    result = ExecuteStep().run(ctx)
+    result = await ExecuteStep().run(ctx)
     assert not result.success
     assert "patched tests" in (result.error or "")
 
 
-def test_step09_requires_sut(tmp_path: Path):
+async def test_step09_requires_sut(tmp_path: Path):
     ctx = _ctx(tmp_path)
     # Provide step-8 outputs but remove SUT.
     s8_tests = ctx.workspace.step_dir(8) / "tests"
     s8_tests.mkdir(parents=True)
     (s8_tests / "a.py").write_text("pass\n", encoding="utf-8")
     shutil.rmtree(ctx.workspace.sut)
-    result = ExecuteStep().run(ctx)
+    result = await ExecuteStep().run(ctx)
     assert not result.success
     assert "SUT" in (result.error or "")
 
 
-def test_step09_all_pass_completes(tmp_path: Path):
+async def test_step09_all_pass_completes(tmp_path: Path):
     ctx = _ctx(tmp_path)
     cmd = _make_fake_pytest(tmp_path / "pt.py", junit_xml=_JUNIT_PASS, exit_code=0)
     _seed_minimal_inputs(ctx, command=cmd)
 
-    result = ExecuteStep().run(ctx)
+    result = await ExecuteStep().run(ctx)
     assert result.success, result.error
     assert result.status == "completed"
     payload = json.loads((ctx.workspace.step_dir(9) / "run-results.json").read_text(encoding="utf-8"))
@@ -223,20 +223,19 @@ def test_step09_all_pass_completes(tmp_path: Path):
     assert (ctx.workspace.sut / "worca-tests" / "a.py").exists()
 
 
-def test_step09_failures_without_heal_yield_warned_and_bugs(tmp_path: Path, monkeypatch):
+async def test_step09_failures_without_heal_yield_warned_and_bugs(tmp_path: Path, monkeypatch):
     ctx = _ctx(tmp_path)
     cmd = _make_fake_pytest(tmp_path / "pt.py", junit_xml=_JUNIT_FAIL, exit_code=1)
     _seed_minimal_inputs(ctx, command=cmd)
 
     # Fake claude that returns no usable patch (no files).
-    bin_path = write_fake_claude(
-        tmp_path / "bin",
-        events=[{"type": "result", "result": "no fix"}],
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "no fix"}],
         files={},
     )
-    install_on_path(monkeypatch, bin_path)
 
-    result = ExecuteStep().run(ctx)
+    result = await ExecuteStep().run(ctx)
     assert result.success
     assert result.status == "warned"
     payload = json.loads((ctx.workspace.step_dir(9) / "run-results.json").read_text(encoding="utf-8"))
@@ -251,7 +250,7 @@ def test_step09_failures_without_heal_yield_warned_and_bugs(tmp_path: Path, monk
     assert "T-" in heal_log
 
 
-def test_step09_self_heal_repairs_and_passes(tmp_path: Path, monkeypatch):
+async def test_step09_self_heal_repairs_and_passes(tmp_path: Path, monkeypatch):
     ctx = _ctx(tmp_path)
     marker = tmp_path / "marker.txt"
     cmd = _make_flaky_pytest(tmp_path / "pt.py", marker)
@@ -259,14 +258,13 @@ def test_step09_self_heal_repairs_and_passes(tmp_path: Path, monkeypatch):
 
     # Fake fixer that DOES write a replacement file - this triggers the rerun.
     # Use distinct content so the patch detector sees an actual change.
-    bin_path = write_fake_claude(
-        tmp_path / "bin",
-        events=[{"type": "result", "result": "patched"}],
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "patched"}],
         files={"a.py": "def test_ok():  # patched\n    assert True\n"},
     )
-    install_on_path(monkeypatch, bin_path)
 
-    result = ExecuteStep().run(ctx)
+    result = await ExecuteStep().run(ctx)
     assert result.success, result.error
     payload = json.loads((ctx.workspace.step_dir(9) / "run-results.json").read_text(encoding="utf-8"))
     assert payload["self_heal"]["attempts"] == 2

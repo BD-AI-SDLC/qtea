@@ -141,7 +141,7 @@ class _CountingStep(Step):
         self.number = num
         self._counter = counter
 
-    def run(self, ctx: StepContext) -> StepResult:
+    async def run(self, ctx: StepContext) -> StepResult:
         self._counter[self.number] = self._counter.get(self.number, 0) + 1
         out_dir = self.out_dir(ctx.workspace)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -161,34 +161,34 @@ def _make_pipeline_ctx(tmp_path: Path, **opts_kw):
     )
 
 
-def test_completed_step_is_skipped_on_resume(tmp_path: Path):
+async def test_completed_step_is_skipped_on_resume(tmp_path: Path):
     _ws, state, _opts, ctx = _make_pipeline_ctx(tmp_path)
     counter = {}
     step = _CountingStep(1, counter)
 
-    step.execute(ctx)
+    await step.execute(ctx)
     assert counter[1] == 1
     assert is_step_complete(state, 1)
 
-    step.execute(ctx)
+    await step.execute(ctx)
     assert counter[1] == 2
 
 
-def test_force_reruns_completed_step(tmp_path: Path):
+async def test_force_reruns_completed_step(tmp_path: Path):
     _ws, _state, _opts, ctx = _make_pipeline_ctx(tmp_path, force=True)
     counter = {}
     step = _CountingStep(1, counter)
 
-    step.execute(ctx)
+    await step.execute(ctx)
     assert counter[1] == 1
 
 
-def test_hash_invalidation_triggers_rerun(tmp_path: Path):
+async def test_hash_invalidation_triggers_rerun(tmp_path: Path):
     ws, state, _opts, ctx = _make_pipeline_ctx(tmp_path)
     counter = {}
     step = _CountingStep(1, counter)
 
-    step.execute(ctx)
+    await step.execute(ctx)
     assert is_step_complete(state, 1)
     assert outputs_match(state, 1, ws.step_dir(1))
 
@@ -197,12 +197,12 @@ def test_hash_invalidation_triggers_rerun(tmp_path: Path):
     assert not outputs_match(state, 1, ws.step_dir(1))
 
 
-def test_state_roundtrip_preserves_hashes(tmp_path: Path):
+async def test_state_roundtrip_preserves_hashes(tmp_path: Path):
     ws, state, _opts, ctx = _make_pipeline_ctx(tmp_path)
     counter = {}
     step = _CountingStep(1, counter)
 
-    step.execute(ctx)
+    await step.execute(ctx)
     save_state(state, ws.state_file)
 
     loaded = load_state(ws.state_file)

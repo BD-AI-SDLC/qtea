@@ -21,7 +21,7 @@ from worca_t.steps.s10_bug_classifier import (
 )
 from worca_t.workspace import create_workspace
 
-from ._fake_claude import install_on_path, write_fake_claude
+from ._fake_claude import install_fake_query
 
 # ---------------------------------------------------------------------------
 # Pure helpers
@@ -137,10 +137,10 @@ def _seed_run(ctx: StepContext, *, candidates: list[dict]) -> None:
     )
 
 
-def test_step10_short_circuits_when_no_candidates(tmp_path: Path):
+async def test_step10_short_circuits_when_no_candidates(tmp_path: Path):
     ctx = _ctx(tmp_path)
     _seed_run(ctx, candidates=[])
-    result = BugClassifierStep().run(ctx)
+    result = await BugClassifierStep().run(ctx)
     assert result.success
     assert result.status == "completed"
     out = ctx.workspace.step_dir(10)
@@ -150,7 +150,7 @@ def test_step10_short_circuits_when_no_candidates(tmp_path: Path):
     assert "No failing tests" in md
 
 
-def test_step10_uses_agent_output_when_valid(tmp_path: Path, monkeypatch):
+async def test_step10_uses_agent_output_when_valid(tmp_path: Path, monkeypatch):
     ctx = _ctx(tmp_path)
     candidates = [
         {"test_id": "T-a", "title": "logs in", "status": "failed", "message": "x"},
@@ -160,17 +160,16 @@ def test_step10_uses_agent_output_when_valid(tmp_path: Path, monkeypatch):
     # Build a schema-valid agent payload referencing the run id.
     agent_payload = _synthesize(ctx.workspace.run_id, candidates, {})
     agent_payload["bugs"][0]["rationale"] = "agent-classified"
-    bin_path = write_fake_claude(
-        tmp_path / "bin",
-        events=[{"type": "result", "result": "ok"}],
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
         files={
             "bug-reports.json": json.dumps(agent_payload),
             "bug-reports.md": "# Agent-rendered report\n",
         },
     )
-    install_on_path(monkeypatch, bin_path)
 
-    result = BugClassifierStep().run(ctx)
+    result = await BugClassifierStep().run(ctx)
     assert result.success, result.error
     assert result.status == "completed"
     out = ctx.workspace.step_dir(10)
@@ -180,7 +179,7 @@ def test_step10_uses_agent_output_when_valid(tmp_path: Path, monkeypatch):
     assert "Agent-rendered report" in md
 
 
-def test_step10_falls_back_when_agent_output_invalid(tmp_path: Path, monkeypatch):
+async def test_step10_falls_back_when_agent_output_invalid(tmp_path: Path, monkeypatch):
     ctx = _ctx(tmp_path)
     candidates = [
         {"test_id": "T-a", "title": "logs in", "status": "failed", "message": "x"},
@@ -188,14 +187,13 @@ def test_step10_falls_back_when_agent_output_invalid(tmp_path: Path, monkeypatch
     _seed_run(ctx, candidates=candidates)
 
     # Agent writes garbage JSON.
-    bin_path = write_fake_claude(
-        tmp_path / "bin",
-        events=[{"type": "result", "result": "ok"}],
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
         files={"bug-reports.json": "not json{"},
     )
-    install_on_path(monkeypatch, bin_path)
 
-    result = BugClassifierStep().run(ctx)
+    result = await BugClassifierStep().run(ctx)
     assert result.success
     assert result.status == "warned"
     rep = json.loads(
@@ -207,19 +205,18 @@ def test_step10_falls_back_when_agent_output_invalid(tmp_path: Path, monkeypatch
     assert rep["bugs"][0]["rationale"].startswith("auto-classified")
 
 
-def test_step10_falls_back_when_agent_omits_file(tmp_path: Path, monkeypatch):
+async def test_step10_falls_back_when_agent_omits_file(tmp_path: Path, monkeypatch):
     ctx = _ctx(tmp_path)
     candidates = [{"test_id": "T-a", "title": "t", "status": "failed"}]
     _seed_run(ctx, candidates=candidates)
 
-    bin_path = write_fake_claude(
-        tmp_path / "bin",
-        events=[{"type": "result", "result": "ok"}],
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
         files={},
     )
-    install_on_path(monkeypatch, bin_path)
 
-    result = BugClassifierStep().run(ctx)
+    result = await BugClassifierStep().run(ctx)
     assert result.success
     assert result.status == "warned"
     rep = json.loads(
@@ -228,21 +225,20 @@ def test_step10_falls_back_when_agent_omits_file(tmp_path: Path, monkeypatch):
     assert rep["bugs"][0]["rationale"].startswith("auto-classified")
 
 
-def test_step10_renders_md_when_agent_omits_it(tmp_path: Path, monkeypatch):
+async def test_step10_renders_md_when_agent_omits_it(tmp_path: Path, monkeypatch):
     """Agent produced valid JSON but no .md: step must render one from JSON."""
     ctx = _ctx(tmp_path)
     candidates = [{"test_id": "T-a", "title": "t", "status": "failed"}]
     _seed_run(ctx, candidates=candidates)
 
     agent_payload = _synthesize(ctx.workspace.run_id, candidates, {})
-    bin_path = write_fake_claude(
-        tmp_path / "bin",
-        events=[{"type": "result", "result": "ok"}],
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
         files={"bug-reports.json": json.dumps(agent_payload)},
     )
-    install_on_path(monkeypatch, bin_path)
 
-    result = BugClassifierStep().run(ctx)
+    result = await BugClassifierStep().run(ctx)
     assert result.success
     md = (ctx.workspace.step_dir(10) / "bug-reports.md").read_text(encoding="utf-8")
     assert "T-a" in md

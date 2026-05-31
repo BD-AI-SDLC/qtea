@@ -1,81 +1,84 @@
-"""Shared fake-claude shim factory for step integration tests."""
+"""Shared SDK-fake helpers for step / runner tests.
+
+Replaces the old subprocess-based `claude` CLI shim. Now we monkeypatch
+`claude_agent_sdk.query` (as imported by `worca_t.claude_runner`) to yield
+fake SDK Message objects. Optionally writes files into the agent's workdir
+(matching the CWD-write side-effect the old shim provided).
+"""
 
 from __future__ import annotations
 
-import json
-import os
-import stat
-import sys
 from pathlib import Path
-from textwrap import dedent
+from typing import Any
+
+from claude_agent_sdk import AssistantMessage, ResultMessage, SystemMessage
 
 
-def write_fake_claude(
-    bin_dir: Path,
-    *,
-    events: list[dict] | None = None,
-    files: dict[str, str] | None = None,
-    exit_code: int = 0,
-    sleep_s: float = 0.0,
-) -> Path:
-    """Install a fake `claude` CLI in `bin_dir`.
+def _make_message(spec: dict) -> Any:
+    """Construct a real SDK Message instance with the given attributes set.
 
-    The fake claude script:
-      - emits `events` to stdout (NDJSON, one per line)
-      - writes each `files[relpath] = content` into its current working dir,
-        which matches the agent workdir because run_agent sets cwd=workdir.
+    Uses ``__new__`` so we don't depend on the SDK's constructor signatures.
+    Recognised ``type`` values: ``system``, ``assistant``, ``result``.
     """
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    payload_path = bin_dir / "fake_payload.json"
-    payload_path.write_text(
-        json.dumps(
-            {
-                "events": events or [{"type": "result", "result": "ok"}],
-                "files": files or {},
-                "sleep_s": sleep_s,
-                "exit_code": exit_code,
-            }
-        ),
-        encoding="utf-8",
+    cls_map = {
+        "system": SystemMessage,
+        "assistant": AssistantMessage,
+        "result": ResultMessage,
+    }
+    t = spec.get("type")
+    if t not in cls_map:
+        raise ValueError(f"unknown fake message type: {t!r}")
+    cls = cls_map[t]
+    m = cls.__new__(cls)
+    for key, val in spec.items():
+        if key == "type":
+            continue
+        setattr(m, key, val)
+    return m
+
+
+def install_fake_query(
+    monkeypatch,
+    *,
+    messages: list[dict] | None = None,
+    files: dict[str, str] | None = None,
+    raises: Exception | None = None,
+    delay_s: float = 0.0,
+    on_call=None,
+) -> None:
+    """Replace ``worca_t.claude_runner.query`` with an async iterator factory.
+
+    Parameters
+    ----------
+    messages: list of message specs. Default is a single ``result`` message.
+    files: ``{relpath: content}`` written into the agent's cwd (workdir).
+    raises: exception to raise mid-iteration (after writing files).
+    delay_s: sleep this many seconds before yielding (for timeout tests).
+    on_call: callable invoked with ``(prompt, options)`` per query call.
+    """
+    import asyncio as _asyncio
+
+    msgs = messages or [{"type": "result", "result": "ok"}]
+    file_map = files or {}
+
+    async def _fake_query(*, prompt, options=None, transport=None):  # noqa: ARG001
+        if on_call is not None:
+            on_call(prompt, options)
+        cwd = Path(options.cwd) if options and getattr(options, "cwd", None) else Path.cwd()
+        for rel, content in file_map.items():
+            p = cwd / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+        if delay_s:
+            await _asyncio.sleep(delay_s)
+        if raises is not None:
+            raise raises
+        for spec in msgs:
+            yield _make_message(spec)
+
+    # Bypass the missing-binary precheck so tests don't need a real `claude`.
+    monkeypatch.setattr(
+        "worca_t.claude_runner.shutil.which",
+        lambda *_a, **_kw: "/fake/claude",
     )
-
-    impl = bin_dir / "fake_claude_impl.py"
-    impl.write_text(
-        dedent(
-            f"""
-            import json, os, sys, time
-            payload = json.loads(open(r"{payload_path}", "r", encoding="utf-8").read())
-            for evt in payload["events"]:
-                sys.stdout.write(json.dumps(evt) + "\\n")
-                sys.stdout.flush()
-            for rel, content in payload.get("files", {{}}).items():
-                p = os.path.join(os.getcwd(), rel)
-                os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
-                with open(p, "w", encoding="utf-8") as f:
-                    f.write(content)
-            time.sleep(payload.get("sleep_s", 0))
-            sys.exit(payload.get("exit_code", 0))
-            """
-        ),
-        encoding="utf-8",
-    )
-
-    if os.name == "nt":
-        bin_path = bin_dir / "claude.cmd"
-        bin_path.write_text(
-            f'@echo off\r\n"{sys.executable}" "{impl}" %*\r\n', encoding="utf-8"
-        )
-    else:
-        bin_path = bin_dir / "claude"
-        bin_path.write_text(
-            f'#!/usr/bin/env bash\nexec "{sys.executable}" "{impl}" "$@"\n',
-            encoding="utf-8",
-        )
-        bin_path.chmod(bin_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    return bin_path
-
-
-def install_on_path(monkeypatch, bin_path: Path) -> None:
-    bin_dir = bin_path.parent
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
-    monkeypatch.setenv("WORCA_T_CLAUDE_BIN", bin_path.name)
+    monkeypatch.setattr("worca_t.claude_runner.query", _fake_query)

@@ -41,7 +41,9 @@
       "Bash(stat -c '%Y' \"C:/Users/ets1wz/.worca-t/20260527-222541-93dd21/step-06/transcript.jsonl\" 2>/dev/null; date +%s)",
       "Read(//c/MAS/Production_ready/worca-t/**)",
       "Bash(grep -v \"^$\")",
-      "Bash(PYTHONPATH=\"c:/MAS/Production_ready/worca-t/src\" python -m pytest tests/ -v -x)"
+      "Bash(PYTHONPATH=\"c:/MAS/Production_ready/worca-t/src\" python -m pytest tests/ -v -x)",
+      "mcp__atlassian__jira_get_issue",
+      "mcp__atlassian__jira_get_myself"
     ]
   }
 }

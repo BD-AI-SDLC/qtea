@@ -8,9 +8,6 @@
   "properties": {
     "title": { "type": "string", "minLength": 1 },
     "scope": { "type": ["string", "null"] },
-    "objectives": { "type": "array", "items": { "type": "string" } },
-    "types": { "type": "array", "items": { "type": "string" } },
-    "risks": { "type": "array", "items": { "type": "string" } },
     "test_cases": {
       "type": "array",
       "items": {
@@ -28,8 +25,6 @@
           "raw": { "type": "string" }
         }
       }
-    },
-    "edge_cases": { "type": "array", "items": { "type": "string" } },
-    "exit_criteria": { "type": "array", "items": { "type": "string" } }
+    }
   }
 }

@@ -183,7 +183,7 @@ class XrayUploadStep(Step):
     name = "xray-upload"
     timeout_s = step_timeout(5)
 
-    def run(self, ctx: StepContext) -> StepResult:
+    async def run(self, ctx: StepContext) -> StepResult:
         out_dir = self.out_dir(ctx.workspace)
         out_dir.mkdir(parents=True, exist_ok=True)
         mapping_path = out_dir / "xray-mapping.json"

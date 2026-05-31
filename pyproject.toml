@@ -5,7 +5,7 @@ description = "Worca-T - Fully autonomous QA SDLC orchestrator (Python + LLM hyb
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "Worca-T Maintainers" }]
+authors = [{ name = "Sagui Ettinger" }]
 keywords = ["qa", "sdlc", "automation", "testing", "playwright", "allure", "llm", "claude"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -20,6 +20,7 @@ classifiers = [
 ]
 dependencies = [
     "anthropic>=0.40",
+    "claude-agent-sdk>=0.1",
     "typer>=0.12",
     "rich>=13",
     "pydantic>=2.7",
@@ -39,8 +40,8 @@ allure = ["allure-pytest>=2.13"]
 worca-t = "worca_t.cli:app"
 
 [project.urls]
-Homepage = "https://github.com/anomalyco/opencode"
-Issues = "https://github.com/anomalyco/opencode/issues"
+Homepage = "https://github.boschdevcloud.com/ETS1WZ/worca-t"
+Issues = "https://github.boschdevcloud.com/ETS1WZ/worca-t/issues"
 
 [build-system]
 requires = ["hatchling>=1.25"]
@@ -91,11 +92,11 @@ ignore = ["S101", "PLR0913", "PLR2004", "PLR0912", "PLR0915", "S603", "S607", "S
 "src/worca_t/cli.py" = ["B008", "PLC0415"]
 "src/worca_t/logging_setup.py" = ["PLW0603"]
 # Best-effort cleanup paths.
-"src/worca_t/claude_runner.py" = ["SIM105", "S110"]
+"src/worca_t/claude_runner.py" = ["S110"]
 "src/worca_t/mcp_manager.py" = ["SIM105", "S110"]
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
     "pytest-mock>=3.12",

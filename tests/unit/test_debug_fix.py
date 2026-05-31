@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from worca_t.checkpoints import RunState
 from worca_t.pipeline import PipelineOptions
@@ -40,7 +40,7 @@ class _FailOnceStep(Step):
     def __init__(self):
         self._call_count = 0
 
-    def run(self, ctx: StepContext) -> StepResult:
+    async def run(self, ctx: StepContext) -> StepResult:
         self._call_count += 1
         if self._call_count == 1:
             return StepResult(success=False, status="failed", outputs=[], error="first attempt fail")
@@ -53,7 +53,7 @@ class _AlwaysFailStep(Step):
     name = "always-fail"
     timeout_s = 60
 
-    def run(self, ctx: StepContext) -> StepResult:
+    async def run(self, ctx: StepContext) -> StepResult:
         return StepResult(success=False, status="failed", outputs=[], error="always fails")
 
 
@@ -63,7 +63,7 @@ class _AlwaysPassStep(Step):
     name = "always-pass"
     timeout_s = 60
 
-    def run(self, ctx: StepContext) -> StepResult:
+    async def run(self, ctx: StepContext) -> StepResult:
         return StepResult(success=True, status="completed", outputs=[], notes="ok")
 
 
@@ -76,7 +76,7 @@ class _ExceptionStep(Step):
     def __init__(self):
         self._call_count = 0
 
-    def run(self, ctx: StepContext) -> StepResult:
+    async def run(self, ctx: StepContext) -> StepResult:
         self._call_count += 1
         if self._call_count == 1:
             raise RuntimeError("boom")
@@ -88,20 +88,20 @@ class _ExceptionStep(Step):
 # ---------------------------------------------------------------------------
 
 
-def test_step_succeeds_first_attempt(tmp_path: Path):
+async def test_step_succeeds_first_attempt(tmp_path: Path):
     ctx = _ctx(tmp_path)
     step = _AlwaysPassStep()
-    result = step.execute(ctx)
+    result = await step.execute(ctx)
     assert result.success
     assert result.status == "completed"
     record = ctx.state.steps[97]
     assert record.attempts == 1
 
 
-def test_step_fails_then_succeeds_on_retry(tmp_path: Path):
+async def test_step_fails_then_succeeds_on_retry(tmp_path: Path):
     ctx = _ctx(tmp_path)
     step = _FailOnceStep()
-    result = step.execute(ctx)
+    result = await step.execute(ctx)
     assert result.success
     assert result.status == "warned"
     record = ctx.state.steps[99]
@@ -109,20 +109,20 @@ def test_step_fails_then_succeeds_on_retry(tmp_path: Path):
     assert "retry" in (record.notes or "")
 
 
-def test_step_fails_twice_no_fix(tmp_path: Path):
+async def test_step_fails_twice_no_fix(tmp_path: Path):
     ctx = _ctx(tmp_path)
     step = _AlwaysFailStep()
-    result = step.execute(ctx)
+    result = await step.execute(ctx)
     assert not result.success
     assert result.status == "failed"
     record = ctx.state.steps[98]
     assert record.attempts == 2
 
 
-def test_exception_retry_recovers(tmp_path: Path):
+async def test_exception_retry_recovers(tmp_path: Path):
     ctx = _ctx(tmp_path)
     step = _ExceptionStep()
-    result = step.execute(ctx)
+    result = await step.execute(ctx)
     assert result.success
     assert result.status == "warned"
     record = ctx.state.steps[96]
@@ -139,11 +139,11 @@ def test_debug_flag_sets_extras_before_attempt1(tmp_path: Path):
     assert ctx.options.debug is True
 
 
-def test_failed_attempt1_sets_debug_live_for_retry(tmp_path: Path):
+async def test_failed_attempt1_sets_debug_live_for_retry(tmp_path: Path):
     ctx = _ctx(tmp_path)
     assert ctx.extras.get("debug_live") is None
     step = _FailOnceStep()
-    step.execute(ctx)
+    await step.execute(ctx)
     assert ctx.extras.get("debug_live") is True
 
 
@@ -167,36 +167,39 @@ def test_debug_artifacts_snapshotted_on_failure(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def test_fix_proposal_invoked_on_double_failure(tmp_path: Path):
+async def test_fix_proposal_invoked_on_double_failure(tmp_path: Path):
     ctx = _ctx(tmp_path, fix=True)
     step = _AlwaysFailStep()
 
-    with patch("worca_t.steps.base.run_agent") as mock_agent:
+    with patch("worca_t.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
         mock_agent.return_value = type("R", (), {
             "success": False, "final_text": "mock analysis", "error": None,
         })()
-        result = step.execute(ctx)
+        result = await step.execute(ctx)
 
     assert not result.success
     proposal = ctx.workspace.debug / "step-98-fix-proposal.md"
     assert proposal.exists()
 
 
-def test_no_fix_proposal_without_flag(tmp_path: Path):
+async def test_no_fix_proposal_without_flag(tmp_path: Path):
     ctx = _ctx(tmp_path, fix=False)
     step = _AlwaysFailStep()
-    result = step.execute(ctx)
+    result = await step.execute(ctx)
     assert not result.success
     proposal = ctx.workspace.debug / "step-98-fix-proposal.md"
     assert not proposal.exists()
 
 
-def test_fix_flow_failure_does_not_crash(tmp_path: Path):
+async def test_fix_flow_failure_does_not_crash(tmp_path: Path):
     ctx = _ctx(tmp_path, fix=True)
     step = _AlwaysFailStep()
 
-    with patch("worca_t.steps.base.run_agent", side_effect=Exception("agent unavailable")):
-        result = step.execute(ctx)
+    with patch(
+        "worca_t.steps.base.run_agent",
+        new=AsyncMock(side_effect=Exception("agent unavailable")),
+    ):
+        result = await step.execute(ctx)
 
     assert not result.success
     assert result.status == "failed"
@@ -211,14 +214,14 @@ def test_fix_flow_failure_does_not_crash(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def test_run_fix_proposal_writes_files(tmp_path: Path):
+async def test_run_fix_proposal_writes_files(tmp_path: Path):
     ctx = _ctx(tmp_path)
 
-    with patch("worca_t.steps.base.run_agent") as mock_agent:
+    with patch("worca_t.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
         mock_agent.return_value = type("R", (), {
             "success": False, "final_text": "analysis text", "error": None,
         })()
-        path = _run_fix_proposal(42, ctx, "# Step 42 failure\n\nSomething broke")
+        path = await _run_fix_proposal(42, ctx, "# Step 42 failure\n\nSomething broke")
 
     assert path is not None
     assert path.exists()

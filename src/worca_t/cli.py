@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from enum import StrEnum
 from pathlib import Path
@@ -226,6 +227,11 @@ def run(
     report_inline_images: bool = typer.Option(False, "--report-inline-images"),
     open_report: bool = typer.Option(False, "--open-report"),
     log_level: LogLevel = typer.Option(LogLevel.info, "--log-level"),
+    no_hitl: bool = typer.Option(
+        False,
+        "--no-hitl",
+        help="Disable interactive prompts for blockers/clarifications (CI mode).",
+    ),
     env_file: Path | None = typer.Option(
         None,
         "--env-file",
@@ -258,8 +264,9 @@ def run(
         open_report=open_report,
         log_level=log_level.value,
         env_file=env_file,
+        no_hitl=no_hitl,
     )
-    rc = run_pipeline(opts, console=console)
+    rc = asyncio.run(run_pipeline(opts, console=console))
     raise typer.Exit(code=rc)
 
 

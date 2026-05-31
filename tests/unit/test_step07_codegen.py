@@ -11,7 +11,7 @@ from worca_t.steps.base import StepContext
 from worca_t.steps.s07_codegen import CodegenStep
 from worca_t.workspace import create_workspace
 
-from ._fake_claude import install_on_path, write_fake_claude
+from ._fake_claude import install_fake_query
 
 GOOD_TS_TEST = """\
 import { test, expect } from '@playwright/test';
@@ -61,24 +61,22 @@ def _ctx(
     return StepContext(workspace=ws, state=state, spec_source="x", sut_source=".", options=opts)
 
 
-def test_step07_requires_strategy(tmp_path: Path):
+async def test_step07_requires_strategy(tmp_path: Path):
     ctx = _ctx(tmp_path, with_strategy=False)
-    result = CodegenStep().run(ctx)
+    result = await CodegenStep().run(ctx)
     assert not result.success
     assert "test-strategy.md" in (result.error or "")
 
 
-def test_step07_happy_path_indexes_and_validates(tmp_path: Path, monkeypatch):
-    bin_dir = tmp_path / "bin"
-    bin_path = write_fake_claude(
-        bin_dir,
-        events=[{"type": "result", "result": "ok"}],
+async def test_step07_happy_path_indexes_and_validates(tmp_path: Path, monkeypatch):
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
         files={"tests/login.spec.ts": GOOD_TS_TEST},
     )
-    install_on_path(monkeypatch, bin_path)
 
     ctx = _ctx(tmp_path)
-    result = CodegenStep().run(ctx)
+    result = await CodegenStep().run(ctx)
     assert result.success, result.error
     out = ctx.workspace.step_dir(7)
     assert (out / "tests" / "login.spec.ts").exists()
@@ -90,17 +88,15 @@ def test_step07_happy_path_indexes_and_validates(tmp_path: Path, monkeypatch):
     assert not index["violations"]
 
 
-def test_step07_rejects_xpath_violation(tmp_path: Path, monkeypatch):
-    bin_dir = tmp_path / "bin"
-    bin_path = write_fake_claude(
-        bin_dir,
-        events=[{"type": "result", "result": "ok"}],
+async def test_step07_rejects_xpath_violation(tmp_path: Path, monkeypatch):
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
         files={"tests/bad.spec.ts": BAD_XPATH_TS},
     )
-    install_on_path(monkeypatch, bin_path)
 
     ctx = _ctx(tmp_path)
-    result = CodegenStep().run(ctx)
+    result = await CodegenStep().run(ctx)
     assert not result.success
     assert "violation" in (result.error or "")
     out = ctx.workspace.step_dir(7)
@@ -109,60 +105,56 @@ def test_step07_rejects_xpath_violation(tmp_path: Path, monkeypatch):
     assert (out / "tests-with-tbd.json").exists()
 
 
-def test_step07_rejects_hard_wait_violation(tmp_path: Path, monkeypatch):
+async def test_step07_rejects_hard_wait_violation(tmp_path: Path, monkeypatch):
     bad = """import time\ndef test_x(page):\n    time.sleep(3)\n"""
-    bin_path = write_fake_claude(
-        tmp_path / "bin",
-        events=[{"type": "result", "result": "ok"}],
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
         files={"tests/test_bad.py": bad},
     )
-    install_on_path(monkeypatch, bin_path)
 
     ctx = _ctx(tmp_path, detected_stack="pytest")
-    result = CodegenStep().run(ctx)
+    result = await CodegenStep().run(ctx)
     assert not result.success
     assert "violation" in (result.error or "")
 
 
-def test_step07_empty_tests_dir_fails(tmp_path: Path, monkeypatch):
-    bin_path = write_fake_claude(
-        tmp_path / "bin",
-        events=[{"type": "result", "result": "ok"}],
+async def test_step07_empty_tests_dir_fails(tmp_path: Path, monkeypatch):
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
         files={},  # writes no tests/
     )
-    install_on_path(monkeypatch, bin_path)
 
     ctx = _ctx(tmp_path)
-    result = CodegenStep().run(ctx)
+    result = await CodegenStep().run(ctx)
     assert not result.success
     assert "tests" in (result.error or "")
 
 
-def test_step07_zero_indexed_tests_fails(tmp_path: Path, monkeypatch):
+async def test_step07_zero_indexed_tests_fails(tmp_path: Path, monkeypatch):
     # File exists but contains no recognisable test function.
-    bin_path = write_fake_claude(
-        tmp_path / "bin",
-        events=[{"type": "result", "result": "ok"}],
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
         files={"tests/notatest.spec.ts": "const x = 1;\n"},
     )
-    install_on_path(monkeypatch, bin_path)
 
     ctx = _ctx(tmp_path)
-    result = CodegenStep().run(ctx)
+    result = await CodegenStep().run(ctx)
     assert not result.success
     assert "0 tests" in (result.error or "")
 
 
-def test_step07_uses_extension_fallback_when_no_stack(tmp_path: Path, monkeypatch):
-    bin_path = write_fake_claude(
-        tmp_path / "bin",
-        events=[{"type": "result", "result": "ok"}],
+async def test_step07_uses_extension_fallback_when_no_stack(tmp_path: Path, monkeypatch):
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
         files={"tests/test_x.py": "def test_basic():\n    assert True\n"},
     )
-    install_on_path(monkeypatch, bin_path)
 
     ctx = _ctx(tmp_path, detected_stack=None)
-    result = CodegenStep().run(ctx)
+    result = await CodegenStep().run(ctx)
     assert result.success, result.error
     index = json.loads((ctx.workspace.step_dir(7) / "tests-with-tbd.json").read_text(encoding="utf-8"))
     assert index["framework"] == "pytest"

@@ -16,7 +16,7 @@ from worca_t.steps.s06_research import (
 )
 from worca_t.workspace import create_workspace
 
-from ._fake_claude import install_on_path, write_fake_claude
+from ._fake_claude import install_fake_query
 
 RESEARCH_MD = """\
 # Repository Discovery
@@ -67,22 +67,20 @@ def _ctx(tmp_path: Path, sut: Path) -> StepContext:
     return StepContext(workspace=ws, state=state, spec_source="x", sut_source=str(sut), options=opts)
 
 
-def test_research_step_local_sut_and_agent_output(tmp_path: Path, monkeypatch):
+async def test_research_step_local_sut_and_agent_output(tmp_path: Path, monkeypatch):
     # Create a local SUT directory.
     sut = tmp_path / "my-sut"
     sut.mkdir()
     (sut / "package.json").write_text('{"name":"x"}', encoding="utf-8")
 
-    bin_dir = tmp_path / "bin"
-    bin_path = write_fake_claude(
-        bin_dir,
-        events=[{"type": "result", "result": "ok"}],
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
         files={"research.md": RESEARCH_MD},
     )
-    install_on_path(monkeypatch, bin_path)
 
     ctx = _ctx(tmp_path, sut)
-    result = ResearchStep().run(ctx)
+    result = await ResearchStep().run(ctx)
     assert result.success, result.error
     out = ctx.workspace.step_dir(6)
     assert (out / "research.md").exists()
@@ -92,21 +90,19 @@ def test_research_step_local_sut_and_agent_output(tmp_path: Path, monkeypatch):
     assert (ctx.workspace.sut / "package.json").exists()
 
 
-def test_research_step_missing_sut_fails(tmp_path: Path):
+async def test_research_step_missing_sut_fails(tmp_path: Path):
     ctx = _ctx(tmp_path, tmp_path / "does-not-exist")
-    result = ResearchStep().run(ctx)
+    result = await ResearchStep().run(ctx)
     assert not result.success
     assert "sut" in (result.error or "").lower()
 
 
-def test_research_step_agent_no_output_fails(tmp_path: Path, monkeypatch):
+async def test_research_step_agent_no_output_fails(tmp_path: Path, monkeypatch):
     sut = tmp_path / "sut2"
     sut.mkdir()
-    bin_dir = tmp_path / "bin"
-    bin_path = write_fake_claude(bin_dir, events=[{"type": "result", "result": "ok"}], files={})
-    install_on_path(monkeypatch, bin_path)
+    install_fake_query(monkeypatch, messages=[{"type": "result", "result": "ok"}], files={})
 
     ctx = _ctx(tmp_path, sut)
-    result = ResearchStep().run(ctx)
+    result = await ResearchStep().run(ctx)
     assert not result.success
     assert "research.md" in (result.error or "")

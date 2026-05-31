@@ -234,7 +234,7 @@ class BugClassifierStep(Step):
     name = "bug-classifier"
     timeout_s = step_timeout(10)
 
-    def run(self, ctx: StepContext) -> StepResult:
+    async def run(self, ctx: StepContext) -> StepResult:
         out_dir = self.out_dir(ctx.workspace)
         out_dir.mkdir(parents=True, exist_ok=True)
         wd = self.workdir(ctx.workspace)
@@ -303,7 +303,7 @@ class BugClassifierStep(Step):
             f"`{run_id}` in the JSON output."
         )
 
-        agent_res = run_agent(
+        agent_res = await run_agent(
             agent,
             workdir=wd,
             inputs={},

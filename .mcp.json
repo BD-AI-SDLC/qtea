@@ -10,11 +10,13 @@
     },
     "atlassian": {
       "command": "npx",
-      "args": ["-y", "@aashari/mcp-server-atlassian-jira"],
+      "args": ["atlassian-jira-mcp"],
       "env": {
-        "ATLASSIAN_URL": "${ATLASSIAN_URL}",
-        "ATLASSIAN_EMAIL": "${ATLASSIAN_EMAIL}",
-        "ATLASSIAN_API_TOKEN": "${ATLASSIAN_API_TOKEN}"
+        "JIRA_BASE_URL": "${JIRA_BASE_URL}",
+        "JIRA_EMAIL": "${JIRA_EMAIL}",
+        "JIRA_API_TOKEN": "${JIRA_API_TOKEN}",
+        "HTTPS_PROXY": "${HTTPS_PROXY}",
+        "HTTP_PROXY": "${HTTP_PROXY}"
       }
     }
   }

@@ -15,7 +15,7 @@ from worca_t.steps.s03_plan import (
 )
 from worca_t.workspace import create_workspace
 
-from ._fake_claude import install_on_path, write_fake_claude
+from ._fake_claude import install_fake_query
 
 PLAN_MD = """\
 # Test Implementation Plan
@@ -123,17 +123,15 @@ def _ctx(tmp_path: Path, *, with_research: bool = True, with_refined: bool = Tru
     return StepContext(workspace=ws, state=state, spec_source="x", sut_source=".", options=opts)
 
 
-def test_plan_step_writes_md_and_json(tmp_path: Path, monkeypatch):
-    bin_dir = tmp_path / "bin"
-    bin_path = write_fake_claude(
-        bin_dir,
-        events=[{"type": "result", "result": "ok"}],
+async def test_plan_step_writes_md_and_json(tmp_path: Path, monkeypatch):
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
         files={"plan.md": PLAN_MD},
     )
-    install_on_path(monkeypatch, bin_path)
 
     ctx = _ctx(tmp_path)
-    result = PlanStep().run(ctx)
+    result = await PlanStep().run(ctx)
     assert result.success, result.error
     out = ctx.workspace.step_dir(3)
     assert (out / "plan.md").exists()
@@ -141,19 +139,82 @@ def test_plan_step_writes_md_and_json(tmp_path: Path, monkeypatch):
     assert len(proj["phases"]) == 2
 
 
-def test_plan_step_requires_inputs(tmp_path: Path):
+async def test_plan_step_requires_inputs(tmp_path: Path):
     ctx = _ctx(tmp_path, with_research=False, with_refined=False)
-    result = PlanStep().run(ctx)
+    result = await PlanStep().run(ctx)
     assert not result.success
     assert "step 3 requires" in (result.error or "")
 
 
-def test_plan_step_agent_no_output_fails(tmp_path: Path, monkeypatch):
-    bin_dir = tmp_path / "bin"
-    bin_path = write_fake_claude(bin_dir, events=[{"type": "result", "result": "ok"}], files={})
-    install_on_path(monkeypatch, bin_path)
+async def test_plan_step_agent_no_output_fails(tmp_path: Path, monkeypatch):
+    install_fake_query(monkeypatch, messages=[{"type": "result", "result": "ok"}], files={})
 
     ctx = _ctx(tmp_path)
-    result = PlanStep().run(ctx)
+    result = await PlanStep().run(ctx)
     assert not result.success
     assert "plan.md" in (result.error or "")
+
+
+PLAN_MD_WITH_BLOCKERS = """\
+# Test Implementation Plan
+
+## Overview
+
+Plan overview.
+
+## Blockers
+
+| Blocker | Affected TCs | Severity |
+|---------|--------------|----------|
+| SSO config unavailable | TC-AUTH-001 | high |
+
+## Phase Summary
+
+| Phase | Focus           | Files | Est. Tests |
+|-------|-----------------|-------|------------|
+| 1     | Core utilities  | 1     | 5          |
+
+---
+
+## Phase 1: Core Utilities
+
+### Overview
+
+Foundation tests.
+
+### Files to Test
+
+#### 1. utils/login.ts
+- **Source**: `src/utils/login.ts`
+- **Test File**: `tests/utils/login.spec.ts`
+"""
+
+
+async def test_plan_step_hitl_loop_prompts_user_and_reruns(tmp_path: Path, monkeypatch):
+    call_count = {"n": 0}
+    outputs = [PLAN_MD_WITH_BLOCKERS, PLAN_MD]
+
+    def on_call(_prompt, options):
+        idx = call_count["n"]
+        call_count["n"] = idx + 1
+        cwd = Path(options.cwd)
+        (cwd / "plan.md").write_text(outputs[min(idx, len(outputs) - 1)], encoding="utf-8")
+
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
+        files={},
+        on_call=on_call,
+    )
+
+    monkeypatch.setattr(
+        "worca_t.steps.base.prompt_user",
+        lambda questions, *, agent_label: {q.id: "use mock IdP" for q in questions},
+    )
+
+    ctx = _ctx(tmp_path)
+    result = await PlanStep().run(ctx)
+    assert result.success, result.error
+    assert call_count["n"] == 2
+    wd = ctx.workspace.step_workdir(3)
+    assert (wd / "user-answers.md").exists()

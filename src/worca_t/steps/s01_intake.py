@@ -50,12 +50,12 @@ def _copy_local(src: str, dst: Path) -> None:
     shutil.copy2(p, dst)
 
 
-def _jira_via_agent(ctx: StepContext, ticket_id: str, out_dir: Path, workdir: Path) -> Path:
+async def _jira_via_agent(ctx: StepContext, ticket_id: str, out_dir: Path, workdir: Path) -> Path:
     agents_root = package_resource_root() / "agents"
     agent = agents_root / "jira-to-ai-spec.agent.md"
     claude_md = package_resource_root() / "CLAUDE.md"
 
-    result = run_agent(
+    result = await run_agent(
         agent,
         workdir=workdir,
         inputs={},
@@ -87,7 +87,7 @@ class IntakeStep(Step):
     name = "intake"
     timeout_s = step_timeout(1)
 
-    def run(self, ctx: StepContext) -> StepResult:
+    async def run(self, ctx: StepContext) -> StepResult:
         out_dir = self.out_dir(ctx.workspace)
         wd = self.workdir(ctx.workspace)
         wd.mkdir(parents=True, exist_ok=True)
@@ -101,7 +101,7 @@ class IntakeStep(Step):
                 ticket = src.split(":", 1)[1].strip()
                 if not ticket:
                     raise ValueError("jira: source missing ticket id")
-                _jira_via_agent(ctx, ticket, out_dir, wd)
+                await _jira_via_agent(ctx, ticket, out_dir, wd)
                 if not jira_dst.exists():
                     jira_dst.write_text(
                         f"# {ticket}\n\n(raw Jira capture written by agent)\n",

@@ -8,13 +8,16 @@
 ## Test Strategy: User Authentication
 
 ### Scope
-Testing user authentication functionality including email/password login and persistent session via "Remember Me" feature.
+
+**In scope:** Email/password login, "Remember Me" persistent session, input validation, error handling, security (injection, brute force).
+
+**Out of scope:** Registration, password reset, SSO/OAuth, admin login.
 
 ### Test Cases
 
 #### TC-001: Successful Login - Valid Credentials
 - **Type**: UI + API
-- **Priority**: Critical
+- **Priority**: P0
 - **Preconditions**: 
   - User account exists with email: `test.user@example.com`
   - Database is accessible
@@ -28,14 +31,10 @@ Testing user authentication functionality including email/password login and per
   - Session cookie created
   - API returns 200 with auth token
   - User profile loaded
-- **Edge Cases**: 
-  - Email with + sign: `user+test@example.com`
-  - Password at max length (255 chars)
-  - Concurrent login from different device
 
 #### TC-002: Failed Login - Invalid Password
 - **Type**: UI + API
-- **Priority**: High
+- **Priority**: P0
 - **Preconditions**: User account exists
 - **Steps**: 
   1. Navigate to `/login`
@@ -47,14 +46,10 @@ Testing user authentication functionality including email/password login and per
   - Remain on login page
   - API returns 401 Unauthorized
   - Failed attempt logged
-- **Edge Cases**: 
-  - 5+ failed attempts (rate limiting)
-  - SQL injection attempt: `' OR '1'='1`
-  - Password field case sensitivity
 
 #### TC-003: Remember Me Functionality
 - **Type**: UI + Session Management
-- **Priority**: Medium
+- **Priority**: P1
 - **Preconditions**: Valid user credentials
 - **Steps**: 
   1. Navigate to `/login`
@@ -67,14 +62,10 @@ Testing user authentication functionality including email/password login and per
   - User auto-logged in
   - 30-day persistent token active
   - No re-authentication required
-- **Edge Cases**: 
-  - Token expiration after 30 days
-  - Logout clears "Remember Me" token
-  - Different browser/device behavior
 
 #### TC-004: Empty Field Validation
 - **Type**: UI Validation
-- **Priority**: High
+- **Priority**: P1
 - **Steps**: 
   1. Navigate to `/login`
   2. Leave both fields empty
@@ -83,14 +74,10 @@ Testing user authentication functionality including email/password login and per
   - Error: "Email and password are required"
   - No API call made
   - Form doesn't submit
-- **Edge Cases**: 
-  - Only email empty
-  - Only password empty
-  - Whitespace-only input
 
 #### TC-005: Unregistered Email
 - **Type**: UI + API
-- **Priority**: High
+- **Priority**: P1
 - **Steps**: 
   1. Enter unregistered email: `nobody@example.com`
   2. Enter any password
@@ -102,7 +89,7 @@ Testing user authentication functionality including email/password login and per
 
 #### TC-006: Network Interruption During Login
 - **Type**: Error Handling
-- **Priority**: High
+- **Priority**: P1
 - **Steps**: 
   1. Enter valid credentials
   2. Click "Login"
@@ -112,81 +99,62 @@ Testing user authentication functionality including email/password login and per
   - Retry option available
   - No partial auth state
 
-### Edge Cases Summary
+#### TC-007: SQL Injection Attempt
+- **Type**: Security
+- **Priority**: P0
+- **Steps**:
+  1. Navigate to `/login`
+  2. Enter email: `' OR '1'='1`
+  3. Enter password: `' OR '1'='1`
+  4. Click "Login"
+- **Expected Result**:
+  - Login rejected
+  - Input sanitized server-side
+  - No database error exposed
 
-**Input Validation:**
-- Null/empty values
-- Leading/trailing spaces
-- Special characters in email: `user+tag@example.com`
-- Maximum lengths (email: 254, password: 255)
-- Copy-paste behavior
+#### TC-008: Brute Force Rate Limiting
+- **Type**: Security
+- **Priority**: P0
+- **Steps**:
+  1. Navigate to `/login`
+  2. Submit 5 consecutive login attempts with wrong password
+  3. Attempt a 6th login
+- **Expected Result**:
+  - Account temporarily locked or CAPTCHA displayed
+  - Rate limit response (429) after threshold
 
-**Security:**
-- SQL injection: `' OR 1=1--`
-- XSS attempts: `<script>alert('xss')</script>`
-- Brute force protection (rate limiting)
-- CSRF token validation
-- Secure cookie flags (HttpOnly, Secure)
+#### TC-009: Email With Special Characters
+- **Type**: UI + API
+- **Priority**: P2
+- **Steps**:
+  1. Navigate to `/login`
+  2. Enter email: `user+tag@example.com`
+  3. Enter valid password
+  4. Click "Login"
+- **Expected Result**:
+  - Login succeeds if account exists
+  - Email with `+` sign handled correctly
 
-**Session Management:**
-- Concurrent logins
-- Session timeout (30 min inactivity)
-- Token refresh mechanism
-- Logout from all devices
+#### TC-010: Password At Max Length
+- **Type**: UI + API
+- **Priority**: P2
+- **Steps**:
+  1. Navigate to `/login`
+  2. Enter valid email
+  3. Enter password at max allowed length (255 chars)
+  4. Click "Login"
+- **Expected Result**:
+  - Login succeeds if credentials are valid
+  - No truncation or server error
 
-**Cross-browser:**
-- Chrome, Firefox, Safari, Edge (latest 2 versions)
-- Mobile browsers (iOS/Android)
-- Browser autofill compatibility
-
-**Accessibility:**
-- Keyboard navigation (Tab, Enter)
-- Screen reader labels
-- Focus indicators
-- Error message accessibility
-
-### Risk Assessment
-
-**High Risk Areas:**
-1. **Brute Force Attacks**: Rate limiting must work correctly
-2. **Session Security**: Token theft or hijacking
-3. **Remember Me Token**: Long-lived tokens are security-sensitive
-
-**Mitigation:**
-- Implement CAPTCHA after 5 failed attempts
-- Use secure, HttpOnly cookies
-- Encrypt and rotate Remember Me tokens
-
-### API Contract Validation
-
-**Endpoint**: `POST /api/auth/login`
-
-**Request:**
-```json
-{
-  "email": "user@example.com",
-  "password": "password123",
-  "rememberMe": true
-}
-
-Success (200):
-{
-  "token": "eyJhbGc...",
-  "user": {
- "id": "123",
- "email": "user@example.com"
-  },
-  "expiresIn": 3600
-}
-
-Error (401):
-{
-  "error": "Invalid credentials"
-}
-
-Success Criteria
-✅ All critical tests pass (100%)
-✅ API response time <500ms
-✅ Zero P0/P1 security vulnerabilities
-✅ WCAG 2.1 AA compliant
-✅ Works in all target browsers
+#### TC-011: Whitespace-Only Input
+- **Type**: UI Validation
+- **Priority**: P2
+- **Steps**:
+  1. Navigate to `/login`
+  2. Enter spaces-only in both fields
+  3. Click "Login"
+- **Expected Result**:
+  - Treated as empty input
+  - Validation error shown
+  - No API call made

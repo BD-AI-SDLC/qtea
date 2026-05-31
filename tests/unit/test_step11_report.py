@@ -283,10 +283,10 @@ def test_generate_allure_html_invokes_subprocess(tmp_path: Path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_step11_happy_path(tmp_path: Path):
+async def test_step11_happy_path(tmp_path: Path):
     ctx = _ctx(tmp_path)
     _seed(ctx, results=_sample_results(), bugs=[_sample_bug(ctx.workspace.run_id)])
-    result = ReportStep().run(ctx)
+    result = await ReportStep().run(ctx)
     assert result.success
     assert result.status == "completed"
     out = ctx.workspace.step_dir(11)
@@ -297,39 +297,39 @@ def test_step11_happy_path(tmp_path: Path):
     assert ok, err
 
 
-def test_step11_skips_when_step9_missing(tmp_path: Path):
+async def test_step11_skips_when_step9_missing(tmp_path: Path):
     ctx = _ctx(tmp_path)
-    result = ReportStep().run(ctx)
+    result = await ReportStep().run(ctx)
     assert result.success
     assert result.status == "skipped"
     assert "missing" in (result.notes or "")
 
 
-def test_step11_report_builtin_no_allure(tmp_path: Path):
+async def test_step11_report_builtin_no_allure(tmp_path: Path):
     ctx = _ctx(tmp_path, report="builtin")
     _seed(ctx, results=_sample_results())
-    result = ReportStep().run(ctx)
+    result = await ReportStep().run(ctx)
     assert result.success
     out = ctx.workspace.step_dir(11)
     assert (out / "index.html").exists()
     assert not (out / "allure-results").exists()
 
 
-def test_step11_report_auto_builtin_always(tmp_path: Path, monkeypatch):
+async def test_step11_report_auto_builtin_always(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("shutil.which", lambda _name: None)
     ctx = _ctx(tmp_path, report="auto")
     _seed(ctx, results=_sample_results())
-    result = ReportStep().run(ctx)
+    result = await ReportStep().run(ctx)
     assert result.success
     out = ctx.workspace.step_dir(11)
     assert (out / "index.html").exists()
     assert "html=yes" in (result.notes or "")
 
 
-def test_step11_open_report_flag(tmp_path: Path):
+async def test_step11_open_report_flag(tmp_path: Path):
     ctx = _ctx(tmp_path, open_report=True)
     _seed(ctx, results=_sample_results())
     with patch("worca_t.steps.s11_report.webbrowser.open") as mock_open:
-        result = ReportStep().run(ctx)
+        result = await ReportStep().run(ctx)
         assert result.success
         assert mock_open.called

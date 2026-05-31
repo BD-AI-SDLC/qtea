@@ -57,24 +57,20 @@ If input doesn't match cleanly, default to Feature Spec but note uncertainty.
 
 **Template**: Use `templates/test-strategy-template.md`
 
-1. Define scope (in scope / out of scope)
-2. Identify test types required
-3. Generate test cases with structure:
+1. Define scope (in scope / out of scope) — keep it brief (5-10 lines)
+2. Generate test cases with structure:
    ```
    TC-XXX: [Title]
    - Type: [UI/API/Integration/Performance/Security]
-   - Priority: [Critical/High/Medium/Low]
+   - Priority: [P0/P1/P2/P3]
    - Preconditions: [Required setup]
    - Steps: [Numbered list]
    - Expected Result: [Outcome]
-   - Edge Cases: [Boundary scenarios]
    ```
-4. Apply edge case discovery (see below)
-5. Perform risk assessment
-6. Define success criteria
-7. Estimate timeline and effort
+3. Edge cases are test cases — give each an ID and priority, don't list them in a separate summary section. Use `templates/edge-case-checklist.md` to inform TC design.
+4. Add an Assumptions section only if something non-obvious would affect test design or codegen.
 
-**Output**: `test-strategy-[feature-name].md`
+**Output**: `test-strategy.md`
 
 ---
 
@@ -121,21 +117,7 @@ Document for each bug:
 
 ---
 
-### Step 3: Edge Case Discovery
-
-Run in parallel with Step 2. For each input field or user action, systematically explore:
-
-**Input Fields:** empty/null, too long/short, special characters, HTML/script tags, injection attempts, wrong data type, Unicode/emoji, max/min boundary values
-
-**User Actions:** double-click, navigate away mid-action, network failure mid-action, multiple tabs, session expiry mid-action
-
-**Integration Points:** API down, API error response, very slow response
-
-**Prioritization:** High-impact + High-likelihood = Test Now; Low-impact + Low-likelihood = Skip; everything else = Test Soon or Consider.
-
----
-
-### Step 4: Example Reference
+### Step 3: Example Reference
 
 **Reference Files**:
 - `examples/login-feature-test.md` - Test strategy example
@@ -145,34 +127,14 @@ Use these patterns to ensure consistent format and thoroughness.
 
 ---
 
-### Step 5: Output Compilation
+### Step 4: Output Compilation
 
 **Output Rules**:
 - Format: Markdown (.md)
 - Location: Same directory as input or specified output path
-- Naming: `[type]-[identifier].md`
+- Naming: `test-strategy.md`
 
-**Structure**:
-```markdown
-# [Title]
-
-**Generated**: [Date]
-**Input Type**: [feature_specification|bug_report|test_review]
-**Agent**: Test Manager Agent v1.1.0
-
----
-
-[Content based on template used]
-
----
-
-## Summary
-
-- Test Cases Created: [Count]
-- Edge Cases Identified: [Count]
-- Risk Areas: [List]
-- Recommended Next Steps: [List]
-```
+**Structure**: Follow `templates/test-strategy-template.md` — Scope, Test Cases, optional Assumptions. No additional sections.
 
 ---
 
@@ -198,23 +160,6 @@ Never invent concrete-looking test data identifiers not present in the input spe
 - **Titles**: Specific and descriptive (e.g., "TC-001: Verify user with valid credentials can login and is redirected to /dashboard")
 - **Expected Results**: Specific and measurable (e.g., "API returns 200 OK with {token: string, userId: uuid, expiresIn: 3600}")
 - **Structure**: Use the `TC-XXX` template from Step 2A consistently
-
----
-
-## Risk Assessment
-
-For each feature, ask: What could go wrong? What's the blast radius? How likely? How hard to detect? How hard to recover?
-
-| Likelihood \ Impact | Critical | High | Medium | Low |
-|---------------------|----------|------|--------|-----|
-| **Very Likely** | Extreme | High | Medium | Low |
-| **Likely** | High | Medium | Low | Minimal |
-| **Unlikely** | Medium | Low | Minimal | Minimal |
-| **Rare** | Low | Minimal | Minimal | Minimal |
-
-**Risk response**: Extreme = may block release; High = mitigate before release; Medium = accept with monitoring; Low = accept.
-
-Document each risk with: Likelihood, Impact, Severity, Mitigation Strategy, Testing Focus (which TCs cover it).
 
 ---
 
@@ -250,12 +195,10 @@ standards:
 
 Before finalizing output, verify:
 
-- [ ] All required template sections populated
+- [ ] Scope section present (in/out of scope)
 - [ ] At least one test case per critical path
-- [ ] Edge cases identified for input validation
-- [ ] Security considerations addressed
-- [ ] Success criteria defined
-- [ ] Clear, actionable recommendations
-- [ ] Justification provided for priorities/classifications
+- [ ] Edge cases are actual TCs with IDs and priorities (not a separate list)
+- [ ] Security considerations addressed via TCs
+- [ ] No duplicate or near-duplicate test cases
 
 ---

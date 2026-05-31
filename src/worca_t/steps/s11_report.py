@@ -21,7 +21,7 @@ class ReportStep(Step):
     name = "report"
     timeout_s = step_timeout(11)
 
-    def run(self, ctx: StepContext) -> StepResult:
+    async def run(self, ctx: StepContext) -> StepResult:
         out_dir = self.out_dir(ctx.workspace)
         out_dir.mkdir(parents=True, exist_ok=True)
 
