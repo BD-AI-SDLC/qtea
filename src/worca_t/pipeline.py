@@ -12,10 +12,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from rich.console import Console
+from rich.table import Table
 
-from worca_t.checkpoints import RunState, is_step_complete, load_state, outputs_match, save_state
+from worca_t.checkpoints import RunState, StepRecord, is_step_complete, load_state, outputs_match, save_state
 from worca_t.config import load_env
 from worca_t.logging_setup import configure_logging
+from worca_t.metrics import format_cost, format_tokens
 from worca_t.steps.base import Step, StepContext
 from worca_t.steps.s01_intake import IntakeStep
 from worca_t.steps.s02_refine import RefineStep
@@ -234,16 +236,112 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
         console.print(f"[cyan]>>> step {step_num:02d} {step.name}[/]")
         result = await step.execute(ctx)
         save_state(state, ws.state_file)
+        record = state.steps.get(step_num)
 
         if not result.success:
             console.print(f"[red]step {step_num:02d} FAILED:[/] {result.error or result.notes}")
+            if record is not None:
+                console.print(f"   {_format_step_metrics_line(record)}")
             exit_code = 1
             break
 
         marker = "warned" if result.status == "warned" else "ok"
-        console.print(f"[green]step {step_num:02d} {marker}[/]  -> {len(result.outputs)} outputs")
+        line = f"[green]step {step_num:02d} {marker}[/]  -> {len(result.outputs)} outputs"
+        if record is not None:
+            line += f"  [dim]{_format_step_metrics_line(record)}[/]"
+        console.print(line)
 
     state.finished_at = datetime.now(UTC).isoformat()
     save_state(state, ws.state_file)
-    log.info("pipeline.end", status="ok" if exit_code == 0 else "failed")
+    _render_summary_table(state, console)
+    log.info(
+        "pipeline.end",
+        status="ok" if exit_code == 0 else "failed",
+        **_pipeline_totals(state),
+    )
     return exit_code
+
+
+def _format_step_metrics_line(record: StepRecord) -> str:
+    """One-line summary appended to per-step console output."""
+    duration = f"{record.duration_s:.1f}s" if record.duration_s is not None else "-"
+    tokens_in = format_tokens(record.tokens_input)
+    tokens_out = format_tokens(record.tokens_output)
+    cost = format_cost(record.cost_usd)
+    return f"[elapsed {duration} | {tokens_in}->{tokens_out} tok | {cost}]"
+
+
+def _pipeline_totals(state: RunState) -> dict[str, float | int]:
+    total_duration = 0.0
+    total_in = 0
+    total_out = 0
+    total_cost = 0.0
+    total_calls = 0
+    for rec in state.steps.values():
+        if rec.duration_s is not None:
+            total_duration += rec.duration_s
+        total_in += rec.tokens_input
+        total_out += rec.tokens_output
+        total_cost += rec.cost_usd
+        total_calls += rec.agent_calls
+    return {
+        "total_duration_s": round(total_duration, 3),
+        "total_tokens_input": total_in,
+        "total_tokens_output": total_out,
+        "total_cost_usd": round(total_cost, 6),
+        "total_agent_calls": total_calls,
+    }
+
+
+def _render_summary_table(state: RunState, console: Console) -> None:
+    """Print a per-step + totals table after the pipeline finishes."""
+    if not state.steps:
+        return
+
+    table = Table(title="Pipeline Summary", title_style="bold cyan", show_lines=False)
+    table.add_column("#", justify="right", style="dim", no_wrap=True)
+    table.add_column("Step", style="cyan", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Time", justify="right", no_wrap=True)
+    table.add_column("In tok", justify="right", no_wrap=True)
+    table.add_column("Out tok", justify="right", no_wrap=True)
+    table.add_column("Calls", justify="right", no_wrap=True)
+    table.add_column("Cost", justify="right", no_wrap=True)
+
+    status_color = {
+        "completed": "green",
+        "skipped": "dim",
+        "warned": "yellow",
+        "failed": "red",
+        "in_progress": "yellow",
+        "pending": "dim",
+    }
+
+    for step_num in sorted(state.steps):
+        rec = state.steps[step_num]
+        color = status_color.get(rec.status, "white")
+        duration = f"{rec.duration_s:.1f}s" if rec.duration_s is not None else "-"
+        table.add_row(
+            f"{step_num:02d}",
+            rec.name or "",
+            f"[{color}]{rec.status}[/]",
+            duration,
+            format_tokens(rec.tokens_input),
+            format_tokens(rec.tokens_output),
+            str(rec.agent_calls),
+            format_cost(rec.cost_usd),
+        )
+
+    totals = _pipeline_totals(state)
+    table.add_section()
+    table.add_row(
+        "",
+        "[bold]TOTAL[/]",
+        "",
+        f"[bold]{totals['total_duration_s']:.1f}s[/]",
+        f"[bold]{format_tokens(int(totals['total_tokens_input']))}[/]",
+        f"[bold]{format_tokens(int(totals['total_tokens_output']))}[/]",
+        f"[bold]{totals['total_agent_calls']}[/]",
+        f"[bold]{format_cost(float(totals['total_cost_usd']))}[/]",
+    )
+    console.print(table)

@@ -26,6 +26,7 @@ from claude_agent_sdk import (
 from worca_t.config import CLAUDE_SESSION_KEYS, SECRET_ENV_KEYS, get_settings, model_for_agent, step_timeout
 from worca_t.logging_setup import get_logger
 from worca_t.mcp_manager import stage_mcp_config
+from worca_t.metrics import CURRENT_STEP_METRICS, AgentMetrics, extract_agent_metrics
 from worca_t.proxy import with_proxy_env
 
 log = get_logger(__name__)
@@ -43,6 +44,7 @@ class AgentResult:
     timed_out: bool = False
     error: str | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
+    metrics: AgentMetrics = field(default_factory=AgentMetrics)
 
 
 # MCP tool allowlist. The SDK's `permission_mode="acceptEdits"` does NOT
@@ -182,10 +184,13 @@ async def _drive_query(
     options: ClaudeAgentOptions,
     transcript_path: Path,
     on_event: Any | None,
-) -> tuple[list[dict[str, Any]], str]:
-    """Iterate the SDK query, write transcript, return (events, final_text)."""
+) -> tuple[list[dict[str, Any]], str, AgentMetrics]:
+    """Iterate the SDK query, write transcript, return (events, final_text, metrics)."""
     events: list[dict[str, Any]] = []
     final_text = ""
+    # ResultMessage typically appears once at end-of-turn, but if the SDK ever
+    # emits more than one we sum them so caller never under-counts.
+    totals = AgentMetrics()
 
     with transcript_path.open("w", encoding="utf-8") as transcript_fp:
         async for message in query(prompt=user_prompt, options=options):
@@ -212,6 +217,19 @@ async def _drive_query(
                 result = getattr(message, "result", None)
                 if isinstance(result, str) and result:
                     final_text = result
+                m = extract_agent_metrics(
+                    getattr(message, "usage", None),
+                    getattr(message, "total_cost_usd", None),
+                )
+                turns = getattr(message, "num_turns", None)
+                if isinstance(turns, int):
+                    m.num_turns = turns
+                totals.input_tokens += m.input_tokens
+                totals.output_tokens += m.output_tokens
+                totals.cache_creation_input_tokens += m.cache_creation_input_tokens
+                totals.cache_read_input_tokens += m.cache_read_input_tokens
+                totals.cost_usd += m.cost_usd
+                totals.num_turns += m.num_turns
             elif isinstance(message, UserMessage):
                 # User-turn echo from the SDK (e.g., tool-result feedback).
                 pass
@@ -222,7 +240,7 @@ async def _drive_query(
                 except Exception:
                     pass
 
-    return events, final_text
+    return events, final_text, totals
 
 
 async def run_agent(
@@ -372,6 +390,7 @@ async def run_agent(
     started = time.monotonic()
     events: list[dict[str, Any]] = []
     final_text = ""
+    agent_metrics = AgentMetrics()
     timed_out = False
     error: str | None = None
     exit_code = -1
@@ -381,7 +400,7 @@ async def run_agent(
     stderr_path.write_text("", encoding="utf-8")
 
     try:
-        events, final_text = await asyncio.wait_for(
+        events, final_text, agent_metrics = await asyncio.wait_for(
             _drive_query(
                 user_prompt=user_prompt,
                 options=options,
@@ -403,6 +422,13 @@ async def run_agent(
     duration = time.monotonic() - started
     success = (exit_code == 0) and not timed_out and error is None
 
+    # Push into the active step accumulator (if any). Token/cost counts a
+    # partial run too -- the SDK can emit a ResultMessage even on early
+    # termination, and the user has already been billed for the tokens.
+    accumulator = CURRENT_STEP_METRICS.get()
+    if accumulator is not None:
+        accumulator.record(agent_metrics)
+
     metrics = {
         "agent": agent_path.name,
         "model": resolved_model,
@@ -412,6 +438,12 @@ async def run_agent(
         "timed_out": timed_out,
         "error": error,
         "event_count": len(events),
+        "tokens_input": agent_metrics.input_tokens,
+        "tokens_output": agent_metrics.output_tokens,
+        "tokens_cache_creation": agent_metrics.cache_creation_input_tokens,
+        "tokens_cache_read": agent_metrics.cache_read_input_tokens,
+        "cost_usd": round(agent_metrics.cost_usd, 6),
+        "num_turns": agent_metrics.num_turns,
     }
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     if error and not stderr_path.read_text(encoding="utf-8"):
@@ -424,6 +456,9 @@ async def run_agent(
         exit_code=exit_code,
         duration_s=metrics["duration_s"],
         timed_out=timed_out,
+        tokens_input=agent_metrics.input_tokens,
+        tokens_output=agent_metrics.output_tokens,
+        cost_usd=round(agent_metrics.cost_usd, 6),
     )
 
     return AgentResult(
@@ -437,4 +472,5 @@ async def run_agent(
         timed_out=timed_out,
         error=error,
         events=events,
+        metrics=agent_metrics,
     )

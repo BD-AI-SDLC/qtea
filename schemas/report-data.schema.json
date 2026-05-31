@@ -44,7 +44,34 @@
         "errors": { "type": "integer", "minimum": 0 },
         "total_bugs": { "type": "integer", "minimum": 0 },
         "duration_s": { "type": ["number", "null"], "minimum": 0 },
-        "pass_rate": { "type": "number", "minimum": 0, "maximum": 1 }
+        "pass_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+        "pipeline_duration_s": { "type": "number", "minimum": 0 },
+        "total_tokens_input": { "type": "integer", "minimum": 0 },
+        "total_tokens_output": { "type": "integer", "minimum": 0 },
+        "total_tokens_cache_creation": { "type": "integer", "minimum": 0 },
+        "total_tokens_cache_read": { "type": "integer", "minimum": 0 },
+        "total_cost_usd": { "type": "number", "minimum": 0 },
+        "total_agent_calls": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "steps_summary": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["step", "name", "status"],
+        "additionalProperties": false,
+        "properties": {
+          "step": { "type": "integer", "minimum": 1 },
+          "name": { "type": "string" },
+          "status": { "type": "string" },
+          "duration_s": { "type": ["number", "null"], "minimum": 0 },
+          "tokens_input": { "type": "integer", "minimum": 0 },
+          "tokens_output": { "type": "integer", "minimum": 0 },
+          "tokens_cache_creation": { "type": "integer", "minimum": 0 },
+          "tokens_cache_read": { "type": "integer", "minimum": 0 },
+          "cost_usd": { "type": "number", "minimum": 0 },
+          "agent_calls": { "type": "integer", "minimum": 0 }
+        }
       }
     }
   }

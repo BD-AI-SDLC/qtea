@@ -105,6 +105,81 @@ def test_select_steps_skip_steps():
 # ---------------------------------------------------------------------------
 
 
+def test_step_record_new_metrics_fields_default_to_zero():
+    """Backward compat: old code or fresh records start at zero metrics."""
+    rec = StepRecord(step=1, name="x")
+    assert rec.tokens_input == 0
+    assert rec.tokens_output == 0
+    assert rec.tokens_cache_creation == 0
+    assert rec.tokens_cache_read == 0
+    assert rec.cost_usd == 0.0
+    assert rec.agent_calls == 0
+
+
+def test_load_state_with_old_schema_fills_metrics_defaults(tmp_path: Path):
+    """A state.json from before this feature has no token/cost fields. Load must succeed."""
+    legacy = {
+        "run_id": "r1",
+        "workspace": str(tmp_path),
+        "spec_source": "x",
+        "sut_source": ".",
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "finished_at": None,
+        "steps": {
+            "1": {
+                "step": 1,
+                "name": "intake",
+                "status": "completed",
+                "attempts": 1,
+                "started_at": "2026-01-01T00:00:00+00:00",
+                "finished_at": "2026-01-01T00:00:05+00:00",
+                "duration_s": 5.0,
+                "output_hashes": {},
+                "notes": None,
+                "timed_out": False,
+            }
+        },
+    }
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    loaded = load_state(path)
+    assert loaded is not None
+    rec = loaded.steps[1]
+    assert rec.duration_s == 5.0
+    assert rec.tokens_input == 0
+    assert rec.cost_usd == 0.0
+    assert rec.agent_calls == 0
+
+
+def test_state_roundtrip_preserves_metrics_fields(tmp_path: Path):
+    state = RunState(run_id="r", workspace=str(tmp_path), spec_source="x", sut_source=".")
+    state.steps[1] = StepRecord(
+        step=1,
+        name="intake",
+        status="completed",
+        duration_s=2.5,
+        tokens_input=1234,
+        tokens_output=567,
+        tokens_cache_creation=200,
+        tokens_cache_read=5000,
+        cost_usd=0.0421,
+        agent_calls=3,
+    )
+    path = tmp_path / "state.json"
+    save_state(state, path)
+
+    loaded = load_state(path)
+    assert loaded is not None
+    r = loaded.steps[1]
+    assert r.tokens_input == 1234
+    assert r.tokens_output == 567
+    assert r.tokens_cache_creation == 200
+    assert r.tokens_cache_read == 5000
+    assert r.cost_usd == 0.0421
+    assert r.agent_calls == 3
+
+
 def test_load_state_returns_none_on_corrupted_json(tmp_path: Path):
     bad = tmp_path / "state.json"
     bad.write_text("not valid json{{{", encoding="utf-8")
