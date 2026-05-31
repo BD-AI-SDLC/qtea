@@ -53,6 +53,7 @@ class PipelineOptions:
     log_level: str = "info"
     run_id: str | None = None
     env_file: Path | None = None
+    no_hitl: bool = False
 
 
 def _build_registry() -> dict[int, Step]:
@@ -147,7 +148,7 @@ def _select_steps(opts: PipelineOptions) -> list[int]:
     return [i for i in range(start, TOTAL_STEPS + 1) if i not in opts.skip_steps]
 
 
-def run_pipeline(opts: PipelineOptions, *, console: Console | None = None) -> int:
+async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None) -> int:
     console = console or Console()
 
     if opts.env_file:
@@ -231,7 +232,7 @@ def run_pipeline(opts: PipelineOptions, *, console: Console | None = None) -> in
             continue
 
         console.print(f"[cyan]>>> step {step_num:02d} {step.name}[/]")
-        result = step.execute(ctx)
+        result = await step.execute(ctx)
         save_state(state, ws.state_file)
 
         if not result.success:

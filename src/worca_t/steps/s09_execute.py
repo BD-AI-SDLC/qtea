@@ -211,7 +211,7 @@ class ExecuteStep(Step):
     name = "execute"
     timeout_s = step_timeout(9)
 
-    def run(self, ctx: StepContext) -> StepResult:
+    async def run(self, ctx: StepContext) -> StepResult:
         out_dir = self.out_dir(ctx.workspace)
         out_dir.mkdir(parents=True, exist_ok=True)
         heal_log_path = out_dir / "self-heal" / "heal-log.jsonl"
@@ -282,7 +282,7 @@ class ExecuteStep(Step):
                     staged_copy = orig_dir / Path(entry.file).name
                     shutil.copy2(target_in_sut, staged_copy)
 
-                agent_res = run_agent(
+                agent_res = await run_agent(
                     fixer_agent,
                     workdir=heal_wd,
                     inputs={},

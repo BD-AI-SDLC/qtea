@@ -14,12 +14,11 @@ import json
 import re
 import shutil
 
-from worca_t.claude_runner import run_agent
 from worca_t.config import package_resource_root, step_timeout
 from worca_t.logging_setup import get_logger
 from worca_t.md_parser import extract_bullets, extract_tables, parse_markdown
 from worca_t.schemas import is_valid
-from worca_t.steps.base import Step, StepContext, StepResult
+from worca_t.steps.base import Step, StepContext, StepResult, run_agent_with_hitl
 
 log = get_logger(__name__)
 
@@ -122,7 +121,7 @@ class PlanStep(Step):
     name = "plan"
     timeout_s = step_timeout(3)
 
-    def run(self, ctx: StepContext) -> StepResult:
+    async def run(self, ctx: StepContext) -> StepResult:
         out_dir = self.out_dir(ctx.workspace)
         wd = self.workdir(ctx.workspace)
         wd.mkdir(parents=True, exist_ok=True)
@@ -146,8 +145,9 @@ class PlanStep(Step):
         agent = agents_root / "polyglot-test-planner.agent.md"
         claude_md = package_resource_root() / "CLAUDE.md"
 
-        result = run_agent(
-            agent,
+        result = await run_agent_with_hitl(
+            ctx=ctx,
+            agent_path=agent,
             workdir=wd,
             inputs=inputs,
             user_prompt=(
@@ -155,6 +155,8 @@ class PlanStep(Step):
                 "present) and produce a phased test implementation plan at "
                 "`./plan.md` following the structure in your agent prompt."
             ),
+            output_filename="plan.md",
+            agent_label="polyglot-test-planner",
             timeout_s=self.timeout_s,
             step=3,
             max_turns=15,

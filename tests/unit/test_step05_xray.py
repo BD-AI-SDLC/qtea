@@ -134,12 +134,12 @@ def test_build_mappings_partial_failure():
 # ---------------------------------------------------------------------------
 
 
-def test_step05_skips_when_no_credentials(tmp_path: Path, monkeypatch):
+async def test_step05_skips_when_no_credentials(tmp_path: Path, monkeypatch):
     monkeypatch.delenv("JIRA_XRAY_CLIENT_ID", raising=False)
     monkeypatch.delenv("JIRA_XRAY_CLIENT_SECRET", raising=False)
     monkeypatch.delenv("JIRA_XRAY_API_KEY", raising=False)
     ctx = _ctx(tmp_path)
-    result = XrayUploadStep().run(ctx)
+    result = await XrayUploadStep().run(ctx)
     assert result.success
     assert result.status == "skipped"
     out = ctx.workspace.step_dir(5) / "xray-mapping.json"
@@ -150,19 +150,19 @@ def test_step05_skips_when_no_credentials(tmp_path: Path, monkeypatch):
     assert ok, err
 
 
-def test_step05_skips_when_only_client_id(tmp_path: Path, monkeypatch):
+async def test_step05_skips_when_only_client_id(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("JIRA_XRAY_CLIENT_ID", "id-only")
     monkeypatch.delenv("JIRA_XRAY_CLIENT_SECRET", raising=False)
     monkeypatch.delenv("JIRA_XRAY_API_KEY", raising=False)
     ctx = _ctx(tmp_path)
-    result = XrayUploadStep().run(ctx)
+    result = await XrayUploadStep().run(ctx)
     assert result.status == "skipped"
 
 
-def test_step05_skips_when_strategy_missing(tmp_path: Path, monkeypatch):
+async def test_step05_skips_when_strategy_missing(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("JIRA_XRAY_API_KEY", "test-key")
     ctx = _ctx(tmp_path)
-    result = XrayUploadStep().run(ctx)
+    result = await XrayUploadStep().run(ctx)
     assert result.status == "skipped"
     assert "step 4" in (result.notes or "")
 
@@ -230,7 +230,7 @@ def test_xray_client_import_success(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_step05_happy_path(tmp_path: Path, monkeypatch):
+async def test_step05_happy_path(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("JIRA_XRAY_API_KEY", "test-key")
     monkeypatch.delenv("JIRA_XRAY_CLIENT_ID", raising=False)
     monkeypatch.delenv("JIRA_XRAY_CLIENT_SECRET", raising=False)
@@ -249,7 +249,7 @@ def test_step05_happy_path(tmp_path: Path, monkeypatch):
     )
     _seed_strategy(ctx)
 
-    result = XrayUploadStep().run(ctx)
+    result = await XrayUploadStep().run(ctx)
     assert result.success
     assert result.status == "completed"
     out = ctx.workspace.step_dir(5)
@@ -261,7 +261,7 @@ def test_step05_happy_path(tmp_path: Path, monkeypatch):
     assert all(m["status"] == "created" for m in data["mappings"])
 
 
-def test_step05_auth_failure_strict(tmp_path: Path, monkeypatch):
+async def test_step05_auth_failure_strict(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("JIRA_XRAY_CLIENT_ID", "cid")
     monkeypatch.setenv("JIRA_XRAY_CLIENT_SECRET", "csec")
     monkeypatch.delenv("JIRA_XRAY_API_KEY", raising=False)
@@ -274,12 +274,12 @@ def test_step05_auth_failure_strict(tmp_path: Path, monkeypatch):
     ctx = _ctx(tmp_path, strict_xray=True)
     _seed_strategy(ctx)
 
-    result = XrayUploadStep().run(ctx)
+    result = await XrayUploadStep().run(ctx)
     assert not result.success
     assert result.status == "failed"
 
 
-def test_step05_auth_failure_non_strict(tmp_path: Path, monkeypatch):
+async def test_step05_auth_failure_non_strict(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("JIRA_XRAY_CLIENT_ID", "cid")
     monkeypatch.setenv("JIRA_XRAY_CLIENT_SECRET", "csec")
     monkeypatch.delenv("JIRA_XRAY_API_KEY", raising=False)
@@ -292,12 +292,12 @@ def test_step05_auth_failure_non_strict(tmp_path: Path, monkeypatch):
     ctx = _ctx(tmp_path)
     _seed_strategy(ctx)
 
-    result = XrayUploadStep().run(ctx)
+    result = await XrayUploadStep().run(ctx)
     assert result.success
     assert result.status == "warned"
 
 
-def test_step05_partial_failure_strict(tmp_path: Path, monkeypatch):
+async def test_step05_partial_failure_strict(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("JIRA_XRAY_API_KEY", "test-key")
     monkeypatch.delenv("JIRA_XRAY_CLIENT_ID", raising=False)
     monkeypatch.delenv("JIRA_XRAY_CLIENT_SECRET", raising=False)
@@ -316,6 +316,6 @@ def test_step05_partial_failure_strict(tmp_path: Path, monkeypatch):
     )
     _seed_strategy(ctx)
 
-    result = XrayUploadStep().run(ctx)
+    result = await XrayUploadStep().run(ctx)
     assert not result.success
     assert result.status == "failed"

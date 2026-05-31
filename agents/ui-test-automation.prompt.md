@@ -270,7 +270,7 @@ Handling browser-specific issues:
 - Feature detection over browser detection.
 - Polyfills for older browsers (if required).
 - Separate test suites for browser-specific behaviors.
-- Tag tests: `@chromium-only`, `@webkit-only`.
+- Tag tests: `@chromium-only`, `@firefox-only`, `@webkit-only`.
 
 ---
 

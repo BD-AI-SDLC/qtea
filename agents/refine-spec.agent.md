@@ -151,9 +151,11 @@ The refined spec retains the original structure and appends/replaces sections:
   attachment lists, issue links, sub-tasks, comments, Figma-link tables) may
   and should be stripped so refinement runs on the substantive requirement.
 - Mark assumptions explicitly with `[ASSUMPTION]` tag.
-- Flag ambiguities with `[CLARIFICATION NEEDED]` tag for upstream resolution.
+- Flag ambiguities with `[CLARIFICATION NEEDED]` tag for upstream resolution. Involve user to answer if needed.
 - All acceptance criteria must use Given/When/Then and be tagged with automation feasibility.
 - Each AC must trace back to a user flow.
 - Requirement ID (`REQ-<slug>`) is mandatory — generate one if the source spec lacks it.
 - Emit `READY` verdict only when all Definition-of-Ready items pass. Otherwise emit `NOT READY` with blocker list.
 - No GitHub/Jira API calls — this agent works on local markdown files only.
+- The refined spec has to be unique and not contain any duplicate content.
+- If there are any Blockers or `[CLARIFICATION NEEDED]` tags, the agent must ask the user to resolve them before finalizing the refined spec.

@@ -35,16 +35,17 @@ Create a `.env` file in your working directory with your values:
 # Required — Anthropic API key for Claude agents
 ANTHROPIC_API_KEY=sk-ant-api03-...
 
-# Required if your spec comes from Jira (step 1)
-ATLASSIAN_URL=https://yourcompany.atlassian.net
-ATLASSIAN_EMAIL=you@company.com
-ATLASSIAN_API_TOKEN=your-atlassian-api-token
+# Required if your spec comes from Jira (step 1) — also used by the
+# Atlassian MCP server that .mcp.json spawns
+JIRA_BASE_URL=https://yourcompany.atlassian.net
+JIRA_EMAIL=you@company.com
+JIRA_API_TOKEN=your-jira-api-token
 
 # Optional — Xray Cloud (step 5 auto-skips if unset)
 JIRA_XRAY_CLIENT_ID=
 JIRA_XRAY_CLIENT_SECRET=
 
-# Optional — corporate proxy
+# Optional — corporate proxy (also forwarded to MCP servers)
 HTTP_PROXY=http://proxy:3128
 HTTPS_PROXY=http://proxy:3128
 
@@ -54,6 +55,11 @@ SUT_BASE_URL=http://localhost:3000
 
 **Minimum for a local run:** only `ANTHROPIC_API_KEY` is required. Jira
 and Xray credentials are optional — steps 1 and 5 auto-adapt.
+
+**MCP servers:** `.mcp.json` references `JIRA_BASE_URL`, `JIRA_EMAIL`,
+`JIRA_API_TOKEN`, `HTTP_PROXY`, and `HTTPS_PROXY` via `${VAR}` syntax.
+The Claude CLI resolves these from your environment at launch time, so
+make sure they are set in your `.env` file or exported in your shell.
 
 Alternatively, pass a custom env file at runtime:
 
@@ -304,6 +310,37 @@ worca-t run --spec ./spec.md --sut ./app --strict-xray
 
 --report-inline-images  # embed screenshots as base64 in HTML
 --open-report           # open the report in your browser when done
+```
+
+## Developing worca-t locally
+
+The installed wheel contains **two kinds of frozen content** that don't
+auto-update when you edit the source tree:
+
+| What you edited | How to pick it up |
+| --- | --- |
+| Markdown resources: `agents/`, `templates/`, `schemas/`, `skills/`, `examples/`, `CLAUDE.md`, `.mcp.json` | Set `WORCA_T_RESOURCE_ROOT=<repo-root>` — the runner reads from there instead of the frozen `_resources/` snapshot. **No reinstall needed.** |
+| Python code: anything under `src/worca_t/**.py` | Either reinstall the tool, or run the dev venv binary (editable install). The env var does **not** help here — Python imports come from site-packages, not from `WORCA_T_RESOURCE_ROOT`. |
+
+```bash
+# A) Set the resource-root env var (works only for markdown edits).
+export WORCA_T_RESOURCE_ROOT=/path/to/worca-t      # bash / zsh
+$Env:WORCA_T_RESOURCE_ROOT = "C:\path\to\worca-t"  # PowerShell
+set WORCA_T_RESOURCE_ROOT=C:\path\to\worca-t       # cmd
+
+# B) Reinstall the tool (covers BOTH markdown and Python changes).
+uv tool install --reinstall --force /path/to/worca-t
+
+# C) Run the dev venv binary directly (editable install — picks up Python
+#    edits live; pair with WORCA_T_RESOURCE_ROOT for markdown edits).
+/path/to/worca-t/.venv/bin/worca-t run ...
+C:\path\to\worca-t\.venv\Scripts\worca-t.exe run ...
+```
+
+To disable interactive prompts (e.g., for CI runs), pass `--no-hitl`:
+
+```bash
+worca-t run --spec ... --sut ... --no-hitl
 ```
 
 ## Next steps

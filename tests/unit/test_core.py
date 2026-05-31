@@ -51,6 +51,10 @@ def test_proxy_mirroring(monkeypatch):
     # HTTPS_PROXY automatically makes https_proxy visible. On POSIX our
     # explicit mirroring in with_proxy_env() does the same. Either way the
     # returned env must expose both spellings.
+    # Clear any pre-existing lower-case value (corp registry may set it) so
+    # we're testing the mirroring path, not env-merge precedence.
+    monkeypatch.delenv("https_proxy", raising=False)
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy:3128")
     env = with_proxy_env()
     assert env.get("HTTPS_PROXY") == "http://proxy:3128"

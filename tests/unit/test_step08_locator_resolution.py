@@ -19,7 +19,7 @@ from worca_t.steps.s08_locator_resolution import (
 )
 from worca_t.workspace import create_workspace
 
-from ._fake_claude import install_on_path, write_fake_claude
+from ._fake_claude import install_fake_query
 
 # ---------------------------------------------------------------------------
 # Unit tests (pure functions)
@@ -222,14 +222,14 @@ def _ctx(tmp_path: Path) -> StepContext:
     return StepContext(workspace=ws, state=state, spec_source="x", sut_source=".", options=opts)
 
 
-def test_step08_requires_step07_outputs(tmp_path: Path):
+async def test_step08_requires_step07_outputs(tmp_path: Path):
     ctx = _ctx(tmp_path)
-    result = LocatorResolutionStep().run(ctx)
+    result = await LocatorResolutionStep().run(ctx)
     assert not result.success
     assert "step 8 requires" in (result.error or "")
 
 
-def test_step08_short_circuits_when_no_tbd(tmp_path: Path, monkeypatch):
+async def test_step08_short_circuits_when_no_tbd(tmp_path: Path, monkeypatch):
     ctx = _ctx(tmp_path)
     step7 = ctx.workspace.root / "artifacts" / "step07"
     (step7 / "tests").mkdir(parents=True, exist_ok=True)
@@ -263,13 +263,10 @@ def test_step08_short_circuits_when_no_tbd(tmp_path: Path, monkeypatch):
         encoding="utf-8",
     )
 
-    # Even though we install a fake claude, it must NOT be invoked.
-    install_on_path(
-        monkeypatch,
-        write_fake_claude(tmp_path / "bin", events=[{"type": "result", "result": "ok"}], exit_code=99),
-    )
+    # Even though we install a fake query, it must NOT be invoked.
+    install_fake_query(monkeypatch, raises=RuntimeError("simulated exit 99"))
 
-    result = LocatorResolutionStep().run(ctx)
+    result = await LocatorResolutionStep().run(ctx)
     assert result.success
     assert result.status == "completed"
     res = json.loads((ctx.workspace.step_dir(8) / "locator-resolution.json").read_text(encoding="utf-8"))
@@ -277,7 +274,7 @@ def test_step08_short_circuits_when_no_tbd(tmp_path: Path, monkeypatch):
     assert res["totals"]["tests_with_tbd"] == 0
 
 
-def test_step08_happy_path_patches_files(tmp_path: Path, monkeypatch):
+async def test_step08_happy_path_patches_files(tmp_path: Path, monkeypatch):
     ctx = _ctx(tmp_path)
     _seed_step7(ctx.workspace.root)
     monkeypatch.setenv("SUT_BASE_URL", "https://example.test")
@@ -300,14 +297,13 @@ def test_step08_happy_path_patches_files(tmp_path: Path, monkeypatch):
             }
         ],
     }
-    bin_path = write_fake_claude(
-        tmp_path / "bin",
-        events=[{"type": "result", "result": "ok"}],
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
         files={"locator-resolution.json": json.dumps(resolution)},
     )
-    install_on_path(monkeypatch, bin_path)
 
-    result = LocatorResolutionStep().run(ctx)
+    result = await LocatorResolutionStep().run(ctx)
     assert result.success, result.error
     assert result.status == "completed"
     out = ctx.workspace.step_dir(8)
@@ -322,7 +318,7 @@ def test_step08_happy_path_patches_files(tmp_path: Path, monkeypatch):
     assert not reidx["violations"]
 
 
-def test_step08_rejects_xpath_replacement_via_patcher(tmp_path: Path, monkeypatch):
+async def test_step08_rejects_xpath_replacement_via_patcher(tmp_path: Path, monkeypatch):
     ctx = _ctx(tmp_path)
     _seed_step7(ctx.workspace.root)
 
@@ -337,14 +333,13 @@ def test_step08_rejects_xpath_replacement_via_patcher(tmp_path: Path, monkeypatc
             }
         ]
     }
-    bin_path = write_fake_claude(
-        tmp_path / "bin",
-        events=[{"type": "result", "result": "ok"}],
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
         files={"locator-resolution.json": json.dumps(resolution)},
     )
-    install_on_path(monkeypatch, bin_path)
 
-    result = LocatorResolutionStep().run(ctx)
+    result = await LocatorResolutionStep().run(ctx)
     # Step succeeds but warns: token stays, applied=0, skipped=1.
     assert result.success
     assert result.status == "warned"
@@ -356,39 +351,37 @@ def test_step08_rejects_xpath_replacement_via_patcher(tmp_path: Path, monkeypatc
     assert "TBD_LOCATOR" in (out / "tests" / "login.spec.ts").read_text(encoding="utf-8")
 
 
-def test_step08_agent_invalid_json_fails(tmp_path: Path, monkeypatch):
+async def test_step08_agent_invalid_json_fails(tmp_path: Path, monkeypatch):
     ctx = _ctx(tmp_path)
     _seed_step7(ctx.workspace.root)
 
-    bin_path = write_fake_claude(
-        tmp_path / "bin",
-        events=[{"type": "result", "result": "ok"}],
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
         files={"locator-resolution.json": "not json{"},
     )
-    install_on_path(monkeypatch, bin_path)
 
-    result = LocatorResolutionStep().run(ctx)
+    result = await LocatorResolutionStep().run(ctx)
     assert not result.success
     assert "not valid JSON" in (result.error or "")
 
 
-def test_step08_agent_no_output_fails(tmp_path: Path, monkeypatch):
+async def test_step08_agent_no_output_fails(tmp_path: Path, monkeypatch):
     ctx = _ctx(tmp_path)
     _seed_step7(ctx.workspace.root)
 
-    bin_path = write_fake_claude(
-        tmp_path / "bin",
-        events=[{"type": "result", "result": "ok"}],
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
         files={},
     )
-    install_on_path(monkeypatch, bin_path)
 
-    result = LocatorResolutionStep().run(ctx)
+    result = await LocatorResolutionStep().run(ctx)
     assert not result.success
     assert "locator-resolution.json" in (result.error or "")
 
 
-def test_step08_resolves_file_from_test_id_when_omitted(tmp_path: Path, monkeypatch):
+async def test_step08_resolves_file_from_test_id_when_omitted(tmp_path: Path, monkeypatch):
     ctx = _ctx(tmp_path)
     _seed_step7(ctx.workspace.root)
 
@@ -403,14 +396,13 @@ def test_step08_resolves_file_from_test_id_when_omitted(tmp_path: Path, monkeypa
             }
         ]
     }
-    bin_path = write_fake_claude(
-        tmp_path / "bin",
-        events=[{"type": "result", "result": "ok"}],
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
         files={"locator-resolution.json": json.dumps(resolution)},
     )
-    install_on_path(monkeypatch, bin_path)
 
-    result = LocatorResolutionStep().run(ctx)
+    result = await LocatorResolutionStep().run(ctx)
     assert result.success
     payload = json.loads((ctx.workspace.step_dir(8) / "locator-resolution.json").read_text(encoding="utf-8"))
     assert payload["totals"]["applied"] == 1

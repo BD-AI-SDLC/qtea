@@ -15,14 +15,14 @@ from dotenv import load_dotenv
 MAX_STEP_TIMEOUT_S = 1800
 
 DEFAULT_STEP_TIMEOUTS: dict[int, int] = {
-    1: 600,
-    2: 240,
+    1: 120,
+    2: 300,
     3: 900,
-    4: 1200,
+    4: 1500,
     5: 120,
     6: 900,
     7: 1800,
-    8: 1200,
+    8: 1500,
     9: 1800,
     10: 600,
     11: 600,
@@ -37,7 +37,7 @@ SECRET_ENV_KEYS = frozenset(
     {
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
-        "ATLASSIAN_API_TOKEN",
+        "JIRA_API_TOKEN",
         "JIRA_XRAY_CLIENT_SECRET",
         "JIRA_XRAY_API_KEY",
         "JIRA_XRAY_CLIENT_ID",
@@ -141,11 +141,18 @@ def step_timeout(step: int, override: int | None = None) -> int:
 def package_resource_root() -> Path:
     """Best-effort path to the package resource root (for agents/, skills/, etc.).
 
-    In dev-tree this points to the project root. When installed via wheel, points
-    to the on-disk extraction inside the package's `_resources` dir.
+    Resolution order:
+      1. ``WORCA_T_RESOURCE_ROOT`` env var (developer override — point at the
+         working tree to pick up live edits without reinstalling).
+      2. ``_resources`` baked into the installed wheel.
+      3. Dev tree (two parents up from this file).
     """
+    override = os.environ.get("WORCA_T_RESOURCE_ROOT")
+    if override:
+        p = Path(override)
+        if p.exists():
+            return p
     pkg_resources = Path(__file__).parent / "_resources"
     if pkg_resources.exists():
         return pkg_resources
-    # Dev tree: project root is two parents up from src/worca_t/config.py
     return Path(__file__).parent.parent.parent

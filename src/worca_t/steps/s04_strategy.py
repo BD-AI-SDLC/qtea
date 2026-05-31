@@ -1,9 +1,8 @@
 """Step 4: Test strategy generation via test-manager agent.
 
 Reads plan.md + refined-spec.md, invokes test-manager (with the
-quality-playbook and breakdown-test skills + test-strategy template + Jira
-checklist staged), parses output into test-strategy.json with extracted
-test cases.
+test-strategy template + edge-case checklist + schema staged), parses
+output into test-strategy.json with extracted test cases.
 
 Outputs (artifacts/step04/):
   - test-strategy.md
@@ -99,23 +98,13 @@ def _project_strategy(md: str) -> dict:
             seen_ids.add(tc["id"])
             cases.append(tc)
 
-    def find_content(needle: str) -> str | None:
-        s = root.find(needle)
-        return s.content if s else None
-
-    def find_bullets(needle: str) -> list[str]:
-        s = root.find(needle)
-        return extract_bullets(s.content) if s else []
+    scope_sec = root.find("scope")
+    scope = scope_sec.content if scope_sec else None
 
     return {
         "title": title,
-        "scope": find_content("scope"),
-        "objectives": find_bullets("objectives") or find_bullets("goals"),
-        "types": find_bullets("test types") or find_bullets("types of testing"),
-        "risks": find_bullets("risks"),
+        "scope": scope,
         "test_cases": cases,
-        "edge_cases": find_bullets("edge case"),
-        "exit_criteria": find_bullets("exit criteria") or find_bullets("done"),
     }
 
 
@@ -124,7 +113,7 @@ class StrategyStep(Step):
     name = "strategy"
     timeout_s = step_timeout(4)
 
-    def run(self, ctx: StepContext) -> StepResult:
+    async def run(self, ctx: StepContext) -> StepResult:
         out_dir = self.out_dir(ctx.workspace)
         wd = self.workdir(ctx.workspace)
         wd.mkdir(parents=True, exist_ok=True)
@@ -144,16 +133,11 @@ class StrategyStep(Step):
             inputs["refined-spec.md"] = refined_md
 
         agents_root = package_resource_root() / "agents"
-        skills_root = package_resource_root() / "skills"
         docs_root = package_resource_root()
         agent = agents_root / "test-manager.agent.md"
         claude_md = package_resource_root() / "CLAUDE.md"
 
         extras = []
-        for skill in ("quality-playbook", "breakdown-test"):
-            p = skills_root / skill
-            if p.exists():
-                extras.append(p)
         for doc in ("templates/test-strategy-template.md", "templates/edge-case-checklist.md"):
             p = docs_root / doc
             if p.exists():
@@ -162,14 +146,14 @@ class StrategyStep(Step):
         if schema.exists():
             extras.append(schema)
 
-        result = run_agent(
+        result = await run_agent(
             agent,
             workdir=wd,
             inputs=inputs,
             user_prompt=(
                 "Read `./plan.md` (and `./refined-spec.md` if present). Follow "
                 "your authoritative workflow in `test-manager.prompt.md` and "
-                "produce a comprehensive test strategy document at "
+                "produce a focused test strategy document at "
                 "`./test-strategy.md`. Every test case must have an id of the "
                 "form `TC-<slug>` and a priority (`P0`-`P3`)."
             ),

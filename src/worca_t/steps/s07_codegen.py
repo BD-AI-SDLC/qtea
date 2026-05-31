@@ -58,7 +58,7 @@ class CodegenStep(Step):
     name = "codegen"
     timeout_s = step_timeout(7)
 
-    def run(self, ctx: StepContext) -> StepResult:
+    async def run(self, ctx: StepContext) -> StepResult:
         out_dir = self.out_dir(ctx.workspace)
         wd = self.workdir(ctx.workspace)
         wd.mkdir(parents=True, exist_ok=True)
@@ -111,7 +111,7 @@ class CodegenStep(Step):
                 f"Never hardcode their values."
             )
 
-        result = run_agent(
+        result = await run_agent(
             agent,
             workdir=wd,
             inputs=inputs,

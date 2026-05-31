@@ -1,7 +1,7 @@
 """Step 6: Repository discovery via polyglot-test-researcher.
 
 - Materializes the SUT into workspace/sut/ (clone if remote, copy if local).
-- Optionally pre-runs the skill's deterministic scan.py.
+- Optionally pre-runs the bundled deterministic scan.py.
 - Invokes the researcher agent against the SUT.
 - Parses its Discovery Summary into research.json (best-effort projection).
 
@@ -270,7 +270,7 @@ class ResearchStep(Step):
     name = "research"
     timeout_s = step_timeout(6)
 
-    def run(self, ctx: StepContext) -> StepResult:
+    async def run(self, ctx: StepContext) -> StepResult:
         out_dir = self.out_dir(ctx.workspace)
         wd = self.workdir(ctx.workspace)
         wd.mkdir(parents=True, exist_ok=True)
@@ -305,21 +305,20 @@ class ResearchStep(Step):
         claude_md = package_resource_root() / "CLAUDE.md"
 
         extras: list[Path] = []
-        for skill in ("acquire-codebase-knowledge", "context-map", "stack-catalog"):
+        for skill in ("stack-catalog",):
             sp = skills_root / skill
             if sp.exists():
                 extras.append(sp)
         # Stage the SUT next to the agent so it can grep/read it.
         extras.append(ctx.workspace.sut)
 
-        result = run_agent(
+        result = await run_agent(
             agent,
             workdir=wd,
             inputs={},
             user_prompt=(
-                "Follow the procedure in `./polyglot-test-researcher.prompt.md` "
-                "and the skill at `./acquire-codebase-knowledge/SKILL.md`. The "
-                "repository under test is in `./sut/`. A pre-computed "
+                "Follow the procedure in `./polyglot-test-researcher.prompt.md`. "
+                "The repository under test is in `./sut/`. A pre-computed "
                 "deterministic scan is at `./scan.txt` — read it first to seed "
                 "your discovery. Produce the Discovery Summary at "
                 "`./research.md` with explicit Build, Test, and Lint commands "

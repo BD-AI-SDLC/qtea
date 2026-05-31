@@ -74,7 +74,7 @@
 - **Locator priority:** `id > data-testid > role > label > text > placeholder > scoped CSS`. **Never XPath.**
 - **AOM snapshots only** (`page.accessibility.snapshot()`). Never `page.content()`.
 - **No hard waits** in generated tests (`time.sleep`, `cy.wait(<n>)`, etc.).
-- **No secrets in code.** Env vars only. Masked in logs: `ANTHROPIC_API_KEY`, `ATLASSIAN_API_TOKEN`, `JIRA_XRAY_API_KEY`, `JIRA_XRAY_CLIENT_ID`, `JIRA_XRAY_CLIENT_SECRET`.
+- **No secrets in code.** Env vars only. Masked in logs: `ANTHROPIC_API_KEY`, `JIRA_API_TOKEN`, `JIRA_XRAY_API_KEY`, `JIRA_XRAY_CLIENT_ID`, `JIRA_XRAY_CLIENT_SECRET`.
 - **Self-heal scope** (step 9): locators only — never assertions, never business logic.
 - **F.I.R.S.T.** test principles.
 - **Markdown size:** ~200 lines target, 500 hard cap (CI-enforced).
@@ -122,3 +122,4 @@ When executing `worca-t run` or any pipeline step:
 - Trust the runner's design — execute the command as given.
 - Only perform additional operations if explicitly requested by the user, or if the runner fails and needs troubleshooting.
 - When echoing environment variables or reading from `.env`, never expose the real value of any key in the terminal or in any output — mask or omit the value entirely.
+- Resources (`agents/`, `templates/`, `schemas/`, `skills/`, `examples/`, `CLAUDE.md`, `.mcp.json`) are baked into the installed wheel as a frozen `_resources/` snapshot. Markdown edits propagate when `WORCA_T_RESOURCE_ROOT=<repo-root>` is set. **Python code edits (`src/worca_t/**.py`) require a tool reinstall** (`uv tool install --reinstall --force <repo-root>`) or running from the dev `.venv` (editable install) — the env var does not help with Python.

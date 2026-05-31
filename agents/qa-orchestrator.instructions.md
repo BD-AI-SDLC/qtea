@@ -63,7 +63,7 @@ For each step in `_select_steps()` (respecting `--from-step`, `--only-step`, `--
    - A per-step timeout cap (see `config.py`; max **1200 seconds**).
 4. Stream agent progress. Write each event to `run.log.jsonl` with fields:
    `run_id`, `step`, `agent`, `attempt`, `correlation_id`, `timestamp`.
-5. Mask secrets in all log output: `ANTHROPIC_API_KEY`, `ATLASSIAN_API_TOKEN`,
+5. Mask secrets in all log output: `ANTHROPIC_API_KEY`, `JIRA_API_TOKEN`,
    `JIRA_XRAY_API_KEY`, `JIRA_XRAY_CLIENT_ID`, `JIRA_XRAY_CLIENT_SECRET`.
 
 ### 2.3 Validate

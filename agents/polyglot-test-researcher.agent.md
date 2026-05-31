@@ -60,8 +60,9 @@ Summary without doc = incomplete. Doc without summary = no machine hook.
 
 | Skill | When | Purpose |
 |---|---|---|
-| `skills/acquire-codebase-knowledge/SKILL.md` | Step 1 | Run `scripts/scan.py` (Python, deterministic) for 7 baseline docs as seed before LLM steps 2-11. |
-| `skills/context-map/SKILL.md` | Before emitting `research.md` | File-level dependency + risk map; downstream architect uses for `automation_cost` and `flake_risk`. |
+| `skills/stack-catalog/SKILL.md` | When identifying or matching a framework | Per-framework indicators (deps + config + imports) and minimal pattern examples. |
+
+A deterministic codebase scan is pre-computed and staged as `./scan.txt`; read it first to seed discovery before exploring source files.
 
 ## Gurdrails
 Never expose any value of a key of environment variable.

@@ -58,14 +58,25 @@ def with_proxy_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     env = _windows_user_env()
     env.update(os.environ)
 
-    # Ensure both upper- and lower-case proxy keys are mirrored if only one exists.
+    # Ensure both upper- and lower-case proxy keys agree. When process env sets
+    # one spelling, it's authoritative for both (overrides the Windows registry
+    # fallback). Falls back to copy-the-only-present-spelling when neither is in
+    # process env.
     proxy_pairs = (
         ("HTTP_PROXY", "http_proxy"),
         ("HTTPS_PROXY", "https_proxy"),
         ("NO_PROXY", "no_proxy"),
     )
     for upper, lower in proxy_pairs:
-        if upper in env and lower not in env:
+        upper_proc = os.environ.get(upper)
+        lower_proc = os.environ.get(lower)
+        if upper_proc is not None:
+            env[upper] = upper_proc
+            env[lower] = upper_proc
+        elif lower_proc is not None:
+            env[upper] = lower_proc
+            env[lower] = lower_proc
+        elif upper in env and lower not in env:
             env[lower] = env[upper]
         elif lower in env and upper not in env:
             env[upper] = env[lower]

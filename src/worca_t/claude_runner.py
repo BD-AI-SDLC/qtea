@@ -1,4 +1,4 @@
-"""Spawn the `claude` CLI per agent, stream stream-json output, enforce timeout.
+"""Drive a single agent via the Claude Agent SDK in an isolated workdir.
 
 This is the single execution path for every agent in worca-t. All step modules
 funnel through `run_agent()`.
@@ -6,15 +6,22 @@ funnel through `run_agent()`.
 
 from __future__ import annotations
 
+import asyncio
 import json
-import os
 import shutil
-import subprocess
-import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any
+
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ResultMessage,
+    SystemMessage,
+    UserMessage,
+    query,
+)
 
 from worca_t.config import CLAUDE_SESSION_KEYS, SECRET_ENV_KEYS, get_settings, model_for_agent, step_timeout
 from worca_t.logging_setup import get_logger
@@ -36,6 +43,20 @@ class AgentResult:
     timed_out: bool = False
     error: str | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
+
+
+# MCP tool allowlist. The SDK's `permission_mode="acceptEdits"` does NOT
+# auto-approve MCP tools (only file edits and filesystem Bash) — the CLI behaved
+# differently. Pre-approve every MCP server we ship with so steps that touch
+# Playwright / Chrome DevTools / Atlassian don't stall on permission prompts.
+_MCP_ALLOWLIST: tuple[str, ...] = (
+    "mcp__playwright__*",
+    "mcp__chrome-devtools__*",
+    "mcp__atlassian__*",
+)
+
+# Sanity threshold for an unusually large agent file (informational only).
+_AGENT_PROMPT_WARN_BYTES = 30_000
 
 
 def _agent_key(agent_path: Path) -> str:
@@ -101,138 +122,110 @@ def _stage_resources(
     return agent_dst
 
 
-# Sanity threshold for an unusually large agent file (informational only —
-# system-prompt content is passed via --append-system-prompt-file, not on the
-# command line, so there is no real argv length pressure).
-_AGENT_PROMPT_WARN_BYTES = 30_000
-
-
-def _build_command(
-    *,
-    claude_bin: str,
-    agent_path_in_workdir: Path,
-    user_prompt: str,
-    model: str | None,
-    max_turns: int | None,
-    permission_mode: str,
-) -> list[str]:
-    """Build the `claude` CLI argv.
-
-    The agent's markdown is delivered via ``--append-system-prompt-file`` so
-    its full contents reach the model. The previously used ``@filename``
-    syntax inside ``--append-system-prompt`` is NOT expanded by the Claude
-    CLI; it was being passed verbatim and silently producing a degenerate
-    system prompt. Inlining the file body on the command line was also
-    unsafe on Windows where long argv values can corrupt downstream
-    positional argument parsing in the Node-based CLI wrapper.
-    """
-    if not agent_path_in_workdir.exists():
-        raise RuntimeError(
-            f"agent file missing in workdir: {agent_path_in_workdir}"
-        )
-
-    try:
-        agent_size = agent_path_in_workdir.stat().st_size
-    except OSError as e:
-        raise RuntimeError(
-            f"failed to stat agent file: {agent_path_in_workdir} ({e})"
-        ) from e
-
-    if agent_size > _AGENT_PROMPT_WARN_BYTES:
-        log.warning(
-            "agent.system_prompt.large",
-            agent=agent_path_in_workdir.name,
-            bytes=agent_size,
-        )
-
-    cmd: list[str] = [
-        claude_bin,
-        "--print",
-        "--verbose",
-        "--output-format",
-        "stream-json",
-        "--input-format",
-        "text",
-        "--append-system-prompt-file",
-        agent_path_in_workdir.name,
-        "--mcp-config",
-        ".mcp.json",
-        "--permission-mode",
-        permission_mode,
-    ]
-    if model:
-        cmd.extend(["--model", model])
-    if max_turns is not None:
-        cmd.extend(["--max-turns", str(max_turns)])
-    cmd.append(user_prompt)
-    return cmd
-
-
 def _mask_env(env: dict[str, str]) -> dict[str, str]:
     return {k: ("***REDACTED***" if k in SECRET_ENV_KEYS else v) for k, v in env.items()}
 
 
-def _terminate_process(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
-    if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
-            capture_output=True,
-            check=False,
-        )
-    else:
-        proc.terminate()
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+def _message_to_dict(message: Any) -> dict[str, Any]:
+    """Best-effort serialization of an SDK Message to a JSON-safe dict.
 
-
-def _drain_stream(
-    stream: Any,
-    transcript_fp: Any,
-    events: list[dict[str, Any]],
-    final_text_holder: list[str],
-    on_event: Any | None,
-    stream_done: threading.Event | None = None,
-) -> None:
-    """Read newline-delimited JSON from claude's stdout, persist + parse."""
-    try:
-        for raw_line in iter(stream.readline, b""):
-            if not raw_line:
-                break
-            line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
-            if not line:
+    Preserves the audit trail in `transcript.jsonl`. Shape differs from the
+    pre-SDK stream-json events but contains the same information.
+    """
+    out: dict[str, Any] = {"type": message.__class__.__name__}
+    for attr in ("subtype", "session_id", "result", "data", "content",
+                 "parent_tool_use_id", "stop_reason", "usage", "total_cost_usd"):
+        if hasattr(message, attr):
+            value = getattr(message, attr)
+            if value is None:
                 continue
-            transcript_fp.write(line + "\n")
-            transcript_fp.flush()
             try:
-                evt = json.loads(line)
-            except json.JSONDecodeError:
-                evt = {"type": "raw", "text": line}
+                out[attr] = _coerce_json(value)
+            except Exception:
+                out[attr] = repr(value)
+    return out
+
+
+def _coerce_json(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _coerce_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_coerce_json(v) for v in value]
+    if is_dataclass(value):
+        return {f.name: _coerce_json(getattr(value, f.name))
+                for f in value.__dataclass_fields__.values()}  # type: ignore[attr-defined]
+    if hasattr(value, "__dict__"):
+        return {k: _coerce_json(v) for k, v in vars(value).items() if not k.startswith("_")}
+    return str(value)
+
+
+def _extract_text_from_blocks(content: Any) -> str:
+    """Walk an AssistantMessage's `content` and return the last text block."""
+    if not isinstance(content, list):
+        return ""
+    last = ""
+    for block in content:
+        text = getattr(block, "text", None)
+        if text is None and isinstance(block, dict):
+            if block.get("type") == "text":
+                text = block.get("text")
+        if isinstance(text, str) and text:
+            last = text
+    return last
+
+
+async def _drive_query(
+    *,
+    user_prompt: str,
+    options: ClaudeAgentOptions,
+    transcript_path: Path,
+    on_event: Any | None,
+) -> tuple[list[dict[str, Any]], str]:
+    """Iterate the SDK query, write transcript, return (events, final_text)."""
+    events: list[dict[str, Any]] = []
+    final_text = ""
+
+    with transcript_path.open("w", encoding="utf-8") as transcript_fp:
+        async for message in query(prompt=user_prompt, options=options):
+            evt = _message_to_dict(message)
+            transcript_fp.write(json.dumps(evt, ensure_ascii=False) + "\n")
+            transcript_fp.flush()
             events.append(evt)
-            # Best-effort: capture final assistant text for downstream parsing.
-            etype = evt.get("type")
-            if etype == "result" and isinstance(evt.get("result"), str):
-                final_text_holder[0] = evt["result"]
-                if stream_done is not None:
-                    stream_done.set()
-            elif etype == "assistant":
-                msg = evt.get("message") or {}
-                for block in msg.get("content", []) or []:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        final_text_holder[0] = block.get("text", "")
+
+            if isinstance(message, SystemMessage) and getattr(message, "subtype", None) == "init":
+                data = getattr(message, "data", {}) or {}
+                servers = data.get("mcp_servers") or []
+                # SDK status enum: connected | failed | needs-auth | pending | disabled.
+                # `pending` is transient (server still starting at init-message time)
+                # and `disabled` is intentional, so only flag the genuinely bad states.
+                bad = [s for s in servers
+                       if isinstance(s, dict) and s.get("status") in ("failed", "needs-auth")]
+                if bad:
+                    log.warning("agent.mcp.failed_servers", failed=bad)
+            elif isinstance(message, AssistantMessage):
+                text = _extract_text_from_blocks(getattr(message, "content", None))
+                if text:
+                    final_text = text
+            elif isinstance(message, ResultMessage):
+                result = getattr(message, "result", None)
+                if isinstance(result, str) and result:
+                    final_text = result
+            elif isinstance(message, UserMessage):
+                # User-turn echo from the SDK (e.g., tool-result feedback).
+                pass
+
             if on_event:
                 try:
                     on_event(evt)
                 except Exception:
                     pass
-    except (OSError, ValueError):
-        pass
+
+    return events, final_text
 
 
-def run_agent(
+async def run_agent(
     agent_path: Path,
     *,
     workdir: Path,
@@ -249,7 +242,7 @@ def run_agent(
     on_event: Any | None = None,
     debug_live: bool = False,
 ) -> AgentResult:
-    """Run a single agent via the `claude` CLI in an isolated workdir.
+    """Run a single agent via the Claude Agent SDK in an isolated workdir.
 
     The ``workdir`` passed here is a staging-only directory. ``inputs``
     and ``extra_paths`` are copied IN at the start of each call; the
@@ -273,8 +266,10 @@ def run_agent(
     extra_paths: dirs/files to copy into the workdir (skills, docs, ...).
     mcp_source: override .mcp.json source path.
     claude_md: path to CLAUDE.md to stage at the workdir root.
-    on_event: optional callback invoked for each parsed stream-json event.
+    on_event: optional callback invoked for each parsed event.
+    debug_live: accepted for API compatibility; currently no-op.
     """
+    del debug_live  # accepted for API compat
     workdir.mkdir(parents=True, exist_ok=True)
     transcript_path = workdir / "transcript.jsonl"
     stderr_path = workdir / "stderr.log"
@@ -294,41 +289,19 @@ def run_agent(
     )
     _stage_inputs(workdir, inputs)
 
-    cmd = _build_command(
-        claude_bin=settings.claude_bin,
-        agent_path_in_workdir=agent_in_wd,
-        user_prompt=user_prompt,
-        model=resolved_model,
-        max_turns=max_turns,
-        permission_mode=permission_mode,
-    )
-    env = with_proxy_env()
-    for key in CLAUDE_SESSION_KEYS:
-        env.pop(key, None)
+    try:
+        agent_size = agent_in_wd.stat().st_size
+    except OSError as e:
+        raise RuntimeError(
+            f"failed to stat agent file: {agent_in_wd} ({e})"
+        ) from e
+    if agent_size > _AGENT_PROMPT_WARN_BYTES:
+        log.warning("agent.system_prompt.large", agent=agent_in_wd.name, bytes=agent_size)
 
-    safe_cmd = [*cmd[:-1], "<user-prompt>"]
-    relevant_env = {
-        k: env[k]
-        for k in env
-        if k.startswith(("WORCA_", "ANTHROPIC_", "HTTP", "HTTPS", "NO_PROXY"))
-    }
-    log.info(
-        "agent.start",
-        agent=agent_path.name,
-        model=resolved_model,
-        workdir=str(workdir),
-        timeout_s=resolved_timeout,
-        cmd=safe_cmd,
-    )
-    log.debug("agent.env", env=_mask_env(relevant_env))
+    agent_md_text = agent_in_wd.read_text(encoding="utf-8")
 
-    started = time.monotonic()
-    events: list[dict[str, Any]] = []
-    final_text: list[str] = [""]
-    timed_out = False
-    error: str | None = None
-    exit_code = -1
-
+    # The SDK still shells out to the `claude` Code binary internally. Keep the
+    # missing-binary precheck so the failure mode is identical to today.
     if not shutil.which(settings.claude_bin):
         msg = f"`{settings.claude_bin}` not found on PATH"
         stderr_path.write_text(msg, encoding="utf-8")
@@ -351,110 +324,81 @@ def run_agent(
             error=msg,
         )
 
-    transcript_fp = transcript_path.open("w", encoding="utf-8")
-    stderr_fp = stderr_path.open("wb")
-    # On Windows, .cmd/.bat wrappers must be invoked via cmd.exe.
-    spawn_cmd = cmd
-    if os.name == "nt":
-        resolved = shutil.which(cmd[0])
-        if resolved and resolved.lower().endswith((".cmd", ".bat")):
-            spawn_cmd = ["cmd", "/c"] + cmd
+    # Build env: proxy + filtered Anthropic/WORCA keys, with Claude session
+    # keys stripped so the SDK doesn't think it's running nested.
+    full_env = with_proxy_env()
+    for key in CLAUDE_SESSION_KEYS:
+        full_env.pop(key, None)
+    forwarded_env = {
+        k: full_env[k]
+        for k in full_env
+        if k.startswith(("WORCA_", "ANTHROPIC_", "HTTP", "HTTPS", "NO_PROXY"))
+    }
+
+    sdk_options_kwargs: dict[str, Any] = {
+        "cwd": str(workdir),
+        # Append our agent .md to the Claude Code preset system prompt — same
+        # semantic as the deprecated `--append-system-prompt-file` flag.
+        "system_prompt": {
+            "type": "preset",
+            "preset": "claude_code",
+            "append": agent_md_text,
+        },
+        "permission_mode": permission_mode,
+        # Load .mcp.json + CLAUDE.md staged into the workdir.
+        "setting_sources": ["project"],
+        # Pre-approve our MCP tools so steps don't stall on permission prompts.
+        "allowed_tools": list(_MCP_ALLOWLIST),
+        "env": forwarded_env,
+    }
+    if resolved_model:
+        sdk_options_kwargs["model"] = resolved_model
+    if max_turns is not None:
+        sdk_options_kwargs["max_turns"] = max_turns
+
+    options = ClaudeAgentOptions(**sdk_options_kwargs)
+
+    log.info(
+        "agent.start",
+        agent=agent_path.name,
+        model=resolved_model,
+        workdir=str(workdir),
+        timeout_s=resolved_timeout,
+        permission_mode=permission_mode,
+        max_turns=max_turns,
+    )
+    log.debug("agent.env", env=_mask_env(forwarded_env))
+
+    started = time.monotonic()
+    events: list[dict[str, Any]] = []
+    final_text = ""
+    timed_out = False
+    error: str | None = None
+    exit_code = -1
+
+    # Initialise stderr file (SDK doesn't surface a stderr stream the way the
+    # subprocess did; we still create the file for forensic-artifact contract).
+    stderr_path.write_text("", encoding="utf-8")
 
     try:
-        proc = subprocess.Popen(
-            spawn_cmd,
-            cwd=workdir,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=stderr_fp,
-            env=env,
-            bufsize=0,
-            creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
+        events, final_text = await asyncio.wait_for(
+            _drive_query(
+                user_prompt=user_prompt,
+                options=options,
+                transcript_path=transcript_path,
+                on_event=on_event,
+            ),
+            timeout=resolved_timeout,
         )
-
-        stream_done = threading.Event()
-
-        reader = threading.Thread(
-            target=_drain_stream,
-            args=(proc.stdout, transcript_fp, events, final_text, on_event, stream_done),
-            daemon=True,
-        )
-        reader.start()
-
-        # Grace period after the stream emits a 'result' event.  On Windows
-        # the cmd.exe wrapper may keep pipe handles open long after the
-        # Claude CLI exits; this avoids waiting indefinitely.
-        _POST_RESULT_GRACE_S = 30
-
-        try:
-            deadline = time.monotonic() + resolved_timeout
-            grace_deadline: float | None = None
-
-            while True:
-                rc = proc.poll()
-                if rc is not None:
-                    exit_code = rc
-                    break
-
-                now = time.monotonic()
-
-                if now >= deadline:
-                    timed_out = True
-                    error = f"timeout after {resolved_timeout}s"
-                    log.error("agent.timeout", agent=agent_path.name, timeout_s=resolved_timeout)
-                    _terminate_process(proc)
-                    try:
-                        exit_code = proc.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        exit_code = -9
-                    break
-
-                if stream_done.is_set():
-                    if grace_deadline is None:
-                        grace_deadline = now + _POST_RESULT_GRACE_S
-                        log.info(
-                            "agent.stream_done_process_alive",
-                            agent=agent_path.name,
-                            grace_s=_POST_RESULT_GRACE_S,
-                            pid=proc.pid,
-                        )
-                    elif now >= grace_deadline:
-                        log.warning(
-                            "agent.grace_period_expired",
-                            agent=agent_path.name,
-                            pid=proc.pid,
-                            grace_s=_POST_RESULT_GRACE_S,
-                        )
-                        _terminate_process(proc)
-                        try:
-                            exit_code = proc.wait(timeout=10)
-                        except subprocess.TimeoutExpired:
-                            exit_code = -9
-                        break
-
-                time.sleep(0.5)
-
-        finally:
-            if proc.stdout is not None:
-                try:
-                    proc.stdout.close()
-                except OSError:
-                    pass
-            reader.join(timeout=5)
-            if reader.is_alive():
-                log.warning("agent.reader_thread_stuck", agent=agent_path.name)
+        exit_code = 0
+    except asyncio.TimeoutError:
+        timed_out = True
+        exit_code = -9
+        error = f"timeout after {resolved_timeout}s"
+        log.error("agent.timeout", agent=agent_path.name, timeout_s=resolved_timeout)
     except Exception as e:
-        error = f"spawn error: {e}"
-        log.error("agent.spawn_error", agent=agent_path.name, error=str(e))
-    finally:
-        try:
-            transcript_fp.close()
-        except Exception:
-            pass
-        try:
-            stderr_fp.close()
-        except Exception:
-            pass
+        error = f"sdk error: {e}"
+        log.exception("agent.sdk_error", agent=agent_path.name, error=str(e))
 
     duration = time.monotonic() - started
     success = (exit_code == 0) and not timed_out and error is None
@@ -470,6 +414,8 @@ def run_agent(
         "event_count": len(events),
     }
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    if error and not stderr_path.read_text(encoding="utf-8"):
+        stderr_path.write_text(error, encoding="utf-8")
 
     log.info(
         "agent.end",
@@ -487,7 +433,7 @@ def run_agent(
         transcript_path=transcript_path,
         stderr_path=stderr_path,
         metrics_path=metrics_path,
-        final_text=final_text[0],
+        final_text=final_text,
         timed_out=timed_out,
         error=error,
         events=events,
