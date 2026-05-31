@@ -6,13 +6,23 @@ import base64
 from pathlib import Path
 from string import Template
 
-from worca_t.report.data_builder import RunReport
+from worca_t.metrics import format_cost, format_tokens
+from worca_t.report.data_builder import RunReport, StepTiming
 
 _STATUS_COLORS = {
     "passed": "#22c55e",
     "failed": "#ef4444",
     "skipped": "#9ca3af",
     "error": "#f97316",
+}
+
+_STEP_STATUS_COLORS = {
+    "completed": "#22c55e",
+    "warned": "#eab308",
+    "failed": "#ef4444",
+    "skipped": "#9ca3af",
+    "in_progress": "#3b82f6",
+    "pending": "#cbd5e1",
 }
 
 _SEVERITY_COLORS = {
@@ -71,6 +81,8 @@ summary{cursor:pointer;font-weight:600;color:#3b82f6}
 <div class="card"><div class="num">$pass_rate_pct</div><div class="lbl">Pass Rate</div><div class="bar"><div class="bar-fill" style="width:$pass_rate_pct;background:$pass_rate_color"></div></div></div>
 $duration_card
 </div>
+
+$pipeline_section
 
 <h2>Test Results</h2>
 $test_section
@@ -236,6 +248,51 @@ def _render_plan_section(report: RunReport) -> str:
     return ""
 
 
+def _render_pipeline_section(steps: list[StepTiming], summary) -> str:
+    if not steps:
+        return ""
+
+    header = (
+        "<tr>"
+        "<th>#</th><th>Step</th><th>Status</th><th>Time</th>"
+        "<th>In tok</th><th>Out tok</th><th>Calls</th><th>Cost</th>"
+        "</tr>"
+    )
+    rows: list[str] = []
+    for st in steps:
+        color = _STEP_STATUS_COLORS.get(st.status, "#6b7280")
+        badge = f'<span class="badge" style="background:{color}">{_escape(st.status)}</span>'
+        dur = f"{st.duration_s:.1f}s" if st.duration_s is not None else "-"
+        rows.append(
+            f"<tr>"
+            f"<td>{st.step:02d}</td>"
+            f"<td>{_escape(st.name)}</td>"
+            f"<td>{badge}</td>"
+            f"<td>{dur}</td>"
+            f"<td>{_escape(format_tokens(st.tokens_input))}</td>"
+            f"<td>{_escape(format_tokens(st.tokens_output))}</td>"
+            f"<td>{st.agent_calls}</td>"
+            f"<td>{_escape(format_cost(st.cost_usd))}</td>"
+            f"</tr>"
+        )
+
+    totals_row = (
+        f"<tr style='font-weight:700;background:#f1f5f9'>"
+        f"<td></td><td>TOTAL</td><td></td>"
+        f"<td>{summary.pipeline_duration_s:.1f}s</td>"
+        f"<td>{_escape(format_tokens(summary.total_tokens_input))}</td>"
+        f"<td>{_escape(format_tokens(summary.total_tokens_output))}</td>"
+        f"<td>{summary.total_agent_calls}</td>"
+        f"<td>{_escape(format_cost(summary.total_cost_usd))}</td>"
+        f"</tr>"
+    )
+    return (
+        "<h2>Pipeline Execution</h2>"
+        f"<table><thead>{header}</thead>"
+        f"<tbody>{''.join(rows)}{totals_row}</tbody></table>"
+    )
+
+
 def render_html(report: RunReport, *, inline_images: bool = False) -> str:
     s = report.summary
     pass_pct = f"{s.pass_rate * 100:.0f}%"
@@ -244,11 +301,22 @@ def render_html(report: RunReport, *, inline_images: bool = False) -> str:
     duration_card = ""
     if s.duration_s is not None:
         duration_card = f'<div class="card"><div class="num">{s.duration_s:.1f}s</div><div class="lbl">Duration</div></div>'
+    if s.pipeline_duration_s:
+        duration_card += (
+            f'<div class="card"><div class="num">{s.pipeline_duration_s:.1f}s</div>'
+            f'<div class="lbl">Pipeline</div></div>'
+        )
+    if s.total_cost_usd or s.total_agent_calls:
+        duration_card += (
+            f'<div class="card"><div class="num">{_escape(format_cost(s.total_cost_usd))}</div>'
+            f'<div class="lbl">Total Cost</div></div>'
+        )
 
     results = report.run_results.get("results", [])
     test_section = _render_test_rows(results, inline_images)
     bug_section = _render_bug_cards(report.bug_reports.get("bugs", []))
     plan_section = _render_plan_section(report)
+    pipeline_section = _render_pipeline_section(report.steps_summary, s)
 
     return _PAGE_TEMPLATE.substitute(
         run_id=_escape(report.run_id),
@@ -263,6 +331,7 @@ def render_html(report: RunReport, *, inline_images: bool = False) -> str:
         pass_rate_pct=pass_pct,
         pass_rate_color=pass_color,
         duration_card=duration_card,
+        pipeline_section=pipeline_section,
         test_section=test_section,
         bug_section=bug_section,
         plan_section=plan_section,

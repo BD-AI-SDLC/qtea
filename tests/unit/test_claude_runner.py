@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from worca_t.claude_runner import _agent_key, run_agent
+from worca_t.metrics import CURRENT_STEP_METRICS, StepMetricsAccumulator
 
 from ._fake_claude import install_fake_query
 
@@ -145,6 +146,111 @@ async def test_run_agent_missing_input_raises(tmp_path: Path, monkeypatch):
             timeout_s=5,
             mcp_source=mcp,
         )
+
+
+async def test_run_agent_captures_token_usage_and_cost(tmp_path: Path, monkeypatch):
+    """ResultMessage.usage + total_cost_usd land on AgentResult.metrics."""
+    install_fake_query(
+        monkeypatch,
+        messages=[
+            {
+                "type": "result",
+                "result": "done",
+                "usage": {
+                    "input_tokens": 1234,
+                    "output_tokens": 567,
+                    "cache_creation_input_tokens": 200,
+                    "cache_read_input_tokens": 5000,
+                },
+                "total_cost_usd": 0.0421,
+                "num_turns": 3,
+            },
+        ],
+    )
+    agent = tmp_path / "a.agent.md"; agent.write_text("x", encoding="utf-8")
+    mcp = tmp_path / ".mcp.json"; mcp.write_text("{}", encoding="utf-8")
+
+    result = await run_agent(
+        agent,
+        workdir=tmp_path / "wd-tokens",
+        inputs={},
+        user_prompt="go",
+        timeout_s=5,
+        mcp_source=mcp,
+    )
+    assert result.success is True
+    assert result.metrics.input_tokens == 1234
+    assert result.metrics.output_tokens == 567
+    assert result.metrics.cache_creation_input_tokens == 200
+    assert result.metrics.cache_read_input_tokens == 5000
+    assert result.metrics.cost_usd == pytest.approx(0.0421)
+    assert result.metrics.num_turns == 3
+
+    # metrics.json on disk also includes the new fields.
+    on_disk = json.loads(result.metrics_path.read_text(encoding="utf-8"))
+    assert on_disk["tokens_input"] == 1234
+    assert on_disk["tokens_output"] == 567
+    assert on_disk["cost_usd"] == pytest.approx(0.0421)
+
+
+async def test_run_agent_pushes_into_active_accumulator(tmp_path: Path, monkeypatch):
+    """When CURRENT_STEP_METRICS is set, run_agent records into it."""
+    install_fake_query(
+        monkeypatch,
+        messages=[
+            {
+                "type": "result",
+                "result": "done",
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+                "total_cost_usd": 0.002,
+            },
+        ],
+    )
+    agent = tmp_path / "a.agent.md"; agent.write_text("x", encoding="utf-8")
+    mcp = tmp_path / ".mcp.json"; mcp.write_text("{}", encoding="utf-8")
+
+    acc = StepMetricsAccumulator()
+    token = CURRENT_STEP_METRICS.set(acc)
+    try:
+        # Two calls in the same context should aggregate.
+        for i in range(2):
+            await run_agent(
+                agent,
+                workdir=tmp_path / f"wd-acc-{i}",
+                inputs={},
+                user_prompt="go",
+                timeout_s=5,
+                mcp_source=mcp,
+            )
+    finally:
+        CURRENT_STEP_METRICS.reset(token)
+
+    assert acc.agent_calls == 2
+    assert acc.totals.input_tokens == 20
+    assert acc.totals.output_tokens == 10
+    assert acc.totals.cost_usd == pytest.approx(0.004)
+
+
+async def test_run_agent_tolerates_missing_usage(tmp_path: Path, monkeypatch):
+    """Old SDK responses without usage/total_cost_usd should still succeed."""
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
+    )
+    agent = tmp_path / "a.agent.md"; agent.write_text("x", encoding="utf-8")
+    mcp = tmp_path / ".mcp.json"; mcp.write_text("{}", encoding="utf-8")
+
+    result = await run_agent(
+        agent,
+        workdir=tmp_path / "wd-nousage",
+        inputs={},
+        user_prompt="go",
+        timeout_s=5,
+        mcp_source=mcp,
+    )
+    assert result.success is True
+    assert result.metrics.input_tokens == 0
+    assert result.metrics.cost_usd == 0.0
 
 
 # Keep a reference to asyncio so unused-import linters don't strip it.

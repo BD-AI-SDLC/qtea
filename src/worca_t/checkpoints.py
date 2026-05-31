@@ -26,6 +26,12 @@ class StepRecord:
     output_hashes: dict[str, str] = field(default_factory=dict)
     notes: str | None = None
     timed_out: bool = False
+    tokens_input: int = 0
+    tokens_output: int = 0
+    tokens_cache_creation: int = 0
+    tokens_cache_read: int = 0
+    cost_usd: float = 0.0
+    agent_calls: int = 0
 
 
 @dataclass

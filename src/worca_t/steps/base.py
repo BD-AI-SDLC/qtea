@@ -20,6 +20,7 @@ from worca_t.hitl import (
     write_answers_file,
 )
 from worca_t.logging_setup import get_logger
+from worca_t.metrics import CURRENT_STEP_METRICS, StepMetricsAccumulator
 from worca_t.workspace import Workspace
 
 log = get_logger(__name__)
@@ -373,30 +374,61 @@ class Step(ABC):
         record.started_at = datetime.now(UTC).isoformat()
 
         log.info("step.start", step=self.number, name=self.name, attempt=record.attempts)
+        # Fresh accumulator per attempt; we accumulate the result onto the
+        # StepRecord cumulatively so retries reflect total billing, not just
+        # the final attempt. First attempt starts from zero implicitly because
+        # StepRecord defaults the fields to 0.
+        accumulator = StepMetricsAccumulator()
+        token = CURRENT_STEP_METRICS.set(accumulator)
         started = time.monotonic()
         try:
-            result = await self.run(ctx)
-        except Exception as e:
+            try:
+                result = await self.run(ctx)
+            except Exception as e:
+                duration = time.monotonic() - started
+                record.status = "failed"
+                record.finished_at = datetime.now(UTC).isoformat()
+                record.duration_s = round(duration, 3)
+                record.notes = f"unhandled exception: {e}"
+                _accumulate_metrics_into_record(record, accumulator)
+                log.exception("step.exception", step=self.number, error=str(e))
+                return StepResult(success=False, status="failed", outputs=[], error=str(e))
+
             duration = time.monotonic() - started
-            record.status = "failed"
+            record.status = result.status
             record.finished_at = datetime.now(UTC).isoformat()
             record.duration_s = round(duration, 3)
-            record.notes = f"unhandled exception: {e}"
-            log.exception("step.exception", step=self.number, error=str(e))
-            return StepResult(success=False, status="failed", outputs=[], error=str(e))
+            record.notes = result.notes
+            record.output_hashes = hash_paths(result.outputs)
+            _accumulate_metrics_into_record(record, accumulator)
+            log.info(
+                "step.end",
+                step=self.number,
+                name=self.name,
+                status=result.status,
+                duration_s=record.duration_s,
+                outputs=[str(p) for p in result.outputs],
+                tokens_input=record.tokens_input,
+                tokens_output=record.tokens_output,
+                cost_usd=record.cost_usd,
+                agent_calls=record.agent_calls,
+            )
+            return result
+        finally:
+            CURRENT_STEP_METRICS.reset(token)
 
-        duration = time.monotonic() - started
-        record.status = result.status
-        record.finished_at = datetime.now(UTC).isoformat()
-        record.duration_s = round(duration, 3)
-        record.notes = result.notes
-        record.output_hashes = hash_paths(result.outputs)
-        log.info(
-            "step.end",
-            step=self.number,
-            name=self.name,
-            status=result.status,
-            duration_s=record.duration_s,
-            outputs=[str(p) for p in result.outputs],
-        )
-        return result
+
+def _accumulate_metrics_into_record(
+    record: StepRecord, accumulator: StepMetricsAccumulator
+) -> None:
+    """Add the attempt's metrics onto the step record's running totals.
+
+    Cumulative across attempts so retry billing is visible to the user.
+    """
+    t = accumulator.totals
+    record.tokens_input += t.input_tokens
+    record.tokens_output += t.output_tokens
+    record.tokens_cache_creation += t.cache_creation_input_tokens
+    record.tokens_cache_read += t.cache_read_input_tokens
+    record.cost_usd = round(record.cost_usd + t.cost_usd, 6)
+    record.agent_calls += accumulator.agent_calls
