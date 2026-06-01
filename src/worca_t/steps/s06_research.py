@@ -12,6 +12,7 @@ Outputs (artifacts/step06/):
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -163,6 +164,209 @@ _INTERNAL_PREFIXES = ("WORCA_T_", "ANTHROPIC_", "CLAUDE", "NODE_", "npm_",
                       "PATH", "HOME", "USER", "SHELL", "TERM", "LANG",
                       "HOSTNAME", "PWD", "OLDPWD", "SHLVL", "TMPDIR")
 
+# Pydantic BaseSettings discovery — keep AST work to files that mention it.
+_BASESETTINGS_HINT = re.compile(rb"\bBaseSettings\b")
+_ENV_KEY_FINAL = re.compile(r"^[A-Z][A-Z0-9_]{1,80}$")
+
+
+def _literal_str(node: ast.AST | None) -> str | None:
+    """Return the str value if node is a Constant str literal, else None."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _is_basesettings_base(base: ast.expr) -> bool:
+    """True when a class base resolves to a name ending in 'BaseSettings'."""
+    if isinstance(base, ast.Name):
+        return base.id == "BaseSettings"
+    if isinstance(base, ast.Attribute):
+        return base.attr == "BaseSettings"
+    return False
+
+
+def _extract_env_prefix(class_body: list[ast.stmt]) -> str:
+    """Pull env_prefix from a nested `class Config:` or `model_config = SettingsConfigDict(...)`.
+
+    Non-literal values fall back to an empty prefix. Only string literals supported.
+    """
+    for stmt in class_body:
+        # Nested `class Config: env_prefix = "..."`
+        if isinstance(stmt, ast.ClassDef) and stmt.name == "Config":
+            for sub in stmt.body:
+                if (
+                    isinstance(sub, ast.Assign)
+                    and len(sub.targets) == 1
+                    and isinstance(sub.targets[0], ast.Name)
+                    and sub.targets[0].id == "env_prefix"
+                ):
+                    lit = _literal_str(sub.value)
+                    if lit is not None:
+                        return lit
+        # `model_config = SettingsConfigDict(env_prefix="APP_")`
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and stmt.targets[0].id == "model_config"
+            and isinstance(stmt.value, ast.Call)
+        ):
+            for kw in stmt.value.keywords:
+                if kw.arg == "env_prefix":
+                    lit = _literal_str(kw.value)
+                    if lit is not None:
+                        return lit
+    return ""
+
+
+def _parse_field_call(call: ast.Call) -> tuple[str | None, bool]:
+    """Inspect a `Field(...)` call. Returns (alias_or_None, is_required).
+
+    Required = first positional arg is `...` (Ellipsis) AND no default kw.
+    Otherwise optional. Alias is taken from `alias=` keyword if literal string.
+    Non-literal alias (e.g. variable reference) returns None so the caller can
+    fall back to the field-name-uppercased convention.
+    """
+    alias: str | None = None
+    has_default = False
+    first_positional_is_ellipsis = False
+
+    if call.args:
+        first = call.args[0]
+        if isinstance(first, ast.Constant) and first.value is Ellipsis:
+            first_positional_is_ellipsis = True
+        else:
+            # Positional default — `Field("foo")` means default="foo".
+            has_default = True
+
+    for kw in call.keywords:
+        if kw.arg in ("default", "default_factory"):
+            # Treat `default=...` (literal Ellipsis) as still required.
+            if kw.arg == "default" and isinstance(kw.value, ast.Constant) and kw.value.value is Ellipsis:
+                continue
+            has_default = True
+        elif kw.arg == "alias":
+            lit = _literal_str(kw.value)
+            if lit is not None:
+                alias = lit
+
+    is_required = first_positional_is_ellipsis and not has_default
+    return alias, is_required
+
+
+def _annotation_is_optional(ann: ast.AST | None) -> bool:
+    """True for `Optional[X]`, `X | None`, or `None | X` annotations."""
+    if ann is None:
+        return False
+    # `Optional[X]`
+    if isinstance(ann, ast.Subscript):
+        value = ann.value
+        if isinstance(value, ast.Name) and value.id == "Optional":
+            return True
+        if isinstance(value, ast.Attribute) and value.attr == "Optional":
+            return True
+    # `X | None` / `None | X`
+    if isinstance(ann, ast.BinOp) and isinstance(ann.op, ast.BitOr):
+        for side in (ann.left, ann.right):
+            if isinstance(side, ast.Constant) and side.value is None:
+                return True
+            if isinstance(side, ast.Name) and side.id == "None":
+                return True
+    return False
+
+
+def _discover_pydantic_env_keys(sut_path: Path) -> tuple[set[str], set[str]]:
+    """Scan SUT Python source for Pydantic BaseSettings field declarations.
+
+    Returns ``(required_keys, optional_keys)`` — env var names that the SUT
+    reads implicitly through ``BaseSettings`` field bindings rather than
+    explicit ``os.environ.get`` calls.
+
+    Implementation notes:
+      - Prefilter on raw bytes (cheap) so we only ``ast.parse`` files that
+        actually mention ``BaseSettings``.
+      - For each class inheriting BaseSettings, extract ``env_prefix`` from
+        ``class Config`` or ``model_config = SettingsConfigDict(...)``.
+      - For each annotated assignment, derive the env var name from
+        ``Field(alias="X")`` if present, otherwise ``(env_prefix + field_name).upper()``.
+      - Required iff ``Field(...)`` with bare ellipsis and no default AND
+        annotation is not ``Optional`` AND no value is set on the AnnAssign.
+    """
+    required: set[str] = set()
+    optional: set[str] = set()
+
+    for src in sut_path.glob("**/*.py"):
+        if not src.is_file():
+            continue
+        if src.stat().st_size > 512_000:
+            continue
+        if any(part in (".git", "node_modules", ".venv", "venv", "__pycache__")
+               for part in src.parts):
+            continue
+        try:
+            raw = src.read_bytes()
+        except OSError:
+            continue
+        if not _BASESETTINGS_HINT.search(raw):
+            continue
+        try:
+            tree = ast.parse(raw)
+        except SyntaxError:
+            continue
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            if not any(_is_basesettings_base(b) for b in node.bases):
+                continue
+
+            env_prefix = _extract_env_prefix(node.body)
+
+            for stmt in node.body:
+                if not isinstance(stmt, ast.AnnAssign):
+                    continue
+                if not isinstance(stmt.target, ast.Name):
+                    continue
+                field_name = stmt.target.id
+                # Skip pydantic internals.
+                if field_name in ("model_config", "Config"):
+                    continue
+
+                alias: str | None = None
+                is_required_field = False
+                rhs = stmt.value
+
+                if isinstance(rhs, ast.Call):
+                    func = rhs.func
+                    is_field_call = (
+                        (isinstance(func, ast.Name) and func.id == "Field")
+                        or (isinstance(func, ast.Attribute) and func.attr == "Field")
+                    )
+                    if is_field_call:
+                        alias, is_required_field = _parse_field_call(rhs)
+                    else:
+                        # Non-Field call value — treat as having a default.
+                        is_required_field = False
+                else:
+                    # Bare annotation `qa_url: str` (no value) → required if
+                    # not Optional. `qa_url: str = "x"` → optional (has value).
+                    if rhs is None:
+                        is_required_field = not _annotation_is_optional(stmt.annotation)
+
+                # Optional annotation always overrides required classification.
+                if _annotation_is_optional(stmt.annotation):
+                    is_required_field = False
+
+                env_key = alias if alias else (env_prefix + field_name).upper()
+                if not _ENV_KEY_FINAL.match(env_key):
+                    continue
+
+                (required if is_required_field else optional).add(env_key)
+
+    # Required wins if a key appears in both via different declarations.
+    optional -= required
+    return required, optional
+
 
 def _discover_sut_env_keys(sut_path: Path) -> list[str]:
     """Scan the SUT for env var key names. Returns names only, never values."""
@@ -216,6 +420,12 @@ def _discover_sut_env_keys(sut_path: Path) -> list[str]:
             for pat in _ENV_REF_PATTERNS:
                 for m in pat.finditer(text):
                     keys.add(m.group(m.lastindex))
+
+    # Pydantic BaseSettings field declarations — implicit env-var bindings
+    # that the regex source-scan above cannot detect.
+    pyd_required, pyd_optional = _discover_pydantic_env_keys(sut_path)
+    keys.update(pyd_required)
+    keys.update(pyd_optional)
 
     return sorted(k for k in keys
                   if not any(k.startswith(p) for p in _INTERNAL_PREFIXES))
@@ -358,6 +568,11 @@ class ResearchStep(Step):
         if sut_env_keys:
             log.info("step06.sut_env_keys", count=len(sut_env_keys), keys=sut_env_keys)
 
+        # Pydantic BaseSettings required fields are as authoritative as
+        # `.env.example` membership for classifying a key as required. Pass
+        # the required set as `extra_required` so HITL prompts for them.
+        pyd_required, _pyd_optional = _discover_pydantic_env_keys(ctx.workspace.sut)
+
         # Resolve SUT env vars via multi-strategy cascade.
         env_resolution_audit: dict | None = None
         if sut_env_keys:
@@ -374,6 +589,7 @@ class ResearchStep(Step):
             )
             resolved = resolve_sut_env(
                 resolver_config, sut_env_keys, ctx.workspace.sut,
+                extra_required=pyd_required,
             )
             env_resolution_audit = {
                 "resolved": list(resolved.values.keys()),

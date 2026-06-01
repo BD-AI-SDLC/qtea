@@ -8,7 +8,14 @@ from pathlib import Path
 
 import pytest
 
-from worca_t.claude_runner import _agent_key, run_agent
+from worca_t.claude_runner import (
+    _DriveState,
+    _agent_key,
+    _force_cleanup,
+    _is_model_unavailable,
+    run_agent,
+)
+from worca_t.config import get_model_chain
 from worca_t.metrics import CURRENT_STEP_METRICS, StepMetricsAccumulator
 
 from ._fake_claude import install_fake_query
@@ -331,6 +338,264 @@ async def test_run_agent_does_not_overwrite_audit_files(tmp_path: Path, monkeypa
     assert r2.transcript_path.name == "transcript-01.jsonl"
     assert r1.metrics_path.name == "metrics-00.json"
     assert r2.metrics_path.name == "metrics-01.json"
+
+
+async def test_run_agent_timeout_preserves_partial_metrics(tmp_path: Path, monkeypatch):
+    """Tokens / session_id captured before timeout survive on AgentResult.
+
+    Regression: previously when ``asyncio.wait_for`` raised TimeoutError, the
+    locals holding metrics/session_id were never assigned, so all billing
+    information was lost even when a ResultMessage had been written before
+    the timeout fired.
+    """
+    import asyncio as _asyncio
+
+    from claude_agent_sdk import ResultMessage, SystemMessage
+
+    async def _slow_query(*, prompt, options=None, transport=None):  # noqa: ARG001
+        # First yield an init with a session_id (captured instantly).
+        sysmsg = SystemMessage.__new__(SystemMessage)
+        sysmsg.subtype = "init"
+        sysmsg.data = {"mcp_servers": [], "session_id": "sess-survived"}
+        yield sysmsg
+        # Then a ResultMessage with usage data.
+        rmsg = ResultMessage.__new__(ResultMessage)
+        rmsg.result = "partial"
+        rmsg.usage = {"input_tokens": 42, "output_tokens": 7}
+        rmsg.total_cost_usd = 0.003
+        rmsg.num_turns = 1
+        yield rmsg
+        # Now hang forever — the timeout must fire while we're stuck here.
+        await _asyncio.sleep(3600)
+
+    monkeypatch.setattr(
+        "worca_t.claude_runner.shutil.which",
+        lambda *_a, **_kw: "/fake/claude",
+    )
+    monkeypatch.setattr("worca_t.claude_runner.query", _slow_query)
+
+    agent = tmp_path / "a.agent.md"; agent.write_text("x", encoding="utf-8")
+    mcp = tmp_path / ".mcp.json"; mcp.write_text("{}", encoding="utf-8")
+
+    result = await run_agent(
+        agent,
+        workdir=tmp_path / "wd-partial",
+        inputs={},
+        user_prompt="hang after work",
+        timeout_s=1,
+        mcp_source=mcp,
+    )
+
+    # Timed out — but partial metrics survived through _DriveState.
+    assert result.success is False
+    assert result.timed_out is True
+    assert result.session_id == "sess-survived"
+    assert result.metrics.input_tokens == 42
+    assert result.metrics.output_tokens == 7
+    assert result.metrics.cost_usd == pytest.approx(0.003)
+
+
+async def test_force_cleanup_is_bounded_by_grace_s(tmp_path: Path, monkeypatch):
+    """_force_cleanup must return within grace_s even when task ignores cancel.
+
+    Direct unit test of the helper. Uses a shielded sleep to make the task
+    genuinely uncancellable, and asserts cleanup gives up after grace_s.
+    """
+    import asyncio as _asyncio
+
+    async def _uncancellable():
+        # Shield so the cancel cannot interrupt this sleep.
+        await _asyncio.shield(_asyncio.sleep(30))
+
+    task = _asyncio.create_task(_uncancellable())
+
+    # No psutil children to clean up — patch to return empty list.
+    class FakeMe:
+        def children(self, recursive=True):  # noqa: ARG002
+            return []
+    monkeypatch.setattr(
+        "worca_t.claude_runner.psutil.Process",
+        lambda pid: FakeMe(),  # noqa: ARG005
+    )
+
+    start = _asyncio.get_event_loop().time()
+    await _force_cleanup(task, set(), grace_s=0.5)
+    elapsed = _asyncio.get_event_loop().time() - start
+
+    # Cleanup must respect the grace bound, not hang for 30s.
+    assert elapsed < 2.0, f"_force_cleanup hung {elapsed:.1f}s (grace=0.5s)"
+
+    # Best effort: cancel the stray task so it doesn't leak into other tests.
+    task.cancel()
+    try:
+        await task
+    except (_asyncio.CancelledError, Exception):
+        pass
+
+
+async def test_force_cleanup_spares_pre_existing_children(tmp_path: Path, monkeypatch):
+    """_force_cleanup must not terminate processes that existed before agent.start."""
+    import asyncio as _asyncio
+
+    killed: list[int] = []
+
+    class FakeProc:
+        def __init__(self, pid):
+            self.pid = pid
+        def terminate(self):
+            killed.append(self.pid)
+        def kill(self):
+            killed.append(self.pid)
+        def wait(self, timeout=None):  # noqa: ARG002
+            return 0
+
+    class FakeMe:
+        def __init__(self, all_children):
+            self._all = all_children
+        def children(self, recursive=True):  # noqa: ARG002
+            return self._all
+
+    all_children = [FakeProc(101), FakeProc(102), FakeProc(103)]
+    monkeypatch.setattr(
+        "worca_t.claude_runner.psutil.Process",
+        lambda pid: FakeMe(all_children),  # noqa: ARG005
+    )
+    monkeypatch.setattr(
+        "worca_t.claude_runner.psutil.wait_procs",
+        lambda procs, timeout=None: (procs, []),  # noqa: ARG005
+    )
+
+    # Pre-existing PIDs include 101, 102. Only 103 should be killed.
+    pre_existing = {101, 102}
+
+    async def _noop():
+        pass
+
+    task = _asyncio.create_task(_noop())
+    await task  # let it finish
+
+    await _force_cleanup(task, pre_existing, grace_s=0.1)
+
+    assert killed == [103]
+
+
+def test_is_model_unavailable_detects_outage_errors():
+    assert _is_model_unavailable("Error: 529 overloaded") is True
+    assert _is_model_unavailable("model_not_available for claude-sonnet-4-6") is True
+    assert _is_model_unavailable("service_unavailable: try again later") is True
+    assert _is_model_unavailable("503 Service Unavailable") is True
+    assert _is_model_unavailable("insufficient capacity for model") is True
+    assert _is_model_unavailable("Command failed with exit code 15 (exit code: 15)") is True
+    assert _is_model_unavailable(
+        "There's an issue with the selected model (claude-haiku-4-5). "
+        "It may not exist or you may not have access to it."
+    ) is True
+
+
+def test_is_model_unavailable_ignores_other_errors():
+    assert _is_model_unavailable("sdk blew up") is False
+    assert _is_model_unavailable("timeout after 300s") is False
+    assert _is_model_unavailable("FileNotFoundError: spec.md missing") is False
+
+
+def test_get_model_chain_returns_primary_plus_fallbacks():
+    chain = get_model_chain("claude-sonnet-4-6")
+    assert chain[0] == "claude-sonnet-4-6"
+    assert "claude-opus-4-6" in chain
+    assert "claude-haiku-4-5@20251001" in chain
+    assert len(chain) == 3
+
+
+def test_get_model_chain_unknown_model_returns_singleton():
+    chain = get_model_chain("claude-unknown-99")
+    assert chain == ["claude-unknown-99"]
+
+
+async def test_run_agent_falls_back_on_model_unavailable(tmp_path: Path, monkeypatch):
+    """When the primary model is unavailable, run_agent retries with the fallback."""
+    import asyncio as _asyncio
+
+    from claude_agent_sdk import ResultMessage
+
+    call_count = 0
+    models_seen: list[str | None] = []
+
+    async def _query_with_fallback(*, prompt, options=None, transport=None):  # noqa: ARG001
+        nonlocal call_count
+        call_count += 1
+        model = getattr(options, "model", None)
+        models_seen.append(model)
+        if call_count == 1:
+            raise RuntimeError("529 overloaded")
+        rmsg = ResultMessage.__new__(ResultMessage)
+        rmsg.result = "ok"
+        yield rmsg
+
+    monkeypatch.setattr(
+        "worca_t.claude_runner.shutil.which",
+        lambda *_a, **_kw: "/fake/claude",
+    )
+    monkeypatch.setattr("worca_t.claude_runner.query", _query_with_fallback)
+
+    agent = tmp_path / "a.agent.md"
+    agent.write_text("x", encoding="utf-8")
+    mcp = tmp_path / ".mcp.json"
+    mcp.write_text("{}", encoding="utf-8")
+
+    result = await run_agent(
+        agent,
+        workdir=tmp_path / "wd-fallback",
+        inputs={},
+        user_prompt="go",
+        timeout_s=10,
+        model="claude-sonnet-4-6",
+        mcp_source=mcp,
+    )
+
+    assert result.success is True
+    assert call_count == 2
+    assert models_seen[0] == "claude-sonnet-4-6"
+    assert models_seen[1] == "claude-opus-4-6"
+
+    on_disk = json.loads(result.metrics_path.read_text(encoding="utf-8"))
+    assert on_disk["model"] == "claude-opus-4-6"
+    assert on_disk["model_requested"] == "claude-sonnet-4-6"
+    assert on_disk["models_attempted"] == ["claude-sonnet-4-6", "claude-opus-4-6"]
+
+
+async def test_run_agent_no_fallback_on_non_model_error(tmp_path: Path, monkeypatch):
+    """Non-model errors should NOT trigger the fallback chain."""
+    call_count = 0
+
+    async def _query_that_fails(*, prompt, options=None, transport=None):  # noqa: ARG001
+        nonlocal call_count
+        call_count += 1
+        raise RuntimeError("some random sdk error")
+        yield  # noqa: unreachable -- make this an async generator
+
+    monkeypatch.setattr(
+        "worca_t.claude_runner.shutil.which",
+        lambda *_a, **_kw: "/fake/claude",
+    )
+    monkeypatch.setattr("worca_t.claude_runner.query", _query_that_fails)
+
+    agent = tmp_path / "a.agent.md"
+    agent.write_text("x", encoding="utf-8")
+    mcp = tmp_path / ".mcp.json"
+    mcp.write_text("{}", encoding="utf-8")
+
+    result = await run_agent(
+        agent,
+        workdir=tmp_path / "wd-no-fallback",
+        inputs={},
+        user_prompt="go",
+        timeout_s=10,
+        model="claude-sonnet-4-6",
+        mcp_source=mcp,
+    )
+
+    assert result.success is False
+    assert call_count == 1
 
 
 # Keep a reference to asyncio so unused-import linters don't strip it.

@@ -139,10 +139,11 @@ def test_question_key_normalizes_whitespace_and_case():
     assert question_key(a) == question_key(b)
 
 
-def test_question_key_differs_by_kind():
+def test_question_key_same_across_kinds():
+    """Kind is no longer part of the key — same text means same question."""
     a = Question(id="X", kind="clarification", prompt_text="same text")
     b = Question(id="X", kind="blocker", prompt_text="same text")
-    assert question_key(a) != question_key(b)
+    assert question_key(a) == question_key(b)
 
 
 def test_format_answers_md_renders_skipped_section_with_assumption_directive():
@@ -166,3 +167,142 @@ def test_write_answers_file_passes_skipped_through(tmp_path: Path):
     content = path.read_text(encoding="utf-8")
     assert "Skipped" in content
     assert "ASSUMPTION" in content
+
+
+def test_question_key_strips_blocker_prefix():
+    a = Question(id="CLAR-01", kind="clarification", prompt_text="SSO config unavailable")
+    b = Question(
+        id="BLOCK-01",
+        kind="blocker",
+        prompt_text="How should we resolve this blocker: SSO config unavailable",
+    )
+    assert question_key(a) == question_key(b)
+
+
+def test_question_key_strips_bold_and_normalizes():
+    a = Question(id="X", kind="clarification", prompt_text="exact target URL")
+    b = Question(
+        id="Y",
+        kind="blocker",
+        prompt_text="How should we resolve this blocker: **Exact Target URL**",
+    )
+    assert question_key(a) == question_key(b)
+
+
+def test_dedup_merges_clarification_referencing_blocker():
+    md = """\
+# Spec
+
+The target URL is [CLARIFICATION NEEDED: exact target URL — see blocker #1].
+
+## Blockers
+
+| Blocker | Severity |
+|---------|----------|
+| Exact Gemini Enterprise target URL unknown | high |
+"""
+    qs = extract_questions(md)
+    assert len(qs) == 1
+    assert qs[0].kind == "blocker"
+
+
+def test_dedup_merges_cross_kind_same_normalized_text():
+    md = """\
+# Spec
+
+Login uses [CLARIFICATION NEEDED: SSO config unavailable].
+
+## Blockers
+
+| Blocker | Severity |
+|---------|----------|
+| SSO config unavailable | high |
+"""
+    qs = extract_questions(md)
+    assert len(qs) == 1
+    assert qs[0].kind == "blocker"
+
+
+def test_dedup_full_scenario_seven_to_three():
+    """Reproduce the exact problem: 7 raw questions should merge to 3."""
+    md = """\
+# Spec
+
+German. [CLARIFICATION NEEDED: exact German translation string — see blocker #2]
+Tooltip [CLARIFICATION NEEDED: exact tooltip string — see blocker #3]
+URL [CLARIFICATION NEEDED: exact target URL — see blocker #1]
+DE dup [CLARIFICATION NEEDED: exact DE string — see blocker #2]
+
+## Blockers
+
+| # | Blocker | Affects |
+|---|---------|---------|
+| 1 | **Exact Gemini Enterprise target URL** is not specified. | AC-5 |
+| 2 | **German translation string** for the link label is not provided. | AC-8 |
+| 3 | **Tooltip text** shown on hover is not specified. | AC-3 |
+"""
+    qs = extract_questions(md)
+    assert len(qs) == 3
+    assert all(q.kind == "blocker" for q in qs)
+
+
+def test_extract_blockers_prefers_description_column():
+    """When both 'Blocker' and 'Description' columns exist, use Description."""
+    md = """\
+# Plan
+
+## Blockers
+
+| Blocker | Description | Affected TCs | Severity |
+|---------|-------------|--------------|----------|
+| BLOCK-001 | German translation unknown | TC-NAV-009 | medium |
+"""
+    qs = extract_questions(md)
+    blockers = [q for q in qs if q.kind == "blocker"]
+    assert len(blockers) == 1
+    assert "German translation unknown" in blockers[0].prompt_text
+    assert "BLOCK-001" not in blockers[0].prompt_text
+
+
+def test_dedup_merges_blocker_and_open_question_by_tc_id():
+    """Open question whose TC IDs overlap with a blocker is dropped."""
+    md = """\
+# Plan
+
+## Blockers
+
+| Blocker | Description | Affected TCs | Severity |
+|---------|-------------|--------------|----------|
+| BLOCK-001 | German string missing | TC-NAV-009, TC-NAV-010 | medium |
+
+## Open PO Questions
+
+- **[Blocks TC-NAV-009, TC-NAV-010]** What is the German translation?
+"""
+    qs = extract_questions(md)
+    assert len(qs) == 1
+    assert qs[0].kind == "blocker"
+
+
+def test_dedup_step3_full_scenario_six_to_three():
+    """Reproduce the step 3 problem: 6 questions should merge to 3."""
+    md = """\
+# Test Plan
+
+## Blockers
+
+| Blocker | Description | Affected TCs | Severity |
+|---------|-------------|--------------|----------|
+| BLOCK-001 | German translation string unknown | TC-GNAV-009, TC-GNAV-010 | medium |
+| BLOCK-002 | GA event payload schema unconfirmed | TC-GNAV-011, TC-GNAV-012 | medium |
+| BLOCK-003 | Confirmed aria-label text unspecified | TC-GNAV-013, TC-GNAV-014 | medium |
+
+## Open PO Questions
+
+- **[Blocks TC-GNAV-009, TC-GNAV-010]** What is the approved German translation?
+- **[Blocks TC-GNAV-011, TC-GNAV-012]** Does the GA event need extra params?
+- **[Blocks TC-GNAV-013, TC-GNAV-014]** What is the confirmed aria-label text?
+"""
+    qs = extract_questions(md)
+    assert len(qs) == 3
+    assert all(q.kind == "blocker" for q in qs)

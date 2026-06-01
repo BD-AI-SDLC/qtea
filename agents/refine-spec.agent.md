@@ -156,6 +156,7 @@ The refined spec retains the original structure and appends/replaces sections:
 - Each AC must trace back to a user flow.
 - Requirement ID (`REQ-<slug>`) is mandatory — generate one if the source spec lacks it.
 - Emit `READY` verdict only when all Definition-of-Ready items pass. Otherwise emit `NOT READY` with blocker list.
+- Each unresolved item must appear in exactly ONE canonical location. If an item is listed in the Blockers table, do NOT also emit a `[CLARIFICATION NEEDED]` inline tag for the same item. Keep the item solely in the Blockers table.
 - No GitHub/Jira API calls — this agent works on local markdown files only.
 - The refined spec has to be unique and not contain any duplicate content.
 - If there are any Blockers or `[CLARIFICATION NEEDED]` tags, the agent must ask the user to resolve them before finalizing the refined spec.

@@ -65,7 +65,7 @@
             "properties": {
               "attempted": { "type": "boolean" },
               "success": { "type": "boolean" },
-              "channel": { "enum": ["playwright", "chrome-devtools", "none"] }
+              "channel": { "enum": ["playwright", "none"] }
             }
           },
           "related_test_cases": { "type": "array", "items": { "type": "string" } },
