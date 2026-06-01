@@ -253,5 +253,85 @@ async def test_run_agent_tolerates_missing_usage(tmp_path: Path, monkeypatch):
     assert result.metrics.cost_usd == 0.0
 
 
+async def test_run_agent_captures_session_id(tmp_path: Path, monkeypatch):
+    """session_id from init SystemMessage lands on AgentResult."""
+    install_fake_query(
+        monkeypatch,
+        messages=[
+            {"type": "system", "subtype": "init",
+             "data": {"mcp_servers": [], "session_id": "sess-abc-123"}},
+            {"type": "result", "result": "done"},
+        ],
+    )
+    agent = tmp_path / "a.agent.md"; agent.write_text("x", encoding="utf-8")
+    mcp = tmp_path / ".mcp.json"; mcp.write_text("{}", encoding="utf-8")
+
+    result = await run_agent(
+        agent,
+        workdir=tmp_path / "wd-sess",
+        inputs={},
+        user_prompt="go",
+        timeout_s=5,
+        mcp_source=mcp,
+    )
+    assert result.success is True
+    assert result.session_id == "sess-abc-123"
+
+
+async def test_run_agent_passes_resume_to_sdk(tmp_path: Path, monkeypatch):
+    """resume=<session_id> is propagated to ClaudeAgentOptions."""
+    captured: dict = {}
+
+    def _capture(prompt, options):  # noqa: ARG001
+        captured["resume"] = getattr(options, "resume", None)
+
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
+        on_call=_capture,
+    )
+    agent = tmp_path / "a.agent.md"; agent.write_text("x", encoding="utf-8")
+    mcp = tmp_path / ".mcp.json"; mcp.write_text("{}", encoding="utf-8")
+
+    await run_agent(
+        agent,
+        workdir=tmp_path / "wd-resume",
+        inputs={},
+        user_prompt="continue",
+        timeout_s=5,
+        mcp_source=mcp,
+        resume="sess-xyz-789",
+    )
+    assert captured["resume"] == "sess-xyz-789"
+
+
+async def test_run_agent_does_not_overwrite_audit_files(tmp_path: Path, monkeypatch):
+    """Two calls in the same workdir produce two numbered transcript/metrics/stderr."""
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
+    )
+    agent = tmp_path / "a.agent.md"; agent.write_text("x", encoding="utf-8")
+    mcp = tmp_path / ".mcp.json"; mcp.write_text("{}", encoding="utf-8")
+    wd = tmp_path / "wd-multi"
+
+    r1 = await run_agent(agent, workdir=wd, inputs={}, user_prompt="one",
+                         timeout_s=5, mcp_source=mcp)
+    r2 = await run_agent(agent, workdir=wd, inputs={}, user_prompt="two",
+                         timeout_s=5, mcp_source=mcp)
+
+    # Paths must differ, both must exist on disk.
+    assert r1.transcript_path != r2.transcript_path
+    assert r1.metrics_path != r2.metrics_path
+    assert r1.stderr_path != r2.stderr_path
+    assert r1.transcript_path.exists()
+    assert r2.transcript_path.exists()
+    # Numbered naming.
+    assert r1.transcript_path.name == "transcript-00.jsonl"
+    assert r2.transcript_path.name == "transcript-01.jsonl"
+    assert r1.metrics_path.name == "metrics-00.json"
+    assert r2.metrics_path.name == "metrics-01.json"
+
+
 # Keep a reference to asyncio so unused-import linters don't strip it.
 _ = asyncio

@@ -45,6 +45,10 @@ class AgentResult:
     error: str | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
     metrics: AgentMetrics = field(default_factory=AgentMetrics)
+    # SDK session_id from the init SystemMessage. Pass this back via the
+    # `resume=` parameter on a follow-up run_agent call to continue the same
+    # conversation and benefit from cache_read on the already-cached prefix.
+    session_id: str | None = None
 
 
 # MCP tool allowlist. The SDK's `permission_mode="acceptEdits"` does NOT
@@ -184,10 +188,16 @@ async def _drive_query(
     options: ClaudeAgentOptions,
     transcript_path: Path,
     on_event: Any | None,
-) -> tuple[list[dict[str, Any]], str, AgentMetrics]:
-    """Iterate the SDK query, write transcript, return (events, final_text, metrics)."""
+) -> tuple[list[dict[str, Any]], str, AgentMetrics, str | None]:
+    """Iterate the SDK query, write transcript.
+
+    Returns ``(events, final_text, metrics, session_id)``. ``session_id`` is
+    captured from the first message that carries one (init SystemMessage's
+    ``data.session_id`` or any subsequent message's top-level ``session_id``).
+    """
     events: list[dict[str, Any]] = []
     final_text = ""
+    session_id: str | None = None
     # ResultMessage typically appears once at end-of-turn, but if the SDK ever
     # emits more than one we sum them so caller never under-counts.
     totals = AgentMetrics()
@@ -198,6 +208,17 @@ async def _drive_query(
             transcript_fp.write(json.dumps(evt, ensure_ascii=False) + "\n")
             transcript_fp.flush()
             events.append(evt)
+
+            if session_id is None:
+                sid = getattr(message, "session_id", None)
+                if isinstance(sid, str) and sid:
+                    session_id = sid
+                else:
+                    data = getattr(message, "data", None) or {}
+                    if isinstance(data, dict):
+                        sid = data.get("session_id")
+                        if isinstance(sid, str) and sid:
+                            session_id = sid
 
             if isinstance(message, SystemMessage) and getattr(message, "subtype", None) == "init":
                 data = getattr(message, "data", {}) or {}
@@ -240,7 +261,7 @@ async def _drive_query(
                 except Exception:
                     pass
 
-    return events, final_text, totals
+    return events, final_text, totals, session_id
 
 
 async def run_agent(
@@ -259,6 +280,7 @@ async def run_agent(
     claude_md: Path | None = None,
     on_event: Any | None = None,
     debug_live: bool = False,
+    resume: str | None = None,
 ) -> AgentResult:
     """Run a single agent via the Claude Agent SDK in an isolated workdir.
 
@@ -286,12 +308,22 @@ async def run_agent(
     claude_md: path to CLAUDE.md to stage at the workdir root.
     on_event: optional callback invoked for each parsed event.
     debug_live: accepted for API compatibility; currently no-op.
+    resume: optional SDK session_id from a prior run_agent call. When set,
+        the SDK resumes that conversation instead of starting a new one,
+        letting the cached system-prompt/conversation prefix hit cache_read
+        instead of paying the 25% cache_creation premium again. Capture it
+        from a prior call's ``AgentResult.session_id``.
     """
     del debug_live  # accepted for API compat
     workdir.mkdir(parents=True, exist_ok=True)
-    transcript_path = workdir / "transcript.jsonl"
-    stderr_path = workdir / "stderr.log"
-    metrics_path = workdir / "metrics.json"
+    # Number each call's audit files so multi-call steps (HITL retries,
+    # step 9 self-heal) don't overwrite each other's transcript/metrics/stderr.
+    # `transcript-00.jsonl` is call 0, `transcript-01.jsonl` is call 1, etc.
+    call_idx = len(list(workdir.glob("transcript-*.jsonl")))
+    suffix = f"-{call_idx:02d}"
+    transcript_path = workdir / f"transcript{suffix}.jsonl"
+    stderr_path = workdir / f"stderr{suffix}.log"
+    metrics_path = workdir / f"metrics{suffix}.json"
 
     settings = get_settings()
     resolved_model = model or model_for_agent(_agent_key(agent_path))
@@ -373,6 +405,8 @@ async def run_agent(
         sdk_options_kwargs["model"] = resolved_model
     if max_turns is not None:
         sdk_options_kwargs["max_turns"] = max_turns
+    if resume:
+        sdk_options_kwargs["resume"] = resume
 
     options = ClaudeAgentOptions(**sdk_options_kwargs)
 
@@ -384,6 +418,8 @@ async def run_agent(
         timeout_s=resolved_timeout,
         permission_mode=permission_mode,
         max_turns=max_turns,
+        resume=resume,
+        call_idx=call_idx,
     )
     log.debug("agent.env", env=_mask_env(forwarded_env))
 
@@ -391,6 +427,7 @@ async def run_agent(
     events: list[dict[str, Any]] = []
     final_text = ""
     agent_metrics = AgentMetrics()
+    session_id: str | None = None
     timed_out = False
     error: str | None = None
     exit_code = -1
@@ -400,7 +437,7 @@ async def run_agent(
     stderr_path.write_text("", encoding="utf-8")
 
     try:
-        events, final_text, agent_metrics = await asyncio.wait_for(
+        events, final_text, agent_metrics, session_id = await asyncio.wait_for(
             _drive_query(
                 user_prompt=user_prompt,
                 options=options,
@@ -444,6 +481,9 @@ async def run_agent(
         "tokens_cache_read": agent_metrics.cache_read_input_tokens,
         "cost_usd": round(agent_metrics.cost_usd, 6),
         "num_turns": agent_metrics.num_turns,
+        "session_id": session_id,
+        "resume": resume,
+        "call_idx": call_idx,
     }
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     if error and not stderr_path.read_text(encoding="utf-8"):
@@ -458,7 +498,10 @@ async def run_agent(
         timed_out=timed_out,
         tokens_input=agent_metrics.input_tokens,
         tokens_output=agent_metrics.output_tokens,
+        tokens_cache_read=agent_metrics.cache_read_input_tokens,
         cost_usd=round(agent_metrics.cost_usd, 6),
+        session_id=session_id,
+        resumed=resume is not None,
     )
 
     return AgentResult(
@@ -473,4 +516,5 @@ async def run_agent(
         error=error,
         events=events,
         metrics=agent_metrics,
+        session_id=session_id,
     )

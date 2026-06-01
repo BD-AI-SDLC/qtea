@@ -151,13 +151,37 @@ def test_debug_artifacts_snapshotted_on_failure(tmp_path: Path):
     ctx = _ctx(tmp_path)
     wd = ctx.workspace.step_workdir(98)
     wd.mkdir(parents=True, exist_ok=True)
-    (wd / "transcript.jsonl").write_text('{"type":"test"}\n', encoding="utf-8")
-    (wd / "stderr.log").write_text("error output\n", encoding="utf-8")
+    # Two agent calls in the same step -> two numbered transcripts/stderrs.
+    (wd / "transcript-00.jsonl").write_text('{"type":"test","call":0}\n', encoding="utf-8")
+    (wd / "transcript-01.jsonl").write_text('{"type":"test","call":1}\n', encoding="utf-8")
+    (wd / "stderr-00.log").write_text("first call stderr\n", encoding="utf-8")
+    (wd / "stderr-01.log").write_text("second call stderr\n", encoding="utf-8")
+    (wd / "metrics-00.json").write_text('{"call":0}\n', encoding="utf-8")
+    (wd / "metrics-01.json").write_text('{"call":1}\n', encoding="utf-8")
 
     _snapshot_debug_artifacts(98, ctx, 1)
 
     debug_dir = ctx.workspace.debug / "step-98-attempt1"
     assert debug_dir.exists()
+    # All numbered audit files copied; previously only the latest was preserved.
+    assert (debug_dir / "transcript-00.jsonl").exists()
+    assert (debug_dir / "transcript-01.jsonl").exists()
+    assert (debug_dir / "stderr-00.log").exists()
+    assert (debug_dir / "stderr-01.log").exists()
+    assert (debug_dir / "metrics-00.json").exists()
+    assert (debug_dir / "metrics-01.json").exists()
+
+
+def test_debug_snapshot_includes_legacy_unnumbered_files(tmp_path: Path):
+    """Backward compat: a workdir from before this change still snapshots."""
+    ctx = _ctx(tmp_path)
+    wd = ctx.workspace.step_workdir(97)
+    wd.mkdir(parents=True, exist_ok=True)
+    (wd / "transcript.jsonl").write_text('{"old":"format"}\n', encoding="utf-8")
+    (wd / "stderr.log").write_text("legacy\n", encoding="utf-8")
+
+    _snapshot_debug_artifacts(97, ctx, 1)
+    debug_dir = ctx.workspace.debug / "step-97-attempt1"
     assert (debug_dir / "transcript.jsonl").exists()
     assert (debug_dir / "stderr.log").exists()
 
