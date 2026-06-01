@@ -4,10 +4,6 @@
       "command": "npx",
       "args": ["-y", "@playwright/mcp@latest", "--headless"]
     },
-    "chrome-devtools": {
-      "command": "npx",
-      "args": ["-y", "chrome-devtools-mcp@latest"]
-    },
     "atlassian": {
       "command": "npx",
       "args": ["atlassian-jira-mcp"],

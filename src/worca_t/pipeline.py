@@ -7,6 +7,7 @@ milestones remain runnable end-to-end.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,11 +15,11 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from worca_t.checkpoints import RunState, StepRecord, is_step_complete, load_state, outputs_match, save_state
+from worca_t.checkpoints import RunState, StepRecord, is_step_complete, load_state, outputs_match, save_state, save_state_async
 from worca_t.config import load_env
-from worca_t.logging_setup import configure_logging
+from worca_t.logging_setup import configure_logging, get_logger
 from worca_t.metrics import format_cost, format_tokens
-from worca_t.steps.base import Step, StepContext
+from worca_t.steps.base import Step, StepContext, StepResult
 from worca_t.steps.s01_intake import IntakeStep
 from worca_t.steps.s02_refine import RefineStep
 from worca_t.steps.s03_plan import PlanStep
@@ -150,6 +151,55 @@ def _select_steps(opts: PipelineOptions) -> list[int]:
     return [i for i in range(start, TOTAL_STEPS + 1) if i not in opts.skip_steps]
 
 
+def _should_parallelize_research(opts: PipelineOptions, selected: list[int]) -> bool:
+    """True when Step 6 should run in the background alongside Steps 2-5."""
+    return (
+        6 in selected
+        and opts.only_step is None
+        and any(s in selected for s in (2, 3, 4, 5))
+    )
+
+
+async def _run_step_in_background(
+    step: Step,
+    ctx: StepContext,
+    state: RunState,
+    state_file: Path,
+    opts: PipelineOptions,
+    console: Console,
+    done_event: asyncio.Event,
+) -> StepResult | None:
+    """Execute a step in a background task, signalling *done_event* on completion."""
+    step_num = step.number
+    log = get_logger(__name__)
+    try:
+        if not opts.force and is_step_complete(state, step_num):
+            if outputs_match(state, step_num, ctx.workspace.step_dir(step_num)):
+                log.info("step.skip_complete", step=step_num)
+                console.print(f"[dim]step {step_num:02d} already complete - skipping (background)[/]")
+                return None
+
+        console.print(f"[cyan]>>> step {step_num:02d} {step.name} (background)[/]")
+        result = await step.execute(ctx)
+        await save_state_async(state, state_file)
+        record = state.steps.get(step_num)
+
+        if not result.success:
+            console.print(f"[red]step {step_num:02d} FAILED (background):[/] {result.error or result.notes}")
+            if record is not None:
+                console.print(f"   {_format_step_metrics_line(record)}")
+        else:
+            marker = "warned" if result.status == "warned" else "ok"
+            line = f"[green]step {step_num:02d} {marker} (background)[/]  -> {len(result.outputs)} outputs"
+            if record is not None:
+                line += f"  [dim]{_format_step_metrics_line(record)}[/]"
+            console.print(line)
+
+        return result
+    finally:
+        done_event.set()
+
+
 async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None) -> int:
     console = console or Console()
 
@@ -250,8 +300,48 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
     if opts.debug:
         ctx.extras["debug_live"] = True
 
+    selected_steps = _select_steps(opts)
+    parallelize_research = _should_parallelize_research(opts, selected_steps)
+
+    research_task: asyncio.Task[StepResult | None] | None = None
+    research_done = asyncio.Event()
+    research_result: StepResult | None = None
+
+    if parallelize_research:
+        step6 = STEP_REGISTRY.get(6)
+        if step6 is not None:
+            already_done = (
+                not opts.force
+                and is_step_complete(state, 6)
+                and outputs_match(state, 6, ws.step_dir(6))
+            )
+            if already_done:
+                console.print("[dim]step 06 already complete - skipping (background)[/]")
+                research_done.set()
+            else:
+                research_task = asyncio.create_task(
+                    _run_step_in_background(
+                        step6, ctx, state, ws.state_file, opts, console, research_done,
+                    )
+                )
+        else:
+            research_done.set()
+
     exit_code = 0
-    for step_num in _select_steps(opts):
+    for step_num in selected_steps:
+        if step_num == 6 and parallelize_research:
+            continue
+
+        # Rendezvous: Step 7 requires Step 6's output.
+        if step_num == 7 and research_task is not None:
+            console.print("[dim]awaiting step 06 (research) before step 07…[/]")
+            research_result = await research_task
+            research_task = None
+            if research_result is not None and not research_result.success:
+                console.print("[red]step 06 FAILED (background); cannot proceed to step 07[/]")
+                exit_code = 1
+                break
+
         if not opts.force and is_step_complete(state, step_num):
             if not outputs_match(state, step_num, ws.step_dir(step_num)):
                 log.info("step.invalidated", step=step_num)
@@ -269,7 +359,7 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
 
         console.print(f"[cyan]>>> step {step_num:02d} {step.name}[/]")
         result = await step.execute(ctx)
-        save_state(state, ws.state_file)
+        await save_state_async(state, ws.state_file)
         record = state.steps.get(step_num)
 
         if not result.success:
@@ -277,6 +367,13 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
             if record is not None:
                 console.print(f"   {_format_step_metrics_line(record)}")
             exit_code = 1
+            if research_task is not None:
+                research_task.cancel()
+                try:
+                    await research_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                research_task = None
             break
 
         marker = "warned" if result.status == "warned" else "ok"
@@ -285,8 +382,19 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
             line += f"  [dim]{_format_step_metrics_line(record)}[/]"
         console.print(line)
 
+    # If the pipeline ended before reaching Step 7, await the background task.
+    if research_task is not None:
+        try:
+            research_result = await research_task
+            if research_result is not None and not research_result.success:
+                console.print(f"[red]step 06 (background) FAILED:[/] {research_result.error}")
+                if exit_code == 0:
+                    exit_code = 1
+        except (asyncio.CancelledError, Exception):
+            pass
+
     state.finished_at = datetime.now(UTC).isoformat()
-    save_state(state, ws.state_file)
+    await save_state_async(state, ws.state_file)
     _render_summary_table(state, console)
     log.info(
         "pipeline.end",

@@ -115,6 +115,7 @@ What this phase covers and why it's sequenced here.
 5. **Be incremental** — each phase should be independently valuable
 6. **Clarifications** - if anything you are about to write is uncertain, involve the user immediatelly with questions, so you can build the most accurate plan possible. Don't make assumptions without asking.
 7. **Finalize document** - If there are any Blockers or `[CLARIFICATION NEEDED]` tags, the agent must ask the user to resolve them before finalizing the refined spec.
+8. **No duplicate items** — each unresolved item must appear in exactly ONE canonical location. If an item is listed in the Blockers table, do NOT also list it in Open PO Questions. The Blockers table is the canonical location for items that block specific test cases.
 
 ## Output
 

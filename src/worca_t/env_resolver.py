@@ -35,7 +35,7 @@ log = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 _CRITICAL_PATTERNS = (
-    "BASE_URL", "SUT_", "APP_URL", "API_URL", "DATABASE_URL",
+    "BASE_URL", "SUT_", "APP_URL", "API_URL", "DATABASE_URL", "QA_URL",
 )
 
 _SECRET_NAME_RE = re.compile(
@@ -46,11 +46,14 @@ _SECRET_NAME_RE = re.compile(
 def classify_env_keys(
     keys: list[str],
     sut_path: Path,
+    extra_required: set[str] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Split *keys* into (required, optional).
 
     A key is required when it appears in ``.env.example`` (the canonical
-    "you must set these" file) or matches a critical naming pattern.
+    "you must set these" file), matches a critical naming pattern, or is
+    present in ``extra_required`` (e.g. Pydantic ``BaseSettings`` fields
+    declared without a default).
     """
     required_from_example: set[str] = set()
     env_example = sut_path / ".env.example"
@@ -67,10 +70,15 @@ def classify_env_keys(
         except OSError:
             pass
 
+    extra = extra_required or set()
     required: list[str] = []
     optional: list[str] = []
     for k in keys:
-        if k in required_from_example or any(p in k for p in _CRITICAL_PATTERNS):
+        if (
+            k in required_from_example
+            or k in extra
+            or any(p in k for p in _CRITICAL_PATTERNS)
+        ):
             required.append(k)
         else:
             optional.append(k)
@@ -321,9 +329,17 @@ def resolve_sut_env(
     config: EnvResolverConfig,
     discovered_keys: list[str],
     sut_path: Path,
+    extra_required: set[str] | None = None,
 ) -> ResolvedEnv:
-    """Run the full resolution cascade and inject results into ``os.environ``."""
-    required, optional = classify_env_keys(discovered_keys, sut_path)
+    """Run the full resolution cascade and inject results into ``os.environ``.
+
+    ``extra_required`` flags keys as required beyond the ``.env.example`` and
+    critical-pattern heuristics — typically Pydantic ``BaseSettings`` fields
+    declared without a default.
+    """
+    required, optional = classify_env_keys(
+        discovered_keys, sut_path, extra_required=extra_required,
+    )
     all_keys = required + optional
 
     strategies: list[EnvStrategy] = [ProcessEnvStrategy()]
@@ -355,9 +371,15 @@ def resolve_sut_env(
     sources: dict[str, str] = {}
 
     for strategy in strategies:
-        remaining = [k for k in all_keys if k not in resolved]
+        # Interactive prompts only fire for *required* keys. Optional keys
+        # (e.g. Pydantic BaseSettings fields with literal defaults like
+        # timeout=30, headless=True) must never block the user — if a
+        # value is not found in env/.env/AzDO, the SUT's own default
+        # wins at runtime. Silent strategies still scope over all keys.
+        scope = required if isinstance(strategy, InteractivePromptStrategy) else all_keys
+        remaining = [k for k in scope if k not in resolved]
         if not remaining:
-            break
+            continue
         found = strategy.resolve(remaining, resolved)
         for k, v in found.items():
             resolved[k] = v

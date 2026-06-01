@@ -44,7 +44,7 @@ prioritized bug reports. You do NOT debug or fix; you classify and report.
       "actual": "string",
       "root_cause_hypothesis": "string",
       "attachments": {"screenshots": [], "traces": [], "videos": [], "logs": []},
-      "self_heal": {"attempted": false, "success": false, "channel": "playwright|chrome-devtools|none"},
+      "self_heal": {"attempted": false, "success": false, "channel": "playwright|none"},
       "related_test_cases": ["TC-..."],
       "recommended_action": {"immediate": "...", "short_term": "...", "long_term": "..."}
     }

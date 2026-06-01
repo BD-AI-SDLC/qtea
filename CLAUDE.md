@@ -57,14 +57,18 @@
 
 1. `worca-t run --spec <source> --sut <path>` — `cli.py` parses flags into `PipelineOptions`
 2. `run_pipeline()` creates workspace `~/.worca-t/<run-id>/`, loads or creates `RunState`
-3. `_select_steps()` builds the step list (honoring `--from-step`, `--only-step`, `--skip-step`, `--force`)
-4. For each step: instantiate step class from `steps/sNN_*.py`, call `step.run(StepContext)`
-5. Step invokes agent via `claude_runner.run_agent()` (subprocess: `claude` CLI) or runs pure code
-6. Agent writes artifacts to `~/.worca-t/<run-id>/artifacts/stepNN/`
-7. Step validates output via `schemas.py`, returns `StepResult`
-8. On failure: retry (attempt 2) with `debug.agent.md` co-running
-9. Retries exhausted + `--fix`: `critical-thinking` → `principal-software-engineer` → `fix-proposal.md`
-10. Retries exhausted without `--fix`: mark step `failed`, abort pipeline
+3. SUT is materialized eagerly (cloned/linked into `<workspace>/sut/`) **before** the step loop, so Step 6 has no data dependency on Steps 1–5.
+4. `_select_steps()` builds the step list (honoring `--from-step`, `--only-step`, `--skip-step`, `--force`)
+5. **Step 6 (Repo Discovery) runs concurrently with Steps 2–5 in the background** when (a) Step 6 is selected, (b) `--only-step` is not used, and (c) at least one of Steps 2–5 is also selected (`_should_parallelize_research` in `pipeline.py`). The main loop runs 2→5 sequentially in the foreground while Step 6 executes in parallel. **Rendezvous is at the start of Step 7** — the loop awaits the background task there, since Step 7 (codegen) requires `research.md`. As a consequence, Step 6 may finish wall-clock-before Steps 3/4/5 — this is intentional, not a bug. Step 3's research input is best-effort under parallelization (Step 3 falls back to `refined-spec.md` alone if `research.md` is not yet available).
+6. For each foreground step: instantiate step class from `steps/sNN_*.py`, call `step.run(StepContext)`
+7. Step invokes agent via `claude_runner.run_agent()` (subprocess: `claude` CLI) or runs pure code
+8. Agent writes artifacts to `~/.worca-t/<run-id>/artifacts/stepNN/`
+9. Step validates output via `schemas.py`, returns `StepResult`
+10. On failure: retry (attempt 2) with `debug.agent.md` co-running
+11. Retries exhausted + `--fix`: `critical-thinking` → `principal-software-engineer` → `fix-proposal.md`
+12. Retries exhausted without `--fix`: mark step `failed`, abort pipeline
+
+Concurrent checkpoint writes from the foreground loop and the background Step 6 task are serialized by an `asyncio.Lock` in `save_state_async` (`checkpoints.py`).
 
 ---
 
@@ -88,7 +92,6 @@
 | Server | Used by | Purpose |
 | --- | --- | --- |
 | `playwright` | Steps 8, 9 | AOM snapshots, locator discovery, test browser control |
-| `chrome-devtools` | Step 9 | Fallback browser inspection for self-heal |
 | `atlassian` | Step 1 | Jira ticket intake (optional) |
 
 All MCPs are launched by the `claude` CLI per project-local `.mcp.json`.

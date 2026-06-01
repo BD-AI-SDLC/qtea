@@ -24,6 +24,11 @@ log = get_logger(__name__)
 
 _CLARIFICATION_RE = re.compile(r"\[CLARIFICATION\s+NEEDED:\s*([^\]]+)\]", re.IGNORECASE)
 _NOT_READY_RE = re.compile(r"\bNOT\s+READY\b", re.IGNORECASE)
+_XREF_BLOCKER_RE = re.compile(
+    r"\s*(?:—|--|–|-)\s*see\s+blocker\s+#?(\d+)", re.IGNORECASE
+)
+_BLOCKER_PREFIX = "How should we resolve this blocker: "
+_TC_ID_RE = re.compile(r"TC-[A-Z]+-\d+", re.IGNORECASE)
 
 
 @dataclass
@@ -36,15 +41,85 @@ class Question:
     context: str = ""
 
 
+def _normalize_question_text(text: str) -> str:
+    """Normalize question text for dedup: strip boilerplate, kind-agnostic."""
+    t = text.strip().lower()
+    prefix = _BLOCKER_PREFIX.lower()
+    if t.startswith(prefix):
+        t = t[len(prefix) :]
+    t = re.sub(r"\*\*([^*]*)\*\*", r"\1", t)
+    t = _XREF_BLOCKER_RE.sub("", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
 def question_key(q: Question) -> str:
-    """Stable identity for a question across iterations (kind + normalized text)."""
-    return f"{q.kind}::{q.prompt_text.strip().lower()}"
+    """Stable identity for a question across iterations (kind-agnostic, normalized)."""
+    return _normalize_question_text(q.prompt_text)
+
+
+_KIND_PRIORITY = {"blocker": 0, "open_question": 1, "clarification": 2}
+
+
+def _extract_tc_ids(q: Question) -> set[str]:
+    """Extract test-case IDs (e.g. TC-GNAV-009) from a question's text and context."""
+    ids: set[str] = set()
+    for text in (q.prompt_text, q.context):
+        ids.update(m.upper() for m in _TC_ID_RE.findall(text))
+    return ids
 
 
 def _dedup(qs: list[Question]) -> list[Question]:
+    """Deduplicate questions across kinds, resolving cross-references.
+
+    Three dedup passes run in order:
+    1. "see blocker #N" — clarifications/open questions referencing a blocker
+       by number are dropped.
+    2. TC-ID overlap — non-blocker questions whose test-case IDs overlap with
+       a blocker's affected TCs are dropped.
+    3. Normalised-text — remaining duplicates with the same normalised text
+       are collapsed (blocker wins via sort priority).
+    """
+    blocker_by_num: dict[int, Question] = {}
+    for q in qs:
+        if q.kind == "blocker" and q.id.startswith("BLOCK-"):
+            try:
+                num = int(q.id.split("-")[1])
+                blocker_by_num[num] = q
+            except (IndexError, ValueError):
+                pass
+
+    xref_ids: set[str] = set()
+
+    # Pass 1: "see blocker #N" cross-references
+    for q in qs:
+        if q.kind != "blocker":
+            m = _XREF_BLOCKER_RE.search(q.prompt_text)
+            if m:
+                ref_num = int(m.group(1))
+                if ref_num in blocker_by_num:
+                    xref_ids.add(q.id)
+
+    # Pass 2: TC-ID overlap — drop non-blockers whose TCs are covered by a blocker
+    blocker_tcs: set[str] = set()
+    for q in qs:
+        if q.kind == "blocker":
+            blocker_tcs.update(_extract_tc_ids(q))
+    if blocker_tcs:
+        for q in qs:
+            if q.kind != "blocker" and q.id not in xref_ids:
+                q_tcs = _extract_tc_ids(q)
+                if q_tcs and q_tcs <= blocker_tcs:
+                    xref_ids.add(q.id)
+
+    # Pass 3: normalised-text dedup (blockers sorted first so they win ties)
+    sorted_qs = sorted(qs, key=lambda q: _KIND_PRIORITY.get(q.kind, 9))
+
     seen: set[str] = set()
     out: list[Question] = []
-    for q in qs:
+    for q in sorted_qs:
+        if q.id in xref_ids:
+            continue
         key = question_key(q)
         if key in seen:
             continue
@@ -84,10 +159,13 @@ def _extract_blockers(md_text: str) -> list[Question]:
         if not table or len(table) < 2:
             continue
         header = [h.lower() for h in table[0]]
-        # Tolerate header variations
+        # Prefer "description" column; fall back to "blocker" column.
         desc_idx = next(
-            (i for i, h in enumerate(header) if "blocker" in h or "description" in h),
-            0,
+            (i for i, h in enumerate(header) if "description" in h),
+            next(
+                (i for i, h in enumerate(header) if "blocker" in h),
+                0,
+            ),
         )
         for row_idx, row in enumerate(table[1:], start=1):
             if row_idx > len(table) - 1:
@@ -102,7 +180,7 @@ def _extract_blockers(md_text: str) -> list[Question]:
                 Question(
                     id=f"BLOCK-{row_idx:02d}",
                     kind="blocker",
-                    prompt_text=f"How should we resolve this blocker: {desc}",
+                    prompt_text=f"{_BLOCKER_PREFIX}{desc}",
                     context=" | ".join(row),
                 )
             )
@@ -115,7 +193,7 @@ def _extract_blockers(md_text: str) -> list[Question]:
                 Question(
                     id=f"BLOCK-{idx:02d}",
                     kind="blocker",
-                    prompt_text=f"How should we resolve this blocker: {text}",
+                    prompt_text=f"{_BLOCKER_PREFIX}{text}",
                     context=text,
                 )
             )

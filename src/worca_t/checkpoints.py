@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field
@@ -70,6 +71,16 @@ class RunState:
         return rs
 
 
+_state_lock: asyncio.Lock | None = None
+
+
+def get_state_lock() -> asyncio.Lock:
+    global _state_lock
+    if _state_lock is None:
+        _state_lock = asyncio.Lock()
+    return _state_lock
+
+
 def save_state(state: RunState, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
@@ -80,6 +91,12 @@ def save_state(state: RunState, path: Path) -> None:
         if tmp.exists():
             tmp.unlink(missing_ok=True)
         raise
+
+
+async def save_state_async(state: RunState, path: Path) -> None:
+    """Serialize checkpoint writes when steps run concurrently."""
+    async with get_state_lock():
+        save_state(state, path)
 
 
 def load_state(path: Path) -> RunState | None:

@@ -126,20 +126,15 @@ class PlanStep(Step):
         wd = self.workdir(ctx.workspace)
         wd.mkdir(parents=True, exist_ok=True)
 
-        research = ctx.workspace.step_dir(6) / "research.md"
         refined = ctx.workspace.step_dir(2) / "refined-spec.md"
-        inputs: dict = {}
-        if research.exists():
-            inputs["research.md"] = research
-        if refined.exists():
-            inputs["refined-spec.md"] = refined
-        if not inputs:
+        if not refined.exists():
             return StepResult(
                 success=False,
                 status="failed",
                 outputs=[],
-                error="step 3 requires research.md (step 6) and/or refined-spec.md (step 2)",
+                error="step 3 requires refined-spec.md (step 2)",
             )
+        inputs: dict = {"refined-spec.md": refined}
 
         agents_root = package_resource_root() / "agents"
         agent = agents_root / "polyglot-test-planner.agent.md"
@@ -151,9 +146,9 @@ class PlanStep(Step):
             workdir=wd,
             inputs=inputs,
             user_prompt=(
-                "Read the staged `./research.md` (and `./refined-spec.md` if "
-                "present) and produce a phased test implementation plan at "
-                "`./plan.md` following the structure in your agent prompt."
+                "Read the staged `./refined-spec.md` and produce a phased "
+                "test implementation plan at `./plan.md` following the "
+                "structure in your agent prompt."
             ),
             output_filename="plan.md",
             agent_label="polyglot-test-planner",
@@ -179,15 +174,25 @@ class PlanStep(Step):
         json_dst.write_text(json.dumps(projection, indent=2, ensure_ascii=False), encoding="utf-8")
 
         ok, err = is_valid(projection, "plan")
-        status = "completed" if ok else "warned"
         notes = f"phases={len(projection['phases'])}"
         if not ok:
-            notes += f"; schema_warning={err}"
+            # CLAUDE.md classifies Step 3 failure as "abort": a malformed
+            # plan (no extractable phases or missing required fields)
+            # silently propagates to Step 4's test-manager agent, which
+            # then plans against garbage. Fail-fast so the retry path
+            # (attempt 2 with debug agent co-running) gets a chance.
             log.warning("step03.schema_invalid", error=err)
+            return StepResult(
+                success=False,
+                status="failed",
+                outputs=[md_dst, json_dst],
+                error=f"plan.json schema validation failed: {err}",
+                notes=notes + f"; schema_error={err}",
+            )
 
         return StepResult(
             success=True,
-            status=status,
+            status="completed",
             outputs=[md_dst, json_dst],
             notes=notes,
         )

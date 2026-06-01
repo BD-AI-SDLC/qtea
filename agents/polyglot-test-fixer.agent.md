@@ -25,14 +25,9 @@ FORBIDDEN:
 
 ## MCP Channel
 
-Primary: **Playwright MCP** (`@playwright/mcp@latest --headless`, server name
+**Playwright MCP** (`@playwright/mcp@latest --headless`, server name
 `playwright`). Use `browser_navigate` → `browser_snapshot` (accessibility tree) for
 DOM inspection. Snapshot only — no trace/video recording.
-
-Fallback: **chrome-devtools MCP** (`chrome-devtools-mcp@latest`) when Playwright MCP
-unavailable per orchestrator preflight. Same snapshot-only constraint.
-
-Step 10 passes the resolved transport to you via the agent invocation envelope.
 
 ## Process
 
@@ -60,7 +55,7 @@ Step 10 passes the resolved transport to you via the agent invocation envelope.
   `<workspace>/artifacts/step10/self-heal/heal-log.jsonl`:
 
 ```json
-{ "test_id": "TC-XXX", "drifted_locators": [...], "new_selectors": {...}, "mcp_channel": "playwright|chrome-devtools", "outcome": "self_healed|gave_up", "ts": "..." }
+{ "test_id": "TC-XXX", "drifted_locators": [...], "new_selectors": {...}, "mcp_channel": "playwright", "outcome": "self_healed|gave_up", "ts": "..." }
 ```
 
 - On give-up: orchestrator handles bug report rendering — do not duplicate.

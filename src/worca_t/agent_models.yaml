@@ -1,18 +1,25 @@
 # Worca-T defaults; agent.md overrides via frontmatter when present.
 # Sourced by src/worca_t/config.py (single source of truth).
 
-debug: claude-sonnet-4-6
-polyglot-test-fixer: claude-sonnet-4-6
-polyglot-test-tester: claude-sonnet-4-6
-polyglot-test-researcher: claude-sonnet-4-6
-jira-to-ai-spec: claude-sonnet-4-6
+# -- Phase A: Requirements & Planning --
+jira-to-ai-spec: claude-haiku-4-5@20251001
 refine-spec: claude-sonnet-4-6
 polyglot-test-planner: claude-sonnet-4-6
-plan: claude-sonnet-4-6
-playwright-tester: claude-sonnet-4-6
-bug-report-classifier: claude-sonnet-4-6
 test-manager: claude-sonnet-4-6
+
+# -- Phase B: Research & Implementation --
+polyglot-test-researcher: claude-haiku-4-5@20251001
 ui-test-automation: claude-opus-4-6
+playwright-tester: claude-sonnet-4-6
+
+# -- Phase C: Execution & Reporting --
+polyglot-test-tester: claude-haiku-4-5@20251001
+polyglot-test-fixer: claude-sonnet-4-6
+bug-report-classifier: claude-sonnet-4-6
+
+# -- Infrastructure / Support --
+debug: claude-sonnet-4-6
 qa-sdlc-orchestrator: claude-opus-4-6
 critical-thinking: claude-opus-4-6
 principal-software-engineer: claude-opus-4-6
+plan: claude-sonnet-4-6

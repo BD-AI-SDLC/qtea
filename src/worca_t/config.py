@@ -19,7 +19,7 @@ DEFAULT_STEP_TIMEOUTS: dict[int, int] = {
     2: 300,
     3: 900,
     4: 1500,
-    5: 120,
+    5: 300,
     6: 900,
     7: 1800,
     8: 1500,
@@ -130,9 +130,21 @@ def agent_model_map() -> dict[str, str]:
     return {}
 
 
+MODEL_FALLBACK_CHAIN: dict[str, list[str]] = {
+    "claude-haiku-4-5@20251001": ["claude-sonnet-4-6", "claude-opus-4-6"],
+    "claude-sonnet-4-6": ["claude-opus-4-6", "claude-haiku-4-5@20251001"],
+    "claude-opus-4-6": ["claude-sonnet-4-6", "claude-haiku-4-5@20251001"],
+}
+
+
 def model_for_agent(agent_key: str) -> str | None:
     """Lookup model id for a given agent key (e.g. 'refine-spec')."""
     return agent_model_map().get(agent_key)
+
+
+def get_model_chain(primary: str) -> list[str]:
+    """Return ``[primary, fallback1, fallback2]`` for resilient model selection."""
+    return [primary] + MODEL_FALLBACK_CHAIN.get(primary, [])
 
 
 def step_timeout(step: int, override: int | None = None) -> int:

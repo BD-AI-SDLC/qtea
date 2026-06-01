@@ -42,6 +42,10 @@ def configure_logging(
         root.addHandler(h)
     root.setLevel(lvl)
 
+    # Suppress SDK internal INFO chatter (e.g. "Using bundled Claude Code CLI")
+    # while keeping WARNING/ERROR visible for diagnostics.
+    logging.getLogger("claude_agent_sdk").setLevel(logging.WARNING)
+
     timestamper = structlog.processors.TimeStamper(fmt="iso", utc=True)
     shared_processors: list[Any] = [
         structlog.contextvars.merge_contextvars,

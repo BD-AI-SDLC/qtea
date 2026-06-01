@@ -7,13 +7,16 @@ funnel through `run_agent()`.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import os
 import shutil
 import time
 from dataclasses import dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any
 
+import psutil
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
@@ -23,13 +26,31 @@ from claude_agent_sdk import (
     query,
 )
 
-from worca_t.config import CLAUDE_SESSION_KEYS, SECRET_ENV_KEYS, get_settings, model_for_agent, step_timeout
+from worca_t.config import CLAUDE_SESSION_KEYS, SECRET_ENV_KEYS, get_model_chain, get_settings, model_for_agent, step_timeout
 from worca_t.logging_setup import get_logger
 from worca_t.mcp_manager import stage_mcp_config
 from worca_t.metrics import CURRENT_STEP_METRICS, AgentMetrics, extract_agent_metrics
 from worca_t.proxy import with_proxy_env
 
 log = get_logger(__name__)
+
+
+@dataclass
+class _DriveState:
+    """Live state of an in-flight SDK query.
+
+    Mutated by ``_drive_query`` as each message streams in. Holding state in
+    a shared container (rather than relying on the coroutine's return value)
+    means that everything captured before a timeout/cancellation survives —
+    token billing for partial runs no longer collapses to zero.
+    """
+    events: list[dict[str, Any]] = field(default_factory=list)
+    final_text: str = ""
+    metrics: AgentMetrics = field(default_factory=AgentMetrics)
+    session_id: str | None = None
+    # PIDs that were children of our process at agent.start, so cleanup can
+    # avoid killing siblings if `run_agent` is ever invoked concurrently.
+    pre_existing_children: set[int] = field(default_factory=set)
 
 
 @dataclass
@@ -54,15 +75,33 @@ class AgentResult:
 # MCP tool allowlist. The SDK's `permission_mode="acceptEdits"` does NOT
 # auto-approve MCP tools (only file edits and filesystem Bash) — the CLI behaved
 # differently. Pre-approve every MCP server we ship with so steps that touch
-# Playwright / Chrome DevTools / Atlassian don't stall on permission prompts.
+# Playwright / Atlassian don't stall on permission prompts.
 _MCP_ALLOWLIST: tuple[str, ...] = (
     "mcp__playwright__*",
-    "mcp__chrome-devtools__*",
     "mcp__atlassian__*",
 )
 
 # Sanity threshold for an unusually large agent file (informational only).
 _AGENT_PROMPT_WARN_BYTES = 30_000
+
+_MODEL_UNAVAILABLE_INDICATORS = (
+    "overloaded",
+    "529",
+    "model_not_available",
+    "model not found",
+    "capacity",
+    "service_unavailable",
+    "503",
+    "exit code 15",
+    "issue with the selected model",
+    "may not exist or you may not have access",
+)
+
+
+def _is_model_unavailable(error: str) -> bool:
+    """Return True when the error indicates the model itself is unreachable."""
+    lower = error.lower()
+    return any(ind in lower for ind in _MODEL_UNAVAILABLE_INDICATORS)
 
 
 def _agent_key(agent_path: Path) -> str:
@@ -184,41 +223,35 @@ def _extract_text_from_blocks(content: Any) -> str:
 
 async def _drive_query(
     *,
+    state: _DriveState,
     user_prompt: str,
     options: ClaudeAgentOptions,
     transcript_path: Path,
     on_event: Any | None,
-) -> tuple[list[dict[str, Any]], str, AgentMetrics, str | None]:
-    """Iterate the SDK query, write transcript.
+) -> None:
+    """Iterate the SDK query, mutate *state* in place, write transcript.
 
-    Returns ``(events, final_text, metrics, session_id)``. ``session_id`` is
-    captured from the first message that carries one (init SystemMessage's
-    ``data.session_id`` or any subsequent message's top-level ``session_id``).
+    Mutating a shared state object rather than returning locals means partial
+    progress (events, tokens, session_id) survives if this coroutine is
+    cancelled mid-stream — e.g. by a timeout.
     """
-    events: list[dict[str, Any]] = []
-    final_text = ""
-    session_id: str | None = None
-    # ResultMessage typically appears once at end-of-turn, but if the SDK ever
-    # emits more than one we sum them so caller never under-counts.
-    totals = AgentMetrics()
-
     with transcript_path.open("w", encoding="utf-8") as transcript_fp:
         async for message in query(prompt=user_prompt, options=options):
             evt = _message_to_dict(message)
             transcript_fp.write(json.dumps(evt, ensure_ascii=False) + "\n")
             transcript_fp.flush()
-            events.append(evt)
+            state.events.append(evt)
 
-            if session_id is None:
+            if state.session_id is None:
                 sid = getattr(message, "session_id", None)
                 if isinstance(sid, str) and sid:
-                    session_id = sid
+                    state.session_id = sid
                 else:
                     data = getattr(message, "data", None) or {}
                     if isinstance(data, dict):
                         sid = data.get("session_id")
                         if isinstance(sid, str) and sid:
-                            session_id = sid
+                            state.session_id = sid
 
             if isinstance(message, SystemMessage) and getattr(message, "subtype", None) == "init":
                 data = getattr(message, "data", {}) or {}
@@ -233,11 +266,11 @@ async def _drive_query(
             elif isinstance(message, AssistantMessage):
                 text = _extract_text_from_blocks(getattr(message, "content", None))
                 if text:
-                    final_text = text
+                    state.final_text = text
             elif isinstance(message, ResultMessage):
                 result = getattr(message, "result", None)
                 if isinstance(result, str) and result:
-                    final_text = result
+                    state.final_text = result
                 m = extract_agent_metrics(
                     getattr(message, "usage", None),
                     getattr(message, "total_cost_usd", None),
@@ -245,12 +278,12 @@ async def _drive_query(
                 turns = getattr(message, "num_turns", None)
                 if isinstance(turns, int):
                     m.num_turns = turns
-                totals.input_tokens += m.input_tokens
-                totals.output_tokens += m.output_tokens
-                totals.cache_creation_input_tokens += m.cache_creation_input_tokens
-                totals.cache_read_input_tokens += m.cache_read_input_tokens
-                totals.cost_usd += m.cost_usd
-                totals.num_turns += m.num_turns
+                state.metrics.input_tokens += m.input_tokens
+                state.metrics.output_tokens += m.output_tokens
+                state.metrics.cache_creation_input_tokens += m.cache_creation_input_tokens
+                state.metrics.cache_read_input_tokens += m.cache_read_input_tokens
+                state.metrics.cost_usd += m.cost_usd
+                state.metrics.num_turns += m.num_turns
             elif isinstance(message, UserMessage):
                 # User-turn echo from the SDK (e.g., tool-result feedback).
                 pass
@@ -261,7 +294,74 @@ async def _drive_query(
                 except Exception:
                     pass
 
-    return events, final_text, totals, session_id
+
+def _current_child_pids() -> set[int]:
+    """Snapshot of our process's direct + transitive children. Tolerant of races."""
+    try:
+        return {c.pid for c in psutil.Process(os.getpid()).children(recursive=True)}
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return set()
+
+
+async def _force_cleanup(
+    task: asyncio.Task,
+    pre_existing_children: set[int],
+    grace_s: float,
+) -> None:
+    """Cancel *task* and kill any SDK subprocess tree it spawned.
+
+    The Claude Agent SDK's ``query()`` async generator wraps a ``claude`` CLI
+    subprocess, which itself may spawn MCP server children (e.g. ``npx``).
+    On ``CancelledError``, the generator's ``__aexit__`` awaits the
+    subprocess to exit — which can block indefinitely if an MCP child is
+    hung (e.g. mid-``npx``-install).
+
+    The fix: cancel the task with a bounded wait, then forcibly terminate
+    any process tree that appeared while the task was running. Only NEW
+    children (i.e. PIDs not in ``pre_existing_children``) are killed, so
+    concurrent sibling agents — if any are ever introduced — are spared.
+
+    All cleanup failures are swallowed and logged. Cleanup must never raise
+    into the caller's error path.
+    """
+    if not task.done():
+        task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=grace_s)
+        except (TimeoutError, asyncio.CancelledError):
+            pass
+        except Exception as e:  # noqa: BLE001
+            log.warning("agent.cleanup_task_error", error=str(e))
+
+    try:
+        me = psutil.Process(os.getpid())
+        # Snapshot AFTER cancel so we catch any children spawned during the
+        # cancellation grace window too.
+        children = [
+            c for c in me.children(recursive=True)
+            if c.pid not in pre_existing_children
+        ]
+    except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+        log.warning("agent.cleanup_enum_error", error=str(e))
+        return
+
+    if not children:
+        return
+
+    log.info("agent.cleanup_kill", count=len(children),
+             pids=[c.pid for c in children])
+
+    for child in children:
+        with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+            child.terminate()
+    try:
+        _gone, alive = psutil.wait_procs(children, timeout=3)
+    except Exception as e:  # noqa: BLE001
+        log.warning("agent.cleanup_wait_error", error=str(e))
+        alive = children
+    for proc in alive:
+        with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+            proc.kill()
 
 
 async def run_agent(
@@ -401,33 +501,18 @@ async def run_agent(
         "allowed_tools": list(_MCP_ALLOWLIST),
         "env": forwarded_env,
     }
-    if resolved_model:
-        sdk_options_kwargs["model"] = resolved_model
     if max_turns is not None:
         sdk_options_kwargs["max_turns"] = max_turns
     if resume:
         sdk_options_kwargs["resume"] = resume
 
-    options = ClaudeAgentOptions(**sdk_options_kwargs)
+    # Build the model fallback chain for resilience against model outages.
+    model_chain = get_model_chain(resolved_model) if resolved_model else [resolved_model]
+    models_attempted: list[str | None] = []
 
-    log.info(
-        "agent.start",
-        agent=agent_path.name,
-        model=resolved_model,
-        workdir=str(workdir),
-        timeout_s=resolved_timeout,
-        permission_mode=permission_mode,
-        max_turns=max_turns,
-        resume=resume,
-        call_idx=call_idx,
-    )
     log.debug("agent.env", env=_mask_env(forwarded_env))
 
     started = time.monotonic()
-    events: list[dict[str, Any]] = []
-    final_text = ""
-    agent_metrics = AgentMetrics()
-    session_id: str | None = None
     timed_out = False
     error: str | None = None
     exit_code = -1
@@ -436,25 +521,76 @@ async def run_agent(
     # subprocess did; we still create the file for forensic-artifact contract).
     stderr_path.write_text("", encoding="utf-8")
 
-    try:
-        events, final_text, agent_metrics, session_id = await asyncio.wait_for(
-            _drive_query(
-                user_prompt=user_prompt,
-                options=options,
-                transcript_path=transcript_path,
-                on_event=on_event,
-            ),
-            timeout=resolved_timeout,
+    # Declare state outside the loop so post-loop code always has a reference.
+    state = _DriveState()
+
+    for model_idx, current_model in enumerate(model_chain):
+        opts = dict(sdk_options_kwargs)
+        if current_model:
+            opts["model"] = current_model
+        options = ClaudeAgentOptions(**opts)
+        models_attempted.append(current_model)
+
+        log.info(
+            "agent.start",
+            agent=agent_path.name,
+            model=current_model,
+            workdir=str(workdir),
+            timeout_s=resolved_timeout,
+            permission_mode=permission_mode,
+            max_turns=max_turns,
+            resume=resume,
+            call_idx=call_idx,
+            fallback_attempt=model_idx,
         )
-        exit_code = 0
-    except asyncio.TimeoutError:
-        timed_out = True
-        exit_code = -9
-        error = f"timeout after {resolved_timeout}s"
-        log.error("agent.timeout", agent=agent_path.name, timeout_s=resolved_timeout)
-    except Exception as e:
-        error = f"sdk error: {e}"
-        log.exception("agent.sdk_error", agent=agent_path.name, error=str(e))
+
+        timed_out = False
+        error = None
+        exit_code = -1
+        state = _DriveState(pre_existing_children=_current_child_pids())
+
+        drive_task = asyncio.create_task(_drive_query(
+            state=state,
+            user_prompt=user_prompt,
+            options=options,
+            transcript_path=transcript_path,
+            on_event=on_event,
+        ))
+        try:
+            async with asyncio.timeout(resolved_timeout):
+                await drive_task
+            exit_code = 0
+        except TimeoutError:
+            timed_out = True
+            exit_code = -9
+            error = f"timeout after {resolved_timeout}s"
+            log.error("agent.timeout", agent=agent_path.name, timeout_s=resolved_timeout)
+            await _force_cleanup(drive_task, state.pre_existing_children, grace_s=5.0)
+        except Exception as e:
+            error = f"sdk error: {e}"
+            log.exception("agent.sdk_error", agent=agent_path.name, error=str(e))
+            await _force_cleanup(drive_task, state.pre_existing_children, grace_s=2.0)
+
+            error_context = f"{e} {state.final_text}"
+            if _is_model_unavailable(error_context) and model_idx < len(model_chain) - 1:
+                next_model = model_chain[model_idx + 1]
+                log.warning(
+                    "agent.model_fallback",
+                    agent=agent_path.name,
+                    from_model=current_model,
+                    to_model=next_model,
+                )
+                continue
+
+        break
+
+    # Restore the variables the rest of run_agent expects. Whatever was
+    # captured before cancellation is preserved through `state`.
+    events = state.events
+    final_text = state.final_text
+    agent_metrics = state.metrics
+    session_id = state.session_id
+    used_model = models_attempted[-1] if models_attempted else resolved_model
 
     duration = time.monotonic() - started
     success = (exit_code == 0) and not timed_out and error is None
@@ -468,7 +604,9 @@ async def run_agent(
 
     metrics = {
         "agent": agent_path.name,
-        "model": resolved_model,
+        "model": used_model,
+        "model_requested": resolved_model,
+        "models_attempted": models_attempted,
         "success": success,
         "exit_code": exit_code,
         "duration_s": round(duration, 3),
@@ -502,6 +640,8 @@ async def run_agent(
         cost_usd=round(agent_metrics.cost_usd, 6),
         session_id=session_id,
         resumed=resume is not None,
+        model_used=used_model,
+        model_requested=resolved_model,
     )
 
     return AgentResult(
