@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 MAX_STEP_TIMEOUT_S = 1800
 
 DEFAULT_STEP_TIMEOUTS: dict[int, int] = {
-    1: 120,
+    1: 600,
     2: 300,
     3: 900,
     4: 1500,
@@ -41,15 +41,18 @@ SECRET_ENV_KEYS = frozenset(
         "JIRA_XRAY_CLIENT_SECRET",
         "JIRA_XRAY_API_KEY",
         "JIRA_XRAY_CLIENT_ID",
+        "AZDO_PAT",
     }
 )
 
 # Session vars stripped from claude subprocess env to prevent nesting detection.
-CLAUDE_SESSION_KEYS = frozenset({
-    "CLAUDECODE",
-    "AI_AGENT",
-    "CLAUDE_CODE_ENTRYPOINT",
-})
+CLAUDE_SESSION_KEYS = frozenset(
+    {
+        "CLAUDECODE",
+        "AI_AGENT",
+        "CLAUDE_CODE_ENTRYPOINT",
+    }
+)
 
 # Proxy-related env keys propagated to all subprocesses.
 PROXY_ENV_KEYS = (

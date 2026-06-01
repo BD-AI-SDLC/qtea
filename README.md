@@ -63,6 +63,23 @@ worca-t run --debug --spec ...             # verbose debug agent from step 1
 worca-t run --fix --spec ...               # RCA + fix proposal on failure
 ```
 
+## Environment resolution
+
+Step 6 auto-discovers which environment variables the SUT needs (by
+scanning `.env.example`, source code, etc.) and resolves their values
+through a cascade of strategies:
+
+1. **Host environment** — variables already set in `os.environ`
+2. **Dotenv file** — loaded via `--env-file` or from `.env.example` / `.env.template` in the SUT
+3. **Azure DevOps Variable Groups** — pulled via REST API when `AZDO_ORG`, `AZDO_PROJECT`, `AZDO_VARIABLE_GROUP`, and `AZDO_PAT` are set
+4. **Interactive prompt** — asks for missing required values one by one (skipped with `--no-hitl`)
+
+Resolved values are injected into the process environment for Steps 8–9.
+Values are never logged or persisted to disk.
+
+See `GETTING_STARTED.md` §2 for setup details and Azure DevOps pipeline
+examples.
+
 ## Status
 
 All 11 pipeline steps implemented. Core milestones complete:

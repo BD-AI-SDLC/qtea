@@ -57,10 +57,12 @@ def _snapshot_debug_artifacts(step_num: int, ctx: StepContext, attempt: int) -> 
     workdir = ctx.workspace.step_workdir(step_num)
     if not workdir.exists():
         return
-    for name in ("transcript.jsonl", "stderr.log", "metrics.json"):
-        src = workdir / name
-        if src.exists():
-            shutil.copy2(src, dst / name)
+    # Glob covers both the new per-call numbered names
+    # (transcript-00.jsonl, transcript-01.jsonl, ...) and the legacy
+    # single-file names from older runs (transcript.jsonl, etc.).
+    for pattern in ("transcript*.jsonl", "stderr*.log", "metrics*.json"):
+        for src in workdir.glob(pattern):
+            shutil.copy2(src, dst / src.name)
 
 
 async def _run_fix_proposal(step_num: int, ctx: StepContext, failure_context: str) -> Path | None:
@@ -184,6 +186,11 @@ async def run_agent_with_hitl(
     iteration_prompt = user_prompt
     result: AgentResult | None = None
     skipped_keys: set[str] = set()  # questions the user opted to skip
+    # Resume the SDK session on iteration 2+ so the cached system prompt and
+    # conversation prefix from iteration 1 hit cache_read instead of paying
+    # the 25% cache_creation premium again. Empirically this halves the cost
+    # of a HITL re-invocation. None on iteration 1 (no session to resume).
+    resume_session: str | None = None
 
     hitl_disabled = getattr(ctx.options, "no_hitl", False)
     hitl_dir = (
@@ -201,7 +208,12 @@ async def run_agent_with_hitl(
             step=step,
             max_turns=max_turns,
             claude_md=claude_md,
+            resume=resume_session,
         )
+        # Capture session for the next iteration, regardless of whether we
+        # actually re-invoke -- harmless if we don't.
+        if result.session_id:
+            resume_session = result.session_id
 
         produced = workdir / output_filename
         if not result.success or not produced.exists():

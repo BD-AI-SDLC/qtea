@@ -197,7 +197,12 @@ def doctor(
 @app.command()
 def run(
     spec: str = typer.Option(
-        ..., "--spec", help="jira:KEY-123 | path/to/spec.md | URL"
+        ...,
+        "--spec",
+        help=(
+            "jira:KEY-123 | https://*.atlassian.net/browse/KEY-123 "
+            "| path/to/spec.md | URL"
+        ),
     ),
     sut: str = typer.Option(
         ..., "--sut", help="Local path or git URL of System Under Test"

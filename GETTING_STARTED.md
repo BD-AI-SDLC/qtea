@@ -61,11 +61,107 @@ and Xray credentials are optional — steps 1 and 5 auto-adapt.
 The Claude CLI resolves these from your environment at launch time, so
 make sure they are set in your `.env` file or exported in your shell.
 
-Alternatively, pass a custom env file at runtime:
+Alternatively, pass a custom env file at runtime (the file can live
+anywhere on disk — it does not need to be inside the SUT):
 
 ```bash
 worca-t run --spec ./spec.md --sut ./app --env-file /path/to/.env.prod
 ```
+
+### SUT environment variables (interactive resolution)
+
+When the pipeline reaches Step 6 (Research), it scans the SUT codebase for
+environment variable keys used by the application (e.g., in `.env.example`,
+`process.env.VAR`, `os.environ.get("VAR")`). If any **required** keys are
+not yet set in your environment, worca-t prompts you to enter them one by
+one:
+
+```text
+╭─ SUT environment input required ──────────────────────╮
+│ Step 6 discovered 3 required SUT environment           │
+│ variable(s) that are not yet set.                      │
+│ Enter a value for each, or press Enter to skip.        │
+╰───────────────────────────────────────────────────────╯
+
+  SUT_BASE_URL: https://qa.askbosch.com
+  USERNAME: test_user
+  PASSWORD: ********
+```
+
+Sensitive keys (containing `PASSWORD`, `SECRET`, `TOKEN`, etc.) are
+entered with masked input. Entered values are injected into the process
+environment for the rest of the run but **never logged or persisted to
+disk**.
+
+To skip interactive prompts (e.g., in CI pipelines where variables are
+already set by the pipeline), pass `--no-hitl`:
+
+```bash
+worca-t run --spec ./spec.md --sut ./app --no-hitl
+```
+
+A key is classified as **required** when it appears in `.env.example` or
+matches a critical pattern (`*BASE_URL*`, `SUT_*`, `*DATABASE_URL*`).
+All other discovered keys are **optional** — they are logged but not
+prompted for.
+
+### Remote SUT (git URL)
+
+`--sut` accepts git URLs from any major hosting provider:
+
+```bash
+# GitHub / GitLab / Bitbucket
+worca-t run --spec ./spec.md --sut https://github.com/org/app.git
+
+# Azure DevOps (HTTPS)
+worca-t run --spec ./spec.md \
+  --sut https://org@dev.azure.com/org/project/_git/repo
+
+# Azure DevOps (SSH)
+worca-t run --spec ./spec.md \
+  --sut git@ssh.dev.azure.com:v3/org/project/repo
+```
+
+The repository is shallow-cloned (`--depth=1`) into the workspace. Since
+`.env` files are gitignored, they won't be part of the clone. Use
+`--env-file` to point to a local env file, or let the interactive prompt
+ask for missing values.
+
+### Azure DevOps Variable Groups
+
+When running in an Azure DevOps pipeline (or any environment with access
+to the Azure DevOps REST API), worca-t can pull SUT environment variables
+directly from a Variable Group. Set these environment variables:
+
+| Env Var | Purpose |
+| --- | --- |
+| `AZDO_ORG` | Azure DevOps organization name |
+| `AZDO_PROJECT` | Azure DevOps project name |
+| `AZDO_VARIABLE_GROUP` | Name of the Variable Group to read from |
+| `AZDO_PAT` | Personal Access Token with **Variable Groups (Read)** scope |
+
+When all four are set, Step 6 automatically queries the Variable Group and
+resolves any matching SUT keys. Example pipeline YAML:
+
+```yaml
+variables:
+  - group: my-qa-variables        # the Variable Group in Library
+  - name: AZDO_ORG
+    value: MyOrg
+  - name: AZDO_PROJECT
+    value: MyProject
+  - name: AZDO_VARIABLE_GROUP
+    value: my-qa-variables
+  - name: AZDO_PAT
+    value: $(System.AccessToken)  # or a PAT stored as a secret
+
+steps:
+  - script: worca-t run --spec jira:PROJ-123 --sut $(SUT_REPO_URL) --no-hitl
+```
+
+**Note:** Variables marked as **secret** in Azure DevOps cannot be
+retrieved via the REST API (the API returns `null`). For those, set them
+directly in your pipeline definition or use `--env-file`.
 
 ## 3. Validate your setup
 
@@ -124,6 +220,14 @@ worca-t run --spec ./feature-spec.md --sut ./path-to-your-app
 worca-t run --spec jira:PROJ-123 --sut https://github.com/org/app.git
 ```
 
+**With an Azure DevOps repo and a separate env file:**
+
+```bash
+worca-t run --spec jira:PROJ-123 \
+  --sut https://org@dev.azure.com/org/project/_git/repo \
+  --env-file ./qa.env
+```
+
 **With the report opening automatically:**
 
 ```bash
@@ -165,6 +269,7 @@ All `run` flags:
 | `--open-report` | false | Open the report in your browser when the run finishes |
 | `--log-level LEVEL` | info | `info \| debug \| trace` |
 | `--env-file PATH` | — | Path to a `.env` file to load (values never appear in logs) |
+| `--no-hitl` | false | Disable interactive prompts (CI mode) |
 | `-w / --workspace PATH` | `~/.worca-t` | Override the workspace base directory |
 
 ## 6. List and inspect workspaces

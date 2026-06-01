@@ -243,7 +243,18 @@ class ExecuteStep(Step):
         if sut_env_keys:
             missing = [k for k in sut_env_keys if k not in os.environ]
             if missing:
-                log.warning("step09.env_missing", keys=missing)
+                env_res = research.get("env_resolution")
+                if env_res:
+                    log.warning(
+                        "step09.env_missing",
+                        keys=missing,
+                        strategies_tried=list(env_res.get("sources", {}).values()),
+                        hint="These keys were not resolved by any strategy in Step 6. "
+                             "Provide them via --env-file, host environment, or "
+                             "Azure DevOps Variable Groups.",
+                    )
+                else:
+                    log.warning("step09.env_missing", keys=missing)
 
         # Mirror tests into a dedicated subdir under the SUT and aim the runner
         # at that directory by default (when no detected command is provided).

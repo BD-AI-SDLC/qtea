@@ -194,6 +194,14 @@ class LocatorResolutionStep(Step):
         index = _load_index(src_index)
         sut_base_url = os.environ.get("SUT_BASE_URL")
 
+        if not sut_base_url and _tests_with_tbd(index):
+            log.warning(
+                "step08.sut_base_url_missing",
+                hint="SUT_BASE_URL is not set; locator resolution via Playwright "
+                     "may fail. Set it in your environment, via --env-file, or "
+                     "respond to the Step 6 interactive prompt.",
+            )
+
         # Copy tests into step08 artifact dir; we mutate the copy.
         dst_tests = out_dir / "tests"
         if dst_tests.exists():
