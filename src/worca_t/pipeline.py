@@ -155,6 +155,15 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
 
     if opts.env_file:
         load_env(opts.env_file)
+        try:
+            from dotenv import dotenv_values
+            loaded = {k: v for k, v in dotenv_values(opts.env_file).items() if v}
+            (console or Console()).print(
+                f"[dim]env-file:[/] loaded [bold]{len(loaded)}[/] key(s) from "
+                f"[cyan]{opts.env_file}[/cyan]"
+            )
+        except Exception:
+            pass
     else:
         sut_path = Path(opts.sut).expanduser().resolve()
         if sut_path.is_dir():
@@ -204,6 +213,31 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
     )
     console.print(f"[green]workspace[/] {ws.root}")
     console.print(f"[green]run_id[/]    {ws.run_id}")
+
+    # Early SUT materialization — fail fast before spending time on steps 1-5.
+    import subprocess
+
+    from worca_t.steps.s06_research import _materialize_sut
+
+    console.print("[dim]sut:[/] materializing…")
+    try:
+        _materialize_sut(opts.sut, ws.sut)
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or b"").decode(errors="replace").strip()
+        console.print(f"[red]sut error:[/] failed to clone [cyan]{opts.sut}[/cyan]")
+        if stderr:
+            console.print(f"[red]  {stderr}[/]")
+        log.error("pipeline.sut_failed", sut=opts.sut, error=stderr)
+        return 2
+    except FileNotFoundError as e:
+        console.print(f"[red]sut error:[/] {e}")
+        log.error("pipeline.sut_failed", sut=opts.sut, error=str(e))
+        return 2
+    except Exception as e:
+        console.print(f"[red]sut error:[/] {e}")
+        log.error("pipeline.sut_failed", sut=opts.sut, error=str(e))
+        return 2
+    console.print(f"[dim]sut:[/] ready at [cyan]{ws.sut}[/cyan]")
 
     ctx = StepContext(
         workspace=ws,

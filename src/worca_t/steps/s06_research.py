@@ -31,10 +31,19 @@ from worca_t.steps.base import Step, StepContext, StepResult
 log = get_logger(__name__)
 
 
+_GIT_HOSTS = (
+    "github.com", "gitlab", "bitbucket.org",
+    "dev.azure.com", "ssh.dev.azure.com", "visualstudio.com",
+    "codeberg.org", "gitea.", "sr.ht",
+)
+
+
 def _is_git_url(s: str) -> bool:
-    if not s.startswith(("git@", "http://", "https://")):
+    if not s.startswith(("git@", "ssh://", "http://", "https://")):
         return False
-    return s.endswith(".git") or "github.com" in s or "gitlab" in s
+    if s.endswith(".git"):
+        return True
+    return any(host in s for host in _GIT_HOSTS)
 
 
 def _rmtree_safe(path: Path) -> None:
@@ -275,16 +284,18 @@ class ResearchStep(Step):
         wd = self.workdir(ctx.workspace)
         wd.mkdir(parents=True, exist_ok=True)
 
-        # Materialize SUT.
-        try:
-            _materialize_sut(ctx.sut_source, ctx.workspace.sut)
-        except Exception as e:
-            return StepResult(
-                success=False,
-                status="failed",
-                outputs=[],
-                error=f"sut materialize: {e}",
-            )
+        # Materialize SUT (skip if already done by pipeline early-clone).
+        sut_ready = ctx.workspace.sut.exists() and any(ctx.workspace.sut.iterdir())
+        if not sut_ready:
+            try:
+                _materialize_sut(ctx.sut_source, ctx.workspace.sut)
+            except Exception as e:
+                return StepResult(
+                    success=False,
+                    status="failed",
+                    outputs=[],
+                    error=f"sut materialize: {e}",
+                )
 
         # Pre-run scan skill. Deterministic Python — if it fails it's a bug,
         # not a flake. Hard-fail the step before burning an LLM call on an
@@ -347,9 +358,35 @@ class ResearchStep(Step):
         if sut_env_keys:
             log.info("step06.sut_env_keys", count=len(sut_env_keys), keys=sut_env_keys)
 
+        # Resolve SUT env vars via multi-strategy cascade.
+        env_resolution_audit: dict | None = None
+        if sut_env_keys:
+            from worca_t.env_resolver import EnvResolverConfig, resolve_sut_env
+
+            resolver_config = EnvResolverConfig(
+                env_file=getattr(ctx.options, "env_file", None),
+                sut_path=ctx.workspace.sut,
+                no_hitl=getattr(ctx.options, "no_hitl", False),
+                azdo_org=os.environ.get("AZDO_ORG"),
+                azdo_project=os.environ.get("AZDO_PROJECT"),
+                azdo_variable_group=os.environ.get("AZDO_VARIABLE_GROUP"),
+                azdo_pat=os.environ.get("AZDO_PAT"),
+            )
+            resolved = resolve_sut_env(
+                resolver_config, sut_env_keys, ctx.workspace.sut,
+            )
+            env_resolution_audit = {
+                "resolved": list(resolved.values.keys()),
+                "sources": resolved.sources,
+                "missing_required": resolved.missing_required,
+                "missing_optional": resolved.missing_optional,
+            }
+
         projection = _project_research(
             md_dst.read_text(encoding="utf-8"), scan_text, sut_env_keys=sut_env_keys,
         )
+        if env_resolution_audit is not None:
+            projection["env_resolution"] = env_resolution_audit
         json_dst = out_dir / "research.json"
         json_dst.write_text(json.dumps(projection, indent=2, ensure_ascii=False), encoding="utf-8")
 

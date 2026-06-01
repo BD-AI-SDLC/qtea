@@ -41,6 +41,7 @@ SECRET_ENV_KEYS = frozenset(
         "JIRA_XRAY_CLIENT_SECRET",
         "JIRA_XRAY_API_KEY",
         "JIRA_XRAY_CLIENT_ID",
+        "AZDO_PAT",
     }
 )
 
