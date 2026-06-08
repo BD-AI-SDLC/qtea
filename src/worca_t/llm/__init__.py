@@ -15,11 +15,12 @@ from __future__ import annotations
 from worca_t.llm.browser_agent import run_agent
 from worca_t.llm.file_agent import call_file_editing_agent
 from worca_t.llm.protocols import AgentResult
-from worca_t.llm.reasoning import call_reasoning_llm
+from worca_t.llm.reasoning import call_reasoning_llm, call_reasoning_llm_with_hitl
 
 __all__ = [
     "AgentResult",
     "call_reasoning_llm",
+    "call_reasoning_llm_with_hitl",
     "call_file_editing_agent",
     "run_agent",
 ]

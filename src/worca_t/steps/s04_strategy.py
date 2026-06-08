@@ -1,22 +1,25 @@
 """Step 4: Test strategy generation via test-manager agent.
 
-Reads plan.md + refined-spec.md, invokes test-manager (with the
-test-strategy template + edge-case checklist + schema staged), parses
-output into test-strategy.json with extracted test cases.
+Reads plan.md + refined-spec.md, invokes test-manager via the direct-SDK
+transport with the test-strategy template + edge-case checklist inlined
+into the prompt. Parses output into test-strategy.json with extracted
+test cases.
 
 Outputs (artifacts/step04/):
   - test-strategy.md
   - test-strategy.json
+
+Transport: ``worca_t.llm.reasoning.call_reasoning_llm`` (direct SDK, no
+HITL — Step 4 does not currently emit clarification questions).
 """
 
 from __future__ import annotations
 
 import json
 import re
-import shutil
 
-from worca_t.claude_runner import run_agent
 from worca_t.config import package_resource_root, step_timeout
+from worca_t.llm.reasoning import call_reasoning_llm
 from worca_t.logging_setup import get_logger
 from worca_t.md_parser import Section, extract_bullets, parse_markdown
 from worca_t.schemas import is_valid
@@ -128,45 +131,47 @@ class StrategyStep(Step):
                 error=f"missing {plan_md}; run step 3 first",
             )
 
-        inputs = {"plan.md": plan_md}
+        # Inline plan + refined-spec + reference template docs into the prompt.
+        # Replaces the file-staging extras pattern from the Agent SDK era.
+        # The schema file is NOT inlined — schema validation is local-only and
+        # happens on the post-LLM projection, not on the LLM output itself.
+        inputs: dict[str, str] = {"plan.md": plan_md.read_text(encoding="utf-8")}
         if refined_md.exists():
-            inputs["refined-spec.md"] = refined_md
+            inputs["refined-spec.md"] = refined_md.read_text(encoding="utf-8")
 
-        agents_root = package_resource_root() / "agents"
         docs_root = package_resource_root()
-        agent = agents_root / "test-manager.agent.md"
-        claude_md = package_resource_root() / "CLAUDE.md"
-
-        extras = []
-        for doc in ("templates/test-strategy-template.md", "templates/edge-case-checklist.md"):
+        for doc in (
+            "templates/test-strategy-template.md",
+            "templates/edge-case-checklist.md",
+        ):
             p = docs_root / doc
             if p.exists():
-                extras.append(p)
-        schema = package_resource_root() / "schemas" / "test-strategy.schema.json"
-        if schema.exists():
-            extras.append(schema)
+                inputs[p.name] = p.read_text(encoding="utf-8")
 
-        result = await run_agent(
+        agents_root = package_resource_root() / "agents"
+        agent = agents_root / "test-manager.agent.md"
+
+        result = await call_reasoning_llm(
             agent,
             workdir=wd,
-            inputs=inputs,
             user_prompt=(
-                "Read `./plan.md` (and `./refined-spec.md` if present). Follow "
-                "your workflow and decision-making guidance, then consult "
+                "The plan (and refined spec, if present) are provided in the "
+                "inputs section below, along with the test-strategy template "
+                "and edge-case checklist. Follow your workflow and "
+                "decision-making guidance, then consult "
                 "`test-manager.prompt.md` for TC templates and decision trees. "
-                "Produce a focused test strategy document at "
-                "`./test-strategy.md`. Every test case must have an id of the "
-                "form `TC-<slug>` and a priority (`P0`-`P3`)."
+                "Produce a focused test strategy document. Every test case "
+                "must have an id of the form `TC-<slug>` and a priority "
+                "(`P0`-`P3`). Return only the test-strategy markdown body — "
+                "no preamble, no code fences."
             ),
-            extra_paths=extras,
+            inputs=inputs,
+            output_schema=None,  # markdown output; schema validates projection only
             timeout_s=self.timeout_s,
             step=4,
-            max_turns=25,
-            claude_md=claude_md if claude_md.exists() else None,
         )
 
-        produced = wd / "test-strategy.md"
-        if not result.success or not produced.exists():
+        if not result.success or not result.final_text:
             return StepResult(
                 success=False,
                 status="failed",
@@ -175,7 +180,7 @@ class StrategyStep(Step):
             )
 
         md_dst = out_dir / "test-strategy.md"
-        shutil.copy2(produced, md_dst)
+        md_dst.write_text(result.final_text, encoding="utf-8")
         projection = _project_strategy(md_dst.read_text(encoding="utf-8"))
         json_dst = out_dir / "test-strategy.json"
         json_dst.write_text(json.dumps(projection, indent=2, ensure_ascii=False), encoding="utf-8")

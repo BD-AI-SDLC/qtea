@@ -1,24 +1,29 @@
 """Step 2: Spec refinement.
 
-Invokes the `refine-spec` agent on the step01 spec.md. Then deterministically
-parses the refined markdown into a JSON projection used downstream.
+Invokes the `refine-spec` agent on the step01 spec.md via the direct-SDK
+HITL transport. Then deterministically parses the refined markdown into a
+JSON projection used downstream.
 
 Outputs (artifacts/step02/):
   - refined-spec.md
   - refined-spec.json   (parsed sections + extracted REQ id + AC bullets)
+
+Transport: ``worca_t.llm.reasoning.call_reasoning_llm_with_hitl`` (direct
+Anthropic SDK, no subprocess, no MCP). Multi-turn HITL conversation
+replaces the previous file-staging re-invoke pattern.
 """
 
 from __future__ import annotations
 
 import json
 import re
-import shutil
 
 from worca_t.config import package_resource_root, step_timeout
+from worca_t.llm.reasoning import call_reasoning_llm_with_hitl
 from worca_t.logging_setup import get_logger
 from worca_t.md_parser import extract_bullets, parse_markdown, section_to_dict, slugify
 from worca_t.schemas import is_valid
-from worca_t.steps.base import Step, StepContext, StepResult, run_agent_with_hitl
+from worca_t.steps.base import Step, StepContext, StepResult
 
 log = get_logger(__name__)
 
@@ -83,33 +88,36 @@ class RefineStep(Step):
 
         agents_root = package_resource_root() / "agents"
         agent = agents_root / "refine-spec.agent.md"
-        claude_md = package_resource_root() / "CLAUDE.md"
 
-        result = await run_agent_with_hitl(
+        # Spec contents are inlined into the user prompt (replaces the old
+        # file-staging into the agent workdir).
+        spec_text = spec_in.read_text(encoding="utf-8")
+
+        result = await call_reasoning_llm_with_hitl(
+            agent,
             ctx=ctx,
-            agent_path=agent,
             workdir=wd,
-            inputs={"spec.md": spec_in},
             user_prompt=(
-                "Read `./spec.md` and produce a refined specification at "
-                "`./refined-spec.md` following the structure in your agent "
-                "instructions. First run the Pre-clean Pass: if `./spec.md` "
-                "is a noisy Jira/Confluence export, strip it down to just the "
-                "Description and Acceptance Criteria (overwrite `./spec.md`) "
-                "before refining. If it's already a clean narrative spec, "
-                "skip the pre-clean. Ensure a `Requirement ID: REQ-<slug>` "
-                "line is present near the top of the refined spec."
+                "The current `spec.md` content is provided in the inputs "
+                "section below. Produce a refined specification following "
+                "the structure in your agent instructions. First run the "
+                "Pre-clean Pass: if the spec is a noisy Jira/Confluence "
+                "export, mentally strip it down to just the Description and "
+                "Acceptance Criteria before refining. If it's already a "
+                "clean narrative spec, skip the pre-clean. Ensure a "
+                "`Requirement ID: REQ-<slug>` line is present near the top "
+                "of the refined spec. Return only the refined-spec markdown "
+                "body — no preamble, no code fences."
             ),
+            inputs={"spec.md": spec_text},
             output_filename="refined-spec.md",
-            agent_label="refine-spec",
+            output_schema=None,  # markdown output; schema validates projection only
             timeout_s=self.timeout_s,
             step=2,
-            max_turns=15,
-            claude_md=claude_md if claude_md.exists() else None,
+            agent_label="refine-spec",
         )
 
-        produced = wd / "refined-spec.md"
-        if not result.success or not produced.exists():
+        if not result.success or not result.final_text:
             return StepResult(
                 success=False,
                 status="failed",
@@ -118,7 +126,7 @@ class RefineStep(Step):
             )
 
         md_dst = out_dir / "refined-spec.md"
-        shutil.copy2(produced, md_dst)
+        md_dst.write_text(result.final_text, encoding="utf-8")
 
         try:
             projection = _project_to_json(md_dst.read_text(encoding="utf-8"))

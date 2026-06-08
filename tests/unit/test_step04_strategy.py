@@ -17,7 +17,7 @@ from worca_t.steps.s04_strategy import (
 )
 from worca_t.workspace import create_workspace
 
-from ._fake_claude import install_fake_query
+from ._fake_anthropic import install_fake_anthropic
 
 STRATEGY_MD = """\
 # Test Strategy: Login
@@ -117,11 +117,7 @@ def _ctx(tmp_path: Path, *, with_plan: bool = True) -> StepContext:
 
 
 async def test_strategy_step_writes_md_and_validated_json(tmp_path: Path, monkeypatch):
-    install_fake_query(
-        monkeypatch,
-        messages=[{"type": "result", "result": "ok"}],
-        files={"test-strategy.md": STRATEGY_MD},
-    )
+    install_fake_anthropic(monkeypatch, text=STRATEGY_MD)
 
     ctx = _ctx(tmp_path)
     result = await StrategyStep().run(ctx)
@@ -129,6 +125,32 @@ async def test_strategy_step_writes_md_and_validated_json(tmp_path: Path, monkey
     out = ctx.workspace.step_dir(4)
     proj = json.loads((out / "test-strategy.json").read_text(encoding="utf-8"))
     assert len(proj["test_cases"]) >= 2
+
+
+async def test_strategy_step_inlines_plan_and_refined_into_user_prompt(
+    tmp_path: Path, monkeypatch
+):
+    """Plan + refined-spec content must reach the LLM via inlined inputs."""
+    captured: dict = {}
+    install_fake_anthropic(monkeypatch, text=STRATEGY_MD, on_call=captured.update)
+
+    ctx = _ctx(tmp_path)
+    # Overwrite seeded inputs with distinctive markers.
+    (ctx.workspace.step_dir(3) / "plan.md").write_text(
+        "# Plan\n\nPLAN_INLINE_MARKER_111\n", encoding="utf-8"
+    )
+    (ctx.workspace.step_dir(2) / "refined-spec.md").write_text(
+        "# Refined\n\nREFINED_INLINE_MARKER_222\n", encoding="utf-8"
+    )
+
+    result = await StrategyStep().run(ctx)
+    assert result.success
+
+    user_content = captured["messages"][-1]["content"]
+    assert "PLAN_INLINE_MARKER_111" in user_content
+    assert "REFINED_INLINE_MARKER_222" in user_content
+    assert "plan.md" in user_content
+    assert "refined-spec.md" in user_content
 
 
 async def test_strategy_step_requires_plan(tmp_path: Path):
@@ -139,7 +161,7 @@ async def test_strategy_step_requires_plan(tmp_path: Path):
 
 
 async def test_strategy_step_agent_no_output_fails(tmp_path: Path, monkeypatch):
-    install_fake_query(monkeypatch, messages=[{"type": "result", "result": "ok"}], files={})
+    install_fake_anthropic(monkeypatch, text="")
 
     ctx = _ctx(tmp_path)
     result = await StrategyStep().run(ctx)

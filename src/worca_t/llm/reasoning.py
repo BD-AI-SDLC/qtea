@@ -373,4 +373,170 @@ async def call_reasoning_llm(
     )
 
 
-__all__ = ["call_reasoning_llm"]
+# Matches ``base.HITL_MAX_ITERATIONS`` — kept in sync deliberately so both
+# transports cap HITL at the same iteration count.
+_HITL_MAX_ITERATIONS = 3
+
+
+async def call_reasoning_llm_with_hitl(
+    agent_path: Path,
+    *,
+    ctx: Any,
+    workdir: Path,
+    user_prompt: str,
+    inputs: dict[str, str] | None = None,
+    output_filename: str,
+    output_schema: dict | None = None,
+    model: str | None = None,
+    timeout_s: int | None = None,
+    step: int | None = None,
+    agent_label: str,
+    max_iterations: int = _HITL_MAX_ITERATIONS,
+) -> AgentResult:
+    """HITL-aware wrapper around :func:`call_reasoning_llm`.
+
+    Direct-SDK replacement for :func:`worca_t.steps.base.run_agent_with_hitl`.
+    Where the old wrapper re-invoked the agent fresh on each iteration and
+    staged ``user-answers.md`` as a file input, this version conducts a
+    proper multi-turn conversation: iteration 1's user message + assistant
+    response are appended to ``hitl_history`` and replayed on iteration 2,
+    with the user's answers as a new user turn instructing the agent to
+    rewrite the document.
+
+    Behaviour matches :func:`base.run_agent_with_hitl` closely:
+      * Skips the prompt loop when ``ctx.options.no_hitl`` is set
+      * Tracks ``question_key()``-deduped skipped questions across rounds
+        so the user is never re-prompted with the same item
+      * Persists each round's user-answers to ``<workspace>/.hitl-stepNN/``
+        for audit
+      * Caps at ``max_iterations`` (default 3)
+
+    The agent's response text is also written to ``workdir/output_filename``
+    on every iteration so callers can inspect intermediate state and so
+    the audit trail matches today's debug-artifact contract.
+    """
+    # Lazy import — ``worca_t.hitl`` is heavy (rich) and pulls in modules
+    # we'd otherwise not need for non-HITL reasoning calls.
+    from worca_t.hitl import (
+        extract_questions,
+        format_answers_md,
+        prompt_user,
+        question_key,
+        write_answers_file,
+    )
+
+    hitl_disabled = bool(getattr(ctx.options, "no_hitl", False))
+    hitl_dir = (
+        workdir.parent / f".hitl-step{step:02d}" if step
+        else workdir.parent / ".hitl"
+    )
+
+    # Pre-render the iteration-1 user message (prompt + inlined inputs) so
+    # we can later replay it verbatim in ``hitl_history``. After this, we
+    # pass it as a fully-rendered prompt with inputs=None so call_reasoning_llm
+    # does not re-inline.
+    first_user_content = _inline_inputs(user_prompt, inputs)
+    current_prompt = first_user_content
+    current_history: list[dict[str, Any]] | None = None
+    skipped_keys: set[str] = set()
+    result: AgentResult | None = None
+
+    for iteration in range(1, max_iterations + 1):
+        result = await call_reasoning_llm(
+            agent_path=agent_path,
+            workdir=workdir,
+            user_prompt=current_prompt,
+            inputs=None,  # already inlined into current_prompt for iter 1; absent for iter 2+
+            output_schema=output_schema,
+            model=model,
+            timeout_s=timeout_s,
+            step=step,
+            hitl_history=current_history,
+        )
+
+        if not result.success or not result.final_text:
+            return result
+
+        # Persist this iteration's output for downstream inspection and so
+        # step files that still want to read the file artifact can do so.
+        produced = workdir / output_filename
+        try:
+            produced.write_text(result.final_text, encoding="utf-8")
+        except OSError as e:
+            log.warning("hitl.persist_failed", path=str(produced), error=str(e))
+
+        if hitl_disabled:
+            return result
+
+        all_questions = extract_questions(result.final_text)
+        new_questions = [
+            q for q in all_questions if question_key(q) not in skipped_keys
+        ]
+
+        if not new_questions:
+            if all_questions:
+                log.info(
+                    "hitl.only_previously_skipped",
+                    agent=agent_label,
+                    total=len(all_questions),
+                    skipped=len(skipped_keys),
+                )
+            return result
+
+        log.info(
+            "hitl.questions_found",
+            agent=agent_label,
+            iteration=iteration,
+            new=len(new_questions),
+            already_skipped=len(all_questions) - len(new_questions),
+        )
+
+        if iteration >= max_iterations:
+            log.warning(
+                "hitl.max_iterations_reached",
+                agent=agent_label,
+                pending=len(new_questions),
+            )
+            return result
+
+        answers = prompt_user(new_questions, agent_label=agent_label)
+        skipped_this_round = [q for q in new_questions if q.id not in answers]
+        for q in skipped_this_round:
+            skipped_keys.add(question_key(q))
+
+        # Persist user answers for audit (mirrors run_agent_with_hitl).
+        hitl_dir.mkdir(parents=True, exist_ok=True)
+        write_answers_file(
+            hitl_dir, new_questions, answers, skipped=skipped_this_round
+        )
+
+        # Build the next iteration's conversation: append the rendered
+        # user message we sent + the assistant's response, then a new
+        # user turn with the answers.
+        if current_history is None:
+            current_history = []
+        current_history.append({"role": "user", "content": current_prompt})
+        current_history.append({"role": "assistant", "content": result.final_text})
+
+        answers_md = format_answers_md(
+            new_questions, answers, skipped=skipped_this_round
+        )
+        current_prompt = (
+            f"The user has reviewed your clarification questions. Their "
+            f"responses (and any items they chose to skip) are below.\n\n"
+            f"{answers_md}\n\n"
+            f"- For ANSWERED items: incorporate the answer and remove the "
+            f"corresponding `[CLARIFICATION NEEDED]` tag, blocker row, or "
+            f"open-question entry.\n"
+            f"- For SKIPPED items: make a reasonable assumption, mark it "
+            f"inline with `[ASSUMPTION: ...]`, and remove the original "
+            f"`[CLARIFICATION NEEDED]` tag. **Do NOT re-emit "
+            f"`[CLARIFICATION NEEDED]` for skipped items.**\n\n"
+            f"Rewrite the document above accordingly. Keep the rest of "
+            f"the document intact. Return only the updated document."
+        )
+
+    return result  # pragma: no cover (loop always returns inside)
+
+
+__all__ = ["call_reasoning_llm", "call_reasoning_llm_with_hitl"]
