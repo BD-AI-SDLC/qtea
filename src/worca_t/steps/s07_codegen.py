@@ -1,34 +1,146 @@
 """Step 7: TDD codegen via ui-test-automation.
 
-Inputs: test-strategy.md, plan.md, research.md (+ refined-spec.md).
+Inputs: test-strategy.md (step 4) + research.md + sut_inventory.json (step 6).
+Deliberately NOT included: plan.md and refined-spec.md — both are upstream
+artifacts that test-strategy.md was derived from; staging them only inflates
+the agent's context with redundant information.
+
 Behavior:
-  1. Stage inputs + the matching skill (`playwright-generate-test` if pw stack,
-     else `webapp-testing`) plus the agent prompt.md sidecar.
-  2. Run the agent; it MUST write generated tests under `./tests/`.
-  3. Copy `tests/` into artifacts/step07/tests/.
-  4. Index the result via `test_indexer.index_tests`.
-  5. Enforce non-negotiable rules: if any violation -> FAIL the step.
+  1. Pre-flight: SUT exists, sut_inventory.json present, inventory's
+     referenced files actually reachable under `<workspace>/sut/`. Any
+     miss → fail in <1s instead of waiting on a 1800s agent timeout.
+  2. Stage planning artifacts into the step workdir (the agent reads
+     them via cwd-relative paths).
+  3. Run the agent with `add_dirs=[<workspace>/sut/]` so it can write
+     generated tests + page objects DIRECTLY into the SUT clone on the
+     `worca-t/run-<id>` branch (no per-step copy).
+  4. Index the SUT, filter to `worca_*`-prefixed files (the agent's
+     filename-collision convention), enforce non-negotiable rules.
+  5. Commit the step's changes to the worca-t branch.
 
 Outputs (artifacts/step07/):
-  - tests/...                 (mirrored test source files)
-  - tests-with-tbd.json       (index + violations)
+  - tbd-index.json            (worca-only index + violations)
+  - generated-files.json      (SUT-relative paths of files this step wrote)
   - violations.log            (only when violations exist)
+
+The generated test bytes live in `<workspace>/sut/` on the branch —
+review via `git diff worca-t/run-<id>` rather than reading a duplicate copy.
 """
 
 from __future__ import annotations
 
 import json
-import shutil
+from dataclasses import replace
 from pathlib import Path
 
+from worca_t._sut_git import commit_step
 from worca_t.claude_runner import run_agent
 from worca_t.config import package_resource_root, step_timeout
 from worca_t.logging_setup import get_logger
 from worca_t.schemas import is_valid
 from worca_t.steps.base import Step, StepContext, StepResult
-from worca_t.test_indexer import index_tests, resolve_framework, violations_summary
+from worca_t.test_indexer import IndexResult, index_tests, resolve_framework, violations_summary
 
 log = get_logger(__name__)
+
+
+def _vendor_jit_runtime(sut_root: Path) -> Path | None:
+    """Copy the worca-t JIT runtime template into `<sut>/tests/worca_t_runtime.py`.
+
+    Returns the destination path on success, or None if the template can't be
+    located (best-effort — the absence is logged and Step 8's JIT short-circuit
+    won't fire, so the legacy agent-navigation path runs instead).
+    """
+    template = (
+        package_resource_root() / "_resources" / "runtime" / "worca_t_runtime.py.tpl"
+    )
+    if not template.is_file():
+        # Dev tree may not have the template under _resources (e.g. when
+        # WORCA_T_RESOURCE_ROOT points at the repo root). Try src/.
+        alt = (
+            package_resource_root() / "src" / "worca_t" / "_resources"
+            / "runtime" / "worca_t_runtime.py.tpl"
+        )
+        if alt.is_file():
+            template = alt
+        else:
+            log.warning(
+                "step07.jit_runtime_template_missing",
+                tried=[str(template), str(alt)],
+                hint="Step 8 will run the legacy agent-navigation flow.",
+            )
+            return None
+    dest_dir = sut_root / "tests"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / "worca_t_runtime.py"
+    try:
+        dest.write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
+        log.info("step07.jit_runtime_vendored", path=str(dest))
+        return dest
+    except OSError as e:
+        log.warning("step07.jit_runtime_vendor_failed", error=str(e))
+        return None
+
+
+def _ensure_conftest_registers_runtime(sut_root: Path) -> None:
+    """Make sure at least one conftest.py under `<sut>/tests/` has
+    `pytest_plugins` referencing `tests.worca_t_runtime`.
+
+    Idempotent — if a conftest already registers it, no change. If no
+    conftest exists at the tests/ root, creates a minimal one. If a
+    conftest exists but doesn't register the plugin, appends the
+    registration line.
+    """
+    tests_dir = sut_root / "tests"
+    if not tests_dir.is_dir():
+        return
+    conftest = tests_dir / "conftest.py"
+    plugin_line = 'pytest_plugins = ["tests.worca_t_runtime"]\n'
+    if not conftest.exists():
+        conftest.write_text(
+            "# worca-t generated: registers the JIT locator runtime plugin\n"
+            + plugin_line,
+            encoding="utf-8",
+        )
+        log.info("step07.jit_conftest_created", path=str(conftest))
+        return
+    try:
+        existing = conftest.read_text(encoding="utf-8")
+    except OSError:
+        return
+    if "tests.worca_t_runtime" in existing:
+        return
+    if "pytest_plugins" in existing:
+        # A pytest_plugins list already exists; append the runtime entry
+        # by replacing the first list-bracket close, best-effort. If the
+        # format is too exotic, fall through to an extra assignment line
+        # (pytest tolerates multiple assignments — last one wins, so put
+        # ours last with the merged content if we can detect a simple list).
+        import re as _re
+        m = _re.search(
+            r"pytest_plugins\s*=\s*\[(?P<items>[^\]]*)\]",
+            existing,
+        )
+        if m:
+            items = m.group("items").strip()
+            new_items = (
+                items + ', "tests.worca_t_runtime"' if items
+                else '"tests.worca_t_runtime"'
+            )
+            replaced = (
+                existing[:m.start()] + f'pytest_plugins = [{new_items}]'
+                + existing[m.end():]
+            )
+            conftest.write_text(replaced, encoding="utf-8")
+            log.info("step07.jit_conftest_extended", path=str(conftest))
+            return
+    # No pytest_plugins detected, or detection didn't match — append a line.
+    with conftest.open("a", encoding="utf-8") as f:
+        if not existing.endswith("\n"):
+            f.write("\n")
+        f.write("\n# worca-t: register the JIT locator runtime plugin\n")
+        f.write(plugin_line)
+    log.info("step07.jit_conftest_appended", path=str(conftest))
 
 
 def _read_research(ctx: StepContext) -> dict:
@@ -53,6 +165,86 @@ def _select_skills(detected_stack: str | None) -> list[str]:
     return ["webapp-testing"]
 
 
+def _active_module_dict(sut_inventory_dict: dict) -> dict | None:
+    """Pull the active module entry out of a raw `sut_inventory` dict.
+
+    Returns None when the inventory has no `active_module` set or the name
+    doesn't match any entry. Tolerant of missing keys so an older
+    research.json (no `sut_inventory` block) won't crash the step.
+    """
+    active = sut_inventory_dict.get("active_module")
+    if not active:
+        return None
+    for mod in sut_inventory_dict.get("modules") or []:
+        if isinstance(mod, dict) and mod.get("name") == active:
+            return mod
+    return None
+
+
+def _inventory_files(active_module: dict | None) -> list[str]:
+    """Return SUT-relative paths the active module says exist.
+
+    Pulled from `auth_flow`, `existing_page_objects`, `existing_fixtures`,
+    `existing_helpers`, `existing_locators` — the same set the previous
+    `_sut_staging.collect_sut_files` helper built. Used by the pre-flight
+    to verify the clone actually contains what step 6 said it would.
+    """
+    if not active_module:
+        return []
+    paths: list[str] = []
+
+    auth = active_module.get("auth_flow") or {}
+    for key in ("entry_method", "fixture_entry"):
+        v = auth.get(key)
+        if isinstance(v, str) and v:
+            # `<file>:<class>.<method>` or `<file>:<func>` → `<file>`
+            paths.append(v.split(":", 1)[0])
+
+    for bucket in ("existing_page_objects", "existing_fixtures",
+                   "existing_helpers", "existing_locators"):
+        for entry in active_module.get(bucket) or []:
+            p = entry.get("file") if isinstance(entry, dict) else None
+            if p:
+                paths.append(p)
+
+    # Dedup, preserve order.
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in paths:
+        if p and p not in seen and Path(p).name != "__init__.py":
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def _is_worca_file(rel: str) -> bool:
+    """True for paths whose basename matches the agent's `worca_`/`Worca` convention."""
+    name = Path(rel).name.lower()
+    return name.startswith("worca")
+
+
+def _filter_index_to_worca(index: IndexResult, sut_root: Path) -> IndexResult:
+    """Return a new IndexResult containing only worca-prefixed entries.
+
+    `index_tests` walks the whole SUT and picks up the SUT's own pre-existing
+    tests / locators alongside worca-generated ones. The user-facing tbd-index
+    must reflect only what worca-t produced, otherwise Step 7's "tests=N" gate
+    and Step 8's TBD-resolution would race against unrelated SUT code.
+    """
+    files = [f for f in index.files if _is_worca_file(f)]
+    tests = [t for t in index.tests if _is_worca_file(t.file)]
+    support_files = [s for s in index.support_files if _is_worca_file(s.file)]
+    violations = [v for v in index.violations if _is_worca_file(v.file)]
+    return replace(
+        index,
+        test_root=str(sut_root),
+        files=files,
+        tests=tests,
+        support_files=support_files,
+        violations=violations,
+    )
+
+
 class CodegenStep(Step):
     number = 7
     name = "codegen"
@@ -62,12 +254,29 @@ class CodegenStep(Step):
         out_dir = self.out_dir(ctx.workspace)
         wd = self.workdir(ctx.workspace)
         wd.mkdir(parents=True, exist_ok=True)
+        sut_root = ctx.workspace.sut.resolve()
+
+        # --- Pre-flight (fail in <1s) ---------------------------------------
+
+        # A: SUT must be materialized. Pipeline materializes eagerly, but a
+        # rogue `--from-step 7` on a workspace whose `<workspace>/sut/` was
+        # manually deleted would otherwise burn the full step timeout.
+        if not sut_root.exists() or not any(sut_root.iterdir()):
+            return StepResult(
+                success=False,
+                status="failed",
+                outputs=[],
+                error=(
+                    f"SUT not found at {sut_root}. Re-run the pipeline from "
+                    f"step 1 (drop --from-step) to re-materialize the clone."
+                ),
+            )
 
         strategy_md = ctx.workspace.step_dir(4) / "test-strategy.md"
-        plan_md = ctx.workspace.step_dir(3) / "plan.md"
         research_md = ctx.workspace.step_dir(6) / "research.md"
-        refined_md = ctx.workspace.step_dir(2) / "refined-spec.md"
+        sut_inv_json = ctx.workspace.step_dir(6) / "sut_inventory.json"
 
+        # B: planning artifacts required by the agent.
         if not strategy_md.exists():
             return StepResult(
                 success=False,
@@ -76,17 +285,85 @@ class CodegenStep(Step):
                 error=f"missing {strategy_md}; run step 4 first",
             )
 
-        inputs = {"test-strategy.md": strategy_md}
-        if plan_md.exists():
-            inputs["plan.md"] = plan_md
-        if research_md.exists():
-            inputs["research.md"] = research_md
-        if refined_md.exists():
-            inputs["refined-spec.md"] = refined_md
+        # C: step 6 must have run. Without sut_inventory.json the codegen
+        # prompt has no active-module context — the agent would have to
+        # re-scan the SUT, which is exactly what we built step 6 to avoid.
+        # Caught here because `--only-step 7` on a fresh workspace is a
+        # common debugging pattern that previously fell through to a confused
+        # agent and a slow timeout.
+        if not sut_inv_json.exists():
+            return StepResult(
+                success=False,
+                status="failed",
+                outputs=[],
+                error=(
+                    "step 7 requires sut_inventory.json from step 6. Run "
+                    "step 6 first (e.g. drop --only-step 7, or use "
+                    "--from-step 6)."
+                ),
+            )
 
         research = _read_research(ctx)
         detected_stack = research.get("detected_stack")
         sut_env_keys = research.get("sut_env_keys") or []
+        sut_inventory_dict = research.get("sut_inventory") or {}
+        active_module_dict = _active_module_dict(sut_inventory_dict)
+
+        # D: when an active module exists, its referenced page-objects /
+        # locators / helpers / auth-flow files must actually live under
+        # `<workspace>/sut/`. A non-empty inventory + zero reachable files
+        # means the clone is incomplete (e.g. shallow-clone dropped a
+        # submodule) — abort cleanly with the count + first-missing path.
+        expected_inventory_files = _inventory_files(active_module_dict)
+        if expected_inventory_files:
+            missing = [p for p in expected_inventory_files
+                       if not (sut_root / p).is_file()]
+            if len(missing) == len(expected_inventory_files):
+                return StepResult(
+                    success=False,
+                    status="failed",
+                    outputs=[],
+                    error=(
+                        f"SUT inventory references {len(expected_inventory_files)} "
+                        f"files; 0 of them found under {sut_root} (first "
+                        f"missing: {missing[0]}). The clone may be incomplete "
+                        f"or step 6 ran against a different SUT — re-run "
+                        f"step 6."
+                    ),
+                )
+
+        # --- Stage planning artifacts (no SUT bytes) ------------------------
+        #
+        # Minimum-sufficient input set, ranked by authority:
+        #   - test-strategy.md (step 4): the curated, authoritative test
+        #     specification. Includes the test cases the agent must implement.
+        #   - research.md (step 6): the SUT discovery narrative — frameworks,
+        #     env vars, build/test commands, README excerpts. Not all of this
+        #     is in the structured `research.json` projection, so the agent
+        #     reads the prose.
+        #   - sut_inventory.json + active_module.json (step 6): the SUT's
+        #     own layout (existing page objects, fixtures, locators, helpers).
+        #
+        # Deliberately NOT staged (redundant with test-strategy.md, which is
+        # derived from them): plan.md (step 3), refined-spec.md (step 2).
+        # The codegen agent doesn't need to re-derive the spec — it needs the
+        # spec's curated downstream form.
+        inputs = {"test-strategy.md": strategy_md}
+        if research_md.exists():
+            inputs["research.md"] = research_md
+        if sut_inv_json.exists():
+            inputs["sut_inventory.json"] = sut_inv_json
+
+        # Write a single-fact pointer (active_module.json) directly into the
+        # agent's workdir so the prompt can reference it as `./active_module.json`.
+        # Do NOT register it in `inputs` — `inputs` is for files that must be
+        # copied IN from outside the workdir, and copying a file to itself
+        # fails on Windows with [WinError 32].
+        if active_module_dict:
+            (wd / "active_module.json").write_text(
+                json.dumps(active_module_dict, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
 
         agents_root = package_resource_root() / "agents"
         skills_root = package_resource_root() / "skills"
@@ -111,54 +388,262 @@ class CodegenStep(Step):
                 f"Never hardcode their values."
             )
 
+        # Reuse + folder integration: when an active module is known, tell the
+        # agent which language to write in, which directories to land each
+        # category of file in (tests vs production code), and which existing
+        # page objects/helpers/fixtures it MUST extend rather than re-implement.
+        # The agent writes ABSOLUTE paths under `<workspace>/sut/` (granted via
+        # `add_dirs=[sut_root]`) — tests + fixtures + data into the SUT's own
+        # test directory, page objects + locators into its src tree. The
+        # `worca_` filename prefix prevents collisions with the SUT's own files
+        # and lets Step 9's runner + indexer pick up only our generated tests.
+        isolated = bool(getattr(ctx.options, "isolated_tests", False))
+        reuse_hint = ""
+        if active_module_dict:
+            am = active_module_dict
+            layout = am.get("test_directory_layout") or {}
+            src_layout = am.get("src_directory_layout") or {}
+            base_dir = layout.get("base_dir") or "tests"
+            default_target = layout.get("default_target") or base_dir
+            language = am.get("language") or "unknown"
+            page_objects = am.get("existing_page_objects") or []
+            helpers = am.get("existing_helpers") or []
+            fixtures = am.get("existing_fixtures") or []
+            locator_classes = am.get("existing_locators") or []
+
+            # The agent writes via absolute paths under the canonical SUT
+            # clone (granted via `add_dirs=[sut_root]`). Build the module-rooted
+            # absolute path for each per-category target so the prompt can
+            # spell out exactly where each kind of file goes — no relative
+            # `./tests/`-style guessing that depends on cwd.
+            module_path = am.get("path") or "."
+            module_root = sut_root if module_path == "." else (sut_root / module_path)
+
+            po_lines = "\n".join(
+                f"  - `{p.get('name')}` ({p.get('scope', 'generic')}) at "
+                f"`{p.get('file')}` — methods: {', '.join((p.get('methods') or [])[:8])}"
+                for p in page_objects[:20]
+            ) or "  (none discovered)"
+            fixture_lines = "\n".join(
+                f"  - `{f.get('name')}` at `{f.get('file')}` "
+                f"(scope={f.get('scope', 'function')})"
+                for f in fixtures[:15]
+            ) or "  (none discovered)"
+            helper_lines = "\n".join(
+                f"  - `{h.get('name')}` at `{h.get('file')}`"
+                for h in helpers[:15]
+            ) or "  (none discovered)"
+            # Existing locator classes — the per-class constant list is what
+            # prevents the agent from inventing byte-identical duplicates
+            # (the LOCALE_SWITCHER / LANGUAGE_DROP_DOWN issue from the
+            # 20260601-212148 run). Cap visible constants per class at 25
+            # to keep the prompt bounded; the absolute path to the full file
+            # lets the agent grep for the rest when it needs them.
+            _MAX_VISIBLE_CONSTS_PER_CLASS = 25
+            if locator_classes:
+                lc_blocks: list[str] = []
+                for lc in locator_classes[:10]:
+                    consts = lc.get("constants") or []
+                    visible = consts[:_MAX_VISIBLE_CONSTS_PER_CLASS]
+                    const_lines = "\n".join(
+                        f"      - `{c.get('name')} = {c.get('selector')!r}`"
+                        for c in visible
+                    )
+                    hidden_remainder = max(
+                        0,
+                        len(consts) - len(visible)
+                        + int(lc.get("truncated_count") or 0),
+                    )
+                    full_file_path = sut_root / (lc.get("file") or "")
+                    tail = (
+                        f"\n      - … {hidden_remainder} more (read "
+                        f"`{full_file_path}` for the full list)"
+                        if hidden_remainder > 0 else ""
+                    )
+                    lc_blocks.append(
+                        f"  - **`{lc.get('class_name')}`** "
+                        f"@ `{lc.get('file')}`:\n{const_lines}{tail}"
+                    )
+                locator_lines = "\n".join(lc_blocks)
+            else:
+                locator_lines = "  (none discovered)"
+            subdir_lines = "\n".join(
+                f"  - `{s.get('path')}` (kind={s.get('kind')})"
+                for s in (layout.get("subdirs") or [])
+            ) or "  (none)"
+
+            # Per-category placement table — absolute paths anchored at the
+            # SUT root. Falls back to test-folder if the src layout wasn't
+            # detected (greenfield TS/JS, or unknown lang).
+            pages_object_dir = src_layout.get("pages_object_dir") or f"{base_dir}/pages/object"
+            pages_locators_dir = src_layout.get("pages_locators_dir") or f"{base_dir}/pages/locators"
+            helpers_dir = src_layout.get("helpers_dir") or f"{base_dir}/helpers"
+            fixtures_dir = f"{base_dir}/fixtures"  # fixtures always under tests/
+            data_dir = f"{base_dir}/data"
+
+            # `--isolated-tests` opts into a dedicated `worca-tests/` subdir
+            # for the test files (Step 9's runner mirrors this resolution).
+            # Page objects + locators + helpers still go under the SUT's src
+            # tree in both modes — they have no parallel "isolated" home and
+            # the worca_ prefix already prevents file collisions.
+            tests_subdir = "worca-tests" if isolated else default_target
+            abs_tests = module_root / tests_subdir
+            abs_data = module_root / (
+                f"{tests_subdir}/data" if isolated else data_dir
+            )
+            abs_fixtures = module_root / (
+                f"{tests_subdir}/fixtures" if isolated else fixtures_dir
+            )
+            abs_pages_object = module_root / pages_object_dir
+            abs_pages_locators = module_root / pages_locators_dir
+            abs_helpers = module_root / helpers_dir
+
+            reuse_hint = (
+                f"\n\n--- ACTIVE MODULE (from `./sut_inventory.json` / "
+                f"`./active_module.json`) ---\n"
+                f"Name: `{am.get('name')}`  Path: `{am.get('path')}`  "
+                f"Language: `{language}`  Package manager: "
+                f"`{am.get('package_manager') or 'unknown'}`\n\n"
+                f"SUT clone (read + write directly here — you have `add_dirs` "
+                f"access; all file paths in the lists below are relative to "
+                f"this root): `{sut_root}`\n\n"
+                f"Test directory layout: `{base_dir}` "
+                f"(convention: {layout.get('convention', 'unknown')}, "
+                f"default target: `{default_target}`)\n"
+                f"Subdirs:\n{subdir_lines}\n\n"
+                f"Src directory layout "
+                f"(source: {src_layout.get('convention_source', 'unknown')}):\n"
+                f"  - package_root: `{src_layout.get('package_root') or '(none)'}`\n"
+                f"  - pages_object_dir: `{pages_object_dir}`\n"
+                f"  - pages_locators_dir: `{pages_locators_dir}`\n"
+                f"  - helpers_dir: `{helpers_dir}`\n\n"
+                f"EXISTING PAGE OBJECTS (reuse these — do NOT redefine):\n"
+                f"{po_lines}\n\n"
+                f"EXISTING FIXTURES:\n{fixture_lines}\n\n"
+                f"EXISTING HELPERS:\n{helper_lines}\n\n"
+                f"EXISTING LOCATORS (reuse these constants — do NOT redefine "
+                f"byte-identical selectors in a new locator class):\n"
+                f"{locator_lines}\n\n"
+                f"--- REUSE RULES (non-negotiable) ---\n"
+                f"1. Before writing any page-object class, helper, fixture, or "
+                f"**locator constant**, check the lists above. If an existing "
+                f"class/method/constant covers the behavior you need, **import "
+                f"and extend it** — do not redefine. A locator constant whose "
+                f"selector string matches an existing one byte-for-byte is "
+                f"ALWAYS a reuse violation: import the existing constant "
+                f"(e.g. `from <pkg>.pages.locators.chat_page_locators import "
+                f"ChatPageLocators`) instead of redeclaring it.\n"
+                f"2. If you must write new code, add a one-line docstring "
+                f"justification (e.g. `\"\"\"New: SUT has no fixture for locale "
+                f"switching.\"\"\"`).\n"
+                f"3. **File placement is per-category** — write each kind of "
+                f"file at its ABSOLUTE path under the SUT clone. The pipeline "
+                f"does NOT copy your output anywhere afterwards — the SUT IS "
+                f"the deliverable, on a worca-t-owned git branch. Specifically:\n"
+                f"   - Test files → `{abs_tests}/worca_test_<feature>.<ext>`\n"
+                f"   - Test data → `{abs_data}/worca_<feature>_data.<ext>`\n"
+                f"   - Fixtures → `{abs_fixtures}/worca_<feature>_fixture.<ext>`\n"
+                f"   - Page objects → `{abs_pages_object}/worca_<feature>_page.<ext>`\n"
+                f"   - Locators → `{abs_pages_locators}/worca_<feature>_locators.<ext>`\n"
+                f"   - Helpers → `{abs_helpers}/worca_<feature>_helper.<ext>`\n"
+                f"   Prefix EVERY generated filename with `worca_` so collisions "
+                f"with the SUT's own files stay at zero. Use the Write tool with "
+                f"those absolute paths directly — do NOT write into "
+                f"`./tests/` or `./src/` relative to your cwd, since your cwd "
+                f"is the worca-t step workdir, NOT the SUT.\n"
+                f"4. Match the active module's language: `{language}`. Never "
+                f"emit Python tests for a TypeScript module or vice versa.\n"
+            )
+
         result = await run_agent(
             agent,
             workdir=wd,
             inputs=inputs,
             user_prompt=(
-                f"{stack_hint}Read the staged `./test-strategy.md` (and `./plan.md`, "
-                f"`./research.md`, `./refined-spec.md` if present). Generate "
-                f"executable test code under `./tests/` according to your "
-                f"agent prompt (ui-test-automation.prompt.md). "
-                f"Use the framework matching the detected stack. "
-                f"Hard rules: locator priority `id > data-testid > role > "
-                f"label > text > placeholder > scoped css`; NO XPath; NO hard "
-                f"waits (no `time.sleep`, no `cy.wait(<number>)`, no "
+                f"{stack_hint}**Stack already resolved by Step 6 — do NOT re-scan the SUT.** "
+                f"Read `./active_module.json` and `./sut_inventory.json` first; the "
+                f"language, package_manager, existing page objects, helpers, "
+                f"fixtures, and test directory layout for the active module are "
+                f"all there. Then read `./test-strategy.md` (the authoritative "
+                f"test specification) and `./research.md` (the SUT discovery "
+                f"narrative — frameworks, env vars, build/test commands). The SUT "
+                f"clone you are testing is at the absolute path `{sut_root}` "
+                f"(read it directly via Read/Grep/Glob — no copy is staged in "
+                f"your working directory). Generate executable test code by "
+                f"writing files at their ABSOLUTE paths under `{sut_root}/` "
+                f"(see the per-category placement table below). The pipeline "
+                f"does NOT copy your output anywhere — your writes ARE the "
+                f"deliverable. Hard rules: locator priority `id > data-testid > "
+                f"role > label > text > placeholder > scoped css`; NO XPath; "
+                f"NO hard waits (no `time.sleep`, no `cy.wait(<number>)`, no "
                 f"`waitForTimeout`); NO `page.content()` - use AOM snapshots; "
                 f"no inline credentials. Mark unresolved selectors with the "
                 f"literal `TBD_LOCATOR` so the locator-resolution step can "
-                f"replace them.{env_hint}"
+                f"replace them.{env_hint}{reuse_hint}"
             ),
             extra_paths=extras,
+            add_dirs=[sut_root],
             timeout_s=self.timeout_s,
             step=7,
             max_turns=40,
             claude_md=claude_md if claude_md.exists() else None,
         )
 
-        produced = wd / "tests"
-        if not result.success or not produced.exists() or not any(produced.rglob("*")):
+        # The agent now writes ABSOLUTE paths under `<workspace>/sut/` via
+        # `add_dirs=[sut_root]`. Detect what it produced by walking the SUT
+        # for the `worca_` filename convention (enforced in the prompt and
+        # by the indexer's worca_ globs in `test_indexer._TEST_FILE_GLOBS`).
+        produced_in_sut: list[Path] = sorted(
+            p for p in sut_root.rglob("worca_*")
+            if p.is_file() and ".git" not in p.parts
+        )
+        # Capitalised Java pattern (`Worca*Test.java`) — search separately
+        # since the lowercase glob above misses it.
+        produced_in_sut.extend(sorted(
+            p for p in sut_root.rglob("Worca*")
+            if p.is_file() and ".git" not in p.parts and p not in produced_in_sut
+        ))
+        if not result.success or not produced_in_sut:
             return StepResult(
                 success=False,
                 status="failed",
                 outputs=[],
-                error=result.error or "agent did not produce any files under ./tests/",
+                error=(
+                    result.error or
+                    f"agent did not produce any worca_*-prefixed files under {sut_root}"
+                ),
             )
 
-        # Mirror tests into the artifact dir for stable downstream references.
-        tests_dst = out_dir / "tests"
-        if tests_dst.exists():
-            shutil.rmtree(tests_dst)
-        shutil.copytree(produced, tests_dst)
-
-        framework = resolve_framework(detected_stack, tests_dst)
-        index = index_tests(tests_dst, framework=framework)
+        # Index the SUT clone, then filter to ONLY worca-prefixed entries so
+        # the SUT's own pre-existing tests don't pollute our tbd-index or
+        # trigger rule-violation reports for code we didn't write.
+        framework = resolve_framework(detected_stack, sut_root)
+        full_index = index_tests(sut_root, framework=framework)
+        index = _filter_index_to_worca(full_index, sut_root)
         payload = index.as_dict()
 
-        index_path = out_dir / "tests-with-tbd.json"
-        index_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        index_path = out_dir / "tbd-index.json"
+        index_path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
-        ok_schema, schema_err = is_valid(payload, "tests-with-tbd")
+        # Manifest: SUT-relative paths of every file the agent produced. Lets
+        # downstream steps and human reviewers see the deliverable without
+        # walking the SUT tree.
+        generated_manifest = {
+            "sut_root": str(sut_root),
+            "branch": f"worca-t/run-{ctx.workspace.run_id}",
+            "files": [str(p.relative_to(sut_root).as_posix())
+                      for p in produced_in_sut],
+        }
+        manifest_path = out_dir / "generated-files.json"
+        manifest_path.write_text(
+            json.dumps(generated_manifest, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        ok_schema, schema_err = is_valid(payload, "tbd-index")
         if not ok_schema:
             log.warning("step07.schema_invalid", error=schema_err)
 
@@ -173,28 +658,63 @@ class CodegenStep(Step):
             return StepResult(
                 success=False,
                 status="failed",
-                outputs=[index_path, out_dir / "violations.log"],
+                outputs=[index_path, manifest_path, out_dir / "violations.log"],
                 error=f"non-negotiable rule violations: {len(index.violations)}",
                 notes=summary[:500],
             )
 
+        # Phase gate: indexer must find at least one real test function.
+        # Support files (page objects / locators with TBDs) alone don't
+        # count — the user wants actual test coverage, not just scaffolding.
         if not index.tests:
             return StepResult(
                 success=False,
                 status="failed",
-                outputs=[index_path],
-                error="indexer found 0 tests in produced output",
+                outputs=[index_path, manifest_path],
+                error=(
+                    f"indexer found 0 worca_*-prefixed test functions under "
+                    f"{sut_root} (support files: {len(index.support_files)}, "
+                    f"total generated: {len(produced_in_sut)}). The agent "
+                    f"may have written only locator/page-object scaffolding. "
+                    f"Inspect the worca_ files listed in generated-files.json."
+                ),
             )
 
+        # JIT runtime vendoring — for Python+pytest+Playwright SUTs only.
+        # Copy `worca_t_runtime.py` into the SUT's tests/ directory so the
+        # pytest plugin can resolve TBD sentinels (`tbd("...")`) at runtime
+        # against the live Playwright page. Add it to the manifest so it's
+        # committed alongside the codegen output.
+        jit_runtime_added: Path | None = None
+        if framework in {"pytest", "playwright-py"}:
+            jit_runtime_added = _vendor_jit_runtime(sut_root)
+            if jit_runtime_added is not None:
+                produced_in_sut.append(jit_runtime_added)
+                _ensure_conftest_registers_runtime(sut_root)
+
+        # Commit the agent's work to the worca-t branch. Per-step commits
+        # give the human reviewer a clear `git log` trail of who-wrote-what.
+        sha = commit_step(
+            sut_root, self.number, self.name,
+            message_detail=f"{len(produced_in_sut)} files, {len(index.tests)} tests",
+        )
+
+        total_tbd = (
+            sum(len(t.tbd_markers) for t in index.tests)
+            + sum(len(s.tbd_markers) for s in index.support_files)
+        )
         notes = (
             f"framework={framework} files={len(index.files)} "
-            f"tests={len(index.tests)} tbd={sum(len(t.tbd_markers) for t in index.tests)}"
+            f"tests={len(index.tests)} "
+            f"support_files={len(index.support_files)} tbd={total_tbd}"
         )
+        if sha:
+            notes += f" commit={sha}"
         if not ok_schema:
             notes += f"; schema_warning={schema_err}"
         return StepResult(
             success=True,
             status="completed" if ok_schema else "warned",
-            outputs=[index_path, tests_dst],
+            outputs=[index_path, manifest_path],
             notes=notes,
         )

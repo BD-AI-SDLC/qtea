@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worca-t/schemas/tbd-index.schema.json",
+  "title": "TBDIndex",
+  "description": "Index of files containing TBD markers after Step 7 codegen (and re-indexed after Step 8 patching). Separates actual test functions from support files (page objects, locators, helpers) that happen to carry TBDs.",
+  "type": "object",
+  "required": ["framework", "tests"],
+  "additionalProperties": true,
+  "properties": {
+    "framework": {
+      "type": "string",
+      "enum": [
+        "playwright-ts",
+        "playwright-py",
+        "pytest",
+        "cypress",
+        "selenium-java",
+        "selenium-py",
+        "robot",
+        "jest",
+        "vitest",
+        "mocha",
+        "wdio",
+        "unknown"
+      ]
+    },
+    "test_root": { "type": "string" },
+    "totals": {
+      "type": "object",
+      "properties": {
+        "files": { "type": "integer", "minimum": 0 },
+        "tests": { "type": "integer", "minimum": 0, "description": "Count of actual test function files (legacy alias of total_tests)." },
+        "total_tests": { "type": "integer", "minimum": 0, "description": "Count of actual test function files in `tests[]`." },
+        "total_support_files": { "type": "integer", "minimum": 0, "description": "Count of support files (page objects / locators / helpers) with TBD markers in `support_files[]`." },
+        "tbd_locators": { "type": "integer", "minimum": 0, "description": "Total TBD markers across tests + support_files." }
+      }
+    },
+    "files": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "tests": {
+      "type": "array",
+      "description": "Files containing actual test functions (matching framework's _TEST_FILE_GLOBS). May or may not carry TBD markers.",
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "file", "status"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "name": { "type": "string" },
+          "file": { "type": "string" },
+          "line": { "type": ["integer", "null"], "minimum": 1 },
+          "status": { "type": "string", "enum": ["pending", "ready", "skipped"] },
+          "tags": { "type": "array", "items": { "type": "string" } },
+          "tc_refs": { "type": "array", "items": { "type": "string" } },
+          "locator_candidates": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["raw", "strategy"],
+              "properties": {
+                "raw": { "type": "string" },
+                "strategy": {
+                  "type": "string",
+                  "enum": [
+                    "id",
+                    "data-testid",
+                    "role",
+                    "label",
+                    "text",
+                    "placeholder",
+                    "css",
+                    "tbd",
+                    "unknown"
+                  ]
+                },
+                "value": { "type": ["string", "null"] },
+                "line": { "type": ["integer", "null"] }
+              }
+            }
+          },
+          "tbd_markers": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["line", "raw"],
+              "properties": {
+                "line": { "type": "integer" },
+                "raw": { "type": "string" },
+                "context": { "type": ["string", "null"] },
+                "description": {
+                  "type": ["string", "null"],
+                  "description": "Optional one-line semantic intent of the locator, populated when the codegen agent attaches a `TBD_INTENT: ...` comment next to the marker. Lets Step 8a's resolver target the right element instead of re-deriving intent from the surrounding code on every run. Absent on older runs — Step 8a falls back to constant name + line context when missing."
+                },
+                "test_function": {
+                  "type": ["string", "null"],
+                  "description": "Optional name of the surrounding test function (e.g. `test_login_with_valid_credentials`) captured by the indexer. Useful additional context for Step 8a when `description` is sparse."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "support_files": {
+      "type": "array",
+      "description": "Files with TBD markers that are NOT test functions: page objects, locators, helpers, fixtures. Step 8 patches TBDs in both `tests[]` and `support_files[]` uniformly.",
+      "items": {
+        "type": "object",
+        "required": ["name", "file", "tbd_markers"],
+        "properties": {
+          "name": { "type": "string" },
+          "file": { "type": "string" },
+          "kind": {
+            "type": "string",
+            "enum": ["locators", "page_object", "helper", "fixture", "other"]
+          },
+          "tbd_markers": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["line", "raw"],
+              "properties": {
+                "line": { "type": "integer" },
+                "raw": { "type": "string" },
+                "context": { "type": ["string", "null"] },
+                "description": {
+                  "type": ["string", "null"],
+                  "description": "Optional one-line semantic intent of the locator (see `tests[].tbd_markers[].description` for the full definition)."
+                },
+                "test_function": {
+                  "type": ["string", "null"],
+                  "description": "Optional surrounding-function name. Often null for support files where TBD markers live at module scope."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "violations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["rule", "file", "line", "snippet"],
+        "properties": {
+          "rule": {
+            "type": "string",
+            "enum": ["xpath", "hard-wait", "page-content", "raw-secret"]
+          },
+          "file": { "type": "string" },
+          "line": { "type": "integer" },
+          "snippet": { "type": "string" }
+        }
+      }
+    }
+  }
+}

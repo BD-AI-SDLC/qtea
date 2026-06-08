@@ -306,3 +306,233 @@ def test_index_as_dict_matches_schema_shape(tmp_path: Path):
     assert d["totals"]["tests"] == 1
     assert d["tests"][0]["id"].startswith("T-")
     assert "locator_candidates" in d["tests"][0]
+
+
+# ---------------------------------------------------------------------------
+# Regression: indexer must see `worca_`-prefixed test files (Layer B convention).
+# ---------------------------------------------------------------------------
+
+
+def test_indexer_finds_worca_prefixed_pytest_files(tmp_path: Path):
+    """Step 7 codegen prefixes every generated test file with `worca_`
+    (e.g. `worca_test_login.py`) to avoid colliding with the SUT's own tests.
+    Without explicit `worca_test_*.py` globs, the indexer reports tests=0 for
+    the actual test file and Step 8 misses every TBD marker.
+    """
+    smoke = tmp_path / "smoke"
+    smoke.mkdir()
+    (smoke / "worca_test_login.py").write_text(
+        "def test_should_login_when_valid_creds():\n    pass\n",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="playwright-py")
+    assert len(result.tests) == 1
+    assert any("worca_test_login.py" in f for f in result.files)
+    assert result.tests[0].name.startswith("test_should_login")
+
+
+def test_indexer_finds_worca_prefixed_playwright_ts_files(tmp_path: Path):
+    pages = tmp_path / "tests"
+    pages.mkdir()
+    (pages / "worca_login.spec.ts").write_text(
+        """test('should login', async ({page}) => {\n  await page.getByRole('button').click();\n});\n""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="playwright-ts")
+    assert len(result.tests) == 1
+    assert any("worca_login.spec.ts" in f for f in result.files)
+
+
+def test_indexer_still_finds_standard_test_files_alongside_worca(tmp_path: Path):
+    """Adding worca_ globs must NOT exclude standard test_ files."""
+    smoke = tmp_path / "smoke"
+    smoke.mkdir()
+    (smoke / "test_native.py").write_text("def test_a(): pass\n", encoding="utf-8")
+    (smoke / "worca_test_added.py").write_text("def test_b(): pass\n", encoding="utf-8")
+    result = index_tests(tmp_path, framework="playwright-py")
+    files = " ".join(result.files)
+    assert "test_native.py" in files
+    assert "worca_test_added.py" in files
+    assert len(result.tests) == 2
+
+
+# ---------------------------------------------------------------------------
+# TBD_INTENT comment parsing — semantic-intent capture for Step 8a
+# ---------------------------------------------------------------------------
+
+
+def test_indexer_attaches_tbd_intent_python_comment(tmp_path: Path):
+    """A `# TBD_INTENT: <text>` comment above a TBD_LOCATOR marker is
+    captured as the marker's `description`. Also: the surrounding test
+    function name lands on `test_function`."""
+    f = tmp_path / "worca_test_login.py"
+    f.write_text(
+        """\
+def test_login_with_valid_credentials(page):
+    # TBD_INTENT: primary submit button on the login form
+    LOGIN_BUTTON = "TBD_LOCATOR"
+    page.locator(LOGIN_BUTTON).click()
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="pytest")
+    assert len(result.tests) == 1
+    markers = result.tests[0].tbd_markers
+    assert len(markers) >= 1
+    target = next(m for m in markers if "TBD_LOCATOR" in m.raw)
+    assert target.description == "primary submit button on the login form"
+    assert target.test_function == "test_login_with_valid_credentials"
+
+
+def test_indexer_attaches_tbd_intent_js_comment(tmp_path: Path):
+    """JS/TS `// TBD_INTENT: <text>` comment style is also recognized."""
+    f = tmp_path / "worca_login.spec.ts"
+    f.write_text(
+        """\
+test('should login', async ({ page }) => {
+  // TBD_INTENT: email input on the sign-in form
+  const EMAIL = 'TBD_LOCATOR';
+  await page.locator(EMAIL).fill('a@b.c');
+});
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="playwright-ts")
+    target = next(m for m in result.tests[0].tbd_markers if "TBD_LOCATOR" in m.raw)
+    assert target.description == "email input on the sign-in form"
+    assert target.test_function == "should login"
+
+
+def test_indexer_legacy_marker_without_intent_has_null_description(tmp_path: Path):
+    """A TBD marker with no adjacent TBD_INTENT comment leaves `description`
+    as None — older runs degrade gracefully, no schema breakage."""
+    f = tmp_path / "worca_test_legacy.py"
+    f.write_text(
+        """\
+def test_legacy(page):
+    LOGIN_BUTTON = "TBD_LOCATOR"
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="pytest")
+    target = next(m for m in result.tests[0].tbd_markers if "TBD_LOCATOR" in m.raw)
+    assert target.description is None
+    assert target.test_function == "test_legacy"
+
+
+def test_indexer_tbd_intent_search_window_is_narrow(tmp_path: Path):
+    """An intent comment 5 lines away from the marker is NOT attached —
+    the search window is ±2 lines so far-away comments don't bleed into
+    unrelated markers."""
+    f = tmp_path / "worca_test_far.py"
+    f.write_text(
+        """\
+def test_far(page):
+    # TBD_INTENT: this is far away
+    pass
+    pass
+    pass
+    pass
+    LOGIN_BUTTON = "TBD_LOCATOR"
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="pytest")
+    target = next(m for m in result.tests[0].tbd_markers if "TBD_LOCATOR" in m.raw)
+    assert target.description is None  # 5 lines away → out of window
+
+
+def test_indexer_tbd_intent_persists_through_as_dict(tmp_path: Path):
+    """The new fields round-trip through the serialised output."""
+    f = tmp_path / "worca_test_serialize.py"
+    f.write_text(
+        """\
+def test_serialize(page):
+    # TBD_INTENT: search box on the homepage
+    SEARCH = "TBD_LOCATOR"
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="pytest")
+    d = result.as_dict()
+    marker = next(
+        m for m in d["tests"][0]["tbd_markers"] if "TBD_LOCATOR" in m["raw"]
+    )
+    assert marker["description"] == "search box on the homepage"
+    assert marker["test_function"] == "test_serialize"
+
+
+# ---------------------------------------------------------------------------
+# JIT-runtime tbd() call parsing — Python+pytest+Playwright codegen path
+# ---------------------------------------------------------------------------
+
+
+def test_indexer_recognizes_tbd_call_in_support_file(tmp_path: Path):
+    """`LOGIN_BUTTON = tbd("intent")` is the JIT-runtime emission style.
+    The indexer extracts intent directly from the call argument."""
+    pages = tmp_path / "pages" / "locators"
+    pages.mkdir(parents=True)
+    (pages / "worca_login_locators.py").write_text(
+        """\
+from tests.worca_t_runtime import tbd
+
+class LoginLocators:
+    LOGIN_BUTTON = tbd("primary submit button on the login form")
+    PASSWORD = tbd("password input on the sign-in form")
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="playwright-py")
+    assert len(result.support_files) == 1
+    markers = result.support_files[0].tbd_markers
+    descriptions = {m.description for m in markers}
+    assert descriptions == {
+        "primary submit button on the login form",
+        "password input on the sign-in form",
+    }
+    # raw captures the actual tbd(...) call text
+    assert any('tbd("primary submit button' in m.raw for m in markers)
+
+
+def test_indexer_mixed_tbd_styles_no_double_count(tmp_path: Path):
+    """A file with both `tbd("...")` calls AND legacy `# TBD_INTENT: ...` +
+    `TBD_LOCATOR` markers should index each marker exactly once."""
+    pages = tmp_path / "pages" / "locators"
+    pages.mkdir(parents=True)
+    (pages / "worca_mixed_locators.py").write_text(
+        """\
+from tests.worca_t_runtime import tbd
+
+class MixedLocators:
+    NEW_STYLE = tbd("new style locator")
+    # TBD_INTENT: legacy style locator
+    LEGACY = "TBD_LOCATOR"
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="playwright-py")
+    markers = result.support_files[0].tbd_markers
+    assert len(markers) == 2
+    descriptions = sorted(m.description for m in markers)
+    assert descriptions == ["legacy style locator", "new style locator"]
+
+
+def test_indexer_tbd_call_with_empty_intent_is_skipped(tmp_path: Path):
+    """`tbd("")` with no intent is rejected by the runtime helper at
+    test time; the indexer also drops it to avoid producing empty markers."""
+    pages = tmp_path / "pages" / "locators"
+    pages.mkdir(parents=True)
+    (pages / "worca_empty_locators.py").write_text(
+        """\
+from tests.worca_t_runtime import tbd
+
+class EmptyLocators:
+    BAD = tbd("")
+    GOOD = tbd("real intent")
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="playwright-py")
+    markers = result.support_files[0].tbd_markers
+    assert len(markers) == 1
+    assert markers[0].description == "real intent"
