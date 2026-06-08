@@ -4,27 +4,32 @@ Reads Step 9's `run-results.json` + `bug-candidates.json` and (optionally)
 `heal-log.jsonl`. When no failures exist, emits an empty, schema-valid
 `bug-reports.json` and a trivial markdown summary, skipping the agent.
 
-Otherwise stages the inputs into the agent workdir, invokes the
-`bug-report-classifier` agent, validates its `bug-reports.json` against the
-canonical schema, and falls back to a deterministic synthesis from
-`bug-candidates.json` when the agent output is unusable. The fallback marks
-every bug with a `rationale` of "auto-classified (agent output unusable)" so
-downstream consumers can distinguish.
+Otherwise inlines the inputs into the agent prompt, invokes the
+`bug-report-classifier` agent via the direct Anthropic SDK with structured
+outputs enforcing the `bug-reports` schema at generation time, and falls back
+to a deterministic synthesis from `bug-candidates.json` when the agent
+output is unusable. The fallback marks every bug with a `rationale` of
+"auto-classified (agent output unusable)" so downstream consumers can
+distinguish.
+
+Transport: this step uses `worca_t.llm.reasoning.call_reasoning_llm` (direct
+SDK, no subprocess, no MCP). The agent returns JSON in its response text;
+the markdown view is always rendered locally from that JSON via
+`_render_markdown` for consistency.
 """
 
 from __future__ import annotations
 
 import json
-import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from worca_t.claude_runner import run_agent
 from worca_t.config import package_resource_root, step_timeout
+from worca_t.llm.reasoning import call_reasoning_llm
 from worca_t.logging_setup import get_logger
 from worca_t.md_parser import slugify
-from worca_t.schemas import is_valid
+from worca_t.schemas import is_valid, load_schema
 from worca_t.steps.base import Step, StepContext, StepResult
 
 log = get_logger(__name__)
@@ -262,25 +267,26 @@ class BugClassifierStep(Step):
                 notes="no failures; empty report",
             )
 
-        # Stage inputs for the agent.
+        # Build inline inputs for the agent. The direct-SDK transport
+        # embeds these as fenced markdown sections in the user prompt
+        # instead of staging them as files in the workdir.
+        inputs: dict[str, str] = {
+            "bug-candidates.json": json.dumps(bug_candidates, indent=2, ensure_ascii=False),
+        }
         if run_results is not None:
-            (wd / "run-results.json").write_text(
-                json.dumps(run_results, indent=2, ensure_ascii=False), encoding="utf-8"
-            )
-        (wd / "bug-candidates.json").write_text(
-            json.dumps(bug_candidates, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+            inputs["run-results.json"] = json.dumps(run_results, indent=2, ensure_ascii=False)
 
         heal_src = ctx.workspace.step_dir(9) / "self-heal" / "heal-log.jsonl"
         heal_map: dict[str, dict] = _load_heal_log(heal_src)
         if heal_src.exists():
-            shutil.copy2(heal_src, wd / "heal-log.jsonl")
+            inputs["heal-log.jsonl"] = heal_src.read_text(encoding="utf-8")
 
         strategy_src = ctx.workspace.step_dir(4) / "test-strategy.json"
         if strategy_src.exists():
-            shutil.copy2(strategy_src, wd / "test-strategy.json")
+            inputs["test-strategy.json"] = strategy_src.read_text(encoding="utf-8")
 
-        # Stage helpful docs (best-effort).
+        # Reference docs the agent uses for classification heuristics
+        # (best-effort — missing docs don't fail the step).
         docs_root = package_resource_root()
         for rel in (
             "templates/bug-report-template.md",
@@ -289,38 +295,34 @@ class BugClassifierStep(Step):
         ):
             src = docs_root / rel
             if src.exists():
-                dst = wd / "docs" / rel
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dst)
+                inputs[Path(rel).name] = src.read_text(encoding="utf-8")
 
         agent = package_resource_root() / "agents" / "bug-report-classifier.agent.md"
         user_prompt = (
-            f"Classify the {len(candidates)} failing test(s) in "
-            f"./bug-candidates.json into structured bug reports. Use "
-            f"./run-results.json, ./heal-log.jsonl (if present), and "
-            f"./test-strategy.json for additional context. Emit "
-            f"`./bug-reports.json` AND `./bug-reports.md`. Use run id "
-            f"`{run_id}` in the JSON output."
+            f"Classify the {len(candidates)} failing test(s) provided in "
+            f"`bug-candidates.json` into structured bug reports. Use "
+            f"`run-results.json`, `heal-log.jsonl` (if present), and "
+            f"`test-strategy.json` for additional context. The required output "
+            f"shape is enforced by JSON schema — respond with the JSON object "
+            f"only. Use run id `{run_id}` in the output."
         )
 
-        agent_res = await run_agent(
+        agent_res = await call_reasoning_llm(
             agent,
             workdir=wd,
-            inputs={},
             user_prompt=user_prompt,
-            extra_paths=[],
+            inputs=inputs,
+            output_schema=load_schema("bug-reports"),
             timeout_s=self.timeout_s,
             step=10,
-            max_turns=20,
         )
 
-        produced_json = wd / "bug-reports.json"
-        produced_md = wd / "bug-reports.md"
+        # Parse the agent's response. Structured outputs guarantees the
+        # response IS the JSON object — no surrounding prose, no fences.
         agent_payload: dict | None = None
-
-        if agent_res.success and produced_json.exists():
+        if agent_res.success and agent_res.final_text:
             try:
-                agent_payload = json.loads(produced_json.read_text(encoding="utf-8"))
+                agent_payload = json.loads(agent_res.final_text)
             except json.JSONDecodeError as e:
                 log.warning("step10.agent_json_invalid", error=str(e))
                 agent_payload = None
@@ -334,17 +336,17 @@ class BugClassifierStep(Step):
                 agent_success=agent_res.success,
             )
             payload = _synthesize(run_id, candidates, heal_map)
-            json_out.write_text(
-                json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
-            )
-            md_out.write_text(_render_markdown(payload), encoding="utf-8")
         else:
-            shutil.copy2(produced_json, json_out)
-            if produced_md.exists():
-                shutil.copy2(produced_md, md_out)
-            else:
-                # Agent forgot the markdown; render from its JSON.
-                md_out.write_text(_render_markdown(agent_payload), encoding="utf-8")
+            payload = agent_payload
+
+        # Markdown is always rendered locally from the validated JSON —
+        # structured outputs returns JSON only, and a deterministic
+        # render keeps the .md view consistent regardless of which
+        # transport produced the JSON.
+        json_out.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        md_out.write_text(_render_markdown(payload), encoding="utf-8")
 
         notes = (
             f"bugs={len(candidates)} fallback={used_fallback}"
