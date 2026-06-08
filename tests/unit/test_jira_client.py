@@ -24,6 +24,7 @@ from worca_t.jira_client import (
     _profile,
     adf_to_markdown,
     fetch_issue,
+    format_payload_as_spec_md,
     normalize_description,
     parse_jira_spec_source,
 )
@@ -422,3 +423,134 @@ def test_normalize_description_falls_back_to_rendered_html():
     out = normalize_description(payload)
     assert "Rendered" in out
     assert "<p>" not in out
+
+
+# ---------------------------------------------------------------------------
+# format_payload_as_spec_md — deterministic JIRA → spec.md renderer
+# ---------------------------------------------------------------------------
+
+
+def _full_payload() -> dict:
+    """A representative Cloud REST v3 payload with most fields populated."""
+    return {
+        "key": "MEAS-5490",
+        "fields": {
+            "summary": "Move function — UI Screens and 3 dots menu",
+            "description": "PRO users can move workspaces between projects.",
+            "status": {"name": "Done"},
+            "priority": {"name": "Medium"},
+            "issuetype": {"name": "Story"},
+            "reporter": {"displayName": "Sagui Ettinger"},
+            "assignee": None,
+            "created": "2024-05-13T08:30:00.000+0200",
+            "updated": "2025-04-01T14:00:00.000+0200",
+            "labels": ["frontend", "move-feature"],
+            "components": [{"name": "UI"}, {"name": "Workspaces"}],
+            "fixVersions": [{"name": "v2025.04"}],
+            "issuelinks": [
+                {
+                    "type": {"name": "Blocks"},
+                    "outwardIssue": {
+                        "key": "MEAS-5489",
+                        "fields": {"summary": "Backend API for move"},
+                    },
+                },
+                {
+                    "type": {"name": "Relates"},
+                    "inwardIssue": {
+                        "key": "MEAS-5250",
+                        "fields": {"summary": "Move & Copy Workspace epic"},
+                    },
+                },
+            ],
+        },
+    }
+
+
+def test_format_renders_title_and_metadata():
+    md = format_payload_as_spec_md(_full_payload())
+    assert "# Move function — UI Screens and 3 dots menu (MEAS-5490)" in md
+    assert "**Status:** Done" in md
+    assert "**Priority:** Medium" in md
+    assert "**Type:** Story" in md
+    assert "**Reporter:** Sagui Ettinger" in md
+    assert "**Assignee:** Unassigned" in md  # null assignee
+    assert "2024-05-13" in md  # created
+    assert "2025-04-01" in md  # updated
+
+
+def test_format_includes_source_url_when_provided():
+    md = format_payload_as_spec_md(
+        _full_payload(), source_url="https://bosch-pt.atlassian.net/browse/MEAS-5490"
+    )
+    assert "**Source:** https://bosch-pt.atlassian.net/browse/MEAS-5490" in md
+
+
+def test_format_omits_source_when_not_provided():
+    md = format_payload_as_spec_md(_full_payload())
+    assert "**Source:**" not in md
+
+
+def test_format_description_block():
+    md = format_payload_as_spec_md(_full_payload())
+    assert "## Description" in md
+    assert "PRO users can move workspaces between projects." in md
+
+
+def test_format_description_placeholder_when_empty():
+    payload = _full_payload()
+    payload["fields"]["description"] = ""
+    md = format_payload_as_spec_md(payload)
+    assert "_No description provided._" in md
+
+
+def test_format_labels_components_fixversions():
+    md = format_payload_as_spec_md(_full_payload())
+    assert "## Labels & Components" in md
+    assert "**Labels:** frontend, move-feature" in md
+    assert "**Components:** UI, Workspaces" in md
+    assert "**Fix Versions:** v2025.04" in md
+
+
+def test_format_omits_labels_section_when_all_empty():
+    """No labels + no components + no fix versions → omit the whole section."""
+    payload = _full_payload()
+    payload["fields"]["labels"] = []
+    payload["fields"]["components"] = []
+    payload["fields"]["fixVersions"] = []
+    md = format_payload_as_spec_md(payload)
+    assert "## Labels & Components" not in md
+
+
+def test_format_linked_issues_include_summary_when_available():
+    md = format_payload_as_spec_md(_full_payload())
+    assert "## Linked Issues" in md
+    assert "_References only — not fetched._" in md
+    assert "MEAS-5489" in md
+    assert "Backend API for move" in md
+    assert "MEAS-5250" in md
+    assert "Move & Copy Workspace epic" in md
+
+
+def test_format_omits_linked_issues_when_none():
+    payload = _full_payload()
+    payload["fields"]["issuelinks"] = []
+    md = format_payload_as_spec_md(payload)
+    assert "## Linked Issues" not in md
+
+
+def test_format_falls_back_to_key_when_summary_missing():
+    payload = {"key": "X-1", "fields": {}}
+    md = format_payload_as_spec_md(payload)
+    assert "# X-1 (X-1)" in md or "# X-1" in md
+    # Description placeholder still emitted.
+    assert "_No description provided._" in md
+
+
+def test_format_handles_dc_wiki_description_string():
+    """DC returns description as a string (wiki markup); pass through as-is."""
+    payload = _full_payload()
+    payload["fields"]["description"] = "h1. DC wiki heading\n\nbody text"
+    md = format_payload_as_spec_md(payload)
+    assert "h1. DC wiki heading" in md
+    assert "body text" in md

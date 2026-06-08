@@ -2,7 +2,9 @@
 # Sourced by src/worca_t/config.py (single source of truth).
 
 # -- Phase A: Requirements & Planning --
-jira-to-ai-spec: claude-haiku-4-5@20251001
+# Step 1 (intake) is pure code — no LLM agent. The jira-to-ai-spec entry
+# was removed when Step 1 was simplified to a deterministic JSON-to-
+# markdown formatter (Step 2's refine-spec handles all semantic structuring).
 refine-spec: claude-sonnet-4-6
 polyglot-test-planner: claude-sonnet-4-6
 test-manager: claude-sonnet-4-6

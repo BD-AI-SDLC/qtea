@@ -416,10 +416,198 @@ def _strip_html(html: str) -> str:
     return _HTML_TAG_RE.sub("", html).strip()
 
 
+# ---------------------------------------------------------------------------
+# Deterministic JIRA-payload → spec.md formatter
+# ---------------------------------------------------------------------------
+
+def _named_list(items: list[Any] | None, key: str = "name") -> str:
+    """Render ``[{"name": "x"}, {"name": "y"}]`` as ``"x, y"``."""
+    if not items:
+        return ""
+    out: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            v = item.get(key)
+            if isinstance(v, str) and v.strip():
+                out.append(v.strip())
+        elif isinstance(item, str):
+            out.append(item.strip())
+    return ", ".join(out)
+
+
+def _person_name(person: Any) -> str:
+    """Render a Jira user object as a display name; fall back to ``Unassigned``."""
+    if isinstance(person, dict):
+        name = person.get("displayName") or person.get("name") or person.get("emailAddress")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    return "Unassigned"
+
+
+def _link_summary(link: dict) -> str:
+    """Reduce an ``issuelinks`` entry to ``"KEY (type, dir): summary"``.
+
+    Returns just the key if the linked-issue payload is missing context.
+    Used for Section "Linked Issues" — references only, never fetched.
+    """
+    inward = link.get("inwardIssue")
+    outward = link.get("outwardIssue")
+    target = inward or outward
+    if not isinstance(target, dict):
+        return ""
+    key = target.get("key", "")
+    if not key:
+        return ""
+    summary = (target.get("fields") or {}).get("summary", "")
+    link_type = (link.get("type") or {}).get("name", "")
+    direction = "inward" if inward else "outward"
+    parts = [key]
+    if link_type:
+        parts[-1] = f"{key} ({link_type}, {direction})"
+    if summary:
+        return f"{parts[0]}: {summary}"
+    return parts[0]
+
+
+def format_payload_as_spec_md(
+    payload: dict[str, Any],
+    *,
+    source_url: str | None = None,
+) -> str:
+    """Render a Jira issue payload as ``spec.md`` markdown deterministically.
+
+    Replaces the legacy ``jira-to-ai-spec`` LLM agent. Step 2's
+    ``refine-spec`` agent already handles the semantic structuring
+    (requirement extraction, AC derivation, edge-case identification),
+    and it operates uniformly across all source types — local file,
+    generic URL, and Jira. Pre-extracting structure here was
+    redundant LLM work that Step 2 immediately threw away.
+
+    The output is a clean, human-readable spec with:
+      * Title heading carrying summary + key
+      * One-line metadata block (status / priority / type / people / dates)
+      * The full description (already ADF → markdown normalized upstream)
+      * Labels / Components / Fix Versions list
+      * Linked Issues as plain references (per the no-fetch rule)
+
+    Step 2's ``refine-spec`` agent has a Pre-clean Pass explicitly for
+    "noisy Jira/Confluence exports" — this output is much cleaner than
+    raw Jira JSON, so Step 2's job is straightforward.
+
+    Parameters
+    ----------
+    payload:
+        The dict returned by :func:`fetch_issue`. May have already gone
+        through :func:`normalize_description` (Cloud ADF → markdown);
+        if not, the description block will render best-effort via
+        ``normalize_description`` here.
+    source_url:
+        Optional ``Source: <url>`` line under the title. Useful when
+        ``--spec`` was a full URL (the orchestrator records it for
+        provenance). Omit for ``jira:KEY`` shorthand.
+    """
+    fields = payload.get("fields") or {}
+    key = payload.get("key", "")
+    summary = fields.get("summary") or key or "Untitled"
+
+    # Normalize description if the caller didn't (idempotent).
+    description = fields.get("description")
+    if isinstance(description, dict):
+        description_md = normalize_description(payload)
+    elif isinstance(description, str):
+        description_md = description
+    else:
+        description_md = ""
+
+    status = (fields.get("status") or {}).get("name", "")
+    priority = (fields.get("priority") or {}).get("name", "")
+    issue_type = (fields.get("issuetype") or {}).get("name", "")
+    reporter = _person_name(fields.get("reporter"))
+    assignee = _person_name(fields.get("assignee"))
+    created = fields.get("created") or ""
+    updated = fields.get("updated") or ""
+
+    labels = ", ".join(fields.get("labels") or [])
+    components = _named_list(fields.get("components"))
+    fix_versions = _named_list(fields.get("fixVersions"))
+
+    issuelinks = fields.get("issuelinks") or []
+    link_lines = [s for s in (_link_summary(lk) for lk in issuelinks) if s]
+
+    lines: list[str] = []
+    title_key = f" ({key})" if key else ""
+    lines.append(f"# {summary}{title_key}")
+    lines.append("")
+
+    if source_url:
+        lines.append(f"> **Source:** {source_url}")
+
+    meta_bits = [
+        f"**Status:** {status}" if status else "",
+        f"**Priority:** {priority}" if priority else "",
+        f"**Type:** {issue_type}" if issue_type else "",
+    ]
+    meta_bits = [b for b in meta_bits if b]
+    if meta_bits:
+        lines.append("> " + " · ".join(meta_bits))
+
+    people_bits = [
+        f"**Reporter:** {reporter}",
+        f"**Assignee:** {assignee}",
+    ]
+    lines.append("> " + " · ".join(people_bits))
+
+    date_bits = [
+        f"**Created:** {created}" if created else "",
+        f"**Updated:** {updated}" if updated else "",
+    ]
+    date_bits = [b for b in date_bits if b]
+    if date_bits:
+        lines.append("> " + " · ".join(date_bits))
+
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("## Description")
+    lines.append("")
+    lines.append(description_md.strip() if description_md.strip() else "_No description provided._")
+    lines.append("")
+
+    # Labels & Components block (only render lines that have content).
+    meta_section: list[str] = []
+    if labels:
+        meta_section.append(f"- **Labels:** {labels}")
+    if components:
+        meta_section.append(f"- **Components:** {components}")
+    if fix_versions:
+        meta_section.append(f"- **Fix Versions:** {fix_versions}")
+    if meta_section:
+        lines.append("---")
+        lines.append("")
+        lines.append("## Labels & Components")
+        lines.append("")
+        lines.extend(meta_section)
+        lines.append("")
+
+    if link_lines:
+        lines.append("---")
+        lines.append("")
+        lines.append("## Linked Issues")
+        lines.append("")
+        lines.append("_References only — not fetched._")
+        lines.append("")
+        for link in link_lines:
+            lines.append(f"- {link}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
 __all__ = [
     "JiraFetchError",
     "adf_to_markdown",
     "fetch_issue",
+    "format_payload_as_spec_md",
     "normalize_description",
     "parse_jira_spec_source",
 ]
