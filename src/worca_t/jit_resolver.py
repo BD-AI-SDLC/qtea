@@ -177,7 +177,13 @@ def _call_anthropic(system: str, user: str, *, model: str) -> str:
     # Lazy import so non-resolver callers don't pay the import cost.
     import anthropic  # type: ignore[import-untyped]
 
-    client = anthropic.Anthropic()  # picks up ANTHROPIC_API_KEY from env
+    # Dispatch ANTHROPIC_AUTH_TOKEN → Bearer vs ANTHROPIC_API_KEY → x-api-key
+    # via the shared helper; mirrors what the claude CLI does and what
+    # llm/reasoning.py does. Without this, a model-farm bearer token gets
+    # sent as x-api-key and authentication fails.
+    from worca_t.config import anthropic_auth_kwargs
+
+    client = anthropic.Anthropic(**anthropic_auth_kwargs())
     response = client.messages.create(
         model=model,
         max_tokens=512,

@@ -398,3 +398,58 @@ async def test_at_date_suffix_normalized_to_dash(tmp_path, monkeypatch):
     )
 
     assert captured["model"] == "claude-haiku-4-5-20251001"
+
+
+# ---------------------------------------------------------------------------
+# Anthropic SDK auth dispatch — ANTHROPIC_AUTH_TOKEN vs ANTHROPIC_API_KEY
+# ---------------------------------------------------------------------------
+
+
+async def test_auth_token_env_sent_as_bearer(tmp_path, monkeypatch):
+    """ANTHROPIC_AUTH_TOKEN must reach the SDK as auth_token= (Bearer header).
+
+    Regression guard for the M1 bug where a model-farm bearer token set via
+    ANTHROPIC_AUTH_TOKEN was passed to anthropic.AsyncAnthropic as api_key=,
+    causing the SDK to send x-api-key and the model farm to reject with
+    "invalid x-api-key" (401).
+    """
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "farm-bearer-xyz")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    install_fake_anthropic(monkeypatch, text="ok")
+    agent = _write_agent_file(tmp_path)
+
+    await call_reasoning_llm(
+        agent_path=agent,
+        workdir=tmp_path / "wd",
+        user_prompt="x",
+        model="claude-sonnet-4-6",
+    )
+
+    # Inspect the captured constructor kwargs from the FakeClient class.
+    import anthropic
+    fc = anthropic.AsyncAnthropic
+    init_kwargs = getattr(fc, "last_init_kwargs", None)
+    assert init_kwargs is not None
+    assert init_kwargs.get("auth_token") == "farm-bearer-xyz"
+    assert "api_key" not in init_kwargs
+
+
+async def test_api_key_env_sent_as_x_api_key(tmp_path, monkeypatch):
+    """ANTHROPIC_API_KEY (no AUTH_TOKEN) must reach the SDK as api_key=."""
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-abc")
+    install_fake_anthropic(monkeypatch, text="ok")
+    agent = _write_agent_file(tmp_path)
+
+    await call_reasoning_llm(
+        agent_path=agent,
+        workdir=tmp_path / "wd",
+        user_prompt="x",
+        model="claude-sonnet-4-6",
+    )
+
+    import anthropic
+    init_kwargs = getattr(anthropic.AsyncAnthropic, "last_init_kwargs", None)
+    assert init_kwargs is not None
+    assert init_kwargs.get("api_key") == "sk-ant-abc"
+    assert "auth_token" not in init_kwargs

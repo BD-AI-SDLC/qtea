@@ -112,6 +112,34 @@ def get_settings() -> Settings:
     )
 
 
+def anthropic_auth_kwargs() -> dict[str, str]:
+    """Return the auth kwargs to pass to ``anthropic.AsyncAnthropic`` / ``anthropic.Anthropic``.
+
+    The Anthropic Python SDK has TWO mutually exclusive auth parameters and
+    they produce different HTTP headers:
+
+    * ``api_key=<k>``    → ``x-api-key: <k>`` header (raw Anthropic API)
+    * ``auth_token=<t>`` → ``Authorization: Bearer <t>`` header (OAuth / model farm proxies)
+
+    The ``claude`` CLI dispatches based on which env var is set:
+    ``ANTHROPIC_AUTH_TOKEN`` → Bearer, ``ANTHROPIC_API_KEY`` → x-api-key.
+    This helper replicates that logic so direct-SDK callers
+    (``llm/reasoning.py``, ``jit_resolver.py``) authenticate correctly
+    against either the raw Anthropic API OR a model-farm proxy that
+    expects Bearer auth.
+
+    Returns an empty dict when neither env var is set — let the SDK raise
+    its standard "no API key" error rather than masking it here.
+    """
+    auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    if auth_token:
+        return {"auth_token": auth_token}
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if api_key:
+        return {"api_key": api_key}
+    return {}
+
+
 @lru_cache(maxsize=1)
 def agent_model_map() -> dict[str, str]:
     """Return the agent->model mapping. Loaded once."""

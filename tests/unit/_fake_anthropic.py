@@ -109,8 +109,17 @@ def install_fake_anthropic(
             self.create = create_mock
 
     class FakeClient:
-        """Stand-in for ``anthropic.AsyncAnthropic`` supporting ``async with``."""
-        def __init__(self, **_kwargs):
+        """Stand-in for ``anthropic.AsyncAnthropic`` supporting ``async with``.
+
+        Records the constructor kwargs on the class so tests can assert which
+        auth mode was selected (``api_key=`` vs ``auth_token=``) without
+        intercepting at the SDK boundary.
+        """
+
+        last_init_kwargs: dict | None = None
+
+        def __init__(self, **kwargs):
+            FakeClient.last_init_kwargs = kwargs
             self.messages = FakeMessages()
 
         async def __aenter__(self):
@@ -119,5 +128,8 @@ def install_fake_anthropic(
         async def __aexit__(self, *_a):
             return None
 
+    # Reset between tests so a leftover value from the prior test can't
+    # spuriously pass an assertion.
+    FakeClient.last_init_kwargs = None
     monkeypatch.setattr("anthropic.AsyncAnthropic", FakeClient)
     return create_mock

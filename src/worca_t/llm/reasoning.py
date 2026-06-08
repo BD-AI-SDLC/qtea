@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from worca_t.config import (
+    anthropic_auth_kwargs,
     get_model_chain,
     get_settings,
     model_for_agent,
@@ -248,8 +249,13 @@ async def call_reasoning_llm(
     models_attempted: list[str] = []
     used_model: str | None = None
 
+    # Dispatch between auth_token (Bearer — model farm / OAuth) and api_key
+    # (x-api-key — raw Anthropic API) based on which env var is set. The
+    # claude CLI does the same dispatch; without this, a model-farm token
+    # set via ANTHROPIC_AUTH_TOKEN gets sent as x-api-key and the proxy
+    # rejects with 401 "invalid x-api-key".
     async with anthropic.AsyncAnthropic(
-        api_key=settings.anthropic_api_key,
+        **anthropic_auth_kwargs(),
         base_url=settings.anthropic_base_url,
         timeout=float(resolved_timeout),
     ) as client:
