@@ -109,14 +109,15 @@ def install_fake_anthropic(
             self.create = create_mock
 
     class FakeClient:
-        """Stand-in for ``anthropic.AsyncAnthropic`` supporting ``async with``.
+        """Stand-in for ``anthropic.AsyncAnthropic`` / ``AsyncAnthropicVertex``.
 
-        Records the constructor kwargs on the class so tests can assert which
-        auth mode was selected (``api_key=`` vs ``auth_token=``) without
-        intercepting at the SDK boundary.
+        Records the constructor kwargs and which class name was used so tests
+        can assert which auth mode + backend was selected without intercepting
+        at the SDK boundary.
         """
 
         last_init_kwargs: dict | None = None
+        last_init_class: str | None = None
 
         def __init__(self, **kwargs):
             FakeClient.last_init_kwargs = kwargs
@@ -128,8 +129,58 @@ def install_fake_anthropic(
         async def __aexit__(self, *_a):
             return None
 
-    # Reset between tests so a leftover value from the prior test can't
-    # spuriously pass an assertion.
+    class FakeStandardClient(FakeClient):
+        """Mock for ``anthropic.AsyncAnthropic`` (standard API path)."""
+        def __init__(self, **kwargs):
+            FakeClient.last_init_class = "AsyncAnthropic"
+            super().__init__(**kwargs)
+
+    class FakeVertexClient(FakeClient):
+        """Mock for ``anthropic.AsyncAnthropicVertex`` (Vertex / model-farm path)."""
+        def __init__(self, **kwargs):
+            FakeClient.last_init_class = "AsyncAnthropicVertex"
+            super().__init__(**kwargs)
+
+    # Reset class-level state between tests so a leftover value from the
+    # prior test can't spuriously pass an assertion.
     FakeClient.last_init_kwargs = None
-    monkeypatch.setattr("anthropic.AsyncAnthropic", FakeClient)
+    FakeClient.last_init_class = None
+    monkeypatch.setattr("anthropic.AsyncAnthropic", FakeStandardClient)
+    monkeypatch.setattr("anthropic.AsyncAnthropicVertex", FakeVertexClient)
+    # Also expose the FakeClient class on the anthropic module so tests
+    # can introspect last_init_kwargs / last_init_class regardless of
+    # which path was taken.
+    monkeypatch.setattr("anthropic._fake_init_record", FakeClient, raising=False)
     return create_mock
+
+
+def disable_vertex_env(monkeypatch) -> None:
+    """Strip Vertex-signal env vars so the code under test takes the standard
+    ``anthropic.AsyncAnthropic`` path.
+
+    Required for tests that verify the standard-SDK auth dispatch
+    (``auth_token`` vs ``api_key``), since the developer's machine may have
+    ``CLAUDE_CODE_USE_VERTEX=1`` and ``ANTHROPIC_VERTEX_BASE_URL`` set
+    globally (Bosch model-farm setup), which would otherwise route to the
+    Vertex branch and skip the assertions.
+    """
+    for var in (
+        "CLAUDE_CODE_USE_VERTEX",
+        "ANTHROPIC_VERTEX_BASE_URL",
+        "ANTHROPIC_VERTEX_PROJECT_ID",
+        "CLOUD_ML_REGION",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+def enable_vertex_env(monkeypatch, *, base_url: str = "https://farm.example/api/google/v1") -> None:
+    """Set the Vertex-signal env vars so the code under test takes the
+    ``anthropic.AsyncAnthropicVertex`` path.
+
+    Use for tests that exercise the Vertex code path explicitly. Sets a
+    placeholder ``base_url`` (overridable) and dummy project_id/region.
+    """
+    monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "1")
+    monkeypatch.setenv("ANTHROPIC_VERTEX_BASE_URL", base_url)
+    monkeypatch.setenv("ANTHROPIC_VERTEX_PROJECT_ID", "_")
+    monkeypatch.setenv("CLOUD_ML_REGION", "us-east5")

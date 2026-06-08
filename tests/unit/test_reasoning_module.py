@@ -15,7 +15,12 @@ from pathlib import Path
 
 import pytest
 
-from tests.unit._fake_anthropic import FakeUsage, install_fake_anthropic
+from tests.unit._fake_anthropic import (
+    FakeUsage,
+    disable_vertex_env,
+    enable_vertex_env,
+    install_fake_anthropic,
+)
 from worca_t.llm.reasoning import call_reasoning_llm
 from worca_t.metrics import CURRENT_STEP_METRICS, StepMetricsAccumulator
 
@@ -315,6 +320,7 @@ async def test_no_model_resolved_raises(tmp_path, monkeypatch):
 
 async def test_model_fallback_on_unavailable_error(tmp_path, monkeypatch):
     """On 'overloaded' / model-unavailable errors, the chain advances."""
+    disable_vertex_env(monkeypatch)
     call_log: list[str] = []
 
     class FailFirstThenSucceed:
@@ -347,7 +353,11 @@ async def test_model_fallback_on_unavailable_error(tmp_path, monkeypatch):
         async def __aexit__(self, *_a):
             return None
 
+    # Patch BOTH client classes so the test works regardless of which
+    # branch the backend selector picks (disable_vertex_env above pins
+    # the standard branch, but defense-in-depth).
     monkeypatch.setattr("anthropic.AsyncAnthropic", FakeClient)
+    monkeypatch.setattr("anthropic.AsyncAnthropicVertex", FakeClient)
     agent = _write_agent_file(tmp_path)
 
     result = await call_reasoning_llm(
@@ -386,6 +396,8 @@ async def test_non_unavailable_error_does_not_trigger_fallback(tmp_path, monkeyp
 # ---------------------------------------------------------------------------
 
 async def test_at_date_suffix_normalized_to_dash(tmp_path, monkeypatch):
+    """Standard SDK path: @-form model IDs get converted to dash-form."""
+    disable_vertex_env(monkeypatch)
     captured: dict = {}
     install_fake_anthropic(monkeypatch, text="ok", on_call=captured.update)
     agent = _write_agent_file(tmp_path)
@@ -413,6 +425,7 @@ async def test_auth_token_env_sent_as_bearer(tmp_path, monkeypatch):
     causing the SDK to send x-api-key and the model farm to reject with
     "invalid x-api-key" (401).
     """
+    disable_vertex_env(monkeypatch)
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "farm-bearer-xyz")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     install_fake_anthropic(monkeypatch, text="ok")
@@ -432,10 +445,12 @@ async def test_auth_token_env_sent_as_bearer(tmp_path, monkeypatch):
     assert init_kwargs is not None
     assert init_kwargs.get("auth_token") == "farm-bearer-xyz"
     assert "api_key" not in init_kwargs
+    assert getattr(fc, "last_init_class", None) == "AsyncAnthropic"
 
 
 async def test_api_key_env_sent_as_x_api_key(tmp_path, monkeypatch):
     """ANTHROPIC_API_KEY (no AUTH_TOKEN) must reach the SDK as api_key=."""
+    disable_vertex_env(monkeypatch)
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-abc")
     install_fake_anthropic(monkeypatch, text="ok")
@@ -453,3 +468,84 @@ async def test_api_key_env_sent_as_x_api_key(tmp_path, monkeypatch):
     assert init_kwargs is not None
     assert init_kwargs.get("api_key") == "sk-ant-abc"
     assert "auth_token" not in init_kwargs
+
+
+# ---------------------------------------------------------------------------
+# Vertex backend selection (Bosch model farm / Google Cloud Vertex AI)
+# ---------------------------------------------------------------------------
+
+
+async def test_vertex_env_routes_to_async_anthropic_vertex(tmp_path, monkeypatch):
+    """CLAUDE_CODE_USE_VERTEX=1 + ANTHROPIC_VERTEX_BASE_URL → AsyncAnthropicVertex.
+
+    Regression guard for the M1 bug where Vertex-routed setups (like Bosch's
+    model farm proxy) silently used anthropic.AsyncAnthropic and got 401
+    "Invalid bearer token" because the auth model doesn't match.
+    """
+    enable_vertex_env(
+        monkeypatch,
+        base_url="https://aoai-farm.bosch-temp.com/api/google/v1",
+    )
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "farm-token-abc")
+    install_fake_anthropic(monkeypatch, text="ok")
+    agent = _write_agent_file(tmp_path)
+
+    await call_reasoning_llm(
+        agent_path=agent,
+        workdir=tmp_path / "wd",
+        user_prompt="x",
+        model="claude-haiku-4-5@20251001",
+    )
+
+    import anthropic
+    init_class = getattr(anthropic.AsyncAnthropicVertex, "last_init_class", None)
+    init_kwargs = getattr(anthropic.AsyncAnthropicVertex, "last_init_kwargs", None)
+    assert init_class == "AsyncAnthropicVertex"
+    assert init_kwargs is not None
+    # access_token is the Vertex-equivalent of auth_token + reads from
+    # ANTHROPIC_AUTH_TOKEN (same env var the Bosch CLI uses).
+    assert init_kwargs.get("access_token") == "farm-token-abc"
+    assert init_kwargs.get("base_url") == "https://aoai-farm.bosch-temp.com/api/google/v1"
+    assert init_kwargs.get("project_id") == "_"
+
+
+async def test_vertex_keeps_at_form_model_id(tmp_path, monkeypatch):
+    """Vertex backend expects ``claude-haiku-4-5@20251001`` (@-form), unchanged."""
+    enable_vertex_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tok")
+    captured: dict = {}
+    install_fake_anthropic(monkeypatch, text="ok", on_call=captured.update)
+    agent = _write_agent_file(tmp_path)
+
+    await call_reasoning_llm(
+        agent_path=agent,
+        workdir=tmp_path / "wd",
+        user_prompt="x",
+        model="claude-haiku-4-5@20251001",
+    )
+
+    # Vertex path must NOT convert @ to - (the standard SDK does, but Vertex
+    # rejects the dash-form).
+    assert captured["model"] == "claude-haiku-4-5@20251001"
+
+
+async def test_anthropic_vertex_base_url_alone_triggers_vertex(tmp_path, monkeypatch):
+    """ANTHROPIC_VERTEX_BASE_URL alone (no CLAUDE_CODE_USE_VERTEX) triggers Vertex.
+
+    Either signal independently is sufficient to flip the backend.
+    """
+    disable_vertex_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_VERTEX_BASE_URL", "https://farm.example/api/google/v1")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tok")
+    install_fake_anthropic(monkeypatch, text="ok")
+    agent = _write_agent_file(tmp_path)
+
+    await call_reasoning_llm(
+        agent_path=agent,
+        workdir=tmp_path / "wd",
+        user_prompt="x",
+        model="claude-sonnet-4-6",
+    )
+
+    import anthropic
+    assert getattr(anthropic.AsyncAnthropicVertex, "last_init_class", None) == "AsyncAnthropicVertex"

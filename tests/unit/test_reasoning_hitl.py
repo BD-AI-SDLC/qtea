@@ -25,6 +25,7 @@ from tests.unit._fake_anthropic import (
     FakeResponse,
     FakeTextBlock,
     FakeUsage,
+    disable_vertex_env,
 )
 from worca_t.llm.reasoning import call_reasoning_llm_with_hitl
 
@@ -71,7 +72,11 @@ class _ScriptedAnthropic:
             async def __aexit__(self, *_a):
                 return None
 
+        # Patch BOTH client classes so the test works whether the backend
+        # selector picks the standard or Vertex branch (developer machines
+        # with Bosch model-farm env vars set globally take the Vertex path).
         monkeypatch.setattr("anthropic.AsyncAnthropic", FakeClient)
+        monkeypatch.setattr("anthropic.AsyncAnthropicVertex", FakeClient)
 
 
 # ---------------------------------------------------------------------------

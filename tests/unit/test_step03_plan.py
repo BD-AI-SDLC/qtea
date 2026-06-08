@@ -237,7 +237,9 @@ def _install_scripted_anthropic(monkeypatch, texts: list[str]):
         async def __aexit__(self, *_a):
             return None
 
+    # Patch BOTH client classes — Vertex env may be set globally on the dev machine.
     monkeypatch.setattr("anthropic.AsyncAnthropic", FakeClient)
+    monkeypatch.setattr("anthropic.AsyncAnthropicVertex", FakeClient)
     return calls
 
 

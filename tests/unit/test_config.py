@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from worca_t.config import anthropic_auth_kwargs, package_resource_root
+from worca_t.config import (
+    anthropic_auth_kwargs,
+    anthropic_vertex_kwargs,
+    package_resource_root,
+    use_vertex_backend,
+)
 
 
 def test_package_resource_root_respects_env_override(tmp_path: Path, monkeypatch):
@@ -75,3 +80,72 @@ def test_anthropic_auth_kwargs_treats_empty_string_as_unset(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-abc")
     # Current behaviour: empty string is falsy → falls through to api_key.
     assert anthropic_auth_kwargs() == {"api_key": "sk-ant-abc"}
+
+
+# ---------------------------------------------------------------------------
+# use_vertex_backend + anthropic_vertex_kwargs — Vertex AI / model-farm routing
+# ---------------------------------------------------------------------------
+
+
+def test_use_vertex_backend_via_claude_code_use_vertex(monkeypatch):
+    """CLAUDE_CODE_USE_VERTEX=1 alone selects the Vertex client."""
+    monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "1")
+    monkeypatch.delenv("ANTHROPIC_VERTEX_BASE_URL", raising=False)
+    assert use_vertex_backend() is True
+
+
+def test_use_vertex_backend_via_vertex_base_url(monkeypatch):
+    """ANTHROPIC_VERTEX_BASE_URL alone (no explicit opt-in) selects Vertex too."""
+    monkeypatch.delenv("CLAUDE_CODE_USE_VERTEX", raising=False)
+    monkeypatch.setenv("ANTHROPIC_VERTEX_BASE_URL", "https://farm.example/v1")
+    assert use_vertex_backend() is True
+
+
+def test_use_vertex_backend_false_when_neither_signal_set(monkeypatch):
+    """Standard Anthropic path is the default when no Vertex signals are set."""
+    monkeypatch.delenv("CLAUDE_CODE_USE_VERTEX", raising=False)
+    monkeypatch.delenv("ANTHROPIC_VERTEX_BASE_URL", raising=False)
+    assert use_vertex_backend() is False
+
+
+def test_use_vertex_backend_ignores_non_1_value(monkeypatch):
+    """Only exactly "1" enables Vertex via CLAUDE_CODE_USE_VERTEX — match CLI."""
+    monkeypatch.delenv("ANTHROPIC_VERTEX_BASE_URL", raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "true")
+    assert use_vertex_backend() is False
+    monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "0")
+    assert use_vertex_backend() is False
+
+
+def test_anthropic_vertex_kwargs_bosch_farm_shape(monkeypatch):
+    """Exercise the Bosch model farm env shape exactly."""
+    monkeypatch.setenv("ANTHROPIC_VERTEX_BASE_URL", "https://aoai-farm.bosch-temp.com/api/google/v1")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "farm-token-xyz")
+    monkeypatch.setenv("ANTHROPIC_VERTEX_PROJECT_ID", "_")
+    monkeypatch.setenv("CLOUD_ML_REGION", "_")
+    assert anthropic_vertex_kwargs() == {
+        "base_url": "https://aoai-farm.bosch-temp.com/api/google/v1",
+        "access_token": "farm-token-xyz",
+        "project_id": "_",
+        "region": "_",
+    }
+
+
+def test_anthropic_vertex_kwargs_default_region_when_proxy_base_url(monkeypatch):
+    """Custom base_url but no CLOUD_ML_REGION → fall back to placeholder region."""
+    monkeypatch.setenv("ANTHROPIC_VERTEX_BASE_URL", "https://farm.example/v1")
+    monkeypatch.delenv("CLOUD_ML_REGION", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
+    kwargs = anthropic_vertex_kwargs()
+    assert kwargs.get("base_url") == "https://farm.example/v1"
+    assert kwargs.get("region") == "us-east5"  # placeholder for proxy setups
+
+
+def test_anthropic_vertex_kwargs_omits_unset_fields(monkeypatch):
+    """Unset env vars → corresponding kwargs omitted (SDK fills defaults)."""
+    monkeypatch.delenv("ANTHROPIC_VERTEX_BASE_URL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
+    monkeypatch.delenv("CLOUD_ML_REGION", raising=False)
+    assert anthropic_vertex_kwargs() == {}

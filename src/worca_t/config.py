@@ -130,6 +130,10 @@ def anthropic_auth_kwargs() -> dict[str, str]:
 
     Returns an empty dict when neither env var is set — let the SDK raise
     its standard "no API key" error rather than masking it here.
+
+    For Vertex-routed setups (Google Cloud Vertex AI, or proxies that
+    mimic the Vertex API like Bosch's model farm), use
+    :func:`use_vertex_backend` + :func:`anthropic_vertex_kwargs` instead.
     """
     auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
     if auth_token:
@@ -138,6 +142,62 @@ def anthropic_auth_kwargs() -> dict[str, str]:
     if api_key:
         return {"api_key": api_key}
     return {}
+
+
+def use_vertex_backend() -> bool:
+    """Return True when worca-t should route LLM calls through Vertex AI.
+
+    Detection mirrors the ``claude`` CLI:
+      * ``CLAUDE_CODE_USE_VERTEX=1`` (explicit opt-in), OR
+      * ``ANTHROPIC_VERTEX_BASE_URL`` set (proxies like Bosch's
+        ``aoai-farm.bosch-temp.com/api/google/v1`` that mimic the Vertex API)
+
+    Either signal flips the LLM transport from
+    :class:`anthropic.AsyncAnthropic` to :class:`anthropic.AsyncAnthropicVertex`.
+    The two clients construct URLs differently (Vertex includes
+    region + project in the path) and accept different auth (Vertex uses
+    ``access_token``; standard uses ``api_key`` / ``auth_token``).
+    """
+    if os.environ.get("CLAUDE_CODE_USE_VERTEX") == "1":
+        return True
+    if os.environ.get("ANTHROPIC_VERTEX_BASE_URL"):
+        return True
+    return False
+
+
+def anthropic_vertex_kwargs() -> dict[str, str]:
+    """Return constructor kwargs for ``anthropic.AsyncAnthropicVertex``.
+
+    Reads the standard Vertex env vars (``ANTHROPIC_VERTEX_BASE_URL``,
+    ``ANTHROPIC_VERTEX_PROJECT_ID``, ``CLOUD_ML_REGION``) plus the
+    ``access_token`` from ``ANTHROPIC_AUTH_TOKEN``. For proxy setups
+    (Bosch model farm) ``project_id`` is often a placeholder like ``"_"``
+    and ``region`` is unused because the proxy ignores it.
+
+    Returns only the kwargs that have values in env — the SDK fills in
+    sensible defaults for omitted ones (and raises a clear error if a
+    truly required one is missing, like project_id when ``CLOUD_ML_REGION``
+    isn't set).
+    """
+    kwargs: dict[str, str] = {}
+    base_url = os.environ.get("ANTHROPIC_VERTEX_BASE_URL")
+    if base_url:
+        kwargs["base_url"] = base_url
+    access_token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    if access_token:
+        kwargs["access_token"] = access_token
+    project_id = os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID")
+    if project_id:
+        kwargs["project_id"] = project_id
+    region = os.environ.get("CLOUD_ML_REGION")
+    if region:
+        kwargs["region"] = region
+    elif base_url:
+        # Bosch-style proxy with custom base_url ignores region but the
+        # SDK requires a non-empty value to construct the (then-discarded)
+        # URL template. Provide a safe placeholder.
+        kwargs["region"] = "us-east5"
+    return kwargs
 
 
 @lru_cache(maxsize=1)

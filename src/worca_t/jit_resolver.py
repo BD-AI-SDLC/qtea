@@ -177,15 +177,25 @@ def _call_anthropic(system: str, user: str, *, model: str) -> str:
     # Lazy import so non-resolver callers don't pay the import cost.
     import anthropic  # type: ignore[import-untyped]
 
-    # Dispatch ANTHROPIC_AUTH_TOKEN → Bearer vs ANTHROPIC_API_KEY → x-api-key
-    # via the shared helper; mirrors what the claude CLI does and what
-    # llm/reasoning.py does. Without this, a model-farm bearer token gets
-    # sent as x-api-key and authentication fails.
-    from worca_t.config import anthropic_auth_kwargs
+    # Backend selection: Vertex (or Vertex-mimicking proxy like Bosch's
+    # model farm) when CLAUDE_CODE_USE_VERTEX=1 or ANTHROPIC_VERTEX_BASE_URL
+    # is set; standard Anthropic otherwise. Mirrors llm/reasoning.py.
+    from worca_t.config import (
+        anthropic_auth_kwargs,
+        anthropic_vertex_kwargs,
+        use_vertex_backend,
+    )
 
-    client = anthropic.Anthropic(**anthropic_auth_kwargs())
+    if use_vertex_backend():
+        client = anthropic.AnthropicVertex(**anthropic_vertex_kwargs())
+        # Vertex expects the @-form (e.g. claude-haiku-4-5@20251001).
+        send_model = model
+    else:
+        client = anthropic.Anthropic(**anthropic_auth_kwargs())
+        # Standard SDK expects the dash-form; convert @ to -.
+        send_model = model.replace("@", "-") if "@" in model else model
     response = client.messages.create(
-        model=model,
+        model=send_model,
         max_tokens=512,
         temperature=0.0,
         system=system,

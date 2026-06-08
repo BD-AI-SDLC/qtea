@@ -29,10 +29,12 @@ from typing import Any
 
 from worca_t.config import (
     anthropic_auth_kwargs,
+    anthropic_vertex_kwargs,
     get_model_chain,
     get_settings,
     model_for_agent,
     step_timeout,
+    use_vertex_backend,
 )
 from worca_t.llm.protocols import (
     CURRENT_STEP_METRICS,
@@ -75,13 +77,21 @@ def _agent_key(agent_path: Path) -> str:
     return name
 
 
-def _normalize_model_id(model: str) -> str:
-    """Convert agent_models.yaml's ``'@<date>'`` suffix to SDK-expected form.
+def _normalize_model_id(model: str, *, for_vertex: bool) -> str:
+    """Conditionally normalise the ``@<date>`` suffix in agent_models.yaml entries.
 
-    ``agent_models.yaml`` uses Vertex-style ``claude-haiku-4-5@20251001`` for
-    some entries; the standard Anthropic SDK expects
-    ``claude-haiku-4-5-20251001`` (hyphen, not @).
+    Two model-id conventions are in play across Anthropic backends:
+
+    * Vertex AI (Google Cloud) expects ``claude-haiku-4-5@20251001`` (@-form)
+    * Standard Anthropic API expects ``claude-haiku-4-5-20251001`` (dash-form)
+
+    ``agent_models.yaml`` uses the @-form as canonical. When the active
+    backend is Vertex (or a Vertex-mimicking proxy like Bosch's model farm),
+    we pass the id through unchanged. When it's the standard Anthropic API,
+    we convert ``@`` to ``-``.
     """
+    if for_vertex:
+        return model
     return model.replace("@", "-") if "@" in model else model
 
 
@@ -249,18 +259,30 @@ async def call_reasoning_llm(
     models_attempted: list[str] = []
     used_model: str | None = None
 
-    # Dispatch between auth_token (Bearer — model farm / OAuth) and api_key
-    # (x-api-key — raw Anthropic API) based on which env var is set. The
-    # claude CLI does the same dispatch; without this, a model-farm token
-    # set via ANTHROPIC_AUTH_TOKEN gets sent as x-api-key and the proxy
-    # rejects with 401 "invalid x-api-key".
-    async with anthropic.AsyncAnthropic(
-        **anthropic_auth_kwargs(),
-        base_url=settings.anthropic_base_url,
-        timeout=float(resolved_timeout),
-    ) as client:
+    # Backend selection: Vertex AI (or Vertex-mimicking proxy like Bosch's
+    # model farm) when CLAUDE_CODE_USE_VERTEX=1 or ANTHROPIC_VERTEX_BASE_URL
+    # is set; standard Anthropic API otherwise. The two client classes
+    # construct URLs / accept auth differently — must match the backend.
+    is_vertex = use_vertex_backend()
+    if is_vertex:
+        client_ctx = anthropic.AsyncAnthropicVertex(
+            **anthropic_vertex_kwargs(),
+            timeout=float(resolved_timeout),
+        )
+    else:
+        # Dispatch between auth_token (Bearer) and api_key (x-api-key) per
+        # which env var is set — mirrors the claude CLI.
+        client_ctx = anthropic.AsyncAnthropic(
+            **anthropic_auth_kwargs(),
+            base_url=settings.anthropic_base_url,
+            timeout=float(resolved_timeout),
+        )
+
+    async with client_ctx as client:
         for model_idx, candidate_model in enumerate(model_chain):
-            create_kwargs["model"] = _normalize_model_id(candidate_model)
+            create_kwargs["model"] = _normalize_model_id(
+                candidate_model, for_vertex=is_vertex
+            )
             models_attempted.append(candidate_model)
             used_model = candidate_model
 
