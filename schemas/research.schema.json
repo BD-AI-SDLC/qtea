@@ -18,9 +18,120 @@
       "items": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]+$" },
       "description": "Environment variable names discovered from the SUT (keys only, never values)."
     },
+    "stack_profile": {
+      "type": ["object", "null"],
+      "description": "Deterministic SUT toolchain detection (package manager, wrapper, install/test/start commands). Populated by src/worca_t/stack_profile.py before the researcher agent runs.",
+      "properties": {
+        "language": { "type": ["string", "null"] },
+        "package_manager": { "type": ["string", "null"] },
+        "wrapper_prefix": { "type": ["string", "null"] },
+        "install_command": { "type": ["string", "null"] },
+        "test_command": { "type": ["string", "null"] },
+        "start_command": { "type": ["string", "null"] },
+        "env_file_path": { "type": ["string", "null"] },
+        "venv_path": { "type": ["string", "null"] },
+        "detection_signal": { "type": ["string", "null"] },
+        "notes": { "type": ["array", "null"], "items": { "type": "string" } }
+      },
+      "additionalProperties": true
+    },
+    "url_resolution": {
+      "type": ["object", "null"],
+      "description": "Outcome of QA base-URL discovery (src/worca_t/url_resolver.py). The chosen `key` is the env var the SUT's auth/sign-in code consumes; `value` is non-null when a literal default was recoverable.",
+      "properties": {
+        "key": { "type": ["string", "null"] },
+        "value": { "type": ["string", "null"] },
+        "source": { "type": ["string", "null"] },
+        "confidence": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "candidates": { "type": "array" },
+        "trail": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": true
+    },
+    "sut_inventory": {
+      "type": ["object", "null"],
+      "description": "Language-agnostic, monorepo-aware introspection of the SUT(s). Produced by src/worca_t/sut_inventory.py (Python AST + TS regex deterministic tiers) and augmented from the researcher agent's `## SUT Inventory` YAML block for any language the deterministic tiers don't cover. Consumed by Steps 7/8/9 to integrate generated tests with the SUT's existing layout, page objects, helpers, fixtures, and auth flow rather than ignore them.",
+      "properties": {
+        "is_monorepo": { "type": "boolean" },
+        "monorepo_signal": { "type": ["string", "null"] },
+        "active_module": { "type": ["string", "null"] },
+        "notes": { "type": "array", "items": { "type": "string" } },
+        "modules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "path": { "type": "string" },
+              "language": { "type": ["string", "null"] },
+              "package_manager": { "type": ["string", "null"] },
+              "source": { "type": ["string", "null"], "enum": ["deterministic", "llm_augmented", "llm_only", null] },
+              "test_directory_layout": {
+                "type": ["object", "null"],
+                "properties": {
+                  "base_dir": { "type": ["string", "null"] },
+                  "convention": { "type": ["string", "null"], "enum": ["by_type", "by_page", "flat", "unknown", null] },
+                  "default_target": { "type": ["string", "null"] },
+                  "subdirs": { "type": "array" }
+                },
+                "additionalProperties": true
+              },
+              "src_directory_layout": {
+                "type": ["object", "null"],
+                "description": "Where the SUT puts production (non-test) code. Step 7 codegen places generated page objects + locators here, NOT under tests/.",
+                "properties": {
+                  "package_root": { "type": ["string", "null"] },
+                  "pages_object_dir": { "type": ["string", "null"] },
+                  "pages_locators_dir": { "type": ["string", "null"] },
+                  "helpers_dir": { "type": ["string", "null"] },
+                  "convention_source": { "type": ["string", "null"], "enum": ["detected", "fallback", "llm_only", "llm_augmented", null] }
+                },
+                "additionalProperties": true
+              },
+              "existing_page_objects": { "type": "array" },
+              "existing_helpers": { "type": "array" },
+              "existing_fixtures": { "type": "array" },
+              "existing_locators": {
+                "type": "array",
+                "description": "Locator constant classes discovered in the SUT (e.g. ChatPageLocators). Surfaced so the codegen step's agent can import existing constants instead of inventing byte-identical duplicates.",
+                "items": { "type": "object", "additionalProperties": true }
+              },
+              "auth_flow": {
+                "type": ["object", "null"],
+                "properties": {
+                  "type": { "type": ["string", "null"], "enum": ["sso", "oauth", "basic", "none", "unknown", null] },
+                  "entry_method": { "type": ["string", "null"] },
+                  "credentials_env_vars": { "type": "array", "items": { "type": "string" } },
+                  "fixture_entry": { "type": ["string", "null"] }
+                },
+                "additionalProperties": true
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    },
     "sections": {
       "type": "array",
       "items": { "$ref": "#/$defs/section" }
+    },
+    "dependency_warnings": {
+      "type": "array",
+      "description": "Top-level imports in the SUT's test files that are not in the declared dependency set. Step 9 uses confidence=known entries to pre-install before the first pytest run; confidence=guessed entries surface as console warnings only.",
+      "items": {
+        "type": "object",
+        "required": ["module", "suggested_package", "source_file", "confidence", "suggested_install"],
+        "properties": {
+          "module":            { "type": "string" },
+          "suggested_package": { "type": "string" },
+          "source_file":       { "type": "string" },
+          "confidence":        { "enum": ["known", "guessed"] },
+          "suggested_install": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
     }
   },
   "$defs": {

@@ -10,9 +10,14 @@ Run the appropriate test command and report pass/fail with details.
 
 ## Process
 
-### 1. Discover Test Command
+### 1. Command source
 
-If not provided, check in order:
+Always run the test command passed to you by the pipeline. It comes from
+`research.json.commands.test` and is resolved by
+`src/worca_t/steps/s09_execute.py:_detected_command()`. You receive it via the
+runner argument; do **not** self-discover from project files.
+
+**Fallback only when the passed command is empty.** In that rare case, check in order:
 1. Project files:
    - `playwright.config.{ts,js}` → `npx playwright test`
    - `cypress.config.{ts,js}` → `npx cypress run`
@@ -92,3 +97,17 @@ Failures:
 - Capture the test summary
 - Extract specific failure information
 - Include file:line references when available
+
+## Failure artifacts
+
+The pipeline wraps your text output into `artifacts/step09/run-results.json` (see
+`src/worca_t/steps/s09_execute.py:835-849`) and harvests on-disk artifacts into
+`results[].attachments`. To make sure those attachments exist:
+
+- **Playwright:** ensure `use.screenshot: 'only-on-failure'`, `use.trace: 'retain-on-failure'`, and `use.video: 'retain-on-failure'` are set in the framework config.
+- **Cypress:** screenshots and videos are on by default — do not disable them in the SUT config.
+- **Selenium / WebdriverIO:** ensure the framework's failure-screenshot hook is enabled (`takesScreenshot` capability or `afterTest` hook).
+- **pytest-playwright:** `--screenshot=only-on-failure --video=retain-on-failure --tracing=retain-on-failure`.
+- **Robot Framework:** `--listener` for screenshot-on-failure, or the Browser Library's auto-capture.
+
+If a failure has no captured artifact (e.g., the test crashed before browser launch), still report the failure — the pipeline will record `attachments: { screenshots: [], traces: [], videos: [], logs: ['<stderr-path>'] }` and the bug classifier will categorize it as `environment` rather than `ui`.

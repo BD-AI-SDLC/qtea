@@ -100,6 +100,15 @@ UI patterns: {yes/no}
 Quality signals: hardSleeps={n}, bareNavigation={n}, skipped={n}
 CI/CD: [github-actions, jenkins, ...]
 Reporting: [allure, mochawesome, none]
+
+# Echo these verbatim from the pre-computed artifacts (rule 8 in .agent.md).
+# If the artifact is missing or the field is unset, write `null` — do not invent.
+Package manager: {value-from-stack_profile.json}     # e.g. poetry, npm, maven
+Wrapper prefix: {value-from-stack_profile.json}      # e.g. `poetry run`, ``
+Install command: {value-from-stack_profile.json}     # e.g. `poetry install`
+Canonical URL: {value-from-url_resolution.json}      # SUT base URL chosen by upstream resolver
+Auth flow type: {value-from-sut_inventory.json}      # sso | oauth | basic | none | unknown
+Default test target: {value-from-sut_inventory.json} # e.g. tests/regression/
 ```
 
 Abort conditions:

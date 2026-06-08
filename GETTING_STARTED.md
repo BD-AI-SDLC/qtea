@@ -315,7 +315,7 @@ All artifacts are under `.worca-t/<run-id>/artifacts/`:
 │   ├── step04/   test-strategy.md, test-strategy.json
 │   ├── step05/   xray-mapping.json (skipped if no creds)
 │   ├── step06/   research.md, research.json
-│   ├── step07/   generated test files, tests-with-tbd.json
+│   ├── step07/   generated test files, tbd-index.json
 │   ├── step08/   locator-resolution.json
 │   ├── step09/   run-results.json, screenshots/, traces/
 │   ├── step10/   bug-reports.md, bug-reports.json

@@ -73,3 +73,35 @@ def test_run_all_checks_returns_list(tmp_path: Path, monkeypatch):
     assert isinstance(checks, list)
     assert all(isinstance(c, Check) for c in checks)
     assert len(checks) >= 8
+
+
+def test_run_all_checks_always_includes_mcp_probes(tmp_path: Path, monkeypatch):
+    """MCP probes must always run — they are the only signal that the
+    pipeline can actually launch agents on this machine. Hiding them
+    behind a flag is how broken MCP setups escape doctor unnoticed.
+    """
+    from worca_t.doctor import run_all_checks
+
+    monkeypatch.setattr("worca_t.doctor.probe_server", lambda srv, timeout_s=8.0: (True, "stub ok"))
+    checks = run_all_checks(tmp_path, workspace=tmp_path / "ws")
+    mcp_checks = [c for c in checks if c.name.startswith("mcp:")]
+    assert mcp_checks, "expected at least one mcp:* check in run_all_checks output"
+
+
+def test_check_mcp_servers_reports_failure_as_fail(tmp_path: Path, monkeypatch):
+    """A probe failure must surface as `fail`, not `warn`. The run_pipeline
+    cold-start treats this as fatal; doctor must agree.
+    """
+    from worca_t.doctor import check_mcp_servers
+
+    cfg = tmp_path / ".mcp.json"
+    cfg.write_text(
+        '{"mcpServers": {"x": {"command": "npx", "args": []}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("worca_t.doctor.probe_server", lambda srv, timeout_s=8.0: (False, "spawn error: [WinError 2]"))
+    checks = check_mcp_servers(tmp_path)
+    assert checks, "expected at least one mcp check"
+    assert all(c.severity == "fail" for c in checks), [
+        (c.name, c.severity, c.message) for c in checks
+    ]

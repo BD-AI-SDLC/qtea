@@ -21,6 +21,7 @@ import os
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -41,6 +42,37 @@ _CRITICAL_PATTERNS = (
 _SECRET_NAME_RE = re.compile(
     r"PASSWORD|SECRET|TOKEN|KEY|CREDENTIALS|AUTH", re.IGNORECASE
 )
+
+# Runtime-essential keys: things a real run cannot proceed without and that
+# the user MUST be given the chance to confirm or override interactively —
+# endpoints (BASE_URL / API_URL / QA_URL / DATABASE_URL), identity
+# (USER / USERNAME / EMAIL / LOGIN / SSO_*), and credentials (PASSWORD).
+# Excluded by design: infrastructure / tuning keys (TIMEOUT, BROWSER,
+# HEADLESS, WORKERS, RETRIES, LOG_LEVEL, ...). Those usually have defaults
+# in code; asking the user about them is noise.
+#
+# Note: every substring is matched case-insensitively against the key,
+# so "QA_URL" matches both "QA_URL" and "PROD_QA_URL_BASE".
+_ESSENTIAL_PATTERNS = (
+    # endpoints
+    "URL", "ENDPOINT", "HOST", "BASE_URL", "API_URL", "QA_URL", "DATABASE_URL",
+    # identity / accounts
+    "USER", "USERNAME", "EMAIL", "LOGIN", "ACCOUNT", "SSO",
+    # credentials
+    "PASSWORD", "PASS", "PASSWD", "PWD",
+)
+
+
+def _is_essential_key(key: str) -> bool:
+    """Runtime-essential: the user must confirm endpoints/identity/credentials.
+
+    Matched case-insensitively as a substring; explicitly excludes the
+    internal/infra keys already filtered upstream (`SECRET_ENV_KEYS`,
+    `_INTERNAL_PREFIXES` in `s06_research.py`). False for tuning knobs
+    like TIMEOUT / BROWSER / HEADLESS / WORKERS / RETRIES.
+    """
+    k = key.upper()
+    return any(p in k for p in _ESSENTIAL_PATTERNS)
 
 
 def classify_env_keys(
@@ -155,7 +187,15 @@ class DotenvFileStrategy(EnvStrategy):
         if env_file and env_file.exists():
             self._paths.append(env_file)
         if sut_path:
-            for name in (".env.example", ".env.template", ".env.sample"):
+            # Order matters: dotenv_values entries later in the list override
+            # earlier ones. Templates / examples (placeholders) go first;
+            # real `.env` / `.env.local` files (actual values) go last so they
+            # win. Reading `.env` is what lets `worca-t run --from-step 7+`
+            # find QA_URL across process restarts — without it, the in-process
+            # `os.environ` write from a prior Step 6 run is gone and Step 8
+            # aborts with BASE_URL_UNRESOLVED.
+            for name in (".env.example", ".env.template", ".env.sample",
+                         ".env", ".env.local"):
                 p = sut_path / name
                 if p.exists():
                     self._paths.append(p)
@@ -247,10 +287,14 @@ class AzureDevOpsStrategy(EnvStrategy):
         return out
 
     def _fetch_variables(self) -> dict | None:
+        org = urllib.parse.quote(self._org, safe="")
+        project = urllib.parse.quote(self._project, safe="")
+        query = urllib.parse.urlencode(
+            {"groupName": self._group, "api-version": "7.1"},
+        )
         url = (
-            f"https://dev.azure.com/{self._org}/{self._project}"
-            f"/_apis/distributedtask/variablegroups"
-            f"?groupName={self._group}&api-version=7.1"
+            f"https://dev.azure.com/{org}/{project}"
+            f"/_apis/distributedtask/variablegroups?{query}"
         )
         creds = base64.b64encode(f":{self._pat}".encode()).decode()
         req = urllib.request.Request(
@@ -279,15 +323,33 @@ class AzureDevOpsStrategy(EnvStrategy):
 
 
 class InteractivePromptStrategy(EnvStrategy):
+    """HITL confirmation/override for runtime-essential SUT env vars.
+
+    Unlike the silent strategies, this one is invoked specifically for
+    *essential* keys regardless of whether they're already resolved —
+    the user must always get the chance to confirm or override endpoints,
+    identity, and credentials before any test code runs against them.
+
+    Behaviour per key:
+      * non-secret with a discovered value → prompt shows the value as
+        the default; pressing Enter accepts it, typing overrides it
+      * non-secret with no value           → prompt with empty default;
+        Enter skips, typing supplies it
+      * secret (PASSWORD/TOKEN/AUTH/...)   → prompt is password-masked;
+        any discovered default is preserved silently (never echoed)
+    """
+
     name = "interactive"
+
+    def __init__(self, defaults: dict[str, str] | None = None) -> None:
+        self._defaults = defaults or {}
 
     def resolve(
         self,
         keys: list[str],
-        already_resolved: dict[str, str],
+        already_resolved: dict[str, str],  # noqa: ARG002 — intentionally ignored
     ) -> dict[str, str]:
-        unresolved = [k for k in keys if k not in already_resolved]
-        if not unresolved or not sys.stdin.isatty():
+        if not keys or not sys.stdin.isatty():
             return {}
 
         from rich.console import Console
@@ -298,24 +360,40 @@ class InteractivePromptStrategy(EnvStrategy):
         console.print()
         console.print(
             Panel(
-                f"[bold yellow]Step 6[/] discovered [bold]{len(unresolved)}[/] "
-                f"required SUT environment variable(s) that are not yet set.\n"
-                f"Enter a value for each, or press [bold]Enter[/] to skip.",
+                f"[bold yellow]Step 6[/] needs you to confirm "
+                f"[bold]{len(keys)}[/] runtime-essential SUT variable(s) "
+                f"(endpoints / identity / credentials).\n"
+                f"Press [bold]Enter[/] to accept the discovered default, "
+                f"or type a new value to override.",
                 title="SUT environment input required",
                 border_style="yellow",
             )
         )
 
         out: dict[str, str] = {}
-        for k in unresolved:
+        for k in keys:
             is_secret = bool(_SECRET_NAME_RE.search(k))
+            current = self._defaults.get(k, "")
             console.print()
-            val = Prompt.ask(
-                f"  [green]{k}[/green]",
-                default="",
-                password=is_secret,
-            )
-            val = val.strip()
+            if is_secret:
+                suffix = (
+                    "[dim](found — Enter to keep, or type new)[/]"
+                    if current
+                    else "[dim](not found — type to supply)[/]"
+                )
+                val = Prompt.ask(
+                    f"  [green]{k}[/green] {suffix}",
+                    default=current,
+                    password=True,
+                    show_default=False,
+                )
+            else:
+                val = Prompt.ask(
+                    f"  [green]{k}[/green]",
+                    default=current or "",
+                    show_default=bool(current),
+                )
+            val = (val or "").strip()
             if val:
                 out[k] = val
         return out
@@ -333,23 +411,36 @@ def resolve_sut_env(
 ) -> ResolvedEnv:
     """Run the full resolution cascade and inject results into ``os.environ``.
 
-    ``extra_required`` flags keys as required beyond the ``.env.example`` and
-    critical-pattern heuristics — typically Pydantic ``BaseSettings`` fields
-    declared without a default.
+    Two-phase cascade:
+      1. Silent strategies (process env → .env file → AzDO) try every
+         discovered key. They write to *resolved* and never block.
+      2. Interactive prompt fires **only for runtime-essential keys**
+         (endpoints / identity / credentials — see ``_is_essential_key``).
+         For each essential, the user sees the discovered value as the
+         prompt default and may confirm (Enter) or override (type new).
+         Infrastructure keys (TIMEOUT, BROWSER, HEADLESS, WORKERS, ...)
+         are NEVER prompted for; if they have no value here, the SUT's
+         in-code default wins at runtime.
+
+    ``extra_required`` flags keys as required beyond the ``.env.example``
+    and critical-pattern heuristics — typically Pydantic ``BaseSettings``
+    fields declared without a default. It does NOT influence which keys
+    are prompted for; that's purely the essential-pattern test.
     """
     required, optional = classify_env_keys(
         discovered_keys, sut_path, extra_required=extra_required,
     )
     all_keys = required + optional
+    essentials = [k for k in all_keys if _is_essential_key(k)]
 
-    strategies: list[EnvStrategy] = [ProcessEnvStrategy()]
+    silent: list[EnvStrategy] = [ProcessEnvStrategy()]
 
     if config.env_file or config.sut_path:
-        strategies.append(DotenvFileStrategy(config.env_file, config.sut_path))
+        silent.append(DotenvFileStrategy(config.env_file, config.sut_path))
 
     if config.azdo_org and config.azdo_project and config.azdo_variable_group:
         if config.azdo_pat:
-            strategies.append(
+            silent.append(
                 AzureDevOpsStrategy(
                     config.azdo_org,
                     config.azdo_project,
@@ -364,22 +455,14 @@ def resolve_sut_env(
                      "skipping Azure DevOps variable resolution.",
             )
 
-    if not config.no_hitl:
-        strategies.append(InteractivePromptStrategy())
-
     resolved: dict[str, str] = {}
     sources: dict[str, str] = {}
 
-    for strategy in strategies:
-        # Interactive prompts only fire for *required* keys. Optional keys
-        # (e.g. Pydantic BaseSettings fields with literal defaults like
-        # timeout=30, headless=True) must never block the user — if a
-        # value is not found in env/.env/AzDO, the SUT's own default
-        # wins at runtime. Silent strategies still scope over all keys.
-        scope = required if isinstance(strategy, InteractivePromptStrategy) else all_keys
-        remaining = [k for k in scope if k not in resolved]
+    # Phase 1 — silent strategies over ALL keys.
+    for strategy in silent:
+        remaining = [k for k in all_keys if k not in resolved]
         if not remaining:
-            continue
+            break
         found = strategy.resolve(remaining, resolved)
         for k, v in found.items():
             resolved[k] = v
@@ -387,6 +470,20 @@ def resolve_sut_env(
             if isinstance(strategy, DotenvFileStrategy):
                 label = strategy.source_label
             sources[k] = label
+
+    # Phase 2 — interactive confirmation for essentials only.
+    if not config.no_hitl and essentials:
+        interactive = InteractivePromptStrategy(
+            defaults={k: resolved.get(k, "") for k in essentials},
+        )
+        confirmed = interactive.resolve(essentials, {})
+        for k, v in confirmed.items():
+            # An override is anything the user supplied that differs from
+            # what the silent cascade had (or for a previously-missing key,
+            # anything they supplied at all).
+            if resolved.get(k) != v:
+                sources[k] = "interactive"
+            resolved[k] = v
 
     for k, v in resolved.items():
         os.environ[k] = v

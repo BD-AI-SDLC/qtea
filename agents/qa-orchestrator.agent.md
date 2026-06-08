@@ -21,7 +21,12 @@ the retry/fix-proposal flow.
 - AOM snapshots only.
 - No hard waits, no secrets in code.
 - Markdown files: <=200 lines target, 500 hard cap.
-- Per-step timeout cap: 1200 s.
+- Per-step timeout cap: see `MAX_STEP_TIMEOUT_S` in `src/worca_t/config.py` (currently 1800 s). Per-step values via `step_timeout(N)`. Do not restate the number here.
+
+## Sub-agent dispatch patterns
+- **`polyglot-test-fixer` is a single agent file with two modes.** Heal mode (Step 9) is the default. Audit mode (Step 8b) is selected by prefixing the user prompt with the literal token `MODE: DOM-COMPARISON-AUDIT` (see `src/worca_t/steps/s08_locator_resolution.py`).
+- **`src/worca_t/agent_models.yaml` deliberately holds two keys for this agent** — `polyglot-test-fixer` (heal, larger model) and `polyglot-test-fixer-audit` (audit, smaller model) — to allow per-mode cost tuning. Both keys resolve to the same `.agent.md` file; the difference is only the model the orchestrator picks for the dispatch.
+- **JIT locator resolution (Python + pytest + Playwright SUTs)** replaces Step 8a entirely for that stack. Step 8 short-circuits with `status: skipped, mode: jit`; resolution happens at Step 9 runtime via the vendored `tests/worca_t_runtime.py` plugin (a direct Anthropic SDK call against the live page's AOM — NOT a Playwright MCP call). Under JIT, `playwright-tester` is NOT invoked for Step 8a; `polyglot-test-fixer` heal mode still runs in Step 9 but only for failures the JIT runtime's cache-invalidate-and-retry-on-`TimeoutError` couldn't recover from. See CLAUDE.md § JIT Locator Resolution + `agents/qa-orchestrator.instructions.md` § Step 8 / Step 9 for the full contract.
 
 ## Observability
 Every action emits a structured log entry to `.worca-t/<run-id>/run.log.jsonl`

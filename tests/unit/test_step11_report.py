@@ -237,6 +237,79 @@ def test_render_html_without_plan_strategy():
     assert "<!DOCTYPE html>" in html
 
 
+def test_render_html_bug_card_with_dict_attachments():
+    """Regression: bug-reports.json stores `attachments` as a typed dict
+    ({"screenshots": [...], "traces": [...], "videos": [...], "logs": [...]}),
+    NOT as a list of dicts. The renderer must accept both shapes without
+    raising AttributeError on `'str'.get`.
+    """
+    bug = _sample_bug()
+    bug["attachments"] = {
+        "screenshots": ["/tmp/shot.png"],
+        "traces": [],
+        "videos": [],
+        "logs": ["/tmp/run.log"],
+    }
+    report = _make_report(bugs=[bug])
+    # Should not raise.
+    html = render_html(report)
+    # Both entries should be linked out (basename rendered).
+    assert "shot.png" in html
+    assert "run.log" in html
+
+
+def test_render_html_bug_card_with_list_of_dict_attachments():
+    """Run-results-style list of {path, type} dicts must also work."""
+    bug = _sample_bug()
+    bug["attachments"] = [
+        {"path": "/tmp/a.png", "type": "screenshot"},
+        {"path": "/tmp/b.zip", "type": "trace"},
+    ]
+    report = _make_report(bugs=[bug])
+    html = render_html(report)
+    assert "a.png" in html
+    assert "b.zip" in html
+
+
+def test_render_html_bug_card_with_empty_dict_attachments():
+    """An all-empty dict must not produce an Evidence section at all."""
+    bug = _sample_bug()
+    bug["attachments"] = {"screenshots": [], "traces": [], "videos": [], "logs": []}
+    report = _make_report(bugs=[bug])
+    html = render_html(report)
+    # Bug card still rendered, just no Evidence panel.
+    assert "BUG-r-001" in html
+    assert "Evidence" not in html
+
+
+def test_normalize_bug_attachments_dict_form():
+    from worca_t.report.html_renderer import _normalize_bug_attachments
+    out = _normalize_bug_attachments({
+        "screenshots": ["a.png"],
+        "traces": ["b.zip"],
+        "videos": [],
+        "logs": ["c.log"],
+    })
+    assert sorted(out) == [("a.png", "screenshot"), ("b.zip", "trace"), ("c.log", "log")]
+
+
+def test_normalize_bug_attachments_list_form():
+    from worca_t.report.html_renderer import _normalize_bug_attachments
+    out = _normalize_bug_attachments([
+        {"path": "a.png", "type": "screenshot"},
+        "bare-path.zip",
+    ])
+    assert ("a.png", "screenshot") in out
+    assert ("bare-path.zip", "other") in out
+
+
+def test_normalize_bug_attachments_empty_and_none():
+    from worca_t.report.html_renderer import _normalize_bug_attachments
+    assert _normalize_bug_attachments(None) == []
+    assert _normalize_bug_attachments({}) == []
+    assert _normalize_bug_attachments([]) == []
+
+
 # ---------------------------------------------------------------------------
 # allure_writer tests
 # ---------------------------------------------------------------------------

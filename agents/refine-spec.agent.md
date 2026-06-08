@@ -44,8 +44,10 @@ substantive content:
 3. Discard everything else: issue summary tables, attachments, issue links,
    sub-tasks, comments, UX-design tables of Figma links, image-only rows,
    sprint/label/assignee metadata.
-4. Overwrite `./spec.md` with this cleaned version, then proceed to Step 1
-   below. The rest of the refinement runs on the cleaned text.
+4. Overwrite the workdir's `./spec.md` (your local working copy — the canonical
+   Step 1 artifact at `artifacts/step01/spec.md` is read-only and is not touched
+   by this pass). Then proceed to Step 1 below. The rest of the refinement runs
+   on the cleaned text.
 
 **If clean:** skip this pass and go straight to Step 1.
 
@@ -68,7 +70,7 @@ is to remove tracker boilerplate, not to second-guess the author.
 12. Provide NFRs: performance targets, security constraints, accessibility, compatibility.
 13. Suggest effort estimation based on complexity indicators.
 14. Run the Definition-of-Ready checklist and emit a readiness verdict.
-15. Write the refined spec back to the same file (or a new `-refined.md` suffix if instructed).
+15. Write the refined spec to `./refined-spec.md` in the workdir. The Python pipeline at `src/worca_t/steps/s02_refine.py:120` copies it to `artifacts/step02/refined-spec.md`. Do not overwrite `spec.md`.
 
 ## Output Format
 
@@ -160,3 +162,7 @@ The refined spec retains the original structure and appends/replaces sections:
 - No GitHub/Jira API calls — this agent works on local markdown files only.
 - The refined spec has to be unique and not contain any duplicate content.
 - If there are any Blockers or `[CLARIFICATION NEEDED]` tags, the agent must ask the user to resolve them before finalizing the refined spec.
+
+## Non-interactive mode
+
+If the orchestrator runs with `--no-hitl` / `--yes` (HITL disabled — see `src/worca_t/steps/base.py:222`), do not block on user input. Emit the refined spec with `Readiness: NOT READY` and the full blocker list intact. The orchestrator decides whether to halt the pipeline or proceed. Never invent answers to clarifications you would otherwise have asked.

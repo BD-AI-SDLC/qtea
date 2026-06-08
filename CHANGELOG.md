@@ -182,7 +182,7 @@ pre-commit hook.
   (`playwright-generate-test` for Playwright stacks, `webapp-testing`
   otherwise), copies `tests/` into the artifact dir, indexes + validates,
   REJECTS the step on any rule violation (writes `violations.log`).
-- `schemas/tests-with-tbd.schema.json`.
+- `schemas/tbd-index.schema.json`.
 - Tests: `test_indexer.py` (21 - 8 frameworks + every violation rule),
   `test_step07_codegen.py` (7). **90/90 passing**, ruff clean.
 

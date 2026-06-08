@@ -3,6 +3,15 @@
 > HOW to execute what `agents/qa-orchestrator.agent.md` defines.
 > Read `CLAUDE.md` first -- it is the source of truth for pipeline structure,
 > agent-model map, MCP servers, and non-negotiable rules.
+>
+> **Single sources of truth** (this file points at them; never duplicate):
+> - Agent → model map: [`src/worca_t/agent_models.yaml`](../src/worca_t/agent_models.yaml)
+> - MCP servers: [`.mcp.json`](../.mcp.json)
+> - Per-step timeouts: [`src/worca_t/config.py`](../src/worca_t/config.py)
+> - Schemas: [`schemas/*.schema.json`](../schemas/)
+>
+> Model names and timeout numbers are deliberately omitted from the step
+> tables below to prevent drift. Look them up in the files above.
 
 ## Architecture at a Glance
 
@@ -57,10 +66,11 @@ For each step in `_select_steps()` (respecting `--from-step`, `--only-step`, `--
 2. Look up the model for that agent in `src/worca_t/agent_models.yaml`.
 3. Invoke the agent via `claude_runner.py` (`run_agent()`), which spawns the
    `claude` CLI with:
-   - The correct model from the agent-model map.
+   - The model resolved from the agent-model map.
    - The curated input bundle (files listed in section 3 below).
-   - MCP servers from `.mcp.json` (Playwright, Chrome DevTools, Atlassian).
-   - A per-step timeout cap (see `config.py`; max **1200 seconds**).
+   - MCP servers as configured in [`.mcp.json`](../.mcp.json).
+   - A per-step timeout cap from [`config.py`](../src/worca_t/config.py)
+     (`step_timeout(N)`; the global cap is `MAX_STEP_TIMEOUT`).
 4. Stream agent progress. Write each event to `run.log.jsonl` with fields:
    `run_id`, `step`, `agent`, `attempt`, `correlation_id`, `timestamp`.
 5. Mask secrets in all log output: `ANTHROPIC_API_KEY`, `JIRA_API_TOKEN`,
@@ -70,7 +80,7 @@ For each step in `_select_steps()` (respecting `--from-step`, `--only-step`, `--
 
 1. Confirm every expected output artifact exists (see section 3).
 2. Validate each JSON output against its schema in `schemas/` via `schemas.py`.
-3. For step 7, additionally scan `tests-with-tbd.json` for `violations[]`.
+3. For step 7, additionally scan `tbd-index.json` for `violations[]`.
    Any violation with rule `xpath`, `hard-wait`, `page-content`, or
    `raw-secret` is a hard failure -- reject the output.
 4. If validation fails, treat as a step failure (go to 2.5).
@@ -87,22 +97,24 @@ For each step in `_select_steps()` (respecting `--from-step`, `--only-step`, `--
 
 ```
 Attempt 1 fails  (steps/base.py MAX_ATTEMPTS=2)
-  --> Attempt 2: re-run same inputs + co-run debug.agent.md (claude-sonnet-4-6)
+  --> Attempt 2: re-run same inputs + co-run debug.agent.md
         --> Attempt 2 fails:
-              if --fix: invoke critical-thinking (claude-opus-4-6) for RCA
-                        --> feed analysis to principal-software-engineer (claude-opus-4-6)
+              if --fix: invoke critical-thinking for RCA
+                        --> feed analysis to principal-software-engineer
                         --> produce fix-proposal.md and auto-edit code (no auto-edits if --fix not set)
               else: ABORT pipeline, mark step "failed" in state.json
 ```
 
+(Models for `debug`, `critical-thinking`, and `principal-software-engineer`
+live in `src/worca_t/agent_models.yaml`.)
+
 1. On first failure, increment `attempts` to 2, set `status: "in_progress"`.
 2. Re-invoke the same agent with the same inputs, but also co-run
-   `debug.agent.md` (claude-sonnet-4-6) for verbose diagnostics.
+   `debug.agent.md` for verbose diagnostics.
    If `--debug` was set, `debug.agent.md` was already running from attempt 1.
 3. If attempt 2 also fails and `--fix` is set:
-   a. Invoke `critical-thinking` (claude-opus-4-6) with the failure context.
-   b. Feed the critical-thinking output to `principal-software-engineer`
-      (claude-opus-4-6).
+   a. Invoke `critical-thinking` with the failure context.
+   b. Feed the critical-thinking output to `principal-software-engineer`.
    c. Write `fix-proposal.md` to `artifacts/stepNN/`and auto-edit code.
 4. If attempt 2 fails and `--fix` is NOT set: mark step `"failed"`, abort.
 
@@ -116,7 +128,7 @@ Attempt 1 fails  (steps/base.py MAX_ATTEMPTS=2)
 
 | Field | Value |
 |---|---|
-| Agent | `jira-to-ai-spec` (claude-sonnet-4-6), or pure file copy |
+| Agent | `jira-to-ai-spec`, or pure file copy |
 | Input | `--spec` flag (Jira ticket ID/URL or local markdown path) |
 | Output | `artifacts/step01/spec.md` (required), `jira-spec.md` (if Jira) |
 | Schema | n/a (non-empty file check only) |
@@ -135,7 +147,7 @@ Attempt 1 fails  (steps/base.py MAX_ATTEMPTS=2)
 
 | Field | Value |
 |---|---|
-| Agent | `refine-spec` (claude-sonnet-4-6) |
+| Agent | `refine-spec` |
 | Input | `artifacts/step01/spec.md` |
 | Output | `artifacts/step02/refined-spec.md`, `refined-spec.json` |
 | Schema | `schemas/refined-spec.schema.json` |
@@ -150,7 +162,7 @@ traceability backbone -- they propagate through every downstream artifact.
 
 | Field | Value |
 |---|---|
-| Agent | `polyglot-test-planner` (claude-sonnet-4-6) |
+| Agent | `polyglot-test-planner` |
 | Input | `artifacts/step02/refined-spec.md`, `refined-spec.json` |
 | Output | `artifacts/step03/plan.md`, `plan.json` |
 | Schema | `schemas/plan.schema.json` |
@@ -163,7 +175,7 @@ traceability backbone -- they propagate through every downstream artifact.
 
 | Field | Value |
 |---|---|
-| Agent | `test-manager` (claude-opus-4-6) |
+| Agent | `test-manager` |
 | Input | `artifacts/step03/plan.json` |
 | Output | `artifacts/step04/test-strategy.md`, `test-strategy.json` |
 | Schema | `schemas/test-strategy.schema.json` |
@@ -199,21 +211,21 @@ traceability backbone -- they propagate through every downstream artifact.
 
 | Field | Value |
 |---|---|
-| Agent | `polyglot-test-researcher` (claude-sonnet-4-6) |
+| Agent | `polyglot-test-researcher` |
 | Input | `--sut` (local path or git URL) |
 | Output | `artifacts/step06/research.md`, `research.json` |
 | Schema | `schemas/research.schema.json` |
 
 **Procedure:**
-1. If `--sut` is a git URL, clone to `.worca-t/<run-id>/sut/`.
-2. Pass the SUT directory to `polyglot-test-researcher`.
+1. Clone `--sut` to `.worca-t/<run-id>/sut/`.
+2. Pass the `--sut` directory to `polyglot-test-researcher`.
 3. The agent discovers the test automation stack using 3-signal detection:
    dependency files + imports + config files.
 4. **Critical output**: `detected_stack` determines which polyglot codegen
-   path step 7 takes. If `null`, step 7 falls back to universal patterns.
+   path step 7 takes. If `null`, step 7 falls back to HITL.
 
-**Phase gate:** `sections` array is non-empty. Warn if `detected_stack` is
-null but do not fail.
+**Phase gate:** `sections` array is non-empty. If `detected_stack` is
+null, involve HITL.
 
 ---
 
@@ -221,10 +233,10 @@ null but do not fail.
 
 | Field | Value |
 |---|---|
-| Agent | `ui-test-automation` (claude-opus-4-6) |
+| Agent | `ui-test-automation` |
 | Input | `artifacts/step04/test-strategy.json`, `artifacts/step06/research.json`, `--sut` path |
-| Output | Test source files in `sut/`, `artifacts/step07/tests-with-tbd.json` |
-| Schema | `schemas/tests-with-tbd.schema.json` |
+| Output | Test source files in `sut/`, `artifacts/step07/tbd-index.json` |
+| Schema | `schemas/tbd-index.schema.json` |
 
 **Phase gate:**
 - `framework` is a recognized enum value.
@@ -235,28 +247,90 @@ null but do not fail.
 
 ---
 
-#### Step 8 -- Locator discovery
+#### Step 8 -- Locator discovery + DOM-truth audit (two agents)
 
 | Field | Value |
 |---|---|
-| Agent | `playwright-tester` (claude-sonnet-4-6) |
-| Input | `artifacts/step07/tests-with-tbd.json`, `artifacts/step06/research.json`, `SUT_BASE_URL` env var |
-| Output | `artifacts/step08/locator-resolution.json` |
-| Schema | `schemas/locator-resolution.schema.json` |
+| Agents | **8a** `playwright-tester` (live DOM, resolve TBDs) + **8b** `polyglot-test-fixer` in audit-only mode (compare expected vs actual, no edits) |
+| Input | `artifacts/step07/tbd-index.json`, `artifacts/step06/research.json`, `SUT_BASE_URL` env var |
+| Output | `artifacts/step08/locator-resolution.json` + `artifacts/step08/tbd-index.json` (re-indexed) + `artifacts/step08/dom-comparison.json` (8b auditor verdicts) |
+| Schemas | `schemas/locator-resolution.schema.json`, `schemas/dom-comparison.schema.json` |
 
-**Procedure:**
-1. Navigate the live application via the Playwright MCP
-   (AOM snapshots only -- never `page.content()`).
-2. For each TBD marker, discover the real locator using the priority
+**JIT short-circuit (Python + pytest + Playwright only).** When the active module's framework is `pytest` or `playwright-py` AND `tests/worca_t_runtime.py` exists in the SUT (vendored by Step 7), Step 8 writes a minimal `artifacts/step08/locator-resolution.json` with `mode: "jit"` and returns `status: skipped`. Resolution happens at Step 9 runtime via the vendored pytest plugin — it intercepts `tbd("…")` sentinels against the live Playwright page (already authenticated, already on the right URL because the test's own POMs navigated there). For all other frameworks, the procedure below runs as written.
+
+**Procedure — 8a (playwright-tester) [non-JIT frameworks]:**
+1. Navigate the live application via the Playwright MCP. **AOM-first snapshot policy:**
+   - Every distinct URL opened in the session → capture AOM via
+     `browser_snapshot`, persist to `./page-snapshot-NN.json` (NN
+     zero-padded, starting at 01) BEFORE further work with that page.
+   - Raw-DOM is a scoped fallback only — permitted when the target element
+     is missing from the AOM, non-semantic (div/span without ARIA), or
+     hidden from screen readers. When triggered: capture via
+     `browser_evaluate(() => document.documentElement.outerHTML)`, persist
+     to `./page-snapshot-NN-raw.html`, AND record
+     `snapshot_source: "raw_dom_fallback"` + a `fallback_reason`
+     (`not_in_aom` | `non_semantic` | `aria_hidden` | <free text>) on every
+     resolution item that cited the raw capture.
+   - Within a captured page, element-scoped queries only (never re-capture
+     the whole page).
+2. For each TBD marker, read the `description` field from
+   `tbd-index.json` (semantic intent captured by the codegen agent's
+   `TBD_INTENT:` comment) and discover the real locator using the priority
    chain: `id > data-testid > role > label > text > placeholder > css`.
-   **Never XPath.**
-3. Patch the test source files, replacing TBD markers with real
-   locators, and record each resolution.
+   **Never XPath.** When `description` is missing on legacy runs, infer
+   intent from the constant name + surrounding test code.
+3. Patch the test source files via the orchestrator's anchored line-targeted
+   patcher: the patcher requires a `<CONST_NAME> = <tbd_token>` assignment
+   line within ±10 lines of the agent-supplied `line` and refuses to
+   fall back to global first-occurrence replacement (which previously
+   scrambled assignments when `TBD_LOCATOR` appeared in a comment).
+   Items that don't match an anchor are marked `applied: false` with a
+   drift `skip_reason` and surfaced via HITL / 8b. Record each resolution
+   in `locator-resolution.json` with `applied`/`skip_reason` per item.
+   Honest skips (`strategy: null` + diagnostic `skip_reason`) are
+   preserved — the pipeline no longer overwrites them.
+4. **HITL escalation for unresolvable TBDs.** When the agent sets
+   `applied: false` because an element genuinely cannot be located, it
+   appends a `[CLARIFICATION NEEDED: <CONST> @ <file>:<line>]` block to
+   `./clarifications.md`. The orchestrator extracts those blocks (via
+   `extract_questions` in `src/worca_t/hitl.py`), prompts the user once
+   per block on a TTY, and splices the answer into
+   `./locator-resolution.json`:
+     - User pastes a selector → orchestrator validates (XPath is rejected),
+       infers strategy from shape, sets `applied: true, source: "hitl"`.
+     - User confirms spec gap → orchestrator sets `applied: false,
+       comparison_verdict: "ghost", source: "hitl"`; the gate's
+       `excused_count` then absorbs it.
+     - Non-TTY / `--no-hitl` runs skip the prompt entirely; items stay
+       `applied: false` and fall through to the apply-rate gate exactly
+       as today (no CI regression).
 
-**Phase gate:**
+**Procedure — 8b (polyglot-test-fixer in DOM-COMPARISON-AUDIT mode):**
+- Reads `./tbd-index.json`, `./locator-resolution.json`, every
+  `./page-snapshot-*` persisted by 8a, plus the codegen-produced test
+  files inside the SUT (via `add_dirs=[sut_root]`).
+- Emits `./dom-comparison.json` with one verdict per TBD constant:
+  `matched` / `ghost` / `duplicate` / `low_confidence` / `unevaluated`.
+- **Forbidden:** SUT edits, Playwright MCP calls, new snapshots.
+- The pipeline stamps each verdict into `locator-resolution.json` (via
+  `comparison_verdict`) and forces `applied: false` + clears
+  `strategy`/`replacement` on `ghost`/`duplicate` items.
+
+**Phase gate (post-audit):**
 - `resolutions` array is non-empty.
-- Every `strategy` value is in the allowed enum (no `xpath`).
-- Check `totals.skipped` -- warn if any TBDs remain unresolved.
+- Every applied `strategy` value is in the allowed enum (no `xpath`); `null`
+  is allowed when `applied: false`.
+- Apply rate is now `applied / (applied + skipped - excused)`, where
+  `excused` counts items marked `ghost` or `duplicate` by 8b. Threshold
+  remains 90%. Honest skips for non-existent or duplicate elements no longer
+  penalise the run.
+- `remaining_tbd > 0` with apply rate ≥ 90% → `warned` (Step 9 may pass a
+  subset of tests; unresolved markers stay as bug candidates).
+- Snapshot-policy violations (8a persisted a `*-raw.html` capture without
+  a corresponding `fallback_reason` recorded on any resolution item, or
+  produced zero AOM captures) are logged as
+  `step08.snapshot_policy_violation` warnings only — they do not fail
+  the step.
 
 ---
 
@@ -266,18 +340,28 @@ null but do not fail.
 
 | Field | Value |
 |---|---|
-| Agents | `polyglot-test-tester` (claude-sonnet-4-6) for execution, `polyglot-test-fixer` (claude-sonnet-4-6) for self-heal |
-| Input | `artifacts/step07/tests-with-tbd.json` (TBDs resolved), `--sut` path, `--parallelism N`, `--headless\|--headed` |
-| Output | `artifacts/step09/run-results.json`, screenshots, traces, `bugs/*.md` candidates |
-| Schema | `schemas/run-results.schema.json` |
+| Agents | `polyglot-test-tester` for execution, `polyglot-test-fixer` for self-heal |
+| Input | `artifacts/step07/tbd-index.json` (TBDs resolved), `--sut` path, `--parallelism N`, `--headless\|--headed` |
+| Output | `artifacts/step09/run-results.json`, screenshots, traces, `bugs/*.md` candidates, `locator-cache.json` (when JIT runtime ran) |
+| Schema | `schemas/run-results.schema.json` (+ `schemas/locator-cache.schema.json` for the JIT cache) |
 
-**Procedure:**
-1. Invoke `polyglot-test-tester` to run the test command from
-   `research.json.commands`.
+**JIT runtime (Python + pytest + Playwright only).** When Step 8 returned `mode: jit`, the vendored `tests/worca_t_runtime.py` plugin runs alongside the test command. It:
+- Sets `WORCA_T_*` env vars on the test subprocess: `WORCA_T_CACHE_DIR`, `WORCA_T_RUN_ID`, `ANTHROPIC_API_KEY` (explicitly re-exported through `safe_subprocess_env`'s secret allowlist), `WORCA_T_RESOLVER_MODEL`, `WORCA_T_DEFAULT_TIMEOUT_MS`, and optionally `WORCA_T_DEV_LOCATORS` (when the user passed `--dev-locators` or it's already in env).
+- Monkey-patches `Page.locator` to detect `tbd("…")` sentinels. On sentinel access: consults dev file → runtime cache → `worca-t resolve` subprocess (single Anthropic SDK call, `temperature=0`, prefilled JSON), returning a real `Locator` the test can use. **No Playwright MCP is involved in this path** — the resolver consumes the live page's AOM snapshot captured in-process and makes a direct LLM call.
+- Inflates `page.set_default_timeout` to 60s (configurable via `WORCA_T_DEFAULT_TIMEOUT_MS`; opt-out via `WORCA_T_INFLATE_TIMEOUTS=0`) so resolver latency doesn't bump into per-action timers.
+- Wraps each returned `Locator` in a `_RetryingLocator` proxy. When an action method (`click` / `fill` / `hover` / `text_content` / `wait_for` / etc.) raises `TimeoutError`, the proxy invalidates the failing entry from the cache, re-resolves via the LLM (skipping the dev file + cache so a fresh selector is produced from the current page state), and replays the same action once. This is the **dev-locator-staleness and DOM-drift safety net** — stale dev selectors auto-correct inline before falling through to the heavier polyglot-test-fixer self-heal agent. If the retry also fails, the original `TimeoutError` propagates and the standard self-heal flow takes over.
+- Caches resolutions to `<workspace>/locator-cache/locator-cache.json`; Step 9 copies it to `artifacts/step09/locator-cache.json` after the run.
+
+**Procedure (non-JIT and JIT alike):**
+1. Invoke `polyglot-test-tester` to run the test command. The command comes from
+   `research.json.commands.test`, passed by `s09_execute.py:_detected_command()`.
+   The tester does NOT self-discover the command from project files (that path is
+   a fallback only when `research.json` has no `commands.test`).
 2. Collect results, screenshots (on failure), and traces.
 3. If tests fail due to locator drift, invoke `polyglot-test-fixer`
    to self-heal: patch POM/page-object files with current selectors
-   using the Playwright or Chrome DevTools MCP.
+   using the Playwright MCP (see [`.mcp.json`](../.mcp.json) for the
+   current server list). **JIT note:** under JIT, locator drift triggers the runtime plugin's cache-invalidate-and-re-resolve path BEFORE this self-heal flow runs; self-heal only fires for failures the JIT runtime couldn't resolve.
 4. Re-run healed tests. Record heal attempts in `self_heal` fields.
 5. Write failed-test candidates to `bugs/*.md` for step 10.
 
@@ -291,7 +375,7 @@ failed test.
 
 | Field | Value |
 |---|---|
-| Agent | `bug-report-classifier` (claude-sonnet-4-6) |
+| Agent | `bug-report-classifier` |
 | Input | `artifacts/step09/run-results.json`, `artifacts/step04/test-strategy.json`, `bugs/*.md` candidates |
 | Output | `artifacts/step10/bug-reports.md`, `bug-reports.json` |
 | Schema | `schemas/bug-reports.schema.json` |
@@ -336,7 +420,7 @@ Step 3  --> plan.md/json ------------------> Step 4
 Step 4  --> test-strategy.md/json ---------> Steps 7, 9, 10, 11
 Step 5  --> xray-mapping.json            (stand-alone; no downstream dependency)
 Step 6  --> research.md/json --------------> Steps 7, 8, 9
-Step 7  --> tests-with-tbd.json -----------> Steps 8, 9
+Step 7  --> tbd-index.json -----------> Steps 8, 9
          -> test source files in sut/
 Step 8  --> locator-resolution.json -------> Step 9
 Step 9  --> run-results.json --------------> Steps 10, 11
@@ -373,14 +457,15 @@ These are non-negotiable. Violations trigger step rejection and the retry/fix cy
 |---|---|---|
 | Locator priority | Step 8 agent | `id > data-testid > role > label > text > placeholder > css` |
 | No XPath | Steps 7, 8 | `xpath` in `violations[]` is a hard rejection |
+| No XPath (self-heal) | Step 9 | Any XPath selector introduced by `polyglot-test-fixer` in heal mode (`By.XPATH`, `xpath=`, `//`, `getByXPath(`) is rejected; the heal patch is reverted and the test stays `status: failed`. |
 | No hard waits | Step 7 | `hard-wait` in `violations[]` is a hard rejection |
 | No `page.content()` | Steps 8, 9 | `page-content` in `violations[]` is a hard rejection |
 | No raw secrets | Step 7 | `raw-secret` in `violations[]` is a hard rejection |
 | TC traceability | Step 7 | Every test must have `tc_refs` linking to `TC-*` IDs |
-| REQ traceability | Steps 2, 10 | Every requirement and bug links to a `REQ-*` ID |
+| REQ traceability | Steps 2, 10 | Every requirement links to a `REQ-*` ID. Every bug whose `test_id` resolves to a known TC links to that TC's `requirement_id`; orphan failures (test_id not in strategy) may omit it but must include `rationale: "orphan failure"`. |
 | Self-heal scope | Step 9 | Locators ONLY -- never assertions, never business logic |
 | Schema-first | Every step | Every JSON artifact validated via `schemas.py` before hand-off |
-| AOM snapshot only | Steps 8, 9 | Never `page.content()` -- AOM only |
+| AOM snapshot only | Steps 8, 9 | Generated test code: AOM only — `page.content()` / raw page-source dumps are forbidden. Step 8a runtime: AOM via `browser_snapshot` is the default; raw-DOM via `browser_evaluate(... outerHTML)` is permitted ONLY when the target element is missing from the AOM, non-semantic, or screen-reader-hidden, AND the fallback is annotated per-item with `snapshot_source="raw_dom_fallback"` + a `fallback_reason`. Unjustified raw captures are logged as advisory violations. |
 
 ---
 

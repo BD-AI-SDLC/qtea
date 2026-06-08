@@ -33,7 +33,7 @@ worca-t run --spec ./feature.md --sut ./my-app
 | 4 | Strategy | `test-manager` | `test-strategy.{md,json}` |
 | 5 | Xray | pure code | `xray-mapping.json` |
 | 6 | Research | `polyglot-test-researcher` | `research.{md,json}` |
-| 7 | TDD codegen | `ui-test-automation` | test files + `tests-with-tbd.json` |
+| 7 | TDD codegen | `ui-test-automation` | test files + `tbd-index.json` |
 | 8 | Locators | `playwright-tester` | `locator-resolution.json` |
 | 9 | Run + heal | `polyglot-test-tester` + `polyglot-test-fixer` | `run-results.json` |
 | 10 | Bug class. | `bug-report-classifier` | `bug-reports.{md,json}` |

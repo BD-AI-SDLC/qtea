@@ -4,10 +4,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from worca_t.checkpoints import RunState, save_state
 from worca_t.pipeline import PipelineOptions, _select_workspace, run_pipeline
 from worca_t.steps.base import Step, StepContext, StepResult
 from worca_t.workspace import create_workspace
+
+
+@pytest.fixture(autouse=True)
+def _skip_mcp_preflight(monkeypatch):
+    """Tests in this file don't exercise MCPs; stub the preflight to a no-op."""
+    monkeypatch.setattr("worca_t.mcp_manager.load_mcp_config", lambda path=None: {})
 
 
 async def test_run_pipeline_completes_with_no_steps(tmp_path: Path, monkeypatch):
@@ -105,6 +113,50 @@ def test_select_workspace_from_step_without_run_id_raises(tmp_path: Path):
     )
     with pytest.raises(RuntimeError, match="requires --run-id"):
         _select_workspace(opts)
+
+
+async def test_resume_recovers_spec_and_sut_from_state(tmp_path: Path, monkeypatch):
+    """On --run-id, missing --spec/--sut should fall back to state.json."""
+    monkeypatch.setattr("worca_t.pipeline.STEP_REGISTRY", {})
+
+    spec_file = tmp_path / "prior-spec.md"
+    spec_file.write_text("# prior")
+    sut_dir = tmp_path / "prior-sut"
+    sut_dir.mkdir()
+
+    ws_prior = create_workspace(tmp_path)
+
+    # Stub SUT materialization + preflight — unrelated to the fallback we're testing.
+    def _fake_materialize(src, dest, run_id):  # noqa: ARG001
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / ".git").mkdir(exist_ok=True)
+    monkeypatch.setattr("worca_t.steps.s06_research._materialize_sut", _fake_materialize)
+    monkeypatch.setattr("worca_t._sut_git.current_branch", lambda root: "stub")
+    monkeypatch.setattr("worca_t._sut_git.branch_name", lambda rid: "stub")
+    save_state(
+        RunState(
+            run_id=ws_prior.run_id,
+            workspace=str(ws_prior.root),
+            spec_source=str(spec_file),
+            sut_source=str(sut_dir),
+        ),
+        ws_prior.state_file,
+    )
+
+    opts = PipelineOptions(workspace_base=tmp_path, run_id=ws_prior.run_id)
+    rc = await run_pipeline(opts)
+    assert rc == 0
+    assert opts.spec == str(spec_file)
+    assert opts.sut == str(sut_dir)
+
+
+async def test_fresh_run_without_spec_or_sut_fails(tmp_path: Path, monkeypatch):
+    """A fresh run (no --run-id) with no --spec/--sut must error, not crash."""
+    monkeypatch.setattr("worca_t.pipeline.STEP_REGISTRY", {})
+
+    opts = PipelineOptions(workspace_base=tmp_path / ".ws")
+    rc = await run_pipeline(opts)
+    assert rc == 2
 
 
 async def test_run_pipeline_debug_sets_extras(tmp_path: Path, monkeypatch):

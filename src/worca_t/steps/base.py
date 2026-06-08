@@ -346,6 +346,13 @@ class Step(ABC):
     def workdir(self, ws: Workspace) -> Path:
         return ws.step_workdir(self.number)
 
+    def pre_attempt_cleanup(self, ctx: StepContext, attempt: int) -> None:
+        """Hook fired BEFORE attempt 2+ starts. Override in steps with
+        cross-attempt side effects to wipe or rotate stale artifacts so the
+        next attempt sees a clean slate. ``attempt`` is the upcoming attempt
+        number (2 or higher). Default is no-op."""
+        return None
+
     async def execute(self, ctx: StepContext) -> StepResult:
         """Wraps `run()` with timing, state-record updates, retry, and fix-proposal."""
         # Each attempt below re-invokes self.run(ctx) from scratch. run() is
@@ -361,6 +368,15 @@ class Step(ABC):
         if not result.success and record.attempts < MAX_ATTEMPTS:
             _snapshot_debug_artifacts(self.number, ctx, record.attempts)
             ctx.extras["debug_live"] = True
+            try:
+                self.pre_attempt_cleanup(ctx, record.attempts + 1)
+            except Exception as e:
+                log.warning(
+                    "step.pre_attempt_cleanup_failed",
+                    step=self.number,
+                    attempt=record.attempts + 1,
+                    error=str(e),
+                )
             log.info("step.retry", step=self.number, name=self.name)
             result = await self._attempt(ctx, record)
 

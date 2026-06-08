@@ -1,47 +1,12 @@
-# Test Manager Orchestration Prompt
+# Test Manager — Reference Data
 
-**Purpose**: Orchestrate the Test Manager workflow to process feature specifications and bug reports through the complete QA lifecycle.
+On-demand lookup tables, templates, decision trees, and design principles for the `test-manager.agent.md`. The agent reads specific sections of this file via the Read tool when it needs a template or decision framework — it is NOT loaded into the system prompt.
 
-**Trigger**: On-demand (per task)
-
-**Audience**: Instructions for an AI agent on HOW to execute.
+Persona, mission, workflow steps, decision-making guidance, error handling, and quality gates live in `test-manager.agent.md`.
 
 ---
 
-## Decision-Making Guidance
-
-### When to Ask Clarifying Questions vs. Proceed
-
-**ALWAYS ASK when:**
-- Security implications are unclear
-- Business criticality is unknown
-- Requirements contradict each other
-- Missing information significantly impacts test coverage
-- User workflows or acceptance criteria are unclear
-
-**CAN PROCEED when:**
-- Standard patterns apply (e.g., login flow)
-- Industry best practices fill minor gaps
-- You clearly state assumptions in output
-
-### Prioritization
-
-```
-Is this a critical user journey?
-├─ YES → Critical Priority (test first)
-│   ├─ Authentication/Authorization?
-│   ├─ Payment/Money handling?
-│   └─ Data loss risk?
-├─ NO → Is it high-risk?
-│   ├─ YES → High Priority (complex integration, external API)
-│   └─ NO → Medium/Low Priority
-```
-
----
-
-## Workflow Steps
-
-### Step 1: Input Classification
+## §1 — Input Classification Table
 
 | Input Type | Detection Keywords | Next Step |
 |------------|-------------------|-----------|
@@ -53,32 +18,20 @@ If input doesn't match cleanly, default to Feature Spec but note uncertainty.
 
 ---
 
-### Step 2A: Test Strategy Generation
+## §2 — Test Case Template Structure
 
-**Template**: Use `templates/test-strategy-template.md`
-
-1. Define scope (in scope / out of scope) — keep it brief (5-10 lines)
-2. Generate test cases with structure:
-   ```
-   TC-XXX: [Title]
-   - Type: [UI/API/Integration/Performance/Security]
-   - Priority: [P0/P1/P2/P3]
-   - Preconditions: [Required setup]
-   - Steps: [Numbered list]
-   - Expected Result: [Outcome]
-   ```
-3. Edge cases are test cases — give each an ID and priority, don't list them in a separate summary section. Use `templates/edge-case-checklist.md` to inform TC design.
-4. Add an Assumptions section only if something non-obvious would affect test design or codegen.
-
-**Output**: `test-strategy.md`
+```
+TC-XXX: [Title]
+- Type: [UI/API/Integration/Performance/Security]
+- Priority: [P0/P1/P2/P3]
+- Preconditions: [Required setup]
+- Steps: [Numbered list]
+- Expected Result: [Outcome]
+```
 
 ---
 
-### Step 2B: Bug Classification
-
-**Template**: Use `templates/bug-report-template.md`
-
-Severity decision tree:
+## §3 — Bug Severity Decision Tree
 
 ```
 Does the bug cause system crash, data loss, or security breach?
@@ -101,44 +54,9 @@ Document for each bug:
 - Missing test cases that should catch this bug
 - Post-fix verification steps
 
-**Output**: `bug-analysis-[bug-id].md`
-
 ---
 
-### Step 2C: Test Review/Audit
-
-1. Review provided test cases or test strategy
-2. Assess coverage completeness
-3. Identify gaps using `templates/edge-case-checklist.md`
-4. Evaluate risk areas
-5. Provide recommendations for improvement
-
-**Output**: `test-review-[component].md`
-
----
-
-### Step 3: Example Reference
-
-**Reference Files**:
-- `examples/login-feature-test.md` - Test strategy example
-- `examples/bug-classification-example.md` - Bug analysis example
-
-Use these patterns to ensure consistent format and thoroughness.
-
----
-
-### Step 4: Output Compilation
-
-**Output Rules**:
-- Format: Markdown (.md)
-- Location: Same directory as input or specified output path
-- Naming: `test-strategy.md`
-
-**Structure**: Follow `templates/test-strategy-template.md` — Scope, Test Cases, optional Assumptions. No additional sections.
-
----
-
-## Test Case Design Principles
+## §4 — Test Case Design Principles
 
 ### Independence & Repeatability
 
@@ -159,11 +77,11 @@ Never invent concrete-looking test data identifiers not present in the input spe
 
 - **Titles**: Specific and descriptive (e.g., "TC-001: Verify user with valid credentials can login and is redirected to /dashboard")
 - **Expected Results**: Specific and measurable (e.g., "API returns 200 OK with {token: string, userId: uuid, expiresIn: 3600}")
-- **Structure**: Use the `TC-XXX` template from Step 2A consistently
+- **Structure**: Use the `TC-XXX` template from §2 consistently
 
 ---
 
-## Configuration Defaults
+## §5 — Configuration Defaults
 
 Apply unless explicitly specified:
 
@@ -175,30 +93,3 @@ thresholds:
 standards:
   accessibility: "WCAG_2.1_AA"
 ```
-
----
-
-## Error Handling
-
-| Error Scenario | Handling |
-|----------------|----------|
-| Template not found | Use inline template structure |
-| Input unclear | Generate test strategy with assumptions documented |
-| Missing context | Add "Assumptions" section in output |
-| Edge case checklist unavailable | Manually apply common edge cases |
-| Template fields incomplete | Mark as "[TBD]" and note in summary |
-| Can't determine input type | Default to Feature Spec |
-
----
-
-## Quality Gates
-
-Before finalizing output, verify:
-
-- [ ] Scope section present (in/out of scope)
-- [ ] At least one test case per critical path
-- [ ] Edge cases are actual TCs with IDs and priorities (not a separate list)
-- [ ] Security considerations addressed via TCs
-- [ ] No duplicate or near-duplicate test cases
-
----

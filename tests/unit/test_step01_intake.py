@@ -72,7 +72,6 @@ async def test_intake_jira_via_agent(tmp_path: Path, monkeypatch):
         messages=[{"type": "result", "result": "ok"}],
         files={
             "spec.md": "# REQ-PROJ-1\n\nFrom Jira\n",
-            "jira-spec.md": "# Raw\n\nticket dump\n",
         },
     )
 
@@ -83,7 +82,10 @@ async def test_intake_jira_via_agent(tmp_path: Path, monkeypatch):
     spec = ctx.workspace.step_dir(1) / "spec.md"
     jira = ctx.workspace.step_dir(1) / "jira-spec.md"
     assert "From Jira" in spec.read_text(encoding="utf-8")
-    assert "ticket dump" in jira.read_text(encoding="utf-8")
+    # The agent is told NOT to write jira-spec.md; the step writes a
+    # provenance stub instead (raw capture intentionally not retained).
+    assert "PROJ-1" in jira.read_text(encoding="utf-8")
+    assert "not retained" in jira.read_text(encoding="utf-8")
 
 
 async def test_intake_jira_agent_no_output_fails(tmp_path: Path, monkeypatch):

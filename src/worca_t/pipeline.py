@@ -7,7 +7,6 @@ milestones remain runnable end-to-end.
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,11 +14,11 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from worca_t.checkpoints import RunState, StepRecord, is_step_complete, load_state, outputs_match, save_state, save_state_async
+from worca_t.checkpoints import RunState, StepRecord, is_step_complete, load_state, outputs_match, save_state
 from worca_t.config import load_env
 from worca_t.logging_setup import configure_logging, get_logger
 from worca_t.metrics import format_cost, format_tokens
-from worca_t.steps.base import Step, StepContext, StepResult
+from worca_t.steps.base import Step, StepContext
 from worca_t.steps.s01_intake import IntakeStep
 from worca_t.steps.s02_refine import RefineStep
 from worca_t.steps.s03_plan import PlanStep
@@ -38,9 +37,9 @@ TOTAL_STEPS = 11
 
 @dataclass
 class PipelineOptions:
-    spec: str
-    sut: str
     workspace_base: Path
+    spec: str | None = None
+    sut: str | None = None
     from_step: int | None = None
     only_step: int | None = None
     force: bool = False
@@ -57,6 +56,11 @@ class PipelineOptions:
     run_id: str | None = None
     env_file: Path | None = None
     no_hitl: bool = False
+    module: str | None = None
+    isolated_tests: bool = False
+    yes: bool = False
+    no_auto_deps: bool = False
+    dev_locators: Path | None = None
 
 
 def _build_registry() -> dict[int, Step]:
@@ -151,57 +155,36 @@ def _select_steps(opts: PipelineOptions) -> list[int]:
     return [i for i in range(start, TOTAL_STEPS + 1) if i not in opts.skip_steps]
 
 
-def _should_parallelize_research(opts: PipelineOptions, selected: list[int]) -> bool:
-    """True when Step 6 should run in the background alongside Steps 2-5."""
-    return (
-        6 in selected
-        and opts.only_step is None
-        and any(s in selected for s in (2, 3, 4, 5))
-    )
-
-
-async def _run_step_in_background(
-    step: Step,
-    ctx: StepContext,
-    state: RunState,
-    state_file: Path,
-    opts: PipelineOptions,
-    console: Console,
-    done_event: asyncio.Event,
-) -> StepResult | None:
-    """Execute a step in a background task, signalling *done_event* on completion."""
-    step_num = step.number
-    log = get_logger(__name__)
-    try:
-        if not opts.force and is_step_complete(state, step_num):
-            if outputs_match(state, step_num, ctx.workspace.step_dir(step_num)):
-                log.info("step.skip_complete", step=step_num)
-                console.print(f"[dim]step {step_num:02d} already complete - skipping (background)[/]")
-                return None
-
-        console.print(f"[cyan]>>> step {step_num:02d} {step.name} (background)[/]")
-        result = await step.execute(ctx)
-        await save_state_async(state, state_file)
-        record = state.steps.get(step_num)
-
-        if not result.success:
-            console.print(f"[red]step {step_num:02d} FAILED (background):[/] {result.error or result.notes}")
-            if record is not None:
-                console.print(f"   {_format_step_metrics_line(record)}")
-        else:
-            marker = "warned" if result.status == "warned" else "ok"
-            line = f"[green]step {step_num:02d} {marker} (background)[/]  -> {len(result.outputs)} outputs"
-            if record is not None:
-                line += f"  [dim]{_format_step_metrics_line(record)}[/]"
-            console.print(line)
-
-        return result
-    finally:
-        done_event.set()
-
-
 async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None) -> int:
     console = console or Console()
+
+    try:
+        ws = _select_workspace(opts, console=console)
+    except (FileNotFoundError, RuntimeError) as e:
+        (console or Console()).print(f"[red]workspace error:[/] {e}")
+        return 2
+
+    # On resume (--run-id), recover --spec / --sut from state.json when the
+    # user didn't repeat them on the command line. The workspace already
+    # knows what was run; asking again is noise.
+    prior_state = load_state(ws.state_file)
+    if opts.run_id is not None and prior_state is not None:
+        if opts.spec is None:
+            opts.spec = prior_state.spec_source
+        if opts.sut is None:
+            opts.sut = prior_state.sut_source
+
+    missing = [n for n, v in (("--spec", opts.spec), ("--sut", opts.sut)) if not v]
+    if missing:
+        hint = (
+            " (resume found no prior value in state.json)"
+            if opts.run_id is not None
+            else ""
+        )
+        (console or Console()).print(
+            f"[red]missing required option(s):[/] {', '.join(missing)}{hint}"
+        )
+        return 2
 
     if opts.env_file:
         load_env(opts.env_file)
@@ -221,14 +204,9 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
             if sut_dotenv.is_file():
                 load_env(sut_dotenv)
 
-    try:
-        ws = _select_workspace(opts, console=console)
-    except (FileNotFoundError, RuntimeError) as e:
-        (console or Console()).print(f"[red]workspace error:[/] {e}")
-        return 2
     log = configure_logging(level=opts.log_level, jsonl_path=ws.run_log, run_id=ws.run_id)
 
-    state = load_state(ws.state_file) or RunState(
+    state = prior_state or RunState(
         run_id=ws.run_id,
         workspace=str(ws.root),
         spec_source=opts.spec,
@@ -265,13 +243,17 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
     console.print(f"[green]run_id[/]    {ws.run_id}")
 
     # Early SUT materialization — fail fast before spending time on steps 1-5.
+    # No clone-confirmation prompt: worca-t's entire purpose is to fetch the
+    # SUT, install its dependencies, and run its tests. The user supplied the
+    # URL on the command line — that IS the consent. Asking again is noise.
     import subprocess
+    import sys
 
     from worca_t.steps.s06_research import _materialize_sut
 
     console.print("[dim]sut:[/] materializing…")
     try:
-        _materialize_sut(opts.sut, ws.sut)
+        _materialize_sut(opts.sut, ws.sut, run_id=ws.run_id)
     except subprocess.CalledProcessError as e:
         stderr = (e.stderr or b"").decode(errors="replace").strip()
         console.print(f"[red]sut error:[/] failed to clone [cyan]{opts.sut}[/cyan]")
@@ -287,7 +269,107 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
         console.print(f"[red]sut error:[/] {e}")
         log.error("pipeline.sut_failed", sut=opts.sut, error=str(e))
         return 2
-    console.print(f"[dim]sut:[/] ready at [cyan]{ws.sut}[/cyan]")
+
+    # Post-materialize preflight: catch the silent-failure shape where the
+    # clone "succeeded" but didn't put a usable repo on disk. Both checks fire
+    # in well under a second; without them, a missing/branchless SUT manifests
+    # downstream as a 1800s step-7 timeout (see run 20260603-205851-2d359f).
+    from worca_t._sut_git import branch_name as _branch_name
+    from worca_t._sut_git import current_branch as _current_branch
+
+    if not (ws.sut / ".git").exists():
+        msg = (
+            f"sut not a git repo at {ws.sut} — materialization left no .git/ "
+            f"directory. Re-materialize via `worca-t run` without --run-id, "
+            f"or report this bug."
+        )
+        console.print(f"[red]sut preflight:[/] {msg}")
+        log.error("pipeline.sut_preflight_failed", sut=str(ws.sut), reason="no_git")
+        return 2
+
+    expected_branch = _branch_name(ws.run_id)
+    actual_branch = _current_branch(ws.sut)
+    if actual_branch != expected_branch:
+        msg = (
+            f"sut on wrong branch at {ws.sut}: expected `{expected_branch}`, "
+            f"got `{actual_branch}`. The worca-t isolation branch was not "
+            f"created — re-materialize via `worca-t run` without --run-id."
+        )
+        console.print(f"[red]sut preflight:[/] {msg}")
+        log.error(
+            "pipeline.sut_preflight_failed",
+            sut=str(ws.sut),
+            reason="wrong_branch",
+            expected=expected_branch,
+            actual=actual_branch,
+        )
+        return 2
+
+    console.print(
+        f"[dim]sut:[/] ready at [cyan]{ws.sut}[/cyan] "
+        f"(branch [cyan]{expected_branch}[/cyan])"
+    )
+
+    # MCP preflight — cold-start every server in .mcp.json once up front.
+    # Doing this here (instead of letting each step's `claude` subprocess
+    # bootstrap its own MCPs in parallel) avoids the npx/node contention
+    # that previously starved Step 2 into a 300s timeout, and warms the
+    # npx cache for all downstream agent calls.
+    from worca_t.mcp_manager import load_mcp_config, probe_server
+
+    while True:
+        console.print("[dim]mcp:[/] verifying servers…")
+        try:
+            servers = load_mcp_config()
+        except (FileNotFoundError, OSError, ValueError) as e:
+            console.print(f"[red]mcp preflight:[/] could not load .mcp.json: {e}")
+            log.error("pipeline.mcp_preflight_failed", error=str(e))
+            return 2
+
+        results = [(name, *probe_server(server)) for name, server in servers.items()]
+        failed = [(n, msg) for n, ok, msg in results if not ok]
+
+        if not failed:
+            ok_names = [n for n, ok, _ in results if ok]
+            console.print(
+                "[dim]mcp:[/] " + ", ".join(f"{n} ok" for n in ok_names)
+            )
+            log.info("pipeline.mcp_preflight_ok", servers=ok_names)
+            break
+
+        console.print("[red]mcp preflight:[/] one or more servers failed to start:")
+        for name, msg in failed:
+            console.print(f"  [red]{name}[/]: {msg}")
+        log.error(
+            "pipeline.mcp_preflight_failed",
+            failed=[{"name": n, "error": m} for n, m in failed],
+        )
+
+        if not sys.stdin.isatty() or opts.no_hitl or opts.yes:
+            console.print(
+                "[yellow]Non-interactive mode: fix MCP setup and re-run "
+                "(or omit --no-hitl / --yes to enable the retry prompt).[/yellow]"
+            )
+            return 2
+
+        from rich.prompt import Confirm
+
+        if not Confirm.ask(
+            "Retry MCP initialization?", default=True, console=console
+        ):
+            console.print("[dim]Aborted by user.[/]")
+            return 2
+
+    # Replay env resolution from existing Step 6 artifacts (if any).
+    # Step 6's `resolve_sut_env()` writes into `os.environ` in-process only;
+    # those writes are gone on a fresh `worca-t run` invocation. Without this
+    # replay, re-running `--from-step 7+` leaves SUT_BASE_URL unset and the
+    # locator-resolution agent (Step 8) aborts with BASE_URL_UNRESOLVED.
+    try:
+        from worca_t.steps.s06_research import replay_env_from_artifacts
+        replay_env_from_artifacts(ws, opts)
+    except Exception as e:  # noqa: BLE001 — defensive; never block the pipeline
+        log.warning("pipeline.env_replay_failed", error=str(e))
 
     ctx = StepContext(
         workspace=ws,
@@ -301,47 +383,9 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
         ctx.extras["debug_live"] = True
 
     selected_steps = _select_steps(opts)
-    parallelize_research = _should_parallelize_research(opts, selected_steps)
-
-    research_task: asyncio.Task[StepResult | None] | None = None
-    research_done = asyncio.Event()
-    research_result: StepResult | None = None
-
-    if parallelize_research:
-        step6 = STEP_REGISTRY.get(6)
-        if step6 is not None:
-            already_done = (
-                not opts.force
-                and is_step_complete(state, 6)
-                and outputs_match(state, 6, ws.step_dir(6))
-            )
-            if already_done:
-                console.print("[dim]step 06 already complete - skipping (background)[/]")
-                research_done.set()
-            else:
-                research_task = asyncio.create_task(
-                    _run_step_in_background(
-                        step6, ctx, state, ws.state_file, opts, console, research_done,
-                    )
-                )
-        else:
-            research_done.set()
 
     exit_code = 0
     for step_num in selected_steps:
-        if step_num == 6 and parallelize_research:
-            continue
-
-        # Rendezvous: Step 7 requires Step 6's output.
-        if step_num == 7 and research_task is not None:
-            console.print("[dim]awaiting step 06 (research) before step 07…[/]")
-            research_result = await research_task
-            research_task = None
-            if research_result is not None and not research_result.success:
-                console.print("[red]step 06 FAILED (background); cannot proceed to step 07[/]")
-                exit_code = 1
-                break
-
         if not opts.force and is_step_complete(state, step_num):
             if not outputs_match(state, step_num, ws.step_dir(step_num)):
                 log.info("step.invalidated", step=step_num)
@@ -359,7 +403,7 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
 
         console.print(f"[cyan]>>> step {step_num:02d} {step.name}[/]")
         result = await step.execute(ctx)
-        await save_state_async(state, ws.state_file)
+        save_state(state, ws.state_file)
         record = state.steps.get(step_num)
 
         if not result.success:
@@ -367,13 +411,6 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
             if record is not None:
                 console.print(f"   {_format_step_metrics_line(record)}")
             exit_code = 1
-            if research_task is not None:
-                research_task.cancel()
-                try:
-                    await research_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-                research_task = None
             break
 
         marker = "warned" if result.status == "warned" else "ok"
@@ -382,19 +419,8 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
             line += f"  [dim]{_format_step_metrics_line(record)}[/]"
         console.print(line)
 
-    # If the pipeline ended before reaching Step 7, await the background task.
-    if research_task is not None:
-        try:
-            research_result = await research_task
-            if research_result is not None and not research_result.success:
-                console.print(f"[red]step 06 (background) FAILED:[/] {research_result.error}")
-                if exit_code == 0:
-                    exit_code = 1
-        except (asyncio.CancelledError, Exception):
-            pass
-
     state.finished_at = datetime.now(UTC).isoformat()
-    await save_state_async(state, ws.state_file)
+    save_state(state, ws.state_file)
     _render_summary_table(state, console)
     log.info(
         "pipeline.end",

@@ -179,33 +179,35 @@ def list_workspaces(
 def doctor(
     workspace: Path | None = typer.Option(None, "--workspace", "-w"),
     json_out: bool = typer.Option(False, "--json", help="Emit JSON report."),
-    probe_mcp: bool = typer.Option(
-        False, "--probe-mcp", help="Smoke-spawn each MCP server."
-    ),
 ) -> None:
     """Run health checks (claude CLI, MCP, proxy, env, schemas)."""
     from worca_t.doctor import run_doctor
     from worca_t.node_env import ensure_node
 
     ensure_node(console=console)
-    rc = run_doctor(
-        workspace=workspace, console=console, json_out=json_out, probe_mcp=probe_mcp
-    )
+    rc = run_doctor(workspace=workspace, console=console, json_out=json_out)
     raise typer.Exit(code=rc)
 
 
 @app.command()
 def run(
-    spec: str = typer.Option(
-        ...,
+    spec: str | None = typer.Option(
+        None,
         "--spec",
         help=(
             "jira:KEY-123 | https://*.atlassian.net/browse/KEY-123 "
-            "| path/to/spec.md | URL"
+            "| path/to/spec.md | URL. Required for a fresh run; optional "
+            "with --run-id (falls back to the prior run's stored value)."
         ),
     ),
-    sut: str = typer.Option(
-        ..., "--sut", help="Local path or git URL of System Under Test"
+    sut: str | None = typer.Option(
+        None,
+        "--sut",
+        help=(
+            "Local path or git URL of System Under Test. Required for a "
+            "fresh run; optional with --run-id (falls back to the prior "
+            "run's stored value)."
+        ),
     ),
     workspace: Path | None = typer.Option(None, "--workspace", "-w"),
     run_id: str | None = typer.Option(
@@ -243,6 +245,44 @@ def run(
         exists=True,
         help="Path to a .env file whose values are loaded into the process environment (keys only flow to agents, never values).",
     ),
+    module: str | None = typer.Option(
+        None,
+        "--module",
+        help="For monorepo SUTs: name of the module to target (must match a discovered module). When omitted, a single-module SUT is auto-selected and multi-module SUTs trigger an auto-detect heuristic against the refined spec.",
+    ),
+    isolated_tests: bool = typer.Option(
+        False,
+        "--isolated-tests",
+        help="Escape hatch: mirror generated tests into a `worca-tests/` subdir (under the active module's path) instead of integrating into the SUT's existing test folder convention.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes", "-y",
+        help="Skip interactive confirmation when cloning a remote SUT repository.",
+    ),
+    no_auto_deps: bool = typer.Option(
+        False,
+        "--no-auto-deps",
+        help=(
+            "Disable automatic install of missing test dependencies detected "
+            "at pytest collection time. By default, known-safe missing deps "
+            "(e.g. allure-pytest) are installed and committed to the worca-t "
+            "isolation branch; unknown ones trigger a HITL prompt."
+        ),
+    ),
+    dev_locators: Path | None = typer.Option(
+        None,
+        "--dev-locators",
+        help=(
+            "Path to a dev-supplied JSON file mapping locator-constant names "
+            "to real selectors (`{locators: {LOGIN_BUTTON: {selector: ...}}}`)."
+            " When supplied, the JIT runtime plugin consults this file BEFORE "
+            "calling the LLM resolver. Verified at first use via Playwright "
+            "count(); mismatches fall through to LLM resolution. Highest-"
+            "priority discovery channel — overrides $WORCA_T_DEV_LOCATORS and "
+            "the `<sut>/.worca-t/dev-locators.json` convention path."
+        ),
+    ),
 ) -> None:
     """Run the full SDLC pipeline."""
     from worca_t.node_env import ensure_node
@@ -270,9 +310,57 @@ def run(
         log_level=log_level.value,
         env_file=env_file,
         no_hitl=no_hitl,
+        module=module,
+        isolated_tests=isolated_tests,
+        yes=yes,
+        no_auto_deps=no_auto_deps,
+        dev_locators=dev_locators,
     )
     rc = asyncio.run(run_pipeline(opts, console=console))
     raise typer.Exit(code=rc)
+
+
+@app.command()
+def resolve(
+    intent: str = typer.Option(..., "--intent", help="Semantic intent of the locator (from the `tbd(...)` call in codegen)."),
+    snapshot: Path = typer.Option(..., "--snapshot", exists=True, help="Path to the AOM snapshot JSON the runtime captured."),
+    constant: str = typer.Option(..., "--constant", help="Locator constant name (e.g. LOGIN_BUTTON), for cache keying + provenance."),
+    cache: Path | None = typer.Option(None, "--cache", help="Cache directory; resolver checks `<cache>/locator-cache.json` first and writes the resolved entry back on success."),
+    test_file: str | None = typer.Option(None, "--test-file", help="SUT-relative path of the test/POM file that owns the constant (extra cache-key entropy)."),
+    page_url: str | None = typer.Option(None, "--page-url", help="URL the snapshot came from (informational, stored in the cache entry)."),
+    model: str | None = typer.Option(None, "--model", help="Override the LLM model id. Defaults to $WORCA_T_RESOLVER_MODEL or claude-sonnet-4-6."),
+    run_id: str | None = typer.Option(None, "--run-id", help="Run id stamped into the cache file (defaults to $WORCA_T_RUN_ID)."),
+) -> None:
+    """Resolve one TBD locator. Invoked as a subprocess by the JIT pytest plugin.
+
+    Reads the AOM snapshot, checks the cache, falls through to a single
+    Anthropic API call on miss, and writes a one-line JSON object to stdout
+    describing the result. Exits 0 on success (including the `unresolvable`
+    source); 2 on input errors.
+    """
+    import json as _json
+
+    from worca_t.jit_resolver import resolve_one
+
+    try:
+        snapshot_text = snapshot.read_text(encoding="utf-8")
+    except OSError as e:
+        console.print(f"[red]cannot read snapshot {snapshot}: {e}[/]")
+        raise typer.Exit(code=2) from e
+
+    result = resolve_one(
+        intent=intent,
+        snapshot_text=snapshot_text,
+        constant_name=constant,
+        test_file=test_file,
+        page_url=page_url,
+        cache_dir=cache,
+        model=model,
+        run_id=run_id,
+    )
+    # Single-line JSON on stdout for the plugin to capture.
+    print(_json.dumps(result.as_dict(), ensure_ascii=False))
+    raise typer.Exit(code=0)
 
 
 def main() -> None:  # pragma: no cover

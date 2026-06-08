@@ -152,8 +152,9 @@ class StrategyStep(Step):
             inputs=inputs,
             user_prompt=(
                 "Read `./plan.md` (and `./refined-spec.md` if present). Follow "
-                "your authoritative workflow in `test-manager.prompt.md` and "
-                "produce a focused test strategy document at "
+                "your workflow and decision-making guidance, then consult "
+                "`test-manager.prompt.md` for TC templates and decision trees. "
+                "Produce a focused test strategy document at "
                 "`./test-strategy.md`. Every test case must have an id of the "
                 "form `TC-<slug>` and a priority (`P0`-`P3`)."
             ),

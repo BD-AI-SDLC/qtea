@@ -10,11 +10,20 @@ test-manager: claude-sonnet-4-6
 # -- Phase B: Research & Implementation --
 polyglot-test-researcher: claude-haiku-4-5@20251001
 ui-test-automation: claude-opus-4-6
-playwright-tester: claude-sonnet-4-6
+# Opus, not Sonnet: Sonnet 4.6 was observed delegating browser exploration to
+# general-purpose Task sub-agents (which don't inherit Playwright MCP), then
+# pasting "MCP not connected" back as skip_reason. Opus follows the
+# "use Playwright MCP directly, do not spawn sub-agents" constraint reliably.
+playwright-tester: claude-opus-4-6
 
 # -- Phase C: Execution & Reporting --
 polyglot-test-tester: claude-haiku-4-5@20251001
 polyglot-test-fixer: claude-sonnet-4-6
+# Dual-mode role: in Step 8b the same agent runs in audit-only mode (pure
+# artifact analysis — read snapshots, compare to codegen, emit JSON). Haiku
+# is enough; the heavier sonnet model stays reserved for Step 9 self-heal,
+# which performs SUT edits and benefits from stronger reasoning.
+polyglot-test-fixer-audit: claude-haiku-4-5@20251001
 bug-report-classifier: claude-sonnet-4-6
 
 # -- Infrastructure / Support --

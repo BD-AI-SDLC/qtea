@@ -33,7 +33,7 @@ For each test case, assign:
 - `priority` — critical|high|medium|low
 - `req_id` — traced requirement ID from refined spec
 - `ac_ids[]` — acceptance criteria IDs covered
-- `automation_tag` — automation|manual
+- `automation_tag` — `automation` | `manual` | `needs_investigation`. Mapping from `refine-spec` tags: `[AUTOMATABLE] → automation`, `[MANUAL ONLY] → manual`, `[NEEDS INVESTIGATION] → needs_investigation`. Downstream (Step 4 test-manager, Step 7 codegen) treats `needs_investigation` differently from a confident `manual` — preserve it, don't collapse.
 
 ### 4. Extract Acceptance Criteria (NEW — REQUIRED)
 
@@ -113,8 +113,8 @@ What this phase covers and why it's sequenced here.
 3. **Be specific with IDs** — stable `TC-<DOMAIN>-NNN` format, traced to req_id and ac_ids
 4. **Be realistic** — don't create more TCs than the requirements warrant
 5. **Be incremental** — each phase should be independently valuable
-6. **Clarifications** - if anything you are about to write is uncertain, involve the user immediatelly with questions, so you can build the most accurate plan possible. Don't make assumptions without asking.
-7. **Finalize document** - If there are any Blockers or `[CLARIFICATION NEEDED]` tags, the agent must ask the user to resolve them before finalizing the refined spec.
+6. **Clarifications** - if anything you are about to write is uncertain, involve the user immediatelly with questions, so you can build the most accurate plan possible. Don't make assumptions without asking. **Non-interactive mode (`--no-hitl` / `--yes`):** record the question verbatim in the "Open PO Questions" section, mark affected TCs with `blocks_test_ids[]`, then proceed with the most conservative interpretation. Do not block.
+7. **Finalize document** - If there are any Blockers or `[CLARIFICATION NEEDED]` tags, the agent must ask the user to resolve them before finalizing the refined spec. In non-interactive mode, emit the plan with blockers intact and let the orchestrator decide whether to halt.
 8. **No duplicate items** — each unresolved item must appear in exactly ONE canonical location. If an item is listed in the Blockers table, do NOT also list it in Open PO Questions. The Blockers table is the canonical location for items that block specific test cases.
 
 ## Output

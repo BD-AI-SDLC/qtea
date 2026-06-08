@@ -60,8 +60,11 @@ prioritized bug reports. You do NOT debug or fix; you classify and report.
 - A test that **failed only on the first attempt and passed on the second without code change** -> category `flaky`, severity `minor`, priority `P2`.
 
 ## Non-negotiable rules
-- Every bug MUST have at least one screenshot reference if step 9 produced one.
-- Every bug MUST link back to a `requirement_id` (from test-strategy.json) when known.
+- **Requirement link.** Every bug whose `test_id` resolves to a known TC in `test-strategy.json` MUST set `requirement_id` to that TC's `requirement_id`. Orphan failures (test_id not present in the strategy) MAY omit `requirement_id` but MUST set `rationale: "orphan failure"` so the orchestrator phase gate accepts the bug.
+- **Attachments.** The `attachments` object must be non-empty in every bug.
+  - UI categories (`ui`, `accessibility`, `functional` with UI evidence): MUST include the on-disk screenshot Step 9 captured (`attachments.screenshots[]` non-empty).
+  - Non-UI categories (`api`, `integration`, `performance`, `security`, `environment`, `flaky`): screenshots may be empty; attach `traces[]` / `logs[]` instead (Playwright traces, framework logs, stderr capture).
+  - If Step 9 reports `attachments: {screenshots: [], traces: [], videos: [], logs: ['<stderr-path>']}` (the test crashed before browser launch), categorize as `environment` and use the stderr path as the attachment.
 - No speculation beyond `root_cause_hypothesis`; mark unknowns explicitly.
 - `bug-reports.md` <= 500 lines total. If overflow, paginate per-severity and reference.
 
@@ -71,3 +74,16 @@ prioritized bug reports. You do NOT debug or fix; you classify and report.
 - [ ] Every `bugs[].id` is unique and matches `BUG-<run-id>-<seq>` pattern.
 - [ ] Every `attachments.screenshots[]` path exists on disk.
 - [ ] No PII or secrets present in any field.
+
+## `bug-reports.md` required structure
+
+Step 11 (report generation) reads the markdown to render the per-bug detail page. The template at `templates/bug-report-template.md` is the canonical layout. Every emitted `bug-reports.md` MUST include these top-level headings in this order:
+
+1. `# Bug Reports — <run-id>` (title + run id)
+2. `## Summary` (counts table from `summary{}`)
+3. `## Bugs by Severity` (sectioned: `### Critical`, `### Major`, `### Minor`, `### Cosmetic`; omit empty severities)
+4. `## Bug Details` (one `### BUG-<run-id>-<seq>` subsection per bug, in the same order as `bugs[]` in the JSON; each subsection contains: title, category, priority, requirement_id link, reproduction steps, expected, actual, root cause hypothesis, attachments list with relative paths)
+5. `## Self-Heal History` (table of all `heal-log.jsonl` outcomes — even successful heals that didn't become bugs)
+6. `## Open Questions` (any bug with `root_cause_hypothesis: "unknown"` or `recommended_action.immediate: "investigate"`)
+
+If a section is empty, include the heading with the literal text `_None_` underneath. Step 11 expects every heading to be present.
