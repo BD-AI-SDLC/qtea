@@ -66,7 +66,10 @@ def install_fake_query(
             on_call(prompt, options)
         cwd = Path(options.cwd) if options and getattr(options, "cwd", None) else Path.cwd()
         for rel, content in file_map.items():
-            p = cwd / rel
+            # Absolute paths land where they say (used by steps that now
+            # write into `<workspace>/sut/` via add_dirs); relative paths
+            # still resolve against the agent's cwd (the step workdir).
+            p = Path(rel) if Path(rel).is_absolute() else (cwd / rel)
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(content, encoding="utf-8")
         if delay_s:
@@ -82,3 +85,19 @@ def install_fake_query(
         lambda *_a, **_kw: "/fake/claude",
     )
     monkeypatch.setattr("worca_t.claude_runner.query", _fake_query)
+
+
+def fake_playwright_mcp_call(tool: str = "browser_snapshot") -> dict:
+    """Build a fake AssistantMessage spec that simulates a Playwright MCP tool use.
+
+    Step 8's MCP-usage gate counts ``mcp__playwright__*`` tool names in the
+    written transcript and fails the step when the agent returns
+    ``success=True`` without ever having invoked Playwright MCP. Tests that
+    exercise step 8's downstream paths (patching, schema validation, scope
+    guard) must inject at least one such message into the fake stream — pass
+    the dict this returns alongside the ``{"type": "result", ...}`` terminator.
+    """
+    return {
+        "type": "assistant",
+        "content": [{"name": f"mcp__playwright__{tool}", "input": {}}],
+    }

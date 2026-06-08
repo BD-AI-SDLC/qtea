@@ -85,6 +85,46 @@ def with_proxy_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+def safe_subprocess_env(
+    extra: Mapping[str, str] | None = None,
+    *,
+    isolate_venv: bool = False,
+) -> dict[str, str]:
+    """Like ``with_proxy_env``, but strips inherited ``SECRET_ENV_KEYS``.
+
+    Use for any subprocess that runs SUT-provided code (test commands, install
+    commands, MCP server probes).  Trusted tooling (Claude CLI, git, allure)
+    should continue using ``with_proxy_env`` directly.
+
+    Keys present in ``extra`` are honored even if they appear in
+    ``SECRET_ENV_KEYS``: ``extra`` is the caller's explicit declaration of
+    what the child needs (e.g. an MCP server's ``env`` block in ``.mcp.json``).
+    Only secrets *inherited* from the parent process are scrubbed.
+
+    When ``isolate_venv=True``, ``VIRTUAL_ENV`` and ``POETRY_ACTIVE`` are also
+    stripped (unless overridden via ``extra``). Use this for subprocesses
+    targeting a Python SUT managed by poetry / uv: if worca-t itself runs from
+    a venv (e.g. ``uv tool install --editable``), that venv leaks into the
+    child via ``VIRTUAL_ENV`` and poetry happily reuses it as the SUT's venv
+    when the Python version satisfies the SUT's constraint. The result is a
+    contaminated environment where ``poetry install`` reports "in sync" yet
+    pytest fails on missing SUT-specific deps. Stripping forces poetry to
+    create / use a clean SUT-specific venv.
+    """
+    explicit = {str(k) for k in (extra or {})}
+    env = with_proxy_env(extra)
+    for key in SECRET_ENV_KEYS:
+        if key in explicit:
+            continue
+        env.pop(key, None)
+    if isolate_venv:
+        for key in ("VIRTUAL_ENV", "POETRY_ACTIVE"):
+            if key in explicit:
+                continue
+            env.pop(key, None)
+    return env
+
+
 def mask_secrets(env: Mapping[str, str]) -> dict[str, str]:
     """Return a copy of env with secret values redacted (for logging)."""
     return {k: ("***REDACTED***" if k in SECRET_ENV_KEYS else v) for k, v in env.items()}

@@ -5,6 +5,34 @@ This module's job is to:
   - locate / validate `.mcp.json`
   - render a copy into a step workdir with env variable substitution applied
   - optionally probe whether each MCP server can be spawned (used by doctor)
+
+## Per-call MCP isolation guarantee
+
+worca-t never shares MCP subprocesses across `run_agent()` calls. The
+isolation comes from two independent mechanisms:
+
+1. **Config staging is per-workdir.** `stage_mcp_config()` writes a fresh
+   `.mcp.json` into the agent's workdir on every `run_agent()` invocation
+   (see `claude_runner._stage_resources`). Each step has its own workdir,
+   each agent dispatch has its own staged config.
+
+2. **Subprocess lifecycle is per-call.** Each `run_agent()` spawns its own
+   `claude` CLI subprocess via `claude_agent_sdk.query()`. That subprocess
+   spawns its own MCP server children (e.g. `npx @playwright/mcp` →
+   Playwright browser). The SDK's async-context-manager teardown closes the
+   subprocess on normal completion; `claude_runner._force_cleanup` kills
+   the subprocess tree explicitly on timeout / cancellation (only NEW
+   PIDs not in `pre_existing_children`, so concurrent siblings are spared).
+
+Consequence: Step 8a's Playwright browser does NOT leak into Step 8b or
+Step 9. Step 9's first heal does not share a session with the last call
+of Step 8. Each call's MCP server children die with that call's subprocess
+tree.
+
+Do not add cross-call MCP state to this module. If you find yourself
+wanting to "reuse" a Playwright browser across steps for performance,
+spawn the MCP server out-of-band and configure it as a long-lived remote
+endpoint in `.mcp.json` — do NOT introduce shared state here.
 """
 
 from __future__ import annotations
@@ -19,7 +47,7 @@ from pathlib import Path
 from typing import Any
 
 from worca_t.config import package_resource_root
-from worca_t.proxy import with_proxy_env
+from worca_t.proxy import safe_subprocess_env, with_proxy_env
 
 _ENV_VAR_PATTERN = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
 
@@ -73,11 +101,21 @@ def load_mcp_config(path: Path | None = None) -> dict[str, McpServer]:
     return out
 
 
-def stage_mcp_config(target_dir: Path, source: Path | None = None) -> Path:
+def stage_mcp_config(
+    target_dir: Path,
+    source: Path | None = None,
+) -> Path:
     """Copy .mcp.json into `target_dir` (rendered with env substitution).
 
     The rendered file lets the spawned `claude` CLI read a stable config that
     already has env vars resolved (avoids subprocess-env edge cases).
+
+    Note: worca-t does NOT rewrite the Playwright MCP's `--headless` flag.
+    The MCP runs in the background for AOM snapshots / locator discovery and
+    its UI is never user-facing. Its head state is controlled entirely by the
+    project-local `.mcp.json` (typically `--headless`). The CLI `--headed`
+    flag instead controls Step 9's *SUT test execution* (the real tests the
+    user wants to watch), not the MCP.
     """
     src = source or find_mcp_config()
     raw = json.loads(src.read_text(encoding="utf-8"))
@@ -97,13 +135,16 @@ def probe_server(server: McpServer, timeout_s: float = 8.0) -> tuple[bool, str]:
     """
     if not server.command:
         return False, "no command"
-    if not shutil.which(server.command):
+    resolved = shutil.which(server.command)
+    if not resolved:
         return False, f"`{server.command}` not on PATH"
 
-    env = with_proxy_env(server.env)
+    # Use the resolved path (not the bare name) so Windows CreateProcess can
+    # spawn .cmd / .bat wrappers like `npx.CMD` without needing shell=True.
+    env = safe_subprocess_env(server.env)
     try:
         proc = subprocess.Popen(
-            [server.command, *server.args],
+            [resolved, *server.args],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
