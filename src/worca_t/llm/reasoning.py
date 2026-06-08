@@ -43,6 +43,7 @@ from worca_t.llm.protocols import (
     extract_agent_metrics,
 )
 from worca_t.logging_setup import get_logger
+from worca_t.pricing import PRICING_BASIS, estimate_cost
 
 log = get_logger(__name__)
 
@@ -308,9 +309,23 @@ async def call_reasoning_llm(
                         final_text = getattr(block, "text", "") or final_text
 
                 # Token / cost extraction.
+                # The direct Anthropic SDK doesn't return a cost field in
+                # the response (unlike the Agent SDK's ResultMessage which
+                # carries total_cost_usd computed from a built-in pricing
+                # table). We compute the equivalent estimate here from
+                # token counts × public list prices in worca_t.pricing.
+                # See pricing.py for accuracy caveats — the estimate is
+                # informational, not authoritative billing.
                 agent_metrics = extract_agent_metrics(
                     getattr(response, "usage", None),
-                    None,  # AsyncAnthropic doesn't expose total_cost_usd
+                    None,
+                )
+                agent_metrics.cost_usd = estimate_cost(
+                    candidate_model,
+                    input_tokens=agent_metrics.input_tokens,
+                    output_tokens=agent_metrics.output_tokens,
+                    cache_creation_input_tokens=agent_metrics.cache_creation_input_tokens,
+                    cache_read_input_tokens=agent_metrics.cache_read_input_tokens,
                 )
                 agent_metrics.num_turns = 1
                 accumulated.input_tokens += agent_metrics.input_tokens
@@ -364,6 +379,7 @@ async def call_reasoning_llm(
         "tokens_cache_creation": accumulated.cache_creation_input_tokens,
         "tokens_cache_read": accumulated.cache_read_input_tokens,
         "cost_usd": round(accumulated.cost_usd, 6),
+        "cost_estimation_basis": PRICING_BASIS,
         "num_turns": accumulated.num_turns,
         "transport": "direct-sdk-reasoning",
     }

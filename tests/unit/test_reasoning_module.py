@@ -395,6 +395,58 @@ async def test_non_unavailable_error_does_not_trigger_fallback(tmp_path, monkeyp
 # Model ID normalisation (@<date> → -<date>)
 # ---------------------------------------------------------------------------
 
+async def test_cost_populated_via_pricing_table(tmp_path, monkeypatch):
+    """The reasoning module fills `cost_usd` from the pricing table.
+
+    Regression guard for the cost-zero bug: before the pricing module was
+    wired in, every direct-SDK call produced `cost_usd: 0.0` regardless of
+    tokens because the SDK doesn't return a cost field. The pricing
+    module restores parity with the Agent SDK's `total_cost_usd`.
+    """
+    disable_vertex_env(monkeypatch)
+    install_fake_anthropic(
+        monkeypatch,
+        text="ok",
+        usage=FakeUsage(input_tokens=10_000, output_tokens=5_000),
+    )
+    agent = _write_agent_file(tmp_path)
+
+    result = await call_reasoning_llm(
+        agent_path=agent,
+        workdir=tmp_path / "wd",
+        user_prompt="x",
+        model="claude-sonnet-4-6",
+    )
+
+    # 10k input × $3/MTok + 5k output × $15/MTok = $0.03 + $0.075 = $0.105
+    assert result.metrics.cost_usd == pytest.approx(0.105, abs=1e-6)
+
+    # Audit JSON includes the basis label so consumers know the source.
+    import json as _json
+    metrics = _json.loads(result.metrics_path.read_text())
+    assert metrics["cost_usd"] == pytest.approx(0.105, abs=1e-6)
+    assert "cost_estimation_basis" in metrics
+    assert "anthropic" in metrics["cost_estimation_basis"].lower()
+
+
+async def test_cost_zero_for_unknown_model(tmp_path, monkeypatch):
+    """Unknown model id (no family match) → cost_usd stays 0.0, not crash."""
+    disable_vertex_env(monkeypatch)
+    install_fake_anthropic(monkeypatch, text="ok")
+    agent = _write_agent_file(tmp_path)
+
+    # Force model_for_agent + override model to a non-Anthropic-family id.
+    monkeypatch.setattr("worca_t.llm.reasoning.model_for_agent", lambda _: "gpt-9-future")
+    result = await call_reasoning_llm(
+        agent_path=agent,
+        workdir=tmp_path / "wd",
+        user_prompt="x",
+    )
+
+    assert result.success
+    assert result.metrics.cost_usd == 0.0
+
+
 async def test_at_date_suffix_normalized_to_dash(tmp_path, monkeypatch):
     """Standard SDK path: @-form model IDs get converted to dash-form."""
     disable_vertex_env(monkeypatch)
