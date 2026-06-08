@@ -3,17 +3,6 @@
     "playwright": {
       "command": "npx",
       "args": ["-y", "@playwright/mcp@latest", "--headless"]
-    },
-    "atlassian": {
-      "command": "npx",
-      "args": ["atlassian-jira-mcp"],
-      "env": {
-        "JIRA_BASE_URL": "${JIRA_BASE_URL}",
-        "JIRA_EMAIL": "${JIRA_EMAIL}",
-        "JIRA_API_TOKEN": "${JIRA_API_TOKEN}",
-        "HTTPS_PROXY": "${HTTPS_PROXY}",
-        "HTTP_PROXY": "${HTTP_PROXY}"
-      }
     }
   }
 }

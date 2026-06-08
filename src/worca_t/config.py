@@ -38,6 +38,7 @@ SECRET_ENV_KEYS = frozenset(
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
         "JIRA_API_TOKEN",
+        "JIRA_PAT",
         "JIRA_XRAY_CLIENT_SECRET",
         "JIRA_XRAY_API_KEY",
         "JIRA_XRAY_CLIENT_ID",
