@@ -7,6 +7,7 @@ milestones remain runnable end-to-end.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,6 +19,7 @@ from worca_t.checkpoints import RunState, StepRecord, is_step_complete, load_sta
 from worca_t.config import load_env
 from worca_t.logging_setup import configure_logging, get_logger
 from worca_t.metrics import format_cost, format_tokens
+from worca_t.review_gate import review_step_7_tests
 from worca_t.steps.base import Step, StepContext
 from worca_t.steps.s01_intake import IntakeStep
 from worca_t.steps.s02_refine import RefineStep
@@ -61,6 +63,13 @@ class PipelineOptions:
     yes: bool = False
     no_auto_deps: bool = False
     dev_locators: Path | None = None
+    # Claude Code prompt-cache toggle. Default is OFF because on the Bosch
+    # Vertex relay (aoai-farm.bosch-temp.com) cache_read never fires across
+    # requests — measured net cost ~+$1.30/run on Step 7 Opus turns from the
+    # 25% cache-creation surcharge with no read-side payback (probe data in
+    # run 20260610-082950-6a887f RCA). Set --cache to opt in when running
+    # against a relay or backend that does serve cross-request cache reads.
+    cache: bool = False
 
 
 def _build_registry() -> dict[int, Step]:
@@ -157,6 +166,23 @@ def _select_steps(opts: PipelineOptions) -> list[int]:
 
 async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None) -> int:
     console = console or Console()
+
+    # Translate the --cache toggle into the Claude Code subprocess env knob.
+    # Setting DISABLE_PROMPT_CACHING=1 in the parent suppresses the CLI's
+    # automatic cache_control breakpoints on the system prompt + tools +
+    # CLAUDE.md for every agent invocation in this run. claude_runner
+    # forwards this var into the subprocess env explicitly (see its
+    # forwarded_env block). Default off because cross-request cache_read
+    # never fires on the Bosch Vertex relay — paying the 25% cache-
+    # creation surcharge for zero read-side payback is net cost-negative
+    # there. Pass --cache to opt back in when the backend supports it.
+    if not opts.cache:
+        os.environ["DISABLE_PROMPT_CACHING"] = "1"
+    else:
+        # Re-enable explicitly: if a parent process or prior session set
+        # the disable flag, --cache should clear it so the CLI's auto-
+        # caching is restored for this run.
+        os.environ.pop("DISABLE_PROMPT_CACHING", None)
 
     try:
         ws = _select_workspace(opts, console=console)
@@ -403,15 +429,27 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
 
         console.print(f"[cyan]>>> step {step_num:02d} {step.name}[/]")
         result = await step.execute(ctx)
-        save_state(state, ws.state_file)
         record = state.steps.get(step_num)
 
         if not result.success:
+            save_state(state, ws.state_file)
             console.print(f"[red]step {step_num:02d} FAILED:[/] {result.error or result.notes}")
             if record is not None:
                 console.print(f"   {_format_step_metrics_line(record)}")
             exit_code = 1
             break
+
+        # Lightweight human review of the generated TDD before step 8 patches
+        # locators in place. Skipped automatically in non-TTY / `--no-hitl`
+        # contexts. On manual edits the gate re-indexes the SUT in-place so
+        # downstream steps see fresh line numbers and refreshed hashes.
+        if step_num == 7 and not review_step_7_tests(ctx, result, console):
+            save_state(state, ws.state_file)
+            console.print("[yellow]step 07 rejected by reviewer — aborting[/]")
+            exit_code = 1
+            break
+
+        save_state(state, ws.state_file)
 
         marker = "warned" if result.status == "warned" else "ok"
         line = f"[green]step {step_num:02d} {marker}[/]  -> {len(result.outputs)} outputs"

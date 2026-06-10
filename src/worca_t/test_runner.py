@@ -182,38 +182,111 @@ class RunResult:
 # ---------------------------------------------------------------------------
 
 
+_PYTEST_FRAMEWORKS = frozenset({"pytest", "playwright-py", "selenium-py"})
+
+
+_KNOWN_RUNNER_TOKENS = frozenset({
+    "pytest", "python", "python3", "py",
+    "poetry", "pipenv", "uv", "pdm", "hatch", "rye", "nox", "tox",
+    "npx", "npm", "yarn", "pnpm", "bun", "deno", "node",
+    "mvn", "mvnw", "gradle", "gradlew",
+    "robot", "make", "task", "just",
+    "sh", "bash", "cmd", "powershell", "pwsh",
+})
+
+
+def _looks_like_test_command(s: str) -> bool:
+    """True if `s` plausibly starts with a runner invocation.
+
+    The researcher agent occasionally writes a test *name* (or a markdown
+    snippet) into `research.commands.test` instead of the actual run command.
+    Without this guard we feed that garbage straight to a subprocess and
+    Windows raises `[WinError 2]` / exit 127 — a confusing failure mode that
+    looks like a test failure but is really a code bug.
+    """
+    if not s or not s.strip():
+        return False
+    head = s.strip().split(None, 1)[0]
+    head = head.lstrip("./").lstrip(".\\")
+    # Strip Windows .exe / .bat suffix and any trailing punctuation.
+    head = re.sub(r"\.(exe|bat|cmd|ps1)$", "", head, flags=re.IGNORECASE)
+    return head.lower() in _KNOWN_RUNNER_TOKENS
+
+
+def _inject_pytest_marker(command: str, marker_filter: str | None) -> str:
+    """Append `-m "<filter>"` to a pytest-family command.
+
+    Idempotent: if the command already has `-m` it's left alone so an
+    explicit selector in `detected` (e.g. from a researcher-extracted
+    Makefile target) wins over our default attribution filter.
+    """
+    if not marker_filter:
+        return command
+    if re.search(r"(?:^|\s)-m(?:\s|=)", command):
+        return command
+    return f"{command} -m \"{marker_filter}\""
+
+
 def resolve_command(
     framework: str,
     *,
     detected: str | None,
     cwd: Path,
     profile: StackProfile | None = None,
+    marker_filter: str | None = None,
 ) -> tuple[str, str]:
     """Pick command + parser id.
 
     Resolution order (first non-empty wins):
       1. `detected` — the command the researcher agent extracted from
-         README / CI / pyproject. Used verbatim; we only append the junit
-         flag when the parser expects it and the command doesn't already
-         have one. The researcher is expected to include the package-manager
-         wrapper itself (e.g. ``poetry run pytest …``).
+         README / CI / pyproject. Used verbatim *if it passes
+         `_looks_like_test_command`*; we only append the junit flag when
+         the parser expects it and the command doesn't already have one.
+         The researcher is expected to include the package-manager wrapper
+         itself (e.g. ``poetry run pytest …``).
       2. Framework default from `_DEFAULT_COMMANDS`, wrapped with the
          package-manager prefix from `profile` (e.g. ``pytest …`` becomes
          ``poetry run pytest …``). This is the load-bearing fallback when
-         the researcher fails to extract a runnable command.
+         the researcher fails to extract a runnable command OR when the
+         extracted command fails the runner-token sanity check.
       3. Bare ``pytest --junitxml=…`` as the universal fallback.
+
+    `marker_filter` (pytest-family frameworks only): appended as
+    ``-m "<filter>"`` so callers can scope a run to a subset of tests
+    by marker. Step 9 uses this to select worca-generated tests
+    (e.g. ``worca_smoke or worca_regression``) and exclude the SUT's
+    native suite. No-op on non-pytest frameworks (Cypress / Jest /
+    Playwright-TS) and when the command already carries an explicit
+    ``-m`` selector.
     """
-    if detected:
+    apply_marker = framework in _PYTEST_FRAMEWORKS
+    if detected and _looks_like_test_command(detected):
         parser = _DEFAULT_COMMANDS.get(framework, ("", "auto"))[1]
         if parser == "junit" and "--junitxml" not in detected:
             detected = f"{detected} --junitxml={(cwd / 'worca-junit.xml').as_posix()}"
+        if apply_marker:
+            detected = _inject_pytest_marker(detected, marker_filter)
         return detected, parser
+    if detected:
+        log.warning(
+            "test_runner.detected_command_rejected",
+            detected=detected[:200],
+            reason="does not start with a known runner token "
+                   "(pytest / poetry / npx / mvn / ...) — falling back to "
+                   "framework default. Likely a researcher hallucination.",
+        )
     if framework in _DEFAULT_COMMANDS:
         template, parser = _DEFAULT_COMMANDS[framework]
         bare = _expand_command(template, cwd)
-        return wrap_command(profile, bare), parser
+        wrapped = wrap_command(profile, bare)
+        if apply_marker:
+            wrapped = _inject_pytest_marker(wrapped, marker_filter)
+        return wrapped, parser
     bare = _expand_command("pytest --junitxml={junit}", cwd)
-    return wrap_command(profile, bare), "junit"
+    wrapped = wrap_command(profile, bare)
+    if apply_marker:
+        wrapped = _inject_pytest_marker(wrapped, marker_filter)
+    return wrapped, "junit"
 
 
 def _expand_command(template: str, cwd: Path) -> str:
@@ -573,9 +646,11 @@ def run_tests(
     env_extra: dict[str, str] | None = None,
     profile: StackProfile | None = None,
     headless: bool = True,
+    marker_filter: str | None = None,
 ) -> RunResult:
     command, parser = resolve_command(
         framework, detected=detected_command, cwd=cwd, profile=profile,
+        marker_filter=marker_filter,
     )
 
     # The CLI `--headed` flag is meant to give the user a visible browser
@@ -1022,6 +1097,36 @@ def _python_test_files(sut_root: Path) -> list[Path]:
     return out
 
 
+def _python_prod_files(sut_root: Path) -> list[Path]:
+    """The SUT's own production-source `.py` files.
+
+    Resolves the SUT's own package directory via `_sut_own_package_name`,
+    preferring the PEP 517 `src/` layout over the flat layout. Returns
+    `[]` when the project name is unknown or neither layout directory
+    exists. The walk uses the same dotfile-skip discipline as
+    `_python_test_files` so transient caches inside the package tree
+    (`__pycache__` is already excluded by the `*.py` glob; `.mypy_cache`,
+    `.ruff_cache`, etc. inside the package would be skipped here).
+    """
+    own_pkg = _sut_own_package_name(sut_root)
+    if not own_pkg:
+        return []
+    snake_pkg = _norm_pkg(own_pkg).replace("-", "_")
+    for base in (sut_root / "src" / snake_pkg, sut_root / snake_pkg):
+        if base.is_dir():
+            pkg_dir = base
+            break
+    else:
+        return []
+    out: list[Path] = []
+    for path in pkg_dir.rglob("*.py"):
+        rel_parts = path.relative_to(pkg_dir).parts
+        if any(part.startswith(".") for part in rel_parts):
+            continue
+        out.append(path)
+    return out
+
+
 def _top_level_imports(py_file: Path) -> set[str]:
     """Top-level absolute imports only. Relative `from . import x` is skipped."""
     try:
@@ -1113,24 +1218,35 @@ def _sut_own_package_name(sut_root: Path) -> str | None:
 def audit_missing_deps(
     sut_root: Path, *, package_manager: str | None = None
 ) -> list[dict]:
-    """Find top-level test imports that aren't in declared deps.
+    """Find top-level imports that aren't in declared deps.
+
+    Scans both the SUT's ``tests/`` tree AND its own production source
+    package (resolved via :func:`_sut_own_package_name`, preferring the
+    ``src/`` layout). The prod-side walk catches deps reached transitively
+    through the SUT's source — pytest collection fails the same way on a
+    missing dep whether the test file imports it directly or via a
+    ``conftest.py`` → ``src/<pkg>/...`` chain.
 
     Returns one dict per missing import, with:
       - ``module``: the imported top-level name
       - ``suggested_package``: pip-installable name (from _PYTEST_PLUGIN_PROVIDERS
         when mapped; else the module name verbatim)
-      - ``source_file``: relative path of the first test file importing it
+      - ``source_file``: relative path of the first file importing it
+        (test files are scanned first so they win ties — the operator's
+        mental entry point is the test, not the prod module)
       - ``confidence``: ``"known"`` when the module is in the curated mapping
         table (high-confidence: Step 9 will auto-install). ``"guessed"`` for
         everything else (Step 9 will HITL-prompt or warn).
       - ``suggested_install``: prose hint from :func:`_install_hint_for`.
 
     Best-effort and conservative: unparsable files are skipped, dynamic
-    imports are missed.
+    imports are missed. Returns ``[]`` when there is no ``tests/`` dir at
+    all — Step 9 has nothing to run in that case.
     """
     test_files = _python_test_files(sut_root)
     if not test_files:
         return []
+    prod_files = _python_prod_files(sut_root)
 
     declared = _declared_python_deps(sut_root)
     own_pkg = _sut_own_package_name(sut_root)
@@ -1142,8 +1258,9 @@ def audit_missing_deps(
     stdlib = getattr(sys, "stdlib_module_names", frozenset())
 
     # First-seen wins so we can point the user at the file that needs the dep.
+    # Iterate test files first so they win ties (operator's mental entry point).
     seen: dict[str, Path] = {}
-    for tf in test_files:
+    for tf in (*test_files, *prod_files):
         for name in _top_level_imports(tf):
             if name in skip_top or name in stdlib:
                 continue

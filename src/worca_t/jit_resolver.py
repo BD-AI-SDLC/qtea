@@ -46,7 +46,15 @@ _XPATH_PATTERNS = ("xpath=", "By.XPATH", "by_xpath")
 @dataclass(frozen=True)
 class ResolutionResult:
     """Return shape of :func:`resolve_one`. Serialised to stdout JSON for the
-    pytest plugin to consume."""
+    pytest plugin to consume.
+
+    Cost-tracking fields (``input_tokens`` / ``output_tokens`` / ``model`` /
+    ``duration_ms``) are populated for tier 4 (LLM) results; for ``cached``
+    they're zero / null. The runtime plugin reads these and appends one
+    line per resolution to ``<cache_dir>/resolver-spend.jsonl`` so Step 9
+    can aggregate them into a ``resolver_spend`` summary on
+    ``run-results.json``.
+    """
 
     selector: str | None
     strategy: str | None
@@ -58,6 +66,10 @@ class ResolutionResult:
     snapshot_hash: str | None = None
     reason: str | None = None
     resolved_at: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    model: str | None = None
+    duration_ms: int | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -71,6 +83,10 @@ class ResolutionResult:
             "snapshot_hash": self.snapshot_hash,
             "reason": self.reason,
             "resolved_at": self.resolved_at,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "model": self.model,
+            "duration_ms": self.duration_ms,
         }
 
 
@@ -171,9 +187,13 @@ def _build_prompt(intent: str, snapshot_text: str, constant_name: str) -> tuple[
     return system, user
 
 
-def _call_anthropic(system: str, user: str, *, model: str) -> str:
-    """Single Anthropic API call with prefilled JSON output. Returns the
-    completion text. Raises on transport / SDK errors."""
+def _call_anthropic(system: str, user: str, *, model: str) -> tuple[str, dict[str, int | None]]:
+    """Single Anthropic API call with prefilled JSON output.
+
+    Returns ``(completion_text, usage_dict)`` where ``usage_dict`` carries
+    ``{"input_tokens", "output_tokens"}`` for telemetry (Phase 6). Raises
+    on transport / SDK errors.
+    """
     # Lazy import so non-resolver callers don't pay the import cost.
     import anthropic  # type: ignore[import-untyped]
 
@@ -211,7 +231,12 @@ def _call_anthropic(system: str, user: str, *, model: str) -> str:
         if getattr(block, "type", None) == "text":
             body_parts.append(block.text)
     body = "".join(body_parts)
-    return "{" + body if body else "{}"
+    usage_obj = getattr(response, "usage", None)
+    usage: dict[str, int | None] = {
+        "input_tokens": getattr(usage_obj, "input_tokens", None),
+        "output_tokens": getattr(usage_obj, "output_tokens", None),
+    }
+    return ("{" + body if body else "{}"), usage
 
 
 def _parse_response(text: str) -> dict[str, Any]:
@@ -277,9 +302,11 @@ def resolve_one(
     system, user = _build_prompt(intent, snapshot_text, constant_name)
 
     last_error: str | None = None
+    usage: dict[str, int | None] = {"input_tokens": None, "output_tokens": None}
+    t_call_start = time.monotonic()
     for attempt in range(_MAX_API_RETRIES + 1):
         try:
-            raw = _call_anthropic(system, user, model=chosen_model)
+            raw, usage = _call_anthropic(system, user, model=chosen_model)
             parsed = _parse_response(raw)
             break
         except Exception as e:  # noqa: BLE001 - SDK exceptions are not pinned to one type
@@ -292,10 +319,13 @@ def resolve_one(
                     snapshot_hash=snap_hash,
                     reason=f"resolver API failed after {_MAX_API_RETRIES + 1} attempts: {last_error}",
                     resolved_at=datetime.now(UTC).isoformat(),
+                    model=chosen_model,
+                    duration_ms=int((time.monotonic() - t_call_start) * 1000),
                 )
             time.sleep(_API_RETRY_BACKOFF_S[min(attempt, len(_API_RETRY_BACKOFF_S) - 1)])
     else:  # pragma: no cover - loop always returns or breaks
         raise RuntimeError("unreachable")
+    duration_ms = int((time.monotonic() - t_call_start) * 1000)
 
     selector = parsed.get("selector")
     strategy = normalise_strategy(parsed.get("strategy"))
@@ -311,6 +341,10 @@ def resolve_one(
             snapshot_hash=snap_hash,
             reason=f"resolver returned XPath ({selector!r}); rejected per locator-priority gate",
             resolved_at=datetime.now(UTC).isoformat(),
+            input_tokens=usage.get("input_tokens"),
+            output_tokens=usage.get("output_tokens"),
+            model=chosen_model,
+            duration_ms=duration_ms,
         )
 
     # Confidence-threshold check.
@@ -322,6 +356,10 @@ def resolve_one(
             snapshot_hash=snap_hash,
             reason=reason or "resolver did not return a selector",
             resolved_at=datetime.now(UTC).isoformat(),
+            input_tokens=usage.get("input_tokens"),
+            output_tokens=usage.get("output_tokens"),
+            model=chosen_model,
+            duration_ms=duration_ms,
         )
     else:
         result = ResolutionResult(
@@ -335,6 +373,10 @@ def resolve_one(
             snapshot_hash=snap_hash,
             reason=reason,
             resolved_at=datetime.now(UTC).isoformat(),
+            input_tokens=usage.get("input_tokens"),
+            output_tokens=usage.get("output_tokens"),
+            model=chosen_model,
+            duration_ms=duration_ms,
         )
 
     # Persist.

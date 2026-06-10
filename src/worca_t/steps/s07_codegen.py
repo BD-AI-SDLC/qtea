@@ -143,6 +143,300 @@ def _ensure_conftest_registers_runtime(sut_root: Path) -> None:
     log.info("step07.jit_conftest_appended", path=str(conftest))
 
 
+# ---------------------------------------------------------------------------
+# Framework-aware JIT runtime vendoring dispatch
+# ---------------------------------------------------------------------------
+#
+# Frameworks that have a vendorable runtime plugin map to a function that
+# (a) copies template files into the SUT, (b) registers the plugin with the
+# framework's setup hook (conftest / playwright.config / setupFiles /
+# @Listeners), and (c) returns the list of files it created so they can be
+# added to the commit manifest.
+#
+# Frameworks NOT in the dispatch fall through to Step 9's on-failure heal
+# flow for non-JIT stacks (Selenium / Cypress / Robot / etc.).
+
+
+def _vendor_python_pytest_runtime(sut_root: Path) -> list[Path]:
+    """Vendor the Python pytest+Playwright JIT runtime."""
+    added = _vendor_jit_runtime(sut_root)
+    if added is None:
+        return []
+    _ensure_conftest_registers_runtime(sut_root)
+    return [added]
+
+
+def _locate_runtime_template(filename: str) -> Path | None:
+    """Find a runtime template file under _resources/runtime/, with a
+    src/-prefixed fallback for dev trees where WORCA_T_RESOURCE_ROOT
+    points at the repo root rather than the installed wheel."""
+    primary = (
+        package_resource_root() / "_resources" / "runtime" / filename
+    )
+    if primary.is_file():
+        return primary
+    fallback = (
+        package_resource_root() / "src" / "worca_t" / "_resources"
+        / "runtime" / filename
+    )
+    return fallback if fallback.is_file() else None
+
+
+def _detect_js_test_runner(sut_root: Path) -> str | None:
+    """Inspect package.json to detect the SUT's test runner.
+
+    Returns one of ``"playwright-test"``, ``"jest"``, ``"vitest"``, or
+    ``None`` when nothing matches. When multiple are present, prefer
+    Playwright Test (it's the most likely setup for a Playwright JIT path).
+    """
+    pkg = sut_root / "package.json"
+    if not pkg.is_file():
+        return None
+    try:
+        data = json.loads(pkg.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    deps = {
+        **(data.get("dependencies") or {}),
+        **(data.get("devDependencies") or {}),
+    }
+    if "@playwright/test" in deps:
+        return "playwright-test"
+    if "jest" in deps:
+        return "jest"
+    if "vitest" in deps:
+        return "vitest"
+    return None
+
+
+def _register_playwright_test_global_setup(sut_root: Path, runtime_rel: str) -> Path | None:
+    """Set ``globalSetup`` in playwright.config.{ts,js} to the vendored runtime.
+
+    Best-effort string surgery — if the config file is too exotic to parse,
+    logs the unfinished registration and returns None. The user can add
+    ``globalSetup: "./tests/worca-t-runtime"`` manually in that case.
+    """
+    for ext in ("ts", "mts", "cts", "js", "mjs", "cjs"):
+        cfg = sut_root / f"playwright.config.{ext}"
+        if cfg.is_file():
+            break
+    else:
+        log.warning(
+            "step07.jit_pw_config_missing",
+            hint="playwright.config.* not found; runtime vendored but not "
+                 "registered. Add `globalSetup: \"./tests/worca-t-runtime\"` "
+                 "manually.",
+        )
+        return None
+    try:
+        text = cfg.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if "worca-t-runtime" in text:
+        return cfg  # idempotent — already registered
+    # Find the defineConfig({ ... }) opening brace and inject the key after it.
+    import re as _re
+    m = _re.search(r"defineConfig\s*\(\s*\{", text)
+    if m is None:
+        log.warning(
+            "step07.jit_pw_config_unparseable",
+            path=str(cfg),
+            hint="couldn't find `defineConfig({` shape; add globalSetup manually.",
+        )
+        return None
+    insertion = f'\n  globalSetup: "./{runtime_rel.replace(".js", "")}",'
+    new_text = text[:m.end()] + insertion + text[m.end():]
+    cfg.write_text(new_text, encoding="utf-8")
+    log.info("step07.jit_pw_globalsetup_added", path=str(cfg))
+    return cfg
+
+
+def _register_setup_files(
+    sut_root: Path, runner: str, runtime_rel: str,
+) -> Path | None:
+    """Register the runtime in Jest / Vitest config via the appropriate
+    ``setupFiles`` key. Same best-effort approach as the Playwright-Test
+    registration above.
+    """
+    if runner == "jest":
+        candidates = ["jest.config.js", "jest.config.ts", "jest.config.mjs", "jest.config.cjs"]
+        config_key = "setupFiles"
+    elif runner == "vitest":
+        candidates = ["vitest.config.ts", "vitest.config.js", "vitest.config.mts"]
+        config_key = "test.setupFiles"
+    else:
+        return None
+
+    for name in candidates:
+        cfg = sut_root / name
+        if cfg.is_file():
+            break
+    else:
+        log.warning(
+            "step07.jit_setup_config_missing",
+            runner=runner,
+            hint=f"{runner} config not found; runtime vendored but not registered.",
+        )
+        return None
+    try:
+        text = cfg.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if "worca-t-runtime" in text:
+        return cfg
+    log.warning(
+        "step07.jit_setup_files_manual",
+        runner=runner, path=str(cfg),
+        hint=(
+            f"Auto-edit of {runner} config not supported in v1 — "
+            f"add `{config_key}: ['<rootDir>/{runtime_rel}']` to {cfg.name} "
+            f"manually. The vendored file at {runtime_rel} works once loaded."
+        ),
+    )
+    return cfg
+
+
+def _vendor_typescript_playwright_runtime(sut_root: Path) -> list[Path]:
+    """Vendor the TS/JS Playwright JIT runtime (Playwright Test / Jest / Vitest).
+
+    Strategy:
+
+    1. Copy ``worca-t-runtime.js.tpl`` to ``<sut>/tests/worca-t-runtime.js``.
+       Single CommonJS file — works in CJS and ESM-interop modes.
+    2. Detect the test runner from ``package.json``.
+    3. Register the runtime with the runner's setup hook:
+       - Playwright Test → ``globalSetup`` in ``playwright.config.*``
+       - Jest / Vitest → log a manual-registration hint (auto-edit of
+         their configs is brittle; left for follow-up).
+
+    Returns the list of files created (for commit manifest).
+    """
+    template = _locate_runtime_template("worca-t-runtime.js.tpl")
+    if template is None:
+        log.warning(
+            "step07.jit_runtime_template_missing",
+            framework="typescript-playwright",
+            hint="worca-t-runtime.js.tpl not found in _resources/runtime/.",
+        )
+        return []
+    tests_dir = sut_root / "tests"
+    tests_dir.mkdir(parents=True, exist_ok=True)
+    dest = tests_dir / "worca-t-runtime.js"
+    try:
+        dest.write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
+    except OSError as e:
+        log.warning("step07.jit_runtime_vendor_failed", error=str(e))
+        return []
+    log.info("step07.jit_runtime_vendored", path=str(dest))
+
+    runtime_rel = "tests/worca-t-runtime.js"
+    runner = _detect_js_test_runner(sut_root)
+    if runner == "playwright-test":
+        _register_playwright_test_global_setup(sut_root, runtime_rel)
+    elif runner in ("jest", "vitest"):
+        _register_setup_files(sut_root, runner, runtime_rel)
+    else:
+        log.warning(
+            "step07.jit_no_runner_detected",
+            hint="package.json missing or no recognised runner; runtime "
+                 "vendored but not auto-registered. Tests must require it "
+                 "themselves: `require('./tests/worca-t-runtime');`",
+        )
+    return [dest]
+
+
+def _vendor_java_playwright_runtime(sut_root: Path) -> list[Path]:
+    """Vendor the Java Playwright JIT runtime (JUnit5 + TestNG).
+
+    Strategy:
+
+    1. Copy ``Tbd.java``, ``WorcaT.java``, ``WorcaTResolver.java`` into
+       the SUT's ``src/test/java/com/worca/runtime/`` directory. Standard
+       Maven + Gradle source layout applies to both JUnit5 and TestNG.
+    2. The agent prompt instructs codegen to import ``com.worca.runtime.Tbd``
+       for sentinel constants and call ``WorcaT.wrap(page)`` once at the
+       Page acquisition site (typically in ``@BeforeEach`` / ``@BeforeMethod``).
+       Java does not permit runtime method replacement the way Python /
+       JavaScript do, so explicit wrapping is the cleanest path.
+
+    Returns the list of files created (for commit manifest).
+    """
+    java_templates = ("Tbd.java.tpl", "WorcaT.java.tpl", "WorcaTResolver.java.tpl")
+    located: list[tuple[Path, str]] = []
+    for name in java_templates:
+        path = _locate_runtime_template(name)
+        if path is None:
+            log.warning(
+                "step07.jit_runtime_template_missing",
+                framework="java-playwright",
+                template=name,
+            )
+            return []
+        located.append((path, name.removesuffix(".tpl")))
+
+    dest_dir = sut_root / "src" / "test" / "java" / "com" / "worca" / "runtime"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    created: list[Path] = []
+    for src, target_name in located:
+        dest = dest_dir / target_name
+        try:
+            dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+            created.append(dest)
+            log.info("step07.jit_runtime_vendored", path=str(dest))
+        except OSError as e:
+            log.warning(
+                "step07.jit_runtime_vendor_failed",
+                path=str(dest), error=str(e),
+            )
+    if created:
+        # JUnit5 + TestNG both pick these up automatically once they're on
+        # the test classpath — no @Listeners / META-INF/services entries
+        # required for the explicit-wrap pattern. Tests must call
+        # WorcaT.wrap(page) once at Page acquisition; the agent's TBD-rule §3c
+        # documents the pattern with examples.
+        log.info(
+            "step07.jit_java_runtime_ready",
+            count=len(created),
+            hint=(
+                "Java JIT activated via explicit WorcaT.wrap(page) in tests. "
+                "Build tool (Maven/Gradle) picks up src/test/java/com/worca/"
+                "runtime/ automatically; no config edit needed."
+            ),
+        )
+    return created
+
+
+# Framework name → vendor function. Framework strings match the values
+# produced by `worca_t.test_indexer.resolve_framework()`.
+_RUNTIME_VENDORS = {
+    "pytest": _vendor_python_pytest_runtime,
+    "playwright-py": _vendor_python_pytest_runtime,
+    "playwright-ts": _vendor_typescript_playwright_runtime,
+    "playwright-js": _vendor_typescript_playwright_runtime,
+    "jest": _vendor_typescript_playwright_runtime,
+    "vitest": _vendor_typescript_playwright_runtime,
+    "junit5-playwright": _vendor_java_playwright_runtime,
+    "testng-playwright": _vendor_java_playwright_runtime,
+    "playwright-java": _vendor_java_playwright_runtime,
+}
+
+
+def _vendor_runtime_for_framework(framework: str | None, sut_root: Path) -> list[Path]:
+    """Dispatch JIT runtime vendoring by framework. Returns the list of
+    files written into the SUT (for inclusion in the commit manifest).
+    Frameworks without a dispatch entry return ``[]`` — Step 9 picks them
+    up via the on-failure heal path."""
+    vendor_fn = _RUNTIME_VENDORS.get(framework or "")
+    if vendor_fn is None:
+        log.info(
+            "step07.jit_runtime_not_vendored",
+            framework=framework,
+            hint="Step 9 will use the on-failure heal flow for this stack.",
+        )
+        return []
+    return vendor_fn(sut_root)
+
+
 def _read_research(ctx: StepContext) -> dict:
     research_json = ctx.workspace.step_dir(6) / "research.json"
     if not research_json.exists():
@@ -223,18 +517,41 @@ def _is_worca_file(rel: str) -> bool:
     return name.startswith("worca")
 
 
-def _filter_index_to_worca(index: IndexResult, sut_root: Path) -> IndexResult:
+def _filter_index_to_worca(
+    index: IndexResult,
+    sut_root: Path,
+    *,
+    exclude: set[Path] | None = None,
+) -> IndexResult:
     """Return a new IndexResult containing only worca-prefixed entries.
 
     `index_tests` walks the whole SUT and picks up the SUT's own pre-existing
     tests / locators alongside worca-generated ones. The user-facing tbd-index
     must reflect only what worca-t produced, otherwise Step 7's "tests=N" gate
-    and Step 8's TBD-resolution would race against unrelated SUT code.
+    and Step 9's downstream logic would race against unrelated SUT code.
+
+    ``exclude`` lets the caller drop additional worca-prefixed paths from the
+    index — used to skip pre-vendored JIT runtime files (`worca_t_runtime.py`,
+    `worca-t-runtime.js`, `WorcaT.java`) so they don't inflate the test/support
+    counts. Paths in ``exclude`` must be resolved absolute paths.
     """
-    files = [f for f in index.files if _is_worca_file(f)]
-    tests = [t for t in index.tests if _is_worca_file(t.file)]
-    support_files = [s for s in index.support_files if _is_worca_file(s.file)]
-    violations = [v for v in index.violations if _is_worca_file(v.file)]
+    exclude_set: set[Path] = exclude or set()
+
+    def _keep(rel_path: str) -> bool:
+        if not _is_worca_file(rel_path):
+            return False
+        if not exclude_set:
+            return True
+        try:
+            abs_resolved = (sut_root / rel_path).resolve()
+        except OSError:
+            return True
+        return abs_resolved not in exclude_set
+
+    files = [f for f in index.files if _keep(f)]
+    tests = [t for t in index.tests if _keep(t.file)]
+    support_files = [s for s in index.support_files if _keep(s.file)]
+    violations = [v for v in index.violations if _keep(v.file)]
     return replace(
         index,
         test_root=str(sut_root),
@@ -249,6 +566,51 @@ class CodegenStep(Step):
     number = 7
     name = "codegen"
     timeout_s = step_timeout(7)
+
+    @staticmethod
+    def _build_runtime_hint(
+        framework: str, jit_files: list[Path], sut_root: Path,
+    ) -> str:
+        """One-paragraph hint telling the agent EXACTLY where the JIT runtime
+        is (or that none was vendored). Eliminates the "find worca_t_runtime"
+        detour observed in run 20260610-114657-c9c7c3 step 7 attempt 1.
+
+        Empty hint when the framework has no vendor entry — for those stacks
+        the agent already knows from agent.md §3d to emit `TBD_LOCATOR`
+        placeholders and there's nothing useful to say beyond that.
+        """
+        if not jit_files:
+            if framework in _RUNTIME_VENDORS:
+                return (
+                    "\n\n--- JIT RUNTIME ---\nThe runtime vendor step ran but "
+                    f"produced no files for framework `{framework}` (likely a "
+                    "missing template). Emit `TBD_LOCATOR` placeholders with "
+                    "`TBD_INTENT:` comments per agent.md §3d as a fallback. "
+                    "Do NOT search for or attempt to create the runtime file "
+                    "yourself."
+                )
+            return (
+                "\n\n--- JIT RUNTIME ---\nStack `"
+                f"{framework}` has no JIT runtime; emit `TBD_LOCATOR` "
+                "placeholders with `TBD_INTENT:` comments per agent.md §3d. "
+                "Do NOT search for `worca_t_runtime` / `worca-t-runtime` / "
+                "`Tbd.java` — they are intentionally absent for this stack."
+            )
+        paths = "\n".join(f"  - `{p}`" for p in jit_files)
+        return (
+            "\n\n--- JIT RUNTIME (pre-vendored) ---\n"
+            f"Framework `{framework}` runtime is ALREADY written to the SUT "
+            f"at:\n{paths}\n"
+            "**Do NOT search for it. Do NOT attempt to create it.** Import "
+            "it directly per agent.md §3a-c:\n"
+            "  - Python+pytest+PW → `from tests.worca_t_runtime import tbd`\n"
+            "  - TS/JS+PW → `import { tbd } from \"./worca-t-runtime\"` "
+            "(or relative path)\n"
+            "  - Java+PW → `import com.worca.runtime.Tbd;`\n"
+            "The framework's setup hook (conftest.py / playwright.config / "
+            "setupFiles / @Listeners) was also updated automatically; you "
+            "do NOT need to register the runtime."
+        )
 
     async def run(self, ctx: StepContext) -> StepResult:
         out_dir = self.out_dir(ctx.workspace)
@@ -273,7 +635,6 @@ class CodegenStep(Step):
             )
 
         strategy_md = ctx.workspace.step_dir(4) / "test-strategy.md"
-        research_md = ctx.workspace.step_dir(6) / "research.md"
         sut_inv_json = ctx.workspace.step_dir(6) / "sut_inventory.json"
 
         # B: planning artifacts required by the agent.
@@ -337,33 +698,22 @@ class CodegenStep(Step):
         # Minimum-sufficient input set, ranked by authority:
         #   - test-strategy.md (step 4): the curated, authoritative test
         #     specification. Includes the test cases the agent must implement.
-        #   - research.md (step 6): the SUT discovery narrative — frameworks,
-        #     env vars, build/test commands, README excerpts. Not all of this
-        #     is in the structured `research.json` projection, so the agent
-        #     reads the prose.
-        #   - sut_inventory.json + active_module.json (step 6): the SUT's
-        #     own layout (existing page objects, fixtures, locators, helpers).
+        #   - sut_inventory.json (step 6): the SUT's own layout (existing page
+        #     objects, fixtures, locators, helpers). The active module record
+        #     lives at modules[active_module] — the agent extracts it on read.
         #
-        # Deliberately NOT staged (redundant with test-strategy.md, which is
-        # derived from them): plan.md (step 3), refined-spec.md (step 2).
-        # The codegen agent doesn't need to re-derive the spec — it needs the
-        # spec's curated downstream form.
+        # Deliberately NOT staged:
+        #   - plan.md (step 3) + refined-spec.md (step 2): redundant with
+        #     test-strategy.md, which is derived from them.
+        #   - research.md (step 6): every datum the agent needed (env var
+        #     names via env_hint; frameworks + layout via sut_inventory;
+        #     build/test commands consumed by step 9 via research.json) is
+        #     already supplied by other inputs. Saves ~25 KB / turn.
+        #   - active_module.json: byte-identical duplicate of
+        #     sut_inventory.json["modules"][active_module]. Saves ~22 KB / turn.
         inputs = {"test-strategy.md": strategy_md}
-        if research_md.exists():
-            inputs["research.md"] = research_md
         if sut_inv_json.exists():
             inputs["sut_inventory.json"] = sut_inv_json
-
-        # Write a single-fact pointer (active_module.json) directly into the
-        # agent's workdir so the prompt can reference it as `./active_module.json`.
-        # Do NOT register it in `inputs` — `inputs` is for files that must be
-        # copied IN from outside the workdir, and copying a file to itself
-        # fails on Windows with [WinError 32].
-        if active_module_dict:
-            (wd / "active_module.json").write_text(
-                json.dumps(active_module_dict, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
 
         agents_root = package_resource_root() / "agents"
         skills_root = package_resource_root() / "skills"
@@ -386,6 +736,47 @@ class CodegenStep(Step):
                 f"Reference them in generated tests via process.env.<NAME> "
                 f"(or the framework equivalent such as os.environ). "
                 f"Never hardcode their values."
+            )
+
+        # --- Pre-vendor the JIT runtime BEFORE the agent runs -------------
+        #
+        # Vendoring used to run AFTER the agent succeeded, which forced the
+        # agent into a chicken-and-egg search loop: the prompt told it to
+        # import `tests.worca_t_runtime` / `./worca-t-runtime` / `com.worca.
+        # runtime.Tbd`, but that file did not exist yet. Empirical fallout
+        # from run 20260610-114657-c9c7c3 step 7 attempt 1: the agent spent
+        # 80 turns burning the 1800s timeout with ZERO Writes, including 10
+        # Greps for `def tbd|class.*Runtime|__WORCA_T_TBD__`, 18 Bash
+        # `find`/`grep` calls, and one spawned subagent literally named
+        # "Find worca_t_runtime template". By line 931 it decided IT had
+        # to create the runtime — work the pipeline would have overwritten
+        # with the template anyway.
+        #
+        # Vendoring first means the agent reads the runtime once (Read by
+        # absolute path) and gets to writing tests.
+        #
+        # `detected_stack` is None only when Step 6 hard-failed and the
+        # operator forced through. In that case the SUT may have no test
+        # files yet, so `resolve_framework` would scan an empty dir and
+        # return "unknown" — we can't pick a vendor entry. Defer vendoring
+        # to AFTER the agent runs (original behavior) in that edge case;
+        # the agent will see no runtime and use the TBD_LOCATOR fallback
+        # for this turn, which Step 9's heal flow can pick up.
+        if detected_stack:
+            pre_framework = resolve_framework(detected_stack, sut_root)
+            jit_files_added: list[Path] = _vendor_runtime_for_framework(
+                pre_framework, sut_root,
+            )
+            runtime_hint = self._build_runtime_hint(
+                pre_framework, jit_files_added, sut_root,
+            )
+        else:
+            jit_files_added = []
+            runtime_hint = (
+                "\n\n--- JIT RUNTIME ---\nNo stack was detected by Step 6, so "
+                "no runtime is pre-vendored. Emit `TBD_LOCATOR` placeholders "
+                "with `TBD_INTENT:` comments per agent.md §3d. Do NOT search "
+                "for or attempt to create a worca-t runtime file."
             )
 
         # Reuse + folder integration: when an active module is known, tell the
@@ -499,8 +890,8 @@ class CodegenStep(Step):
             abs_helpers = module_root / helpers_dir
 
             reuse_hint = (
-                f"\n\n--- ACTIVE MODULE (from `./sut_inventory.json` / "
-                f"`./active_module.json`) ---\n"
+                f"\n\n--- ACTIVE MODULE (from "
+                f"`./sut_inventory.json[\"modules\"][active_module]`) ---\n"
                 f"Name: `{am.get('name')}`  Path: `{am.get('path')}`  "
                 f"Language: `{language}`  Package manager: "
                 f"`{am.get('package_manager') or 'unknown'}`\n\n"
@@ -561,25 +952,52 @@ class CodegenStep(Step):
             inputs=inputs,
             user_prompt=(
                 f"{stack_hint}**Stack already resolved by Step 6 — do NOT re-scan the SUT.** "
-                f"Read `./active_module.json` and `./sut_inventory.json` first; the "
-                f"language, package_manager, existing page objects, helpers, "
-                f"fixtures, and test directory layout for the active module are "
-                f"all there. Then read `./test-strategy.md` (the authoritative "
-                f"test specification) and `./research.md` (the SUT discovery "
-                f"narrative — frameworks, env vars, build/test commands). The SUT "
-                f"clone you are testing is at the absolute path `{sut_root}` "
-                f"(read it directly via Read/Grep/Glob — no copy is staged in "
-                f"your working directory). Generate executable test code by "
-                f"writing files at their ABSOLUTE paths under `{sut_root}/` "
-                f"(see the per-category placement table below). The pipeline "
-                f"does NOT copy your output anywhere — your writes ARE the "
-                f"deliverable. Hard rules: locator priority `id > data-testid > "
-                f"role > label > text > placeholder > scoped css`; NO XPath; "
-                f"NO hard waits (no `time.sleep`, no `cy.wait(<number>)`, no "
-                f"`waitForTimeout`); NO `page.content()` - use AOM snapshots; "
-                f"no inline credentials. Mark unresolved selectors with the "
-                f"literal `TBD_LOCATOR` so the locator-resolution step can "
-                f"replace them.{env_hint}{reuse_hint}"
+                f"Read `./sut_inventory.json` first — the top-level "
+                f"`active_module` key names which module to target, and "
+                f"`modules[active_module]` holds the full record (language, "
+                f"package_manager, existing page objects, helpers, fixtures, "
+                f"locators, and test directory layout). Then read "
+                f"`./test-strategy.md` (the authoritative test specification). "
+                f"The SUT clone you are testing is at the absolute path "
+                f"`{sut_root}` (read it directly via Read/Grep/Glob — no copy "
+                f"is staged in your working directory). Generate executable "
+                f"test code by writing files at their ABSOLUTE paths under "
+                f"`{sut_root}/` (see the per-category placement table below). "
+                f"The pipeline does NOT copy your output anywhere — your "
+                f"writes ARE the deliverable. Hard rules: locator priority "
+                f"`id > data-testid > role > label > text > placeholder > "
+                f"scoped css`; NO XPath; NO hard waits (no `time.sleep`, no "
+                f"`cy.wait(<number>)`, no `waitForTimeout`); NO "
+                f"`page.content()` - use AOM snapshots; no inline credentials. "
+                f"Unresolved selectors: follow the four-branch TBD-marker rule "
+                f"in your agent.md §3 (Python+PW -> `tbd(...)`, TS/JS+PW -> "
+                f"`tbd(...)` from `./worca-t-runtime`, Java+PW -> "
+                f"`Tbd.of(...)`, all other stacks -> `TBD_LOCATOR` + "
+                f"`TBD_INTENT:` comment). Pick the branch that matches "
+                f"`sut_inventory.json[\"modules\"][active_module].language` + "
+                f"framework — never mix."
+                f"\n\n--- DISCOVERY DISCIPLINE (non-negotiable) ---\n"
+                f"1. **Do NOT use Bash for filesystem discovery.** No `find`, "
+                f"no `grep -r`, no `ls`. Use `Read` for known paths and "
+                f"`Glob`/`Grep` tools for pattern search — they are faster, "
+                f"cheaper, and don't pay shell-spawn overhead per call.\n"
+                f"2. **Trust `sut_inventory.json`.** Every existing page "
+                f"object, fixture, helper, and locator class is listed there "
+                f"with its absolute file path. Read those paths directly — "
+                f"do NOT Glob/Grep for files the inventory already names.\n"
+                f"3. **Discovery budget: ≤5 reads, ≤2 Glob/Grep calls before "
+                f"your first `Write`.** Reading `sut_inventory.json` + "
+                f"`test-strategy.md` + the 1–3 existing files you'll extend "
+                f"is enough context to start writing. If you find yourself "
+                f"reading a 4th SUT file before any Write, stop and write.\n"
+                f"4. **Batch independent `Write` calls in a single response.** "
+                f"When you have content ready for N files, emit N `Write` "
+                f"tool calls in the same assistant turn — do not serialize "
+                f"them one-per-turn.\n"
+                f"5. **Per-file size discipline.** A locator class, page "
+                f"object, or test file should be ≤200 lines. If you find "
+                f"yourself generating more, split by feature.{env_hint}"
+                f"{runtime_hint}{reuse_hint}"
             ),
             extra_paths=extras,
             add_dirs=[sut_root],
@@ -603,7 +1021,15 @@ class CodegenStep(Step):
             p for p in sut_root.rglob("Worca*")
             if p.is_file() and ".git" not in p.parts and p not in produced_in_sut
         ))
-        if not result.success or not produced_in_sut:
+        # JIT runtime files were vendored BEFORE the agent ran (see the
+        # pre-vendoring block above). They live under worca-prefixed names
+        # (`worca_t_runtime.py`, `worca-t-runtime.js`, `WorcaT.java`, ...)
+        # and will show up in `produced_in_sut` via the rglob above — but
+        # they are NOT agent output, so they don't count toward the
+        # "did the agent write anything?" gate.
+        jit_resolved = {p.resolve() for p in jit_files_added}
+        agent_produced = [p for p in produced_in_sut if p.resolve() not in jit_resolved]
+        if not result.success or not agent_produced:
             return StepResult(
                 success=False,
                 status="failed",
@@ -616,10 +1042,28 @@ class CodegenStep(Step):
 
         # Index the SUT clone, then filter to ONLY worca-prefixed entries so
         # the SUT's own pre-existing tests don't pollute our tbd-index or
-        # trigger rule-violation reports for code we didn't write.
+        # trigger rule-violation reports for code we didn't write. Also drop
+        # pre-vendored JIT runtime files (they are infrastructure, not
+        # agent-authored tests/support — and they live under worca-prefixed
+        # names so they'd otherwise inflate the count).
+        #
+        # Resolve framework AFTER the agent ran when `detected_stack` was
+        # None: the SUT now has the agent's files, so the extension fallback
+        # in `resolve_framework` can pick the right framework (e.g. "pytest"
+        # when the agent wrote `worca_test_*.py`).
         framework = resolve_framework(detected_stack, sut_root)
+        # Lazy-vendor for the no-detected-stack edge case (matches original
+        # post-agent behavior). When `detected_stack` was set, vendoring
+        # already happened pre-agent and this call short-circuits via the
+        # `_RUNTIME_VENDORS` dispatch with idempotent file writes.
+        if not detected_stack:
+            late_added = _vendor_runtime_for_framework(framework, sut_root)
+            for p in late_added:
+                if p not in jit_files_added:
+                    jit_files_added.append(p)
+            jit_resolved.update(p.resolve() for p in late_added)
         full_index = index_tests(sut_root, framework=framework)
-        index = _filter_index_to_worca(full_index, sut_root)
+        index = _filter_index_to_worca(full_index, sut_root, exclude=jit_resolved)
         payload = index.as_dict()
 
         index_path = out_dir / "tbd-index.json"
@@ -680,17 +1124,18 @@ class CodegenStep(Step):
                 ),
             )
 
-        # JIT runtime vendoring — for Python+pytest+Playwright SUTs only.
-        # Copy `worca_t_runtime.py` into the SUT's tests/ directory so the
-        # pytest plugin can resolve TBD sentinels (`tbd("...")`) at runtime
-        # against the live Playwright page. Add it to the manifest so it's
-        # committed alongside the codegen output.
-        jit_runtime_added: Path | None = None
-        if framework in {"pytest", "playwright-py"}:
-            jit_runtime_added = _vendor_jit_runtime(sut_root)
-            if jit_runtime_added is not None:
-                produced_in_sut.append(jit_runtime_added)
-                _ensure_conftest_registers_runtime(sut_root)
+        # JIT runtime files were already vendored before the agent ran
+        # (see the pre-vendoring block at the top of `run`). Make sure they
+        # are present in `produced_in_sut` so the commit manifest below
+        # records them alongside the agent's authored files — the rglob
+        # walk above catches `worca_t_runtime.py` and `WorcaT.java` but
+        # MAY miss `worca-t-runtime.js` (hyphen vs underscore in the
+        # `worca_*` glob), so re-add explicitly to be safe. Set-based
+        # dedup via resolve() avoids double-entries on Windows.
+        already = {p.resolve() for p in produced_in_sut}
+        for p in jit_files_added:
+            if p.resolve() not in already:
+                produced_in_sut.append(p)
 
         # Commit the agent's work to the worca-t branch. Per-step commits
         # give the human reviewer a clear `git log` trail of who-wrote-what.

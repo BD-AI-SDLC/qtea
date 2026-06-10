@@ -244,3 +244,290 @@ async def test_step07_fails_fast_when_inventory_files_unreachable(tmp_path: Path
     assert not result.success
     err = result.error or ""
     assert "0 of them found" in err or "missing_page.py" in err
+
+
+# ---------------------------------------------------------------------------
+# Context-shrink regression guards (~45 KB / turn savings)
+#
+# Drop A: stop staging active_module.json — byte-identical duplicate of
+#   sut_inventory.json["modules"][active_module]. Saves ~22 KB / turn.
+# Drop C: stop staging research.md — every datum the codegen agent needed
+#   was already in env_hint / sut_inventory / test-strategy. Saves ~25 KB.
+#
+# Background: run 20260610-082950-6a887f Step 7 hit a corporate-relay
+# retry storm partly amplified by the oversized per-turn upload (~154 KB).
+# These guards keep the orchestrator from regressing the shrink.
+# ---------------------------------------------------------------------------
+
+
+async def test_step07_does_not_stage_active_module_json(tmp_path: Path, monkeypatch):
+    """active_module.json must NOT be written into the agent workdir — it
+    duplicates sut_inventory.json["modules"][active_module] byte-for-byte."""
+    ctx = _ctx(tmp_path)
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
+        files={_sut_file(ctx.workspace, "tests/worca_test_x.spec.ts"): GOOD_TS_TEST},
+    )
+    await CodegenStep().run(ctx)
+
+    wd = ctx.workspace.step_dir(7)
+    assert not (wd / "active_module.json").exists(), (
+        "active_module.json must not be staged — it duplicates "
+        "sut_inventory.json[\"modules\"][active_module] byte-for-byte and "
+        "wastes ~22 KB / turn."
+    )
+
+
+async def test_step07_does_not_stage_research_md(tmp_path: Path, monkeypatch):
+    """research.md must NOT be staged into the agent workdir even when
+    step 6 produced it. Every datum the codegen agent needed (env vars,
+    frameworks, layout) is already in env_hint / sut_inventory.json."""
+    ctx = _ctx(tmp_path, with_research=True)  # fixture seeds research.md
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
+        files={_sut_file(ctx.workspace, "tests/worca_test_y.spec.ts"): GOOD_TS_TEST},
+    )
+    await CodegenStep().run(ctx)
+
+    wd = ctx.workspace.step_dir(7)
+    assert not (wd / "research.md").exists(), (
+        "research.md must not be staged into step 7's workdir. The agent "
+        "gets env vars via env_hint and frameworks via sut_inventory.json; "
+        "the prose was ~25 KB / turn of redundant context."
+    )
+
+
+async def test_step07_prompt_references_sut_inventory_path_not_separate_files(
+    tmp_path: Path, monkeypatch,
+):
+    """The user_prompt must instruct the agent to navigate
+    sut_inventory.json["modules"][active_module] and must NOT name the
+    dropped files (./active_module.json, ./research.md). Drift here =
+    agent tries to Read files that aren't staged → failed turn."""
+    captured: dict[str, str] = {}
+
+    def _capture(prompt, options):  # noqa: ARG001
+        captured["prompt"] = str(prompt)
+
+    ctx = _ctx(tmp_path)
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
+        files={_sut_file(ctx.workspace, "tests/worca_test_z.spec.ts"): GOOD_TS_TEST},
+        on_call=_capture,
+    )
+    await CodegenStep().run(ctx)
+
+    prompt = captured.get("prompt", "")
+    assert prompt, "fake query should have captured the user_prompt"
+
+    # Negative guards: no references to the dropped files anywhere in
+    # the prompt body. (We allow the substring `active_module` since the
+    # JSON-path notation `modules[active_module]` contains it.)
+    assert "./active_module.json" not in prompt, (
+        "Prompt still references the dropped ./active_module.json file"
+    )
+    assert "active_module.json" not in prompt, (
+        "Prompt still references active_module.json — must use the JSON-"
+        "path notation modules[active_module] instead"
+    )
+    assert "./research.md" not in prompt, (
+        "Prompt still references the dropped ./research.md file"
+    )
+
+    # Positive guard: the new JSON-path navigation wording is present.
+    assert "modules[active_module]" in prompt, (
+        "Prompt must tell the agent to navigate "
+        "sut_inventory.json[\"modules\"][active_module] for the active "
+        "module record"
+    )
+
+
+# ---------------------------------------------------------------------------
+# JIT runtime pre-vendoring regression guards
+#
+# Background: run 20260610-114657-c9c7c3 step 7 burned both 1800s attempts
+# (zero Writes total) because the agent's prompt told it to import
+# `tests.worca_t_runtime` but the runtime did not exist at agent-invoke
+# time — it was vendored AFTER the agent succeeded. The agent spent 80
+# turns hunting for the file, including a dedicated subagent named
+# "Find worca_t_runtime template". The fix is to vendor BEFORE the agent
+# runs so the agent reads the file once by path and gets to writing tests.
+# ---------------------------------------------------------------------------
+
+
+async def test_step07_vendors_jit_runtime_before_agent_runs(
+    tmp_path: Path, monkeypatch,
+):
+    """When `detected_stack` is set, the JIT runtime must be on disk in the
+    SUT BEFORE `run_agent` is called. Without this guard the chicken-and-egg
+    failure mode (agent searches for a runtime that doesn't exist yet)
+    silently re-emerges and step 7 wall-clocks the timeout."""
+    captured: dict[str, bool] = {}
+
+    ctx = _ctx(tmp_path, detected_stack="playwright-ts")
+    expected_runtime = ctx.workspace.sut / "tests" / "worca-t-runtime.js"
+
+    def _capture(prompt, options):  # noqa: ARG001
+        # Side-effect runs at the moment the fake query is dispatched, which
+        # is the exact moment the real SDK would be invoked — i.e. AFTER
+        # any pre-agent vendoring in s07 has finished.
+        captured["runtime_present_at_agent_invoke"] = expected_runtime.is_file()
+
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
+        files={_sut_file(ctx.workspace, "tests/worca_test_z.spec.ts"): GOOD_TS_TEST},
+        on_call=_capture,
+    )
+    await CodegenStep().run(ctx)
+
+    assert captured.get("runtime_present_at_agent_invoke") is True, (
+        "JIT runtime must be vendored to the SUT BEFORE run_agent is "
+        "invoked. Agent prompt tells it to import the runtime; if the "
+        "file is absent at invoke time the agent burns its turn budget "
+        "hunting for it (see RCA in run 20260610-114657-c9c7c3 step 7)."
+    )
+
+
+async def test_step07_prompt_contains_runtime_location_when_vendored(
+    tmp_path: Path, monkeypatch,
+):
+    """The user_prompt must tell the agent EXACTLY where the runtime is and
+    forbid searching for it. Without this directive the agent (justifiably)
+    verifies the runtime's existence before relying on the import."""
+    captured: dict[str, str] = {}
+
+    def _capture(prompt, options):  # noqa: ARG001
+        captured["prompt"] = str(prompt)
+
+    ctx = _ctx(tmp_path, detected_stack="playwright-ts")
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
+        files={_sut_file(ctx.workspace, "tests/worca_test_z.spec.ts"): GOOD_TS_TEST},
+        on_call=_capture,
+    )
+    await CodegenStep().run(ctx)
+
+    prompt = captured.get("prompt", "")
+    assert "JIT RUNTIME (pre-vendored)" in prompt, (
+        "Prompt must include the pre-vendored runtime banner so the agent "
+        "knows the file is already on disk and skips the discovery loop"
+    )
+    assert "Do NOT search for it" in prompt, (
+        "Prompt must explicitly forbid searching for the runtime — "
+        "otherwise the agent's natural verification step burns turns"
+    )
+
+
+async def test_step07_prompt_contains_discovery_discipline_block(
+    tmp_path: Path, monkeypatch,
+):
+    """The DISCOVERY DISCIPLINE block tells the agent: no Bash for filesystem
+    ops, trust sut_inventory.json, ≤5 reads before first Write, batch
+    Write calls. Drift here regresses the timeout fix from run
+    20260610-114657-c9c7c3."""
+    captured: dict[str, str] = {}
+
+    def _capture(prompt, options):  # noqa: ARG001
+        captured["prompt"] = str(prompt)
+
+    ctx = _ctx(tmp_path)
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
+        files={_sut_file(ctx.workspace, "tests/worca_test_z.spec.ts"): GOOD_TS_TEST},
+        on_call=_capture,
+    )
+    await CodegenStep().run(ctx)
+
+    prompt = captured.get("prompt", "")
+    assert "DISCOVERY DISCIPLINE" in prompt
+    assert "Do NOT use Bash for filesystem discovery" in prompt
+    assert "Trust `sut_inventory.json`" in prompt
+    assert "Discovery budget" in prompt
+    assert "Batch independent `Write` calls" in prompt
+
+
+async def test_step07_vendored_runtime_excluded_from_index(
+    tmp_path: Path, monkeypatch,
+):
+    """Pre-vendored runtime files live under worca-prefixed names so the
+    rglob walk catches them — but they are infrastructure, not agent
+    output, and must NOT be counted in the tbd-index's files/support_files
+    totals. Otherwise downstream gates see inflated counts and tests that
+    assert `files == 1` after writing one file would suddenly see 2."""
+    ctx = _ctx(tmp_path, detected_stack="playwright-ts")
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
+        files={_sut_file(ctx.workspace, "tests/worca_test_login.spec.ts"): GOOD_TS_TEST},
+    )
+
+    result = await CodegenStep().run(ctx)
+    assert result.success, result.error
+
+    index = json.loads(
+        (ctx.workspace.step_dir(7) / "tbd-index.json").read_text(encoding="utf-8")
+    )
+    indexed_paths = [f for f in index["files"]]
+    # The runtime file exists on disk (rglob will see it) but must not
+    # appear in the tbd-index — it's not agent output.
+    assert not any("worca-t-runtime" in p for p in indexed_paths), (
+        f"Pre-vendored runtime leaked into tbd-index: {indexed_paths}"
+    )
+    # And the index still has exactly the one test file the agent wrote.
+    assert index["totals"]["files"] == 1
+    assert index["totals"]["tests"] == 1
+
+
+async def test_step07_vendored_runtime_included_in_manifest(
+    tmp_path: Path, monkeypatch,
+):
+    """Even though the runtime is excluded from the tbd-index, it MUST
+    appear in `generated-files.json` so the per-step commit captures it
+    and downstream operators can see what was added to the SUT."""
+    ctx = _ctx(tmp_path, detected_stack="playwright-ts")
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
+        files={_sut_file(ctx.workspace, "tests/worca_test_login.spec.ts"): GOOD_TS_TEST},
+    )
+
+    result = await CodegenStep().run(ctx)
+    assert result.success, result.error
+
+    manifest = json.loads(
+        (ctx.workspace.step_dir(7) / "generated-files.json").read_text(encoding="utf-8")
+    )
+    assert any("worca-t-runtime" in f for f in manifest["files"]), (
+        f"Pre-vendored runtime missing from generated-files.json: "
+        f"{manifest['files']}"
+    )
+
+
+async def test_step07_pre_vendor_does_not_mask_agent_no_writes(
+    tmp_path: Path, monkeypatch,
+):
+    """Subtle failure mode: pre-vendoring writes runtime files into the SUT.
+    The post-agent rglob walk catches them as worca-prefixed files. Without
+    the `jit_resolved` subtraction in `agent_produced`, an agent that wrote
+    ZERO files would falsely pass the "did the agent produce anything?"
+    gate because `produced_in_sut` would be non-empty (containing only the
+    runtime files we vendored)."""
+    ctx = _ctx(tmp_path, detected_stack="playwright-ts")
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
+        files={},  # Agent wrote nothing
+    )
+
+    result = await CodegenStep().run(ctx)
+    assert not result.success, (
+        "Agent wrote ZERO test files; step 7 must still fail even though "
+        "the pre-vendored runtime files exist under worca-prefixed names "
+        "in the SUT. Pre-vendoring must not mask the no-output failure mode."
+    )

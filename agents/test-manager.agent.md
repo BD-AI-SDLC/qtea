@@ -118,6 +118,12 @@ Write `test-strategy.md` to the output directory with three sections:
 Make sure the test strategy is unique, doesn't contain duplicates, and not even similar test cases.
 If the test case is simple, keep it simple and short. Don't overcomplicate it by adding unnecessary details. If the test case is complex, break it down into smaller, more manageable test cases to ensure clarity and maintainability.
 
+**TC count budget — be ruthless.** Step 3's planner roster is your input ceiling, not a floor. For a single-feature spec (one user-facing element / flow / endpoint) the final strategy should land at **5–8 TCs**. Hard ceiling: **≤ 1.5 × the number of automatable ACs in the refined spec** (rounded up). If the planner's roster exceeds this, drop the lowest-signal entries — don't propagate the bloat to Step 7 codegen (which pays the most expensive Opus tokens).
+
+**One TC per behavior, not per variation — use `parametrize`.** Variations of the same behavior across viewport sizes, locales, browser/device tiers, breakpoint thresholds, or themes are ONE TC with a `parametrized_over` field naming the axis. Step 7 codegen will emit a single `@pytest.mark.parametrize` test function. Examples that MUST be collapsed: per-viewport visibility (e.g. desktop/mobile/320px) → one TC parametrized over viewport; per-locale label text (EN/DE/FR) → one TC parametrized over locale; per-locale tooltip text → one TC parametrized over locale; per-locale aria-label → one TC parametrized over locale. Never emit "X-EN" + "X-DE" as separate TCs.
+
+**Collapse near-duplicates aggressively.** "X exists" and "X renders correctly" are the same TC. "DE translation key exists" and "DE label renders 'foo'" are the same TC — if the label renders, the key necessarily exists. When in doubt, keep the higher-signal end-to-end variant and drop the lower-signal isolated check.
+
 ---
 
 ## Error Handling

@@ -642,6 +642,20 @@ async def run_agent(
         for k in full_env
         if k.startswith(("WORCA_", "ANTHROPIC_", "HTTP", "HTTPS", "NO_PROXY"))
     }
+    # Claude Code's prompt-cache disable knobs (DISABLE_PROMPT_CACHING and
+    # per-model DISABLE_PROMPT_CACHING_{OPUS,SONNET,HAIKU}) don't match the
+    # prefix filter above but must reach the subprocess to take effect.
+    # `pipeline.run_pipeline` sets DISABLE_PROMPT_CACHING=1 by default
+    # (cleared by --cache); forward whichever variants are set so the CLI
+    # honours them.
+    for k in (
+        "DISABLE_PROMPT_CACHING",
+        "DISABLE_PROMPT_CACHING_OPUS",
+        "DISABLE_PROMPT_CACHING_SONNET",
+        "DISABLE_PROMPT_CACHING_HAIKU",
+    ):
+        if k in full_env:
+            forwarded_env[k] = full_env[k]
 
     sdk_options_kwargs: dict[str, Any] = {
         "cwd": str(workdir),
@@ -839,8 +853,26 @@ async def run_agent(
         "call_idx": call_idx,
     }
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    if error and not stderr_path.read_text(encoding="utf-8"):
-        stderr_path.write_text(error, encoding="utf-8")
+    if error:
+        # Close the CLI-stderr sink first so the append below isn't racing
+        # with the still-open write handle (matters on Windows). Late
+        # writes from the SDK's stderr-reader task during async cleanup
+        # are absorbed by the sink's try/except.
+        try:
+            stderr_fp.close()
+        except (OSError, ValueError):
+            pass
+        # Append the runner's diagnostic banner as a footer so it doesn't
+        # overwrite the CLI's own --verbose stderr (which contains the
+        # underlying exception text behind `api_retry` events). When the
+        # CLI was silent the banner is all we have; when it wrote
+        # something the banner sits below it as added context, not as a
+        # replacement. Prior behavior dropped the banner whenever the CLI
+        # had written anything, and dropped the CLI text whenever it
+        # hadn't — see RCA in run 20260610-082950-6a887f.
+        cli_stderr = stderr_path.read_text(encoding="utf-8")
+        separator = "\n--- worca-t runner ---\n" if cli_stderr else ""
+        stderr_path.write_text(cli_stderr + separator + error, encoding="utf-8")
 
     log.info(
         "agent.end",

@@ -12,6 +12,7 @@ import pytest
 
 from worca_t.test_runner import (
     _normalize_id,
+    _python_prod_files,
     audit_missing_deps,
     classify_runner_failure,
     execute_command,
@@ -943,3 +944,154 @@ def test_audit_returns_empty_when_no_tests_dir(tmp_path: Path):
     sut.mkdir()
     (sut / "pyproject.toml").write_text("[project]\nname='x'\ndependencies=[]\n")
     assert audit_missing_deps(sut, package_manager="poetry") == []
+
+
+# ---------------------------------------------------------------------------
+# _python_prod_files
+# ---------------------------------------------------------------------------
+
+
+def _write_pyproject(sut: Path, name: str | None) -> None:
+    sut.mkdir(parents=True, exist_ok=True)
+    if name is None:
+        (sut / "pyproject.toml").write_text("[project]\ndependencies = []\n", encoding="utf-8")
+    else:
+        (sut / "pyproject.toml").write_text(
+            f"[project]\nname = \"{name}\"\ndependencies = []\n", encoding="utf-8"
+        )
+
+
+def test_prod_files_src_layout(tmp_path: Path) -> None:
+    sut = tmp_path / "sut"
+    _write_pyproject(sut, "demo")
+    pkg = sut / "src" / "demo"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "core.py").write_text("import x\n", encoding="utf-8")
+    files = {p.relative_to(sut).as_posix() for p in _python_prod_files(sut)}
+    assert files == {"src/demo/__init__.py", "src/demo/core.py"}
+
+
+def test_prod_files_flat_layout(tmp_path: Path) -> None:
+    sut = tmp_path / "sut"
+    _write_pyproject(sut, "demo")
+    pkg = sut / "demo"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "core.py").write_text("import x\n", encoding="utf-8")
+    files = {p.relative_to(sut).as_posix() for p in _python_prod_files(sut)}
+    assert files == {"demo/__init__.py", "demo/core.py"}
+
+
+def test_prod_files_kebab_project_name_resolves_to_snake_dir(tmp_path: Path) -> None:
+    sut = tmp_path / "sut"
+    _write_pyproject(sut, "askbosch-automation-frontend-sync")
+    pkg = sut / "src" / "askbosch_automation_frontend_sync"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    files = {p.relative_to(sut).as_posix() for p in _python_prod_files(sut)}
+    assert files == {"src/askbosch_automation_frontend_sync/__init__.py"}
+
+
+def test_prod_files_prefers_src_over_flat_when_both_exist(tmp_path: Path) -> None:
+    sut = tmp_path / "sut"
+    _write_pyproject(sut, "demo")
+    (sut / "src" / "demo").mkdir(parents=True)
+    (sut / "src" / "demo" / "a.py").write_text("", encoding="utf-8")
+    (sut / "demo").mkdir()
+    (sut / "demo" / "b.py").write_text("", encoding="utf-8")
+    files = {p.relative_to(sut).as_posix() for p in _python_prod_files(sut)}
+    assert files == {"src/demo/a.py"}
+
+
+def test_prod_files_no_pyproject_returns_empty(tmp_path: Path) -> None:
+    sut = tmp_path / "sut"
+    sut.mkdir()
+    assert _python_prod_files(sut) == []
+
+
+def test_prod_files_pyproject_without_name_returns_empty(tmp_path: Path) -> None:
+    sut = tmp_path / "sut"
+    _write_pyproject(sut, None)
+    assert _python_prod_files(sut) == []
+
+
+def test_prod_files_neither_layout_dir_exists_returns_empty(tmp_path: Path) -> None:
+    sut = tmp_path / "sut"
+    _write_pyproject(sut, "demo")
+    # No `src/demo/` and no `demo/` — just the pyproject.
+    assert _python_prod_files(sut) == []
+
+
+# ---------------------------------------------------------------------------
+# audit_missing_deps — transitive prod-code imports
+# ---------------------------------------------------------------------------
+
+
+def test_audit_flags_transitive_prod_code_dep_missed_by_tests_only_walk(
+    tmp_path: Path,
+) -> None:
+    """The pydantic_settings failure shape: tests reach a missing dep only
+    through the SUT's own src/ package. Tests-only walk misses it; widened
+    walk catches it."""
+    sut = tmp_path / "sut"
+    _write_sut(
+        sut,
+        pyproject="""
+            [tool.poetry]
+            name = "askbosch-automation-frontend-sync"
+            [tool.poetry.dependencies]
+            python = "^3.11"
+            pytest = "^8"
+        """,
+        conftest=(
+            "from src.askbosch_automation_frontend_sync.helpers.config import get_base_url\n"
+        ),
+    )
+    pkg = sut / "src" / "askbosch_automation_frontend_sync"
+    (pkg / "helpers").mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "helpers" / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "helpers" / "config.py").write_text(
+        "from askbosch_automation_frontend_sync.config import settings\n", encoding="utf-8"
+    )
+    (pkg / "config").mkdir()
+    (pkg / "config" / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "config" / "settings.py").write_text(
+        "from pydantic_settings import BaseSettings\n", encoding="utf-8"
+    )
+
+    warnings = audit_missing_deps(sut, package_manager="poetry")
+    by_module = {w["module"]: w for w in warnings}
+    assert "pydantic_settings" in by_module
+    w = by_module["pydantic_settings"]
+    assert w["confidence"] == "guessed"
+    assert w["suggested_package"] == "pydantic_settings"
+    assert w["source_file"].endswith(
+        "src/askbosch_automation_frontend_sync/config/settings.py"
+    )
+
+
+def test_audit_test_file_wins_source_attribution_when_both_import(
+    tmp_path: Path,
+) -> None:
+    """When both a test file and a prod file import the same missing dep,
+    the test file should be attributed (operator's mental entry point)."""
+    sut = tmp_path / "sut"
+    _write_sut(
+        sut,
+        pyproject="""
+            [project]
+            name = "demo"
+            dependencies = []
+        """,
+        conftest="import some_missing_dep\n",
+    )
+    pkg = sut / "src" / "demo"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "core.py").write_text("import some_missing_dep\n", encoding="utf-8")
+
+    warnings = audit_missing_deps(sut, package_manager="poetry")
+    by_module = {w["module"]: w for w in warnings}
+    assert by_module["some_missing_dep"]["source_file"].endswith("tests/conftest.py")

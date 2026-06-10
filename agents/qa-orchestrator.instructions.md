@@ -46,6 +46,12 @@ Two layers cooperate to run the pipeline:
 5. If resuming, call `load_state()` and `next_pending_step()` to find the
    first non-completed step. Verify output hashes of completed steps via
    `outputs_match()` -- if any hash mismatches, mark that step `pending`.
+6. **SUT preflight.** Materialize `--sut` into `<workspace>/sut/` (clone or
+   link) and put it on the worca-t isolation branch before any step runs.
+7. **MCP preflight.** Cold-start every server in `.mcp.json` via
+   `mcp_manager.probe_server()`. On failure, prompt the user (TTY) to retry;
+   non-TTY / `--no-hitl` / `--yes` fail fast with exit code 2. Side effect:
+   warms the npx cache so the first agent call doesn't pay the bootstrap cost.
 
 ---
 
@@ -134,10 +140,16 @@ live in `src/worca_t/agent_models.yaml`.)
 | Schema | n/a (non-empty file check only) |
 
 **Procedure:**
-1. If `--spec` starts with `jira:`, invoke `jira-to-ai-spec` with the
-   Atlassian MCP to extract ticket data. Output both `jira-spec.md`
-   (raw extraction) and `spec.md` (formatted for pipeline).
-2. If `--spec` is a local file, copy it to `artifacts/step01/spec.md`.
+1. If `--spec` starts with `jira:` or is a full `https://.../browse/KEY` URL,
+   fetch the issue via direct Jira REST (`worca_t.jira_client.fetch_issue` —
+   the Atlassian MCP was retired in commit `a36dbbe`), slim the payload, and
+   invoke `jira-to-ai-spec` with the JSON inlined under the `jira-issue.json`
+   header. Output both `jira-spec.md` (provenance stub) and `spec.md` (the
+   agent's enriched 10-section output).
+2. If `--spec` is a local file, copy its content verbatim to
+   `artifacts/step01/spec.md` (no LLM call at step 1).
+3. If `--spec` is a non-JIRA URL, download its body and write it verbatim to
+   `artifacts/step01/spec.md` (no LLM call at step 1).
 
 **Phase gate:** `spec.md` exists and is non-empty.
 
@@ -151,6 +163,14 @@ live in `src/worca_t/agent_models.yaml`.)
 | Input | `artifacts/step01/spec.md` |
 | Output | `artifacts/step02/refined-spec.md`, `refined-spec.json` |
 | Schema | `schemas/refined-spec.schema.json` |
+| Transport | `worca_t.llm.reasoning.call_reasoning_llm_with_hitl` (direct Anthropic SDK, multi-turn HITL) |
+
+**HITL loop.** The transport extracts `[CLARIFICATION NEEDED]` tags,
+Blockers table rows, and Open Questions bullets from the agent's output
+via `worca_t.hitl.extract_questions`. Skipped items are deduped across
+iterations (see `worca_t.hitl._dedup`) so the user is never re-prompted
+for the same concern. Capped at `HITL_MAX_ITERATIONS` (3). Auto-skips
+when `--no-hitl` is set or stdin is not a TTY.
 
 **Phase gate:** `requirement_id` matches `^REQ-[A-Za-z0-9][A-Za-z0-9\-_]*$`.
 `acceptance_criteria` array is non-empty. These `REQ-*` IDs are the
@@ -166,6 +186,7 @@ traceability backbone -- they propagate through every downstream artifact.
 | Input | `artifacts/step02/refined-spec.md`, `refined-spec.json` |
 | Output | `artifacts/step03/plan.md`, `plan.json` |
 | Schema | `schemas/plan.schema.json` |
+| Transport | `call_reasoning_llm_with_hitl` (same multi-turn HITL contract as Step 2) |
 
 **Phase gate:** `phases` array is non-empty. Each phase has `number` and `title`.
 
@@ -245,92 +266,60 @@ null, involve HITL.
   or `raw-secret` violation is a **hard rejection** -- return to agent for correction.
 - Every test has `tc_refs` linking back to `TC-*` IDs from step 4.
 
+**Human review gate (post-step-7).** After the phase gate passes,
+`pipeline.py` invokes `review_step_7_tests` (`src/worca_t/review_gate.py`):
+- Renders a lightweight table — one row per test (name, `tc_refs`,
+  `file:line`, one-line description extracted from the test's docstring /
+  leading comment / Javadoc / Robot `[Documentation]` line) plus a footer
+  with totals (tests, support files, tbd locators, violations). Per-locator
+  detail is deliberately omitted — that belongs to step 8.
+- Prompts: `[a]pprove` / `[e]dit files` / `[q]uit`.
+- On `edit`: prints the SUT root, blocks on `Enter`, then re-runs
+  `index_tests` + `_filter_index_to_worca` to rewrite `tbd-index.json`
+  in place and refresh `record.output_hashes` (so a later `--resume` does
+  not treat the manual edits as drift). Re-renders and re-prompts.
+- On `quit`: pipeline aborts with exit code 1.
+- Auto-approves (no prompt) when stdin is not a TTY or `--no-hitl` is set.
+
+No agent re-invocation here — manual edits flow through to Step 9 because
+the JIT runtime (Playwright stacks) and the `polyglot-test-fixer` heal
+agent (other stacks) read test bytes from the SUT disk at execution time.
+
 ---
 
-#### Step 8 -- Locator discovery + DOM-truth audit (two agents)
+#### Step 8 -- Locator resolution (soft-deleted)
 
 | Field | Value |
 |---|---|
-| Agents | **8a** `playwright-tester` (live DOM, resolve TBDs) + **8b** `polyglot-test-fixer` in audit-only mode (compare expected vs actual, no edits) |
-| Input | `artifacts/step07/tbd-index.json`, `artifacts/step06/research.json`, `SUT_BASE_URL` env var |
-| Output | `artifacts/step08/locator-resolution.json` + `artifacts/step08/tbd-index.json` (re-indexed) + `artifacts/step08/dom-comparison.json` (8b auditor verdicts) |
-| Schemas | `schemas/locator-resolution.schema.json`, `schemas/dom-comparison.schema.json` |
+| Agent | None |
+| Input | (n/a) |
+| Output | `artifacts/step08/locator-resolution.json` — stub `{ "mode": "soft-deleted", "status": "skipped", "resolutions": [] }` |
+| Schema | `schemas/locator-resolution.schema.json` (stub-only payload) |
 
-**JIT short-circuit (Python + pytest + Playwright only).** When the active module's framework is `pytest` or `playwright-py` AND `tests/worca_t_runtime.py` exists in the SUT (vendored by Step 7), Step 8 writes a minimal `artifacts/step08/locator-resolution.json` with `mode: "jit"` and returns `status: skipped`. Resolution happens at Step 9 runtime via the vendored pytest plugin — it intercepts `tbd("…")` sentinels against the live Playwright page (already authenticated, already on the right URL because the test's own POMs navigated there). For all other frameworks, the procedure below runs as written.
+**Soft-deleted as of the JIT-runtime refactor.** `s08_locator_resolution.py`
+is a no-op stub that always writes the stub artifact above and returns
+`status: skipped`. Locator resolution moved to Step 9 runtime for every
+stack:
 
-**Procedure — 8a (playwright-tester) [non-JIT frameworks]:**
-1. Navigate the live application via the Playwright MCP. **AOM-first snapshot policy:**
-   - Every distinct URL opened in the session → capture AOM via
-     `browser_snapshot`, persist to `./page-snapshot-NN.json` (NN
-     zero-padded, starting at 01) BEFORE further work with that page.
-   - Raw-DOM is a scoped fallback only — permitted when the target element
-     is missing from the AOM, non-semantic (div/span without ARIA), or
-     hidden from screen readers. When triggered: capture via
-     `browser_evaluate(() => document.documentElement.outerHTML)`, persist
-     to `./page-snapshot-NN-raw.html`, AND record
-     `snapshot_source: "raw_dom_fallback"` + a `fallback_reason`
-     (`not_in_aom` | `non_semantic` | `aria_hidden` | <free text>) on every
-     resolution item that cited the raw capture.
-   - Within a captured page, element-scoped queries only (never re-capture
-     the whole page).
-2. For each TBD marker, read the `description` field from
-   `tbd-index.json` (semantic intent captured by the codegen agent's
-   `TBD_INTENT:` comment) and discover the real locator using the priority
-   chain: `id > data-testid > role > label > text > placeholder > css`.
-   **Never XPath.** When `description` is missing on legacy runs, infer
-   intent from the constant name + surrounding test code.
-3. Patch the test source files via the orchestrator's anchored line-targeted
-   patcher: the patcher requires a `<CONST_NAME> = <tbd_token>` assignment
-   line within ±10 lines of the agent-supplied `line` and refuses to
-   fall back to global first-occurrence replacement (which previously
-   scrambled assignments when `TBD_LOCATOR` appeared in a comment).
-   Items that don't match an anchor are marked `applied: false` with a
-   drift `skip_reason` and surfaced via HITL / 8b. Record each resolution
-   in `locator-resolution.json` with `applied`/`skip_reason` per item.
-   Honest skips (`strategy: null` + diagnostic `skip_reason`) are
-   preserved — the pipeline no longer overwrites them.
-4. **HITL escalation for unresolvable TBDs.** When the agent sets
-   `applied: false` because an element genuinely cannot be located, it
-   appends a `[CLARIFICATION NEEDED: <CONST> @ <file>:<line>]` block to
-   `./clarifications.md`. The orchestrator extracts those blocks (via
-   `extract_questions` in `src/worca_t/hitl.py`), prompts the user once
-   per block on a TTY, and splices the answer into
-   `./locator-resolution.json`:
-     - User pastes a selector → orchestrator validates (XPath is rejected),
-       infers strategy from shape, sets `applied: true, source: "hitl"`.
-     - User confirms spec gap → orchestrator sets `applied: false,
-       comparison_verdict: "ghost", source: "hitl"`; the gate's
-       `excused_count` then absorbs it.
-     - Non-TTY / `--no-hitl` runs skip the prompt entirely; items stay
-       `applied: false` and fall through to the apply-rate gate exactly
-       as today (no CI regression).
+- **Playwright stacks (Python, TypeScript, JavaScript, Java):** Step 7
+  vendors a per-language JIT runtime (`tests/worca_t_runtime.py` for
+  Python+pytest; `worca-t-runtime.js` for TS/JS; `Tbd.java` +
+  `WorcaT.java` + `WorcaTResolver.java` for Java). The runtime intercepts
+  `tbd("intent")` / `Tbd.of("intent")` sentinels against the live page at
+  test time via the tier ladder defined in CLAUDE.md § JIT.
+- **Non-Playwright stacks (Selenium, Cypress, Robot, etc.):** Step 9's
+  on-failure `polyglot-test-fixer` self-heal flow handles `TBD_LOCATOR`
+  markers — either via Playwright MCP observation or a one-off native
+  source capture (`driver.page_source` / `cy.document()` / `Get Source`)
+  when MCP can't reach the page state.
 
-**Procedure — 8b (polyglot-test-fixer in DOM-COMPARISON-AUDIT mode):**
-- Reads `./tbd-index.json`, `./locator-resolution.json`, every
-  `./page-snapshot-*` persisted by 8a, plus the codegen-produced test
-  files inside the SUT (via `add_dirs=[sut_root]`).
-- Emits `./dom-comparison.json` with one verdict per TBD constant:
-  `matched` / `ghost` / `duplicate` / `low_confidence` / `unevaluated`.
-- **Forbidden:** SUT edits, Playwright MCP calls, new snapshots.
-- The pipeline stamps each verdict into `locator-resolution.json` (via
-  `comparison_verdict`) and forces `applied: false` + clears
-  `strategy`/`replacement` on `ghost`/`duplicate` items.
+The step is kept registered so existing `state.json` checkpoints resume
+cleanly and `pipeline.py`'s 11-step list doesn't need to renumber.
+Removing it (10-step pipeline) is a deferred follow-up; see the
+soft-delete docstring in `s08_locator_resolution.py`.
 
-**Phase gate (post-audit):**
-- `resolutions` array is non-empty.
-- Every applied `strategy` value is in the allowed enum (no `xpath`); `null`
-  is allowed when `applied: false`.
-- Apply rate is now `applied / (applied + skipped - excused)`, where
-  `excused` counts items marked `ghost` or `duplicate` by 8b. Threshold
-  remains 90%. Honest skips for non-existent or duplicate elements no longer
-  penalise the run.
-- `remaining_tbd > 0` with apply rate ≥ 90% → `warned` (Step 9 may pass a
-  subset of tests; unresolved markers stay as bug candidates).
-- Snapshot-policy violations (8a persisted a `*-raw.html` capture without
-  a corresponding `fallback_reason` recorded on any resolution item, or
-  produced zero AOM captures) are logged as
-  `step08.snapshot_policy_violation` warnings only — they do not fail
-  the step.
+**Phase gate:** stub artifact exists; `status: "skipped"` is always
+accepted.
 
 ---
 
@@ -345,14 +334,27 @@ null, involve HITL.
 | Output | `artifacts/step09/run-results.json`, screenshots, traces, `bugs/*.md` candidates, `locator-cache.json` (when JIT runtime ran) |
 | Schema | `schemas/run-results.schema.json` (+ `schemas/locator-cache.schema.json` for the JIT cache) |
 
-**JIT runtime (Python + pytest + Playwright only).** When Step 8 returned `mode: jit`, the vendored `tests/worca_t_runtime.py` plugin runs alongside the test command. It:
-- Sets `WORCA_T_*` env vars on the test subprocess: `WORCA_T_CACHE_DIR`, `WORCA_T_RUN_ID`, `ANTHROPIC_API_KEY` (explicitly re-exported through `safe_subprocess_env`'s secret allowlist), `WORCA_T_RESOLVER_MODEL`, `WORCA_T_DEFAULT_TIMEOUT_MS`, and optionally `WORCA_T_DEV_LOCATORS` (when the user passed `--dev-locators` or it's already in env).
-- Monkey-patches `Page.locator` to detect `tbd("…")` sentinels. On sentinel access: consults dev file → runtime cache → `worca-t resolve` subprocess (single Anthropic SDK call, `temperature=0`, prefilled JSON), returning a real `Locator` the test can use. **No Playwright MCP is involved in this path** — the resolver consumes the live page's AOM snapshot captured in-process and makes a direct LLM call.
-- Inflates `page.set_default_timeout` to 60s (configurable via `WORCA_T_DEFAULT_TIMEOUT_MS`; opt-out via `WORCA_T_INFLATE_TIMEOUTS=0`) so resolver latency doesn't bump into per-action timers.
-- Wraps each returned `Locator` in a `_RetryingLocator` proxy. When an action method (`click` / `fill` / `hover` / `text_content` / `wait_for` / etc.) raises `TimeoutError`, the proxy invalidates the failing entry from the cache, re-resolves via the LLM (skipping the dev file + cache so a fresh selector is produced from the current page state), and replays the same action once. This is the **dev-locator-staleness and DOM-drift safety net** — stale dev selectors auto-correct inline before falling through to the heavier polyglot-test-fixer self-heal agent. If the retry also fails, the original `TimeoutError` propagates and the standard self-heal flow takes over.
-- Caches resolutions to `<workspace>/locator-cache/locator-cache.json`; Step 9 copies it to `artifacts/step09/locator-cache.json` after the run.
+**JIT runtime (Playwright stacks — Python, TypeScript, JavaScript, Java).**
+For SUTs whose active module is a Playwright stack (Python+pytest, TS/JS+Playwright Test / Jest / Vitest, Java+JUnit5 / TestNG), Step 7 has vendored a per-language runtime into the SUT. Before launching the test command, Step 9:
 
-**Procedure (non-JIT and JIT alike):**
+- Starts a parent-side `ResolverServer` (TCP loopback, per-run shared secret) and exports `WORCA_T_RESOLVER_PORT` + `WORCA_T_RESOLVER_TOKEN` into the test subprocess env.
+- Sets the rest of the `WORCA_T_*` env vars: `WORCA_T_CACHE_DIR`, `WORCA_T_RUN_ID`, `WORCA_T_RESOLVER_MODEL`, `WORCA_T_DEFAULT_TIMEOUT_MS`, optionally `WORCA_T_DEV_LOCATORS` (when `--dev-locators` or env is set), `WORCA_T_NO_LLM_RESOLVE=1` (when CI opts out of LLM spend).
+- **Strips `ANTHROPIC_API_KEY` from the subprocess env via `safe_subprocess_env`** — the key stays in the trusted parent process where `ResolverServer` makes the Anthropic API call. Leaked tokens from the SUT cannot exfiltrate the key.
+
+At test runtime, the vendored runtime intercepts sentinels — `tbd("intent")` (Python/TS/JS) or `Tbd.of("intent")` (Java) — and resolves them via the tier ladder defined in CLAUDE.md § JIT:
+1. Dev-supplied locator file (`<sut>/.worca-t/dev-locators.json` or `WORCA_T_DEV_LOCATORS`)
+2. Runtime cache
+3. In-process AOM heuristic (`role + name` exact match, ≥0.9 confidence)
+4. ResolverServer over loopback TCP (preferred LLM path; legacy `worca-t resolve` subprocess is the fallback when `WORCA_T_RESOLVER_PORT` is unset)
+5. HITL prompt on TTY / `locator-unresolvable` bug-candidate entry for Step 10 on non-TTY
+
+Each returned `Locator` is wrapped in a retry proxy. On `TimeoutError` during an action (click / fill / hover / etc.), the proxy invalidates the failing cache entry, re-resolves via the LLM (skipping dev file + cache + heuristic so a fresh selector is produced from the current page state), and replays the action once. If the retry also fails, the original `TimeoutError` propagates and the standard `polyglot-test-fixer` self-heal flow takes over.
+
+Resolutions are cached to `<workspace>/locator-cache/locator-cache.json`; Step 9 copies it to `artifacts/step09/locator-cache.json` after the run. HITL answers from Tier 5 prompts are merged into `<sut>/.worca-t/dev-locators.json` so the next run's Tier 1 picks them up without re-prompting.
+
+**Non-Playwright stacks (Selenium, Cypress, Robot, etc.):** JIT does not apply; `polyglot-test-fixer` heal mode handles `TBD_LOCATOR` markers on failure as the procedure below describes. `WORCA_T_NO_LLM_RESOLVE=1` disables both the runtime LLM tier AND the heal agent symmetrically — zero LLM spend in CI.
+
+**Procedure (all stacks):**
 1. Invoke `polyglot-test-tester` to run the test command. The command comes from
    `research.json.commands.test`, passed by `s09_execute.py:_detected_command()`.
    The tester does NOT self-discover the command from project files (that path is
@@ -360,8 +362,7 @@ null, involve HITL.
 2. Collect results, screenshots (on failure), and traces.
 3. If tests fail due to locator drift, invoke `polyglot-test-fixer`
    to self-heal: patch POM/page-object files with current selectors
-   using the Playwright MCP (see [`.mcp.json`](../.mcp.json) for the
-   current server list). **JIT note:** under JIT, locator drift triggers the runtime plugin's cache-invalidate-and-re-resolve path BEFORE this self-heal flow runs; self-heal only fires for failures the JIT runtime couldn't resolve.
+   using the Playwright MCP. **Playwright stacks**: the JIT runtime's cache-invalidate-and-re-resolve path runs first; self-heal only fires for failures the runtime couldn't resolve. **Non-Playwright stacks**: heal mode is the only resolution path.
 4. Re-run healed tests. Record heal attempts in `self_heal` fields.
 5. Write failed-test candidates to `bugs/*.md` for step 10.
 
@@ -419,10 +420,11 @@ Step 2  --> refined-spec.md/json ----------> Step 3
 Step 3  --> plan.md/json ------------------> Step 4
 Step 4  --> test-strategy.md/json ---------> Steps 7, 9, 10, 11
 Step 5  --> xray-mapping.json            (stand-alone; no downstream dependency)
-Step 6  --> research.md/json --------------> Steps 7, 8, 9
-Step 7  --> tbd-index.json -----------> Steps 8, 9
+Step 6  --> research.md/json --------------> Steps 7, 9
+Step 7  --> tbd-index.json ----------------> Step 9
          -> test source files in sut/
-Step 8  --> locator-resolution.json -------> Step 9
+         -> vendored JIT runtime in sut/    (Playwright stacks only)
+Step 8  --> locator-resolution.json (stub, soft-deleted)
 Step 9  --> run-results.json --------------> Steps 10, 11
          -> bugs/*.md
 Step 10 --> bug-reports.md/json -----------> Step 11
@@ -491,8 +493,7 @@ Secrets are always masked before writing to any log or artifact.
 ## 8. Finalization
 
 After step 11 completes (or after abort):
-1. Set `finished_at` in `state.json`.
-2. Persist final state via `save_state()`.
-3. Log a summary line: total steps completed, total duration, pass rate.
-4. If the run completed successfully, all 11 steps show `completed`
-   (or `skipped` for step 5). If any step is `failed`, the run is partial.
+1. Set `finished_at` in `state.json` and persist via `save_state()`.
+2. Log a summary line: total steps completed, total duration, pass rate.
+3. Success = all 11 steps `completed` (or `skipped` for step 5 / step 8).
+   Any `failed` step → run is partial.

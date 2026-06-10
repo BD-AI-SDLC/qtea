@@ -35,11 +35,31 @@ FORBIDDEN:
 - Changing test_ids.
 - Absolute XPath. The Step 9 quality gate (`qa-orchestrator.instructions.md` §6 "No XPath (self-heal)") rejects any heal patch that introduces XPath; the patch is reverted and the test stays `status: failed`. If no non-XPath selector resolves the drifted locator, give up and let the bug report flow handle it.
 
-## MCP Channel
+## MCP Channel + per-stack source capture preference
 
 **Playwright MCP** (`@playwright/mcp@latest --headless`, server name
-`playwright`). Use `browser_navigate` → `browser_snapshot` (accessibility tree) for
-DOM inspection. Snapshot only — no trace/video recording.
+`playwright`) is the default capture channel for ALL stacks. Use
+`browser_navigate` → `browser_snapshot` (accessibility tree) for DOM
+inspection. Snapshot only — no trace/video recording.
+
+When the SUT itself runs Playwright (Python/TS/Java + Playwright), this
+is also the canonical capture method per worca-t's snapshot discipline
+rule: **AOM only — `page.content()` / raw page-source dumps are forbidden
+in tests AND in your live observation**.
+
+When the SUT runs a non-Playwright framework (Selenium / Cypress / Robot
+with SeleniumLibrary / Cypress / etc.), the Playwright MCP still works
+for live observation, BUT if you need to compare against what the SUT's
+test runner actually sees (rare — usually only for shadow-DOM or auth-
+gated pages where Playwright MCP can't reach), you may instruct a one-off
+helper to capture the SUT's native view:
+
+- **Selenium** → `driver.page_source`  (raw HTML)
+- **Cypress** → `cy.document().then(doc => cy.writeFile('out.html', doc.documentElement.outerHTML))`  (raw HTML)
+- **Robot Framework** → `Get Source` (SeleniumLibrary) or `Get Page Source` (Browser Library). When Browser Library is Playwright-backed, prefer `Evaluate JavaScript` to extract an AOM-equivalent tree.
+
+Default to Playwright MCP. Use the native source-capture path only when
+Playwright MCP cannot reach the relevant page state.
 
 ## Live Diagnosis (mandatory when "LIVE DIAGNOSIS" appears in the user prompt)
 

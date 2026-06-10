@@ -8,7 +8,7 @@ Persona, mission, non-negotiable rules, and the high-level workflow (including t
 
 ## §1 — Per-Language Idiom Table
 
-Use the value of `active_module.language` (from `./active_module.json`) to select naming and framework:
+Use the value of `language` from `./sut_inventory.json` at `modules[active_module]` to select naming and framework:
 
 | `language` value | Test file naming | Common framework |
 |---|---|---|
@@ -261,19 +261,19 @@ export default defineConfig({
 
 ## §7 — Example Scenarios
 
-All scenarios assume the normal worca-t pipeline path: `./active_module.json` and `./sut_inventory.json` are staged in your workdir by Step 7's orchestration code.
+All scenarios assume the normal worca-t pipeline path: `./sut_inventory.json` is staged in your workdir by Step 7's orchestration code, and `modules[active_module]` holds the active module record.
 
-**Scenario A (Python + Playwright):** `active_module.json` shows `language: "python"`, `package_manager: "poetry"`, and `sut_inventory.json` lists existing page objects under `pages/object/`.
+**Scenario A (Python + Playwright):** `sut_inventory.json["modules"][active]` shows `language: "python"`, `package_manager: "poetry"`, and lists existing page objects under `pages/object/`.
 → Generate `worca_test_<feature>.py` placed in `sut_inventory.modules[active].test_directory_layout.default_target` (e.g., `tests/regression/`). Import existing `SignInPage` / `<Feature>Page` from the SUT instead of redefining them. Use `pytest-playwright` synchronous fixtures. **Before creating a new `*Page` / `*Locators` class, run the §2 Owning-Page check** — if the SUT's existing locator constants share a `data-testid` prefix family with the selectors you'd write, extend the owning page object instead of forking.
 
-**Scenario B (Java + Selenium):** `active_module.json` shows `language: "java"`, `package_manager: "maven"`.
+**Scenario B (Java + Selenium):** `sut_inventory.json["modules"][active]` shows `language: "java"`, `package_manager: "maven"`.
 → Generate `Worca<Feature>Test.java` under `src/test/java/`. Use TestNG `@Test` annotations and `@FindBy` page-object pattern. Reuse any existing `*Page.java` from `sut_inventory.existing_page_objects`.
 
-**Scenario C (`active_module.json` missing — rare):** Step 6 hard-failed and operator pushed through anyway.
+**Scenario C (`active_module` null or `modules` empty — rare):** Step 6 hard-failed and operator pushed through anyway.
 → The fallback language/framework/pattern prompt is presented by the agent (see `ui-test-automation.agent.md` workflow). **WAIT** for explicit selection. Do NOT scan the SUT root yourself.
 
-**Scenario D (User explicitly overrides):** User states "Generate Python pytest tests" in the task prompt even though `active_module.json` says TypeScript.
+**Scenario D (User explicitly overrides):** User states "Generate Python pytest tests" in the task prompt even though `sut_inventory.json["modules"][active]` says TypeScript.
 → Trust the explicit override but document it: top-of-file comment `# Stack: python+pytest (user override; sut_inventory.json detected typescript)`. This is rare and intentional.
 
-**Scenario E (Robot Framework):** `active_module.json` shows `language: "robot"`, `existing_page_objects` may be empty (Tier 3 LLM-augmented from researcher).
+**Scenario E (Robot Framework):** `sut_inventory.json["modules"][active]` shows `language: "robot"`, `existing_page_objects` may be empty (Tier 3 LLM-augmented from researcher).
 → Generate `Tests/worca_<feature>.robot` and `Resources/<feature>_keywords.resource` using Browser Library locators (`id=`, `css=`, `role=`, `text=`). Reuse existing `*.resource` keywords listed in `sut_inventory.existing_helpers`.

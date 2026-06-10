@@ -14,9 +14,14 @@ from worca_t.checkpoints import RunState, StepRecord, hash_paths
 from worca_t.claude_runner import AgentResult, run_agent
 from worca_t.config import package_resource_root
 from worca_t.hitl import (
+    HitlDecision,
+    append_ledger,
     extract_questions,
+    load_ledger,
     prompt_user,
     question_key,
+    render_prior_decisions_md,
+    resolve_against_ledger,
     write_answers_file,
 )
 from worca_t.logging_setup import get_logger
@@ -197,6 +202,34 @@ async def run_agent_with_hitl(
         workdir.parent / f".hitl-step{step:02d}" if step else workdir.parent / ".hitl"
     )
 
+    # Cross-step ledger (see hitl.py for the design). In-memory list on
+    # ctx.extras, mirrored to <workspace>/.hitl-ledger.jsonl so resumed runs
+    # don't re-prompt for already-decided items.
+    workspace_root = ctx.workspace.root
+    if "hitl_ledger" not in ctx.extras:
+        ctx.extras["hitl_ledger"] = load_ledger(workspace_root)
+    ledger: list[HitlDecision] = ctx.extras["hitl_ledger"]
+    step_decisions: dict[str, HitlDecision] = {}
+
+    # Inject prior-decisions.md as a staged input so the agent sees the
+    # ledger from turn 1 and doesn't paraphrase already-resolved items in
+    # the first place.
+    if ledger:
+        prior_md_path = hitl_dir / "prior-decisions.md"
+        hitl_dir.mkdir(parents=True, exist_ok=True)
+        prior_md_path.write_text(
+            render_prior_decisions_md(ledger), encoding="utf-8"
+        )
+        current_inputs.setdefault("prior-decisions.md", prior_md_path)
+        iteration_prompt = (
+            f"{user_prompt}\n\n"
+            f"**Note:** `./prior-decisions.md` lists items the user already "
+            f"addressed in earlier steps of this run. Treat each entry as "
+            f"final — do NOT re-emit them as new blockers, clarifications, "
+            f"or open questions. For skipped items, apply the same "
+            f"`[ASSUMPTION]` framing the earlier agent used."
+        )
+
     for iteration in range(1, max_iterations + 1):
         result = await run_agent(
             agent_path,
@@ -217,19 +250,38 @@ async def run_agent_with_hitl(
 
         produced = workdir / output_filename
         if not result.success or not produced.exists():
+            _flush_step_decisions(ledger, step_decisions, workspace_root)
             return result
 
         if hitl_disabled:
+            _flush_step_decisions(ledger, step_decisions, workspace_root)
             return result
 
         md_text = produced.read_text(encoding="utf-8")
         all_questions = extract_questions(md_text)
+
+        # Cross-step ledger filter: paraphrases of already-decided items
+        # bypass the user prompt entirely.
+        novel_questions, ledger_resolved = resolve_against_ledger(
+            all_questions, ledger
+        )
+        if ledger_resolved:
+            log.info(
+                "hitl.ledger_suppressed",
+                agent=agent_label,
+                iteration=iteration,
+                count=len(ledger_resolved),
+                ids=[q.id for q, _ in ledger_resolved],
+            )
+
         # Don't re-ask questions the user already chose to skip — the agent is
         # expected to have replaced them with `[ASSUMPTION]` notes. If it didn't,
         # we still won't re-prompt; we just stop the loop to avoid annoyance.
-        new_questions = [q for q in all_questions if question_key(q) not in skipped_keys]
+        new_questions = [
+            q for q in novel_questions if question_key(q) not in skipped_keys
+        ]
 
-        if not new_questions:
+        if not new_questions and not ledger_resolved:
             if all_questions:
                 log.info(
                     "hitl.only_previously_skipped",
@@ -237,6 +289,7 @@ async def run_agent_with_hitl(
                     total=len(all_questions),
                     skipped=len(skipped_keys),
                 )
+            _flush_step_decisions(ledger, step_decisions, workspace_root)
             return result
 
         log.info(
@@ -244,7 +297,8 @@ async def run_agent_with_hitl(
             agent=agent_label,
             iteration=iteration,
             new=len(new_questions),
-            already_skipped=len(all_questions) - len(new_questions),
+            already_skipped=len(all_questions) - len(new_questions) - len(ledger_resolved),
+            ledger_resolved=len(ledger_resolved),
         )
 
         if iteration >= max_iterations:
@@ -252,28 +306,57 @@ async def run_agent_with_hitl(
                 "hitl.max_iterations_reached",
                 agent=agent_label,
                 pending=len(new_questions),
+                ledger_resolved=len(ledger_resolved),
             )
+            _flush_step_decisions(ledger, step_decisions, workspace_root)
             return result
 
-        answers = prompt_user(new_questions, agent_label=agent_label)
+        if new_questions:
+            answers = prompt_user(new_questions, agent_label=agent_label)
+        else:
+            answers = {}
         skipped_this_round = [q for q in new_questions if q.id not in answers]
         for q in skipped_this_round:
             skipped_keys.add(question_key(q))
+            step_decisions.setdefault(
+                question_key(q),
+                HitlDecision.from_question(
+                    q, step=step or 0, agent_label=agent_label, resolution="skipped"
+                ),
+            )
+        for q in new_questions:
+            if q.id in answers:
+                step_decisions[question_key(q)] = HitlDecision.from_question(
+                    q,
+                    step=step or 0,
+                    agent_label=agent_label,
+                    resolution="answered",
+                    answer=answers[q.id],
+                )
 
         # Always re-invoke so the agent can either incorporate answers OR
         # convert skipped clarifications into `[ASSUMPTION]` notes. Skipping
         # the re-run would leave `[CLARIFICATION NEEDED]` tags in the output.
         hitl_dir.mkdir(parents=True, exist_ok=True)
         answers_src = write_answers_file(
-            hitl_dir, new_questions, answers, skipped=skipped_this_round
+            hitl_dir,
+            new_questions,
+            answers,
+            skipped=skipped_this_round,
+            ledger_resolved=ledger_resolved,
         )
         current_inputs = dict(inputs)
         current_inputs["user-answers.md"] = answers_src
+        if ledger:
+            # Re-stage prior-decisions.md on each iteration too — the agent's
+            # working directory is rebuilt per turn in the file-staging path.
+            current_inputs.setdefault("prior-decisions.md", prior_md_path)
         iteration_prompt = (
             f"{user_prompt}\n\n"
             f"The user has reviewed your clarification questions. See "
-            f"`./user-answers.md` for their responses, which include both "
-            f"answered items and items the user chose to skip.\n\n"
+            f"`./user-answers.md` for their responses, which include "
+            f"answered items, items the user chose to skip, and items "
+            f"that were already resolved earlier in this run.\n\n"
             f"- For ANSWERED items: incorporate the answer and remove the "
             f"corresponding `[CLARIFICATION NEEDED]` tag, blocker row, or "
             f"open-question entry.\n"
@@ -281,12 +364,34 @@ async def run_agent_with_hitl(
             f"inline with `[ASSUMPTION: ...]`, and remove the original "
             f"`[CLARIFICATION NEEDED]` tag / blocker row / open-question "
             f"entry. **Do NOT re-emit `[CLARIFICATION NEEDED]` for skipped "
-            f"items** — the user has explicitly opted to defer them.\n\n"
+            f"items** — the user has explicitly opted to defer them.\n"
+            f"- For PREVIOUSLY RESOLVED items: apply the prior answer / "
+            f"assumption verbatim and remove the duplicate entry. **Do "
+            f"NOT re-raise these to the user.**\n\n"
             f"Rewrite `./{output_filename}` accordingly. Keep the rest of "
             f"the document intact."
         )
 
+    _flush_step_decisions(ledger, step_decisions, workspace_root)
     return result  # pragma: no cover (loop always returns inside)
+
+
+def _flush_step_decisions(
+    ledger: list[HitlDecision],
+    step_decisions: dict[str, HitlDecision],
+    workspace_root: Path,
+) -> None:
+    """Append this step's decisions to in-memory + on-disk ledger.
+
+    Idempotent across early returns from the iteration loop: clears the
+    accumulator after appending so a second call is a no-op.
+    """
+    if not step_decisions:
+        return
+    new_entries = list(step_decisions.values())
+    ledger.extend(new_entries)
+    append_ledger(workspace_root, new_entries)
+    step_decisions.clear()
 
 
 class Step(ABC):

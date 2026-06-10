@@ -33,12 +33,13 @@ from worca_t.claude_runner import run_agent
 from worca_t.config import package_resource_root, step_timeout
 from worca_t.logging_setup import get_logger
 from worca_t.proxy import safe_subprocess_env
+from worca_t.resolver_server import ResolverServer
 from worca_t.schemas import is_valid
 from worca_t.stack_profile import PYTHON_VENV_MANAGERS, StackProfile
 from worca_t.steps.base import Step, StepContext, StepResult
-from worca_t.steps.s08_locator_resolution import (
-    _auth_relevant_sut_files,
-    _auth_summary_for_prompt,
+from worca_t.auth_helpers import (
+    auth_relevant_sut_files as _auth_relevant_sut_files,
+    auth_summary_for_prompt as _auth_summary_for_prompt,
 )
 from worca_t.test_runner import (
     _PYTEST_PLUGIN_PROVIDERS,
@@ -53,6 +54,19 @@ log = get_logger(__name__)
 
 # Cap on number of failing tests we'll attempt to self-heal in a single step run.
 _MAX_HEAL_TESTS = int(os.environ.get("WORCA_T_MAX_HEAL", "5"))
+
+# Pytest -m selector that scopes Step 9 to ONLY the worca-t generated tests.
+# The codegen agent (`ui-test-automation.agent.md` rule 8) applies one of these
+# markers to every generated test based on the planning phase. The vendored
+# `tests/worca_t_runtime.py` plugin registers them via `pytest_configure` so
+# strict-markers runs don't fail. Keep this list in sync with the agent prompt
+# and the runtime template's `_WORCA_PHASE_MARKERS`. Operator escape: set
+# `WORCA_T_PYTEST_MARKER` to override (e.g. `""` to disable marker scoping
+# and run the SUT's full native suite alongside worca-generated tests).
+_WORCA_PYTEST_MARKER_FILTER = os.environ.get(
+    "WORCA_T_PYTEST_MARKER",
+    "worca_smoke or worca_regression or worca_e2e or worca_exploratory",
+)
 
 # Patterns that mark an XPath selector. Used by `_patch_introduces_xpath` to
 # reject heal patches that quietly downgrade to XPath in violation of the
@@ -463,6 +477,236 @@ def _build_bug_candidates(failing: list[TestRunEntry]) -> dict:
     return out
 
 
+def _summarize_resolver_spend(jit_cache_dir: Path) -> dict | None:
+    """Read ``<jit_cache_dir>/resolver-spend.jsonl`` and build a summary
+    block for ``run-results.json``. Returns None when no spend file was
+    produced (no JIT runtime ran, or no resolution events fired).
+
+    Telemetry shape kept narrow on purpose — counts, totals, and hits per
+    tier. No selectors, page URLs, or snapshot bodies (privacy + size).
+    """
+    p = jit_cache_dir / "resolver-spend.jsonl"
+    if not p.is_file():
+        return None
+    tier_hits = {1: 0, 2: 0, 3: 0, 4: 0}
+    total_input = 0
+    total_output = 0
+    unresolvable = 0
+    durations_ms: list[int] = []
+    models: set[str] = set()
+    count = 0
+    try:
+        with p.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                count += 1
+                tier = entry.get("tier")
+                if tier in tier_hits:
+                    tier_hits[tier] += 1
+                total_input += int(entry.get("input_tokens") or 0)
+                total_output += int(entry.get("output_tokens") or 0)
+                if entry.get("model"):
+                    models.add(entry["model"])
+                if entry.get("duration_ms") is not None:
+                    durations_ms.append(int(entry["duration_ms"]))
+                if entry.get("success") is False:
+                    unresolvable += 1
+    except OSError:
+        return None
+    if count == 0:
+        return None
+    # Cost estimation reuses the existing pricing table if available;
+    # otherwise the consumer can compute it from input/output tokens.
+    est_cost_usd: float | None = None
+    try:
+        from worca_t.llm.cost import estimate_cost  # type: ignore[import-not-found]
+        for m in (models or {""}):
+            est_cost_usd = (est_cost_usd or 0.0) + estimate_cost(
+                m, total_input, total_output,
+            )
+    except Exception:  # noqa: BLE001 - pricing table is optional
+        est_cost_usd = None
+    return {
+        "total_resolutions": count,
+        "total_input_tokens": total_input,
+        "total_output_tokens": total_output,
+        "tier_1_hits": tier_hits[1],
+        "tier_2_hits": tier_hits[2],
+        "tier_3_hits": tier_hits[3],
+        "tier_4_hits": tier_hits[4],
+        "unresolvable_count": unresolvable,
+        "models": sorted(models) or None,
+        "median_duration_ms": (
+            sorted(durations_ms)[len(durations_ms) // 2] if durations_ms else None
+        ),
+        "est_cost_usd": est_cost_usd,
+    }
+
+
+def _collect_hitl_pending(jit_cache_dir: Path) -> list[dict]:
+    """Read every ``hitl-pending-*.json`` file the JIT runtime dropped during
+    test execution. Each file represents an unresolvable TBD that needs a
+    human-in-the-loop selector OR a structured bug candidate.
+
+    Returns the parsed dicts (one per TBD); files that fail to parse are
+    skipped with a warning. The files are NOT deleted here — Phase 4's
+    HITL prompt deletes the ones that get answered; the rest persist for
+    the bug-candidates emission downstream.
+    """
+    if not jit_cache_dir.is_dir():
+        return []
+    out: list[dict] = []
+    for p in sorted(jit_cache_dir.glob("hitl-pending-*.json")):
+        try:
+            entry = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            log.warning("step09.hitl_pending_unreadable", path=str(p), error=str(e))
+            continue
+        entry["_pending_path"] = str(p)
+        out.append(entry)
+    return out
+
+
+def _hitl_resolve_unresolvable(
+    pendings: list[dict], *,
+    dev_locators_path: Path | None,
+    no_hitl: bool = False,
+) -> tuple[list[dict], list[dict]]:
+    """Surface each unresolved TBD to the user on a TTY, write their
+    answer to ``dev-locators.json`` (next run uses it as Tier 1), and
+    delete the pending file. Non-TTY / ``no_hitl=True`` runs leave every
+    pending in place — caller emits them as structured bug candidates.
+
+    Returns ``(resolved, remaining)`` — ``resolved`` were answered by the
+    user, ``remaining`` are still unresolved and flow into bug-candidates.
+    """
+    import sys
+
+    is_tty = sys.stdin is not None and sys.stdin.isatty()
+    if not is_tty or no_hitl or not pendings:
+        return [], pendings
+
+    resolved: list[dict] = []
+    remaining: list[dict] = []
+    log.info("step09.hitl_pending_count", count=len(pendings))
+    print(
+        f"\n[worca-t] {len(pendings)} locator(s) the JIT runtime could not "
+        f"resolve. You can supply a selector for each, or press ENTER to skip "
+        f"(skipped TBDs become bug-candidate entries for Step 10).\n",
+        flush=True,
+    )
+    for entry in pendings:
+        intent = entry.get("intent") or "(no intent)"
+        constant = entry.get("constant_name") or "(unknown)"
+        page_url = entry.get("page_url") or "(unknown)"
+        print(f"  TBD: {constant} — {intent}")
+        print(f"       page: {page_url}")
+        try:
+            answer = input("       selector (or ENTER to skip): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if not answer:
+            remaining.append(entry)
+            continue
+        if answer.startswith("//") or answer.startswith("xpath=") or "By.XPATH" in answer:
+            print(f"       [rejected] XPath selectors are forbidden by worca-t.")
+            remaining.append(entry)
+            continue
+        entry["_user_selector"] = answer
+        resolved.append(entry)
+        # Best-effort: also remove the pending file so next runs don't re-prompt.
+        try:
+            Path(entry.get("_pending_path", "")).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    if resolved and dev_locators_path is not None:
+        _append_resolved_to_dev_locators(resolved, dev_locators_path)
+    return resolved, remaining
+
+
+def _append_resolved_to_dev_locators(
+    resolved: list[dict], dev_locators_path: Path,
+) -> None:
+    """Merge HITL answers into dev-locators.json so the next run's
+    Tier 1 picks them up without re-prompting. File schema:
+    ``{"locators": {"CONST_NAME": {"selector": "...", "source": "hitl"}}}``."""
+    try:
+        if dev_locators_path.exists():
+            raw = json.loads(dev_locators_path.read_text(encoding="utf-8"))
+        else:
+            raw = {}
+    except (OSError, json.JSONDecodeError):
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    locators = raw.get("locators")
+    if not isinstance(locators, dict):
+        locators = {}
+        raw["locators"] = locators
+    for entry in resolved:
+        const = entry.get("constant_name")
+        sel = entry.get("_user_selector")
+        if not const or not sel:
+            continue
+        locators[const] = {
+            "selector": sel,
+            "source": "hitl",
+            "intent": entry.get("intent"),
+            "page_url": entry.get("page_url"),
+        }
+    try:
+        dev_locators_path.parent.mkdir(parents=True, exist_ok=True)
+        dev_locators_path.write_text(
+            json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8",
+        )
+        log.info(
+            "step09.hitl_dev_locators_updated",
+            path=str(dev_locators_path), added=len(resolved),
+        )
+    except OSError as e:
+        log.warning("step09.hitl_dev_locators_write_failed", error=str(e))
+
+
+def _bug_candidates_for_unresolvable_tbds(remaining: list[dict]) -> list[dict]:
+    """Emit a ``locator-unresolvable`` bug-candidate per HITL-unanswered
+    TBD. Step 10's classifier sees these alongside test failures.
+    """
+    now = datetime.now(UTC).isoformat()
+    out: list[dict] = []
+    for entry in remaining:
+        const = entry.get("constant_name") or "unknown"
+        intent = entry.get("intent") or ""
+        out.append({
+            "id": f"BC-locator-unresolvable-{const}",
+            "test_id": f"locator-unresolvable:{const}",
+            "title": f"Locator could not be resolved: {const}",
+            "file": entry.get("test_file"),
+            "status": "error",
+            "kind": "locator-unresolvable",
+            "message": (
+                f"The JIT runtime could not find any element matching "
+                f"intent {intent!r} on {entry.get('page_url') or '(unknown URL)'}. "
+                f"Provide a selector via .worca-t/dev-locators.json under "
+                f"key {const!r}, or update the test to remove the TBD."
+            ),
+            "traceback": None,
+            "tc_refs": [],
+            "attachments": [],
+            "first_seen": now,
+            "constant_name": const,
+            "intent": intent,
+            "page_url": entry.get("page_url"),
+        })
+    return out
+
+
 class ExecuteStep(Step):
     number = 9
     name = "execute"
@@ -574,14 +818,16 @@ class ExecuteStep(Step):
 
         # JIT runtime plugin env wiring. The vendored `tests/worca_t_runtime.py`
         # (when present) reads these vars to discover the cache, optional
-        # dev-supplied locator file, resolver subprocess command, and timeout
-        # defaults. SECURITY: ANTHROPIC_API_KEY is deliberately NOT re-exported
-        # here — safe_subprocess_env() strips it because the pytest subprocess
-        # executes untrusted SUT test code that could exfiltrate the key via
-        # os.environ. The JIT resolver's LLM path will therefore fail with an
-        # auth error inside the SUT subprocess; resolution falls back to (1) the
-        # dev-supplied locator file, (2) the runtime cache, or (3) the Step 9
-        # self-heal agent which runs in worca-t's trusted parent process.
+        # dev-supplied locator file, resolver port/token, and timeout defaults.
+        # SECURITY: ANTHROPIC_API_KEY is deliberately NOT re-exported here —
+        # safe_subprocess_env() strips it because the pytest subprocess executes
+        # untrusted SUT test code that could exfiltrate the key via os.environ.
+        # The LLM resolver path works WITHOUT the key in the SUT env because
+        # the parent process (here in step 9) starts a ResolverServer on a
+        # local loopback port; the pytest plugin reaches it via the short-lived
+        # per-run WORCA_T_RESOLVER_TOKEN (set further down, once the server
+        # binds a port). Tier order at runtime: dev-locators → cache →
+        # in-process heuristic → ResolverServer (LLM) → HITL/fail-fast.
         jit_cache_dir = ctx.workspace.root / "locator-cache"
         jit_cache_dir.mkdir(parents=True, exist_ok=True)
         runtime_env["WORCA_T_CACHE_DIR"] = str(jit_cache_dir)
@@ -701,428 +947,507 @@ class ExecuteStep(Step):
                     phase="pre", packages=installed_pre, sha=sha,
                 )
 
-        first = run_tests(
-            framework,
-            cwd=ctx.workspace.sut,
-            detected_command=detected_cmd,
-            timeout_s=min(self.timeout_s or 1800, 1800),
-            env_extra=runtime_env,
-            profile=stack_profile,
-            headless=getattr(ctx.options, "headless", True),
-        )
-
-        attempts = 1
-        patches_applied = 0
-        patches_rejected = 0
-
-        failing = _failing_tests(first)
-        self_heal_meta: dict[str, dict] = {}
-
-        # Skip self-heal when the failure is the synthetic `T-runner-failure`
-        # entry — the runner blew up at collection / import time and there is
-        # no per-test traceback, no patch site, nothing the fixer agent can
-        # produce a diff against. Past behaviour burned ~10 timed-out heal
-        # attempts (≈75 min wall-clock + tokens) on exactly these cases
-        # before falling through to the runner_only_failure error path below.
-        # The classifier output (when present on the entry) flows into that
-        # error path so the user sees the missing dep name and install hint.
-        runner_only = (
-            len(failing) > 0
-            and all(r.id == "T-runner-failure" for r in failing)
-        )
-
-        # Runtime dep-recovery: on a missing_module runner failure, attempt
-        # one install + re-run before declaring defeat. This catches gaps
-        # Step 6's static audit missed (dynamic imports, conftest-only deps
-        # the SUT layout heuristic skipped). Bounded to ONE retry per Step 9
-        # invocation — if the re-run still produces runner_only, fall through
-        # to the existing heal_skip behavior.
-        if runner_only and not no_auto_deps:
-            rf = (failing[0].runner_failure or {})
-            module = rf.get("module") if rf.get("kind") == "missing_module" else None
-            if module:
-                confidence = "known" if module in _PYTEST_PLUGIN_PROVIDERS else "guessed"
-                package = _PYTEST_PLUGIN_PROVIDERS.get(module, module)
-                pkg_mgr = stack_profile.package_manager if stack_profile else None
-                proceed = confidence == "known"
-                if confidence == "guessed":
-                    interactive = (
-                        sys.stdin.isatty()
-                        and not getattr(ctx.options, "no_hitl", False)
-                        and not getattr(ctx.options, "yes", False)
-                    )
-                    if interactive:
-                        from rich.console import Console
-                        from rich.prompt import Confirm
-                        proceed = Confirm.ask(
-                            f"Missing test dependency `{module}` detected. "
-                            f"Install `{package}` (`{rf.get('hint') or ''}`) "
-                            f"and retry?",
-                            default=True,
-                            console=Console(),
-                        )
-                    else:
-                        log.warning(
-                            "step09.dep_recover_skipped",
-                            reason="non-interactive and confidence=guessed",
-                            module=module, package=package,
-                        )
-                # Mirror the venv_bin lookup _run_dep_install does internally so
-                # the can-we-install? gate doesn't false-reject pip when the
-                # SUT has a .venv (or false-accept when it doesn't).
-                _venv_bin = (
-                    stack_profile.wrapper_prefix
-                    if stack_profile and (pkg_mgr or "").lower() == "pip"
-                    else None
-                )
-                if proceed and install_command_for(pkg_mgr, package, venv_bin=_venv_bin) is not None:
-                    ok, summary = _run_dep_install(
-                        pkg_mgr, package, ctx.workspace.sut, install_log_path,
-                        profile=stack_profile,
-                    )
-                    log.info(
-                        "step09.auto_install_dep",
-                        phase="runtime",
-                        module=module, package=package,
-                        confidence=confidence,
-                        success=ok, summary=summary,
-                    )
-                    if ok:
-                        sha = commit_step(
-                            ctx.workspace.sut, 9, "execute",
-                            message_detail=f"install missing test dep {package}",
-                        )
-                        log.info(
-                            "step09.auto_install_commit",
-                            phase="runtime", package=package, sha=sha,
-                        )
-                        first = run_tests(
-                            framework,
-                            cwd=ctx.workspace.sut,
-                            detected_command=detected_cmd,
-                            timeout_s=min(self.timeout_s or 1800, 1800),
-                            env_extra=runtime_env,
-                            profile=stack_profile,
-                            headless=getattr(ctx.options, "headless", True),
-                        )
-                        attempts = 2
-                        failing = _failing_tests(first)
-                        runner_only = (
-                            len(failing) > 0
-                            and all(r.id == "T-runner-failure" for r in failing)
-                        )
-                        log.info(
-                            "step09.dep_recover_retry",
-                            runner_only_after=runner_only,
-                            failing_after=len(failing),
-                        )
-
-        if runner_only:
-            rf = (failing[0].runner_failure or {})
-            log.warning(
-                "step09.heal_skip",
-                reason="runner failure — no per-test data to patch",
-                kind=rf.get("kind"),
-                module=rf.get("module"),
-                hint=rf.get("hint"),
+        # Resolver bridge: when the JIT runtime is vendored into the SUT,
+        # start a parent-side TCP server that the pytest plugin can call to
+        # resolve TBDs. This is the security-correct path for the LLM tier:
+        # the Anthropic API key stays in the parent process and is never
+        # exported into the SUT subprocess (where safe_subprocess_env strips
+        # it anyway). The pytest plugin's _call_resolver dispatcher picks
+        # the socket path automatically when WORCA_T_RESOLVER_PORT is set.
+        jit_runtime_vendored = (
+            ctx.workspace.sut / "tests" / "worca_t_runtime.py"
+        ).is_file()
+        _resolver_server = None
+        if jit_runtime_vendored:
+            _resolver_server = ResolverServer(
+                cache_dir=jit_cache_dir,
+                run_id=ctx.workspace.run_id,
+                model=runtime_env.get("WORCA_T_RESOLVER_MODEL"),
             )
-            # Record a heal-log line per skipped runner failure so the audit
-            # trail explains the empty heal block instead of going silent.
-            for entry in failing:
-                rf_entry = entry.runner_failure or {}
-                with heal_log_path.open("a", encoding="utf-8") as fh:
-                    fh.write(json.dumps({
-                        "test_id": entry.id,
-                        "file": entry.file,
-                        "applied": False,
-                        "agent_success": False,
-                        "agent_error": (
-                            f"skipped: {rf_entry.get('summary', 'runner failure')} "
-                            f"— no test to patch"
-                        ),
-                        "ts": datetime.now(UTC).isoformat(),
-                    }, ensure_ascii=False) + "\n")
-            # Short-circuit the regular heal loop without changing the rest
-            # of the flow (run-results.json / bug-candidates.json still get
-            # written, status still falls through to the runner_only_failure
-            # branch below).
-            failing = []
+            _resolver_server.start()
+            runtime_env["WORCA_T_RESOLVER_PORT"] = str(_resolver_server.port)
+            runtime_env["WORCA_T_RESOLVER_TOKEN"] = _resolver_server.token
+            log.info(
+                "step09.resolver_server_started",
+                port=_resolver_server.port,
+            )
 
-        if failing and len(failing) <= _MAX_HEAL_TESTS:
-            fixer_agent = package_resource_root() / "agents" / "polyglot-test-fixer.agent.md"
-            sut_base_url = os.environ.get("SUT_BASE_URL")
-            heal_relevant_sut_files = _auth_relevant_sut_files(active_module)
-            for entry in failing:
-                heal_wd = ctx.workspace.step_workdir(9) / f"heal-{entry.id}"
-                heal_wd.mkdir(parents=True, exist_ok=True)
-                # Snapshot the failing test's current bytes BEFORE the fixer
-                # runs so we can detect a real change after it returns. The
-                # snapshot lives under heal_wd (NOT in the SUT) so it never
-                # ends up in a worca-t commit.
-                target_in_sut = sut_tests / Path(entry.file).name
-                pre_bytes: bytes | None = None
-                if target_in_sut.exists():
-                    try:
-                        pre_bytes = target_in_sut.read_bytes()
-                    except OSError:
-                        pre_bytes = None
+        try:
+            first = run_tests(
+                framework,
+                cwd=ctx.workspace.sut,
+                detected_command=detected_cmd,
+                timeout_s=min(self.timeout_s or 1800, 1800),
+                env_extra=runtime_env,
+                profile=stack_profile,
+                headless=getattr(ctx.options, "headless", True),
+                marker_filter=_WORCA_PYTEST_MARKER_FILTER,
+            )
 
-                agent_res = await run_agent(
-                    fixer_agent,
-                    workdir=heal_wd,
-                    inputs={},
-                    user_prompt=_build_fixer_prompt(
-                        entry, sut_tests,
-                        sut_root=ctx.workspace.sut,
-                        sut_base_url=sut_base_url,
-                        active_module=active_module,
-                        staged_files=heal_relevant_sut_files,
-                    ),
-                    extra_paths=[],
-                    add_dirs=[ctx.workspace.sut],
-                    timeout_s=min((self.timeout_s or 1800) // 4, 600),
-                    step=9,
-                    max_turns=30,
+            attempts = 1
+            patches_applied = 0
+            patches_rejected = 0
+
+            failing = _failing_tests(first)
+            self_heal_meta: dict[str, dict] = {}
+
+            # Skip self-heal when the failure is the synthetic `T-runner-failure`
+            # entry — the runner blew up at collection / import time and there is
+            # no per-test traceback, no patch site, nothing the fixer agent can
+            # produce a diff against. Past behaviour burned ~10 timed-out heal
+            # attempts (≈75 min wall-clock + tokens) on exactly these cases
+            # before falling through to the runner_only_failure error path below.
+            # The classifier output (when present on the entry) flows into that
+            # error path so the user sees the missing dep name and install hint.
+            runner_only = (
+                len(failing) > 0
+                and all(r.id == "T-runner-failure" for r in failing)
+            )
+
+            # Runtime dep-recovery: on a missing_module runner failure, attempt
+            # one install + re-run before declaring defeat. This catches gaps
+            # Step 6's static audit missed (dynamic imports, conftest-only deps
+            # the SUT layout heuristic skipped). Bounded to ONE retry per Step 9
+            # invocation — if the re-run still produces runner_only, fall through
+            # to the existing heal_skip behavior.
+            if runner_only and not no_auto_deps:
+                rf = (failing[0].runner_failure or {})
+                module = rf.get("module") if rf.get("kind") == "missing_module" else None
+                if module:
+                    confidence = "known" if module in _PYTEST_PLUGIN_PROVIDERS else "guessed"
+                    package = _PYTEST_PLUGIN_PROVIDERS.get(module, module)
+                    pkg_mgr = stack_profile.package_manager if stack_profile else None
+                    proceed = confidence == "known"
+                    if confidence == "guessed":
+                        interactive = (
+                            sys.stdin.isatty()
+                            and not getattr(ctx.options, "no_hitl", False)
+                            and not getattr(ctx.options, "yes", False)
+                        )
+                        if interactive:
+                            from rich.console import Console
+                            from rich.prompt import Confirm
+                            proceed = Confirm.ask(
+                                f"Missing test dependency `{module}` detected. "
+                                f"Install `{package}` (`{rf.get('hint') or ''}`) "
+                                f"and retry?",
+                                default=True,
+                                console=Console(),
+                            )
+                        else:
+                            log.warning(
+                                "step09.dep_recover_skipped",
+                                reason="non-interactive and confidence=guessed",
+                                module=module, package=package,
+                            )
+                    # Mirror the venv_bin lookup _run_dep_install does internally so
+                    # the can-we-install? gate doesn't false-reject pip when the
+                    # SUT has a .venv (or false-accept when it doesn't).
+                    _venv_bin = (
+                        stack_profile.wrapper_prefix
+                        if stack_profile and (pkg_mgr or "").lower() == "pip"
+                        else None
+                    )
+                    if proceed and install_command_for(pkg_mgr, package, venv_bin=_venv_bin) is not None:
+                        ok, summary = _run_dep_install(
+                            pkg_mgr, package, ctx.workspace.sut, install_log_path,
+                            profile=stack_profile,
+                        )
+                        log.info(
+                            "step09.auto_install_dep",
+                            phase="runtime",
+                            module=module, package=package,
+                            confidence=confidence,
+                            success=ok, summary=summary,
+                        )
+                        if ok:
+                            sha = commit_step(
+                                ctx.workspace.sut, 9, "execute",
+                                message_detail=f"install missing test dep {package}",
+                            )
+                            log.info(
+                                "step09.auto_install_commit",
+                                phase="runtime", package=package, sha=sha,
+                            )
+                            first = run_tests(
+                                framework,
+                                cwd=ctx.workspace.sut,
+                                detected_command=detected_cmd,
+                                timeout_s=min(self.timeout_s or 1800, 1800),
+                                env_extra=runtime_env,
+                                profile=stack_profile,
+                                headless=getattr(ctx.options, "headless", True),
+                                marker_filter=_WORCA_PYTEST_MARKER_FILTER,
+                            )
+                            attempts = 2
+                            failing = _failing_tests(first)
+                            runner_only = (
+                                len(failing) > 0
+                                and all(r.id == "T-runner-failure" for r in failing)
+                            )
+                            log.info(
+                                "step09.dep_recover_retry",
+                                runner_only_after=runner_only,
+                                failing_after=len(failing),
+                            )
+
+            if runner_only:
+                rf = (failing[0].runner_failure or {})
+                log.warning(
+                    "step09.heal_skip",
+                    reason="runner failure — no per-test data to patch",
+                    kind=rf.get("kind"),
+                    module=rf.get("module"),
+                    hint=rf.get("hint"),
                 )
+                # Record a heal-log line per skipped runner failure so the audit
+                # trail explains the empty heal block instead of going silent.
+                for entry in failing:
+                    rf_entry = entry.runner_failure or {}
+                    with heal_log_path.open("a", encoding="utf-8") as fh:
+                        fh.write(json.dumps({
+                            "test_id": entry.id,
+                            "file": entry.file,
+                            "applied": False,
+                            "agent_success": False,
+                            "agent_error": (
+                                f"skipped: {rf_entry.get('summary', 'runner failure')} "
+                                f"— no test to patch"
+                            ),
+                            "ts": datetime.now(UTC).isoformat(),
+                        }, ensure_ascii=False) + "\n")
+                # Short-circuit the regular heal loop without changing the rest
+                # of the flow (run-results.json / bug-candidates.json still get
+                # written, status still falls through to the runner_only_failure
+                # branch below).
+                failing = []
 
-                # The fixer now edits the failing test file IN PLACE inside
-                # the SUT (via add_dirs). Detect a real change by comparing
-                # the post-run bytes against the snapshot. Fall back to the
-                # legacy "did the agent drop a candidate file in heal_wd?"
-                # path for the rare case where the agent wrote to its cwd
-                # instead of editing in place — _apply_fixer_outputs copies
-                # that file into the SUT.
-                applied = False
-                if agent_res.success:
-                    post_bytes: bytes | None = None
+            # WORCA_T_NO_LLM_RESOLVE=1 disables the JIT runtime LLM tier (in the
+            # pytest subprocess) AND the on-failure self-heal agent here. The
+            # flag is the single dial for "no LLM spend in this test region";
+            # CI runs that need cost determinism set it once and get symmetric
+            # behaviour across runtime resolution and post-failure heal. Tier 5
+            # (HITL/fail-fast with locator-unresolvable bug candidate) still
+            # applies — unresolved TBDs surface in run-results.json for Step 10.
+            no_llm_resolve = os.environ.get("WORCA_T_NO_LLM_RESOLVE") == "1"
+            if failing and no_llm_resolve:
+                log.info(
+                    "step09.heal_skipped",
+                    reason="WORCA_T_NO_LLM_RESOLVE=1",
+                    failing_count=len(failing),
+                )
+                failing = []
+            if failing and len(failing) <= _MAX_HEAL_TESTS:
+                fixer_agent = package_resource_root() / "agents" / "polyglot-test-fixer.agent.md"
+                sut_base_url = os.environ.get("SUT_BASE_URL")
+                heal_relevant_sut_files = _auth_relevant_sut_files(active_module)
+                for entry in failing:
+                    heal_wd = ctx.workspace.step_workdir(9) / f"heal-{entry.id}"
+                    heal_wd.mkdir(parents=True, exist_ok=True)
+                    # Snapshot the failing test's current bytes BEFORE the fixer
+                    # runs so we can detect a real change after it returns. The
+                    # snapshot lives under heal_wd (NOT in the SUT) so it never
+                    # ends up in a worca-t commit.
+                    target_in_sut = sut_tests / Path(entry.file).name
+                    pre_bytes: bytes | None = None
                     if target_in_sut.exists():
                         try:
-                            post_bytes = target_in_sut.read_bytes()
+                            pre_bytes = target_in_sut.read_bytes()
                         except OSError:
-                            post_bytes = None
-                    applied = post_bytes is not None and post_bytes != pre_bytes
-                    if not applied:
-                        applied = _apply_fixer_outputs(
-                            heal_wd,
-                            sut_tests,
-                            entry.file,
-                        )
+                            pre_bytes = None
 
-                xpath_rejected = False
-                if applied:
-                    # Step 9 quality gate: a heal that introduces an XPath
-                    # selector is rejected. Revert the SUT file to its
-                    # pre-heal state (restore bytes if it existed, delete
-                    # if the heal created it from scratch) and mark the
-                    # patch unapplied. See `qa-orchestrator.instructions.md`
-                    # §6 "No XPath (self-heal)".
-                    post_bytes_check = target_in_sut.read_bytes() if target_in_sut.exists() else None
-                    if _patch_introduces_xpath(pre_bytes, post_bytes_check):
-                        xpath_rejected = True
-                        try:
-                            if pre_bytes is not None:
-                                target_in_sut.write_bytes(pre_bytes)
-                            elif target_in_sut.exists():
-                                target_in_sut.unlink()
-                        except OSError as e:
+                    agent_res = await run_agent(
+                        fixer_agent,
+                        workdir=heal_wd,
+                        inputs={},
+                        user_prompt=_build_fixer_prompt(
+                            entry, sut_tests,
+                            sut_root=ctx.workspace.sut,
+                            sut_base_url=sut_base_url,
+                            active_module=active_module,
+                            staged_files=heal_relevant_sut_files,
+                        ),
+                        extra_paths=[],
+                        add_dirs=[ctx.workspace.sut],
+                        timeout_s=min((self.timeout_s or 1800) // 4, 600),
+                        step=9,
+                        max_turns=30,
+                    )
+
+                    # The fixer now edits the failing test file IN PLACE inside
+                    # the SUT (via add_dirs). Detect a real change by comparing
+                    # the post-run bytes against the snapshot. Fall back to the
+                    # legacy "did the agent drop a candidate file in heal_wd?"
+                    # path for the rare case where the agent wrote to its cwd
+                    # instead of editing in place — _apply_fixer_outputs copies
+                    # that file into the SUT.
+                    applied = False
+                    if agent_res.success:
+                        post_bytes: bytes | None = None
+                        if target_in_sut.exists():
+                            try:
+                                post_bytes = target_in_sut.read_bytes()
+                            except OSError:
+                                post_bytes = None
+                        applied = post_bytes is not None and post_bytes != pre_bytes
+                        if not applied:
+                            applied = _apply_fixer_outputs(
+                                heal_wd,
+                                sut_tests,
+                                entry.file,
+                            )
+
+                    xpath_rejected = False
+                    if applied:
+                        # Step 9 quality gate: a heal that introduces an XPath
+                        # selector is rejected. Revert the SUT file to its
+                        # pre-heal state (restore bytes if it existed, delete
+                        # if the heal created it from scratch) and mark the
+                        # patch unapplied. See `qa-orchestrator.instructions.md`
+                        # §6 "No XPath (self-heal)".
+                        post_bytes_check = target_in_sut.read_bytes() if target_in_sut.exists() else None
+                        if _patch_introduces_xpath(pre_bytes, post_bytes_check):
+                            xpath_rejected = True
+                            try:
+                                if pre_bytes is not None:
+                                    target_in_sut.write_bytes(pre_bytes)
+                                elif target_in_sut.exists():
+                                    target_in_sut.unlink()
+                            except OSError as e:
+                                log.warning(
+                                    "step09.xpath_revert_failed",
+                                    test_id=entry.id,
+                                    file=entry.file,
+                                    error=str(e),
+                                )
                             log.warning(
-                                "step09.xpath_revert_failed",
+                                "step09.heal_rejected_xpath",
                                 test_id=entry.id,
                                 file=entry.file,
-                                error=str(e),
                             )
-                        log.warning(
-                            "step09.heal_rejected_xpath",
-                            test_id=entry.id,
-                            file=entry.file,
+                            applied = False
+
+                    if applied:
+                        patches_applied += 1
+                        # Per-test commit so the human reviewer sees exactly which
+                        # heal landed which patch. No-op when the bytes equal the
+                        # branch tip (e.g. agent reverted its own edit).
+                        commit_step(
+                            ctx.workspace.sut,
+                            self.number,
+                            f"{self.name}-heal-{entry.id}",
+                            message_detail=f"healed {Path(entry.file).name}",
                         )
-                        applied = False
+                    else:
+                        patches_rejected += 1
 
-                if applied:
-                    patches_applied += 1
-                    # Per-test commit so the human reviewer sees exactly which
-                    # heal landed which patch. No-op when the bytes equal the
-                    # branch tip (e.g. agent reverted its own edit).
-                    commit_step(
-                        ctx.workspace.sut,
-                        self.number,
-                        f"{self.name}-heal-{entry.id}",
-                        message_detail=f"healed {Path(entry.file).name}",
-                    )
-                else:
-                    patches_rejected += 1
-
-                summary_text = (
-                    agent_res.error
-                    if not agent_res.success
-                    else (
-                        "patch applied"
-                        if applied
+                    summary_text = (
+                        agent_res.error
+                        if not agent_res.success
                         else (
-                            "rejected: heal introduced XPath selector (Step 9 quality gate)"
-                            if xpath_rejected
-                            else "no usable patch produced"
+                            "patch applied"
+                            if applied
+                            else (
+                                "rejected: heal introduced XPath selector (Step 9 quality gate)"
+                                if xpath_rejected
+                                else "no usable patch produced"
+                            )
                         )
                     )
-                )
-                self_heal_meta[entry.id] = {
-                    "attempted": True,
-                    "applied": applied,
-                    "summary": summary_text,
-                }
+                    self_heal_meta[entry.id] = {
+                        "attempted": True,
+                        "applied": applied,
+                        "summary": summary_text,
+                    }
 
-                # Append to heal-log.jsonl
-                heal_entry = {
-                    "test_id": entry.id,
-                    "file": entry.file,
-                    "applied": applied,
-                    "agent_success": agent_res.success,
-                    "agent_error": agent_res.error,
-                    "ts": datetime.now(UTC).isoformat(),
-                }
-                if xpath_rejected:
-                    heal_entry["rejected"] = "xpath"
-                with heal_log_path.open("a", encoding="utf-8") as fh:
-                    fh.write(json.dumps(heal_entry, ensure_ascii=False) + "\n")
+                    # Append to heal-log.jsonl
+                    heal_entry = {
+                        "test_id": entry.id,
+                        "file": entry.file,
+                        "applied": applied,
+                        "agent_success": agent_res.success,
+                        "agent_error": agent_res.error,
+                        "ts": datetime.now(UTC).isoformat(),
+                    }
+                    if xpath_rejected:
+                        heal_entry["rejected"] = "xpath"
+                    with heal_log_path.open("a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(heal_entry, ensure_ascii=False) + "\n")
 
-            if patches_applied > 0:
-                # Re-run the full suite once. Cheaper than per-test filtering
-                # for our typical small surface, and avoids brittle CLI assumptions.
-                second = run_tests(
-                    framework,
-                    cwd=ctx.workspace.sut,
-                    detected_command=detected_cmd,
-                    timeout_s=min((self.timeout_s or 1800) // 2, 900),
-                    env_extra=runtime_env,
-                    profile=stack_profile,
-                    headless=getattr(ctx.options, "headless", True),
+                if patches_applied > 0:
+                    # Re-run the full suite once. Cheaper than per-test filtering
+                    # for our typical small surface, and avoids brittle CLI assumptions.
+                    second = run_tests(
+                        framework,
+                        cwd=ctx.workspace.sut,
+                        detected_command=detected_cmd,
+                        timeout_s=min((self.timeout_s or 1800) // 2, 900),
+                        env_extra=runtime_env,
+                        profile=stack_profile,
+                        headless=getattr(ctx.options, "headless", True),
+                        marker_filter=_WORCA_PYTEST_MARKER_FILTER,
+                    )
+                    attempts = 2
+                    # Second run is authoritative when it produced parseable results.
+                    if second.results:
+                        first.results = second.results
+                        first.exit_code = second.exit_code
+            elif failing:
+                log.warning(
+                    "step09.heal_skip",
+                    reason="too many failing tests",
+                    count=len(failing),
+                    cap=_MAX_HEAL_TESTS,
                 )
-                attempts = 2
-                # Second run is authoritative when it produced parseable results.
-                if second.results:
-                    first.results = second.results
-                    first.exit_code = second.exit_code
-        elif failing:
-            log.warning(
-                "step09.heal_skip",
-                reason="too many failing tests",
-                count=len(failing),
-                cap=_MAX_HEAL_TESTS,
+
+            # Attach SUT-side artifacts discovered post-run to entries without any.
+            extra_attachments = _attachment_glob(ctx.workspace.sut)
+            if extra_attachments:
+                for r in first.results:
+                    if r.status in ("failed", "error") and not r.attachments:
+                        # naive: attach everything (renderer can filter); cheaper
+                        # than walking the per-test trace tree.
+                        r.attachments = extra_attachments
+
+            # Annotate self-heal metadata into per-entry dicts via the serializer.
+            payload = first.as_dict()
+            for entry_dict in payload["results"]:
+                meta = self_heal_meta.get(entry_dict["id"])
+                if meta:
+                    entry_dict["self_heal"] = meta
+            payload["self_heal"] = {
+                "attempts": attempts,
+                "patches_applied": patches_applied,
+                "patches_rejected": patches_rejected,
+            }
+
+            # Resolver telemetry (Phase 6). Per-run only — no global
+            # aggregator. Absent for non-JIT stacks (no spend file).
+            resolver_spend = _summarize_resolver_spend(jit_cache_dir)
+            if resolver_spend is not None:
+                payload["resolver_spend"] = resolver_spend
+                log.info(
+                    "step09.resolver_spend_summarised",
+                    total_resolutions=resolver_spend["total_resolutions"],
+                    total_input_tokens=resolver_spend["total_input_tokens"],
+                    total_output_tokens=resolver_spend["total_output_tokens"],
+                )
+
+            run_results_path = out_dir / "run-results.json"
+            run_results_path.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
             )
 
-        # Attach SUT-side artifacts discovered post-run to entries without any.
-        extra_attachments = _attachment_glob(ctx.workspace.sut)
-        if extra_attachments:
-            for r in first.results:
-                if r.status in ("failed", "error") and not r.attachments:
-                    # naive: attach everything (renderer can filter); cheaper
-                    # than walking the per-test trace tree.
-                    r.attachments = extra_attachments
+            ok_schema, schema_err = is_valid(payload, "run-results")
+            if not ok_schema:
+                log.warning("step09.schema_invalid", error=schema_err)
 
-        # Annotate self-heal metadata into per-entry dicts via the serializer.
-        payload = first.as_dict()
-        for entry_dict in payload["results"]:
-            meta = self_heal_meta.get(entry_dict["id"])
-            if meta:
-                entry_dict["self_heal"] = meta
-        payload["self_heal"] = {
-            "attempts": attempts,
-            "patches_applied": patches_applied,
-            "patches_rejected": patches_rejected,
-        }
+            # HITL escalation pass. The JIT runtime drops `hitl-pending-*.json`
+            # files in the cache dir whenever it could not resolve a TBD.
+            # On a TTY (and unless --no-hitl) we prompt for a selector and
+            # write it to dev-locators.json so the next run skips Tier 4 for
+            # that key; otherwise the unresolved TBDs flow into the bug
+            # candidates as `locator-unresolvable` entries for Step 10.
+            hitl_pendings = _collect_hitl_pending(jit_cache_dir)
+            hitl_dev_locators_path = (
+                ctx.workspace.sut / ".worca-t" / "dev-locators.json"
+            )
+            _, hitl_remaining = _hitl_resolve_unresolvable(
+                hitl_pendings,
+                dev_locators_path=hitl_dev_locators_path,
+                no_hitl=bool(getattr(ctx.options, "no_hitl", False)),
+            )
 
-        run_results_path = out_dir / "run-results.json"
-        run_results_path.write_text(
-            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+            # bug-candidates.json: emitted regardless (empty list when no failures).
+            final_failing = _failing_tests(first)
+            bug_payload = _build_bug_candidates(final_failing)
+            bug_payload["candidates"].extend(
+                _bug_candidates_for_unresolvable_tbds(hitl_remaining)
+            )
+            bug_path = out_dir / "bug-candidates.json"
+            bug_path.write_text(
+                json.dumps(bug_payload, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
 
-        ok_schema, schema_err = is_valid(payload, "run-results")
-        if not ok_schema:
-            log.warning("step09.schema_invalid", error=schema_err)
+            # JIT cache publish — if the runtime plugin populated locator-cache.json
+            # during the test run, copy it into artifacts/step09 so step 11 can
+            # surface per-TBD resolution sources in the report. Best-effort; absence
+            # is normal for non-JIT stacks.
+            jit_cache_src = ctx.workspace.root / "locator-cache" / "locator-cache.json"
+            if jit_cache_src.exists():
+                try:
+                    jit_cache_dst = out_dir / "locator-cache.json"
+                    jit_cache_dst.write_text(
+                        jit_cache_src.read_text(encoding="utf-8"), encoding="utf-8"
+                    )
+                    log.info("step09.jit_cache_published", entries_path=str(jit_cache_dst))
+                except OSError as e:
+                    log.warning("step09.jit_cache_publish_failed", error=str(e))
 
-        # bug-candidates.json: emitted regardless (empty list when no failures).
-        final_failing = _failing_tests(first)
-        bug_payload = _build_bug_candidates(final_failing)
-        bug_path = out_dir / "bug-candidates.json"
-        bug_path.write_text(
-            json.dumps(bug_payload, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+            notes_parts = [
+                f"framework={framework}",
+                f"tests={len(first.results)}",
+                f"failed={payload['totals']['failed']}",
+                f"errors={payload['totals']['errors']}",
+                f"attempts={attempts}",
+                f"healed={patches_applied}",
+            ]
+            notes = " ".join(notes_parts)
 
-        # JIT cache publish — if the runtime plugin populated locator-cache.json
-        # during the test run, copy it into artifacts/step09 so step 11 can
-        # surface per-TBD resolution sources in the report. Best-effort; absence
-        # is normal for non-JIT stacks.
-        jit_cache_src = ctx.workspace.root / "locator-cache" / "locator-cache.json"
-        if jit_cache_src.exists():
-            try:
-                jit_cache_dst = out_dir / "locator-cache.json"
-                jit_cache_dst.write_text(
-                    jit_cache_src.read_text(encoding="utf-8"), encoding="utf-8"
+            # Status semantics:
+            #   - `completed` when nothing failed.
+            #   - `failed` when EVERY result is a synthesised `T-runner-failure`
+            #     (the test runner didn't even produce parseable output — typically
+            #     a conftest import error, missing dep, exit code 4, etc.). The
+            #     prior "warned" status hid this and Step 10/11 ran on garbage;
+            #     Step 11 then crashed rendering an environment-bug card.
+            #     This is an environment failure, not a real test failure.
+            #   - `warned` when real failures or errors remain alongside passing
+            #     tests — Step 10 will classify them as bug candidates.
+            runner_only_failure = (
+                len(first.results) > 0
+                and all(r.id == "T-runner-failure" for r in first.results)
+            )
+            if runner_only_failure:
+                first_entry = first.results[0]
+                first_msg = (first_entry.message or "").strip() or "test runner failed"
+                rf = first_entry.runner_failure or {}
+                # When the classifier identified a specific failure mode
+                # (missing module, collection error), lead the error with the
+                # actionable fix command. Otherwise fall through to the raw
+                # message tail — at least the operator gets the stderr summary.
+                if rf:
+                    error = (
+                        f"test runner failed before any test could run: "
+                        f"{rf.get('summary', 'collection / import error')}. "
+                        f"To fix: {rf.get('hint', 'see stderr in run-results.json')}. "
+                        f"(exit_code={first.exit_code})"
+                    )
+                else:
+                    error = (
+                        f"test runner produced no parseable test results "
+                        f"(exit_code={first.exit_code}). This is an environment "
+                        f"failure, not a real test failure. {first_msg[:300]}"
+                    )
+                return StepResult(
+                    success=False,
+                    status="failed",
+                    outputs=[run_results_path, bug_path],
+                    error=error,
+                    notes=notes,
                 )
-                log.info("step09.jit_cache_published", entries_path=str(jit_cache_dst))
-            except OSError as e:
-                log.warning("step09.jit_cache_publish_failed", error=str(e))
 
-        notes_parts = [
-            f"framework={framework}",
-            f"tests={len(first.results)}",
-            f"failed={payload['totals']['failed']}",
-            f"errors={payload['totals']['errors']}",
-            f"attempts={attempts}",
-            f"healed={patches_applied}",
-        ]
-        notes = " ".join(notes_parts)
-
-        # Status semantics:
-        #   - `completed` when nothing failed.
-        #   - `failed` when EVERY result is a synthesised `T-runner-failure`
-        #     (the test runner didn't even produce parseable output — typically
-        #     a conftest import error, missing dep, exit code 4, etc.). The
-        #     prior "warned" status hid this and Step 10/11 ran on garbage;
-        #     Step 11 then crashed rendering an environment-bug card.
-        #     This is an environment failure, not a real test failure.
-        #   - `warned` when real failures or errors remain alongside passing
-        #     tests — Step 10 will classify them as bug candidates.
-        runner_only_failure = (
-            len(first.results) > 0
-            and all(r.id == "T-runner-failure" for r in first.results)
-        )
-        if runner_only_failure:
-            first_entry = first.results[0]
-            first_msg = (first_entry.message or "").strip() or "test runner failed"
-            rf = first_entry.runner_failure or {}
-            # When the classifier identified a specific failure mode
-            # (missing module, collection error), lead the error with the
-            # actionable fix command. Otherwise fall through to the raw
-            # message tail — at least the operator gets the stderr summary.
-            if rf:
-                error = (
-                    f"test runner failed before any test could run: "
-                    f"{rf.get('summary', 'collection / import error')}. "
-                    f"To fix: {rf.get('hint', 'see stderr in run-results.json')}. "
-                    f"(exit_code={first.exit_code})"
-                )
-            else:
-                error = (
-                    f"test runner produced no parseable test results "
-                    f"(exit_code={first.exit_code}). This is an environment "
-                    f"failure, not a real test failure. {first_msg[:300]}"
-                )
+            status = "completed" if not final_failing else "warned"
             return StepResult(
-                success=False,
-                status="failed",
+                success=True,
+                status=status,
                 outputs=[run_results_path, bug_path],
-                error=error,
                 notes=notes,
             )
 
-        status = "completed" if not final_failing else "warned"
-        return StepResult(
-            success=True,
-            status=status,
-            outputs=[run_results_path, bug_path],
-            notes=notes,
-        )
+        finally:
+            if _resolver_server is not None:
+                _resolver_server.stop()
 
 
 __all__ = [

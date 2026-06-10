@@ -462,10 +462,15 @@ async def call_reasoning_llm_with_hitl(
     # Lazy import — ``worca_t.hitl`` is heavy (rich) and pulls in modules
     # we'd otherwise not need for non-HITL reasoning calls.
     from worca_t.hitl import (
+        HitlDecision,
+        append_ledger,
         extract_questions,
         format_answers_md,
+        load_ledger,
         prompt_user,
         question_key,
+        render_prior_decisions_md,
+        resolve_against_ledger,
         write_answers_file,
     )
 
@@ -475,14 +480,45 @@ async def call_reasoning_llm_with_hitl(
         else workdir.parent / ".hitl"
     )
 
+    # Cross-step ledger: in-memory list on ctx.extras, mirrored to disk so
+    # `--from-step` resumes don't lose it. On first access this run, hydrate
+    # from the on-disk file (covers the resume case).
+    workspace_root = ctx.workspace.root
+    if "hitl_ledger" not in ctx.extras:
+        ctx.extras["hitl_ledger"] = load_ledger(workspace_root)
+    ledger: list[HitlDecision] = ctx.extras["hitl_ledger"]
+
+    # If we have prior decisions, weave them into the agent's first input
+    # so it knows not to re-raise them in the first place. Belt + suspenders
+    # with the post-extract filter below.
+    augmented_inputs = dict(inputs or {})
+    augmented_prompt = user_prompt
+    if ledger:
+        augmented_inputs.setdefault(
+            "prior-decisions.md", render_prior_decisions_md(ledger)
+        )
+        augmented_prompt = (
+            f"{user_prompt}\n\n"
+            f"**Note:** The file `prior-decisions.md` (below) lists items the "
+            f"user already addressed in earlier steps of this run. Treat each "
+            f"entry as final — do NOT re-emit them as new blockers, "
+            f"clarifications, or open questions in your output. For skipped "
+            f"items, apply the same `[ASSUMPTION]` framing the earlier agent "
+            f"used."
+        )
+
     # Pre-render the iteration-1 user message (prompt + inlined inputs) so
     # we can later replay it verbatim in ``hitl_history``. After this, we
     # pass it as a fully-rendered prompt with inputs=None so call_reasoning_llm
     # does not re-inline.
-    first_user_content = _inline_inputs(user_prompt, inputs)
+    first_user_content = _inline_inputs(augmented_prompt, augmented_inputs)
     current_prompt = first_user_content
     current_history: list[dict[str, Any]] | None = None
     skipped_keys: set[str] = set()
+    # Decisions accumulated this step — appended to the run ledger once we
+    # return successfully. Keyed by question_key to deduplicate across the
+    # iteration loop.
+    step_decisions: dict[str, HitlDecision] = {}
     result: AgentResult | None = None
 
     for iteration in range(1, max_iterations + 1):
@@ -499,6 +535,9 @@ async def call_reasoning_llm_with_hitl(
         )
 
         if not result.success or not result.final_text:
+            _flush_step_decisions_to_ledger(
+                ledger, step_decisions, workspace_root, append_ledger
+            )
             return result
 
         # Persist this iteration's output for downstream inspection and so
@@ -510,14 +549,35 @@ async def call_reasoning_llm_with_hitl(
             log.warning("hitl.persist_failed", path=str(produced), error=str(e))
 
         if hitl_disabled:
+            _flush_step_decisions_to_ledger(
+                ledger, step_decisions, workspace_root, append_ledger
+            )
             return result
 
         all_questions = extract_questions(result.final_text)
+
+        # Cross-step ledger filter: any question paraphrasing an already
+        # decided item is silently resolved with the prior answer/skip.
+        novel_questions, ledger_resolved = resolve_against_ledger(
+            all_questions, ledger
+        )
+        if ledger_resolved:
+            log.info(
+                "hitl.ledger_suppressed",
+                agent=agent_label,
+                iteration=iteration,
+                count=len(ledger_resolved),
+                ids=[q.id for q, _ in ledger_resolved],
+            )
+
+        # Within-iteration skip dedup (existing behavior).
         new_questions = [
-            q for q in all_questions if question_key(q) not in skipped_keys
+            q for q in novel_questions if question_key(q) not in skipped_keys
         ]
 
-        if not new_questions:
+        # Nothing left to ask AND no ledger-paraphrases to coach the agent
+        # away from — we're done.
+        if not new_questions and not ledger_resolved:
             if all_questions:
                 log.info(
                     "hitl.only_previously_skipped",
@@ -525,6 +585,9 @@ async def call_reasoning_llm_with_hitl(
                     total=len(all_questions),
                     skipped=len(skipped_keys),
                 )
+            _flush_step_decisions_to_ledger(
+                ledger, step_decisions, workspace_root, append_ledger
+            )
             return result
 
         log.info(
@@ -532,7 +595,8 @@ async def call_reasoning_llm_with_hitl(
             agent=agent_label,
             iteration=iteration,
             new=len(new_questions),
-            already_skipped=len(all_questions) - len(new_questions),
+            already_skipped=len(all_questions) - len(new_questions) - len(ledger_resolved),
+            ledger_resolved=len(ledger_resolved),
         )
 
         if iteration >= max_iterations:
@@ -540,18 +604,47 @@ async def call_reasoning_llm_with_hitl(
                 "hitl.max_iterations_reached",
                 agent=agent_label,
                 pending=len(new_questions),
+                ledger_resolved=len(ledger_resolved),
+            )
+            _flush_step_decisions_to_ledger(
+                ledger, step_decisions, workspace_root, append_ledger
             )
             return result
 
-        answers = prompt_user(new_questions, agent_label=agent_label)
+        # Only prompt the user about questions we couldn't resolve from the
+        # ledger. ledger_resolved go straight into the answers_md so the
+        # agent picks up the prior answer/skip on the next turn.
+        if new_questions:
+            answers = prompt_user(new_questions, agent_label=agent_label)
+        else:
+            answers = {}
         skipped_this_round = [q for q in new_questions if q.id not in answers]
         for q in skipped_this_round:
             skipped_keys.add(question_key(q))
+            step_decisions.setdefault(
+                question_key(q),
+                HitlDecision.from_question(
+                    q, step=step or 0, agent_label=agent_label, resolution="skipped"
+                ),
+            )
+        for q in new_questions:
+            if q.id in answers:
+                step_decisions[question_key(q)] = HitlDecision.from_question(
+                    q,
+                    step=step or 0,
+                    agent_label=agent_label,
+                    resolution="answered",
+                    answer=answers[q.id],
+                )
 
         # Persist user answers for audit (mirrors run_agent_with_hitl).
         hitl_dir.mkdir(parents=True, exist_ok=True)
         write_answers_file(
-            hitl_dir, new_questions, answers, skipped=skipped_this_round
+            hitl_dir,
+            new_questions,
+            answers,
+            skipped=skipped_this_round,
+            ledger_resolved=ledger_resolved,
         )
 
         # Build the next iteration's conversation: append the rendered
@@ -563,11 +656,16 @@ async def call_reasoning_llm_with_hitl(
         current_history.append({"role": "assistant", "content": result.final_text})
 
         answers_md = format_answers_md(
-            new_questions, answers, skipped=skipped_this_round
+            new_questions,
+            answers,
+            skipped=skipped_this_round,
+            ledger_resolved=ledger_resolved,
         )
         current_prompt = (
             f"The user has reviewed your clarification questions. Their "
-            f"responses (and any items they chose to skip) are below.\n\n"
+            f"responses (and any items they chose to skip) are below — "
+            f"along with any items that were already resolved earlier in "
+            f"this run.\n\n"
             f"{answers_md}\n\n"
             f"- For ANSWERED items: incorporate the answer and remove the "
             f"corresponding `[CLARIFICATION NEEDED]` tag, blocker row, or "
@@ -575,12 +673,34 @@ async def call_reasoning_llm_with_hitl(
             f"- For SKIPPED items: make a reasonable assumption, mark it "
             f"inline with `[ASSUMPTION: ...]`, and remove the original "
             f"`[CLARIFICATION NEEDED]` tag. **Do NOT re-emit "
-            f"`[CLARIFICATION NEEDED]` for skipped items.**\n\n"
+            f"`[CLARIFICATION NEEDED]` for skipped items.**\n"
+            f"- For PREVIOUSLY RESOLVED items: apply the prior answer / "
+            f"assumption verbatim and remove the duplicate entry. **Do "
+            f"NOT re-raise these to the user.**\n\n"
             f"Rewrite the document above accordingly. Keep the rest of "
             f"the document intact. Return only the updated document."
         )
 
+    _flush_step_decisions_to_ledger(
+        ledger, step_decisions, workspace_root, append_ledger
+    )
     return result  # pragma: no cover (loop always returns inside)
+
+
+def _flush_step_decisions_to_ledger(
+    ledger: list,
+    step_decisions: dict,
+    workspace_root: Path,
+    append_ledger_fn,
+) -> None:
+    """Append this step's accumulated decisions to both the in-memory and
+    on-disk ledger. Idempotent across early returns inside the loop."""
+    if not step_decisions:
+        return
+    new_entries = list(step_decisions.values())
+    ledger.extend(new_entries)
+    append_ledger_fn(workspace_root, new_entries)
+    step_decisions.clear()
 
 
 __all__ = ["call_reasoning_llm", "call_reasoning_llm_with_hitl"]

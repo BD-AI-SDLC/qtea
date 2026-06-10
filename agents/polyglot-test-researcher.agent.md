@@ -9,12 +9,12 @@ Analyze codebase → emit structured discovery summary + markdown research docum
 ## Authoritative Workflow
 
 The full step-by-step procedure (stack catalogs, regex signals, universal fallback recipe, output template, error matrix) lives in `agents/polyglot-test-researcher.prompt.md`. Read it on demand for any framework- or pattern-specific detail. This file holds only the persona + non-negotiable rules.
-**Attention**: environment variables file is needed, in order to pass it to the tester agent in step 9. Without this file, step 9 won't be able to run. If it's missing, report the missing file.
+
 
 ## Non-Negotiable Rules
 
 1. **Deterministic tools only.** Glob, Read, Grep. No semantic/AI search in discovery.
-2. **Mandatory exclusions** when globbing: `node_modules/`, `.git/`, `dist/`, `build/`, `out/`, `target/`, `coverage/`, `htmlcov/`, `.tox/`, `.venv/`, `venv/`, `__pycache__/`, `.pytest_cache/`, `vendor/`, `.idea/`, `.vscode/`, `*.min.js`, `*.bundle.js`, `*.egg-info/`, `mas/`.
+2. **Mandatory exclusions** when globbing: `node_modules/`, `.git/`, `dist/`, `build/`, `out/`, `target/`, `coverage/`, `htmlcov/`, `.tox/`, `.venv/`, `venv/`, `__pycache__/`, `.pytest_cache/`, `vendor/`, `.idea/`, `.vscode/`, `*.min.js`, `*.bundle.js`, `*.egg-info/`, `.gitignore`.
 3. **Scan limits.** Max 1000 test files analyzed (sort by mtime if exceeded, flag truncation). Max single-file read 2 MB (skip larger).
 4. **Three signal checks for framework detection** — dep file, imports, config file. Confidence = `high` (3/3), `medium` (2/3), `low` (1/3). Never skip a check.
 5. **Multi-framework repos** record every detected framework with its own confidence (e.g., Playwright e2e + Jest unit + Cucumber BDD).

@@ -178,3 +178,58 @@ async def test_run_pipeline_debug_sets_extras(tmp_path: Path, monkeypatch):
     )
     await run_pipeline(opts)
     assert captured_ctx["debug_live"] is True
+
+
+async def test_cache_flag_off_by_default_sets_disable_env(tmp_path: Path, monkeypatch):
+    """Default --cache=False must set DISABLE_PROMPT_CACHING=1 in the parent
+    process env before any step runs, so claude_runner forwards it into
+    every Claude Code subprocess and suppresses the CLI's auto-caching.
+
+    RCA: run 20260610-082950-6a887f Step 7 — cache_create kept paying
+    the 25% surcharge while cache_read stayed stuck at 0 due to the Bosch
+    Vertex relay's lack of cross-request cache affinity. Default-off saves
+    ~$1.30/run on this environment.
+    """
+    import os
+    monkeypatch.delenv("DISABLE_PROMPT_CACHING", raising=False)
+    monkeypatch.setattr("worca_t.pipeline.STEP_REGISTRY", {})
+
+    opts = PipelineOptions(spec="x", sut=".", workspace_base=tmp_path / ".ws")
+    assert opts.cache is False  # default
+
+    await run_pipeline(opts)
+    assert os.environ.get("DISABLE_PROMPT_CACHING") == "1"
+
+
+async def test_cache_flag_on_clears_disable_env(tmp_path: Path, monkeypatch):
+    """--cache must clear any pre-existing DISABLE_PROMPT_CACHING so the
+    Claude Code CLI's auto-caching is restored for this run. Important
+    when a parent process or earlier session left the var set."""
+    import os
+    monkeypatch.setenv("DISABLE_PROMPT_CACHING", "1")
+    monkeypatch.setattr("worca_t.pipeline.STEP_REGISTRY", {})
+
+    opts = PipelineOptions(
+        spec="x", sut=".", workspace_base=tmp_path / ".ws", cache=True,
+    )
+    await run_pipeline(opts)
+    assert "DISABLE_PROMPT_CACHING" not in os.environ
+
+
+def test_claude_runner_forwards_disable_prompt_caching():
+    """claude_runner's env-forwarding filter must include the cache-
+    disable knobs even though they don't match the WORCA_/ANTHROPIC_/HTTP
+    prefix set. Without this forward, setting the var in pipeline.py is
+    inert because the subprocess never sees it."""
+    import os
+    from unittest.mock import patch
+
+    # Read the forwarded_env construction block source-level — it lives
+    # inside run_agent and only runs end-to-end. The deterministic check:
+    # the cache vars must be in the explicit forward list. Find them.
+    from worca_t import claude_runner
+    src = (Path(claude_runner.__file__)).read_text(encoding="utf-8")
+    assert '"DISABLE_PROMPT_CACHING"' in src
+    assert '"DISABLE_PROMPT_CACHING_OPUS"' in src
+    assert '"DISABLE_PROMPT_CACHING_SONNET"' in src
+    assert '"DISABLE_PROMPT_CACHING_HAIKU"' in src

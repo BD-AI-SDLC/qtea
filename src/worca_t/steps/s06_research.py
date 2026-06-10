@@ -912,7 +912,11 @@ def replay_env_from_artifacts(workspace: Any, options: Any) -> bool:
     (no artifacts on disk or nothing to resolve). Never raises; logs errors
     and continues.
     """
-    research_json = workspace.step_dir(6) / "research.json"
+    # Use the read-only path helper here — replay runs at pipeline preflight
+    # BEFORE Step 6 has had a chance to execute. Using `step_dir(6)` would
+    # mkdir an empty `artifacts/step06/` folder on every fresh run even when
+    # no prior research artifacts exist.
+    research_json = workspace.step_dir_path(6) / "research.json"
     if not research_json.exists():
         return False
 

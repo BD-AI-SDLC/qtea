@@ -36,9 +36,21 @@ def _write_agent_file(tmp_path: Path) -> Path:
     return p
 
 
-def _fake_ctx(no_hitl: bool = False) -> SimpleNamespace:
-    """Minimal StepContext stand-in — only ``options.no_hitl`` is read."""
-    return SimpleNamespace(options=SimpleNamespace(no_hitl=no_hitl))
+def _fake_ctx(
+    no_hitl: bool = False, workspace_root: Path | None = None
+) -> SimpleNamespace:
+    """Minimal StepContext stand-in.
+
+    The HITL wrapper reads:
+      * ``ctx.options.no_hitl`` — bypass flag
+      * ``ctx.extras`` — dict that carries the cross-step HITL ledger
+      * ``ctx.workspace.root`` — workspace dir for the on-disk ledger mirror
+    """
+    return SimpleNamespace(
+        options=SimpleNamespace(no_hitl=no_hitl),
+        extras={},
+        workspace=SimpleNamespace(root=workspace_root or Path(".")),
+    )
 
 
 @dataclass
@@ -89,7 +101,7 @@ async def test_no_questions_returns_first_iteration(tmp_path, monkeypatch):
 
     result = await call_reasoning_llm_with_hitl(
         agent_path=_write_agent_file(tmp_path),
-        ctx=_fake_ctx(),
+        ctx=_fake_ctx(workspace_root=tmp_path),
         workdir=tmp_path / "wd",
         user_prompt="Refine this:",
         inputs={"spec.md": "# Original"},
@@ -136,7 +148,7 @@ async def test_one_round_resolution_prompts_user_and_reruns(tmp_path, monkeypatc
 
     result = await call_reasoning_llm_with_hitl(
         agent_path=_write_agent_file(tmp_path),
-        ctx=_fake_ctx(),
+        ctx=_fake_ctx(workspace_root=tmp_path),
         workdir=tmp_path / "wd",
         user_prompt="Refine this:",
         inputs={"spec.md": "# Login (raw)"},
@@ -183,7 +195,7 @@ async def test_no_hitl_flag_returns_first_iteration(tmp_path, monkeypatch):
 
     result = await call_reasoning_llm_with_hitl(
         agent_path=_write_agent_file(tmp_path),
-        ctx=_fake_ctx(no_hitl=True),
+        ctx=_fake_ctx(no_hitl=True, workspace_root=tmp_path),
         workdir=tmp_path / "wd",
         user_prompt="Refine this:",
         inputs={"spec.md": "x"},
@@ -219,7 +231,7 @@ async def test_skipped_question_is_not_reasked(tmp_path, monkeypatch):
 
     result = await call_reasoning_llm_with_hitl(
         agent_path=_write_agent_file(tmp_path),
-        ctx=_fake_ctx(),
+        ctx=_fake_ctx(workspace_root=tmp_path),
         workdir=tmp_path / "wd",
         user_prompt="Refine this:",
         inputs={"spec.md": "x"},
@@ -259,7 +271,7 @@ async def test_max_iterations_cap_terminates_loop(tmp_path, monkeypatch):
 
     result = await call_reasoning_llm_with_hitl(
         agent_path=_write_agent_file(tmp_path),
-        ctx=_fake_ctx(),
+        ctx=_fake_ctx(workspace_root=tmp_path),
         workdir=tmp_path / "wd",
         user_prompt="Refine this:",
         inputs={"spec.md": "x"},
@@ -293,7 +305,7 @@ async def test_failed_llm_call_returns_immediately(tmp_path, monkeypatch):
 
     result = await call_reasoning_llm_with_hitl(
         agent_path=_write_agent_file(tmp_path),
-        ctx=_fake_ctx(),
+        ctx=_fake_ctx(workspace_root=tmp_path),
         workdir=tmp_path / "wd",
         user_prompt="x",
         inputs={"spec.md": "x"},

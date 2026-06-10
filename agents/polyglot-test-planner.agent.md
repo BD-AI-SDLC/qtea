@@ -51,7 +51,8 @@ From the refined spec, copy **every** AC into an "## Acceptance Criteria" sectio
 
 Any issue that prevents a TC from being automated or executed:
 - `blocker_id` — short stable ID (e.g. `BLOCK-001`)
-- `description` — what blocks the test
+- `question` — the actionable question the user must answer to unblock; must end in `?` and be directly answerable (e.g. "Which GA SDK should we intercept — `gtag.js`, `@google-analytics/ga4`, or a custom wrapper?"). Do NOT use a descriptive statement here.
+- `description` — what blocks the test (statement form is fine here)
 - `severity` — critical|high|medium|low
 - `affected_test_ids[]` — TC IDs blocked by this
 
@@ -74,9 +75,9 @@ Create `plan.md` with the following structure:
 Brief description of the testing scope and approach.
 
 ## Blockers
-| Blocker | Affected TCs | Severity |
-|---------|-------------|----------|
-| SSO config unavailable | TC-AUTH-005, TC-AUTH-006 | high |
+| ID | Question | Description | Affected TCs | Severity |
+|----|----------|-------------|--------------|----------|
+| BLOCK-001 | Which IdP should we use for SSO in the test environment? | SSO config unavailable; affects login flows. | TC-AUTH-005, TC-AUTH-006 | high |
 
 (If no blockers exist, write: "No blockers identified.")
 
@@ -115,7 +116,11 @@ What this phase covers and why it's sequenced here.
 5. **Be incremental** — each phase should be independently valuable
 6. **Clarifications** - if anything you are about to write is uncertain, involve the user immediatelly with questions, so you can build the most accurate plan possible. Don't make assumptions without asking. **Non-interactive mode (`--no-hitl` / `--yes`):** record the question verbatim in the "Open PO Questions" section, mark affected TCs with `blocks_test_ids[]`, then proceed with the most conservative interpretation. Do not block.
 7. **Finalize document** - If there are any Blockers or `[CLARIFICATION NEEDED]` tags, the agent must ask the user to resolve them before finalizing the refined spec. In non-interactive mode, emit the plan with blockers intact and let the orchestrator decide whether to halt.
-8. **No duplicate items** — each unresolved item must appear in exactly ONE canonical location. If an item is listed in the Blockers table, do NOT also list it in Open PO Questions. The Blockers table is the canonical location for items that block specific test cases.
+8. **No duplicate items** — each unresolved item must appear in exactly ONE canonical location. If an item is listed in the Blockers table, do NOT also list it in Open PO Questions (even if worded differently — semantic duplicates count). The Blockers table is the canonical location for items that block specific test cases; Open PO Questions is for general product questions not tied to a specific TC.
+9. **Question form is mandatory** — every entry in the Blockers `Question` column and every bullet under Open PO Questions MUST be phrased as an actionable interrogative ending in `?`. Examples: ✅ "Which GA SDK should we intercept — `gtag.js`, `@google-analytics/ga4`, or a custom wrapper?" / ❌ "GA integration detail unconfirmed." Statements describing the gap belong in the `Description` column, never as the prompt to the user.
+10. **TC count budget — be ruthless.** For a single-feature spec (one user-facing element / flow / endpoint) the roster should be **5–8 TCs**; a multi-feature spec scales roughly proportionally to the number of distinct acceptance criteria. Hard ceiling: **≤ 1.5 × the number of automatable ACs in the refined spec** (rounded up). If your draft roster exceeds this, you are over-planning — go back and collapse.
+11. **One TC per behavior, not per variation.** Variations of the same behavior across viewport sizes, locales, browser/device tiers, breakpoint thresholds, or themes are **one** TC with a `parametrized_over` field naming the axis (e.g. `parametrized_over: ["desktop-1024", "mobile-768", "very-narrow-320"]`). The test-manager (Step 4) expands these into pytest `@pytest.mark.parametrize` decorators and codegen emits a single test function. **Never** split a "same logic, different input" TC into two or more entries. Common offenders: per-viewport visibility, per-locale label text, per-locale tooltip text, per-locale aria-label — each pair/triple is ONE TC, not 2–3.
+12. **Collapse near-duplicates aggressively.** "X exists" and "X renders correctly" are the same TC. "DE translation key exists" and "DE label renders 'foo'" are the same TC (if the label renders, the key necessarily exists). When in doubt, keep the higher-signal end-to-end variant and drop the lower-signal isolated check.
 
 ## Output
 

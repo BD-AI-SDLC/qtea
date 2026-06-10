@@ -161,3 +161,59 @@ async def test_stderr_callback_swallows_writes_after_file_closed(
     # Now invoke the callback as the SDK would during late cleanup.
     # Must NOT raise.
     cb("late stderr line after cleanup\n")  # ValueError-on-closed
+
+
+async def test_runner_banner_appended_below_cli_stderr(tmp_path: Path, monkeypatch):
+    """When the CLI emitted stderr AND the run failed, the runner's
+    diagnostic banner must be appended below the CLI stderr (with a
+    separator), not used as a replacement that drops the CLI signal.
+
+    Prior behavior at the `if error and not stderr_path.read_text(...)`
+    cleanup site lost either the CLI text (when error was set and CLI
+    had written) or the runner banner (symmetric case). RCA: run
+    20260610-082950-6a887f, step-07 attempt 1 — `api_retry storm` exit
+    surfaced only the runner banner, with no underlying transport error
+    from the CLI to point at the root cause.
+    """
+    from ._fake_claude import _make_message
+
+    monkeypatch.setattr(
+        "worca_t.claude_runner.shutil.which",
+        lambda *_a, **_kw: "/fake/claude",
+    )
+
+    async def _fake_query(*, prompt, options=None, transport=None):  # noqa: ARG001
+        # CLI writes some diagnostics, then the SDK raises — simulating
+        # a transport error (ECONNRESET / 5xx with no body / etc.) that
+        # also leaves a useful trail in stderr.
+        cb = options.stderr
+        cb("[ERROR] socket hang up\n")
+        cb("[DEBUG] giving up after 5 retries\n")
+        raise RuntimeError("upstream API failure")
+        yield  # noqa: unreachable — keep generator shape
+
+    monkeypatch.setattr("worca_t.claude_runner.query", _fake_query)
+
+    agent_path = _fake_agent_file(tmp_path)
+    workdir = tmp_path / "wd"
+
+    result = await run_agent(
+        agent_path,
+        workdir=workdir,
+        inputs={},
+        user_prompt="anything",
+        timeout_s=60,
+    )
+
+    assert not result.success
+    contents = result.stderr_path.read_text(encoding="utf-8")
+    # CLI text preserved (was dropped under the old logic).
+    assert "socket hang up" in contents
+    assert "giving up after 5 retries" in contents
+    # Runner banner still present (was dropped when CLI had written).
+    assert "upstream API failure" in contents
+    # Separator marks the boundary so post-mortems can tell them apart.
+    assert "--- worca-t runner ---" in contents
+    # CLI text comes BEFORE the separator (banner is the footer).
+    assert contents.index("socket hang up") < contents.index("--- worca-t runner ---")
+    assert contents.index("--- worca-t runner ---") < contents.index("upstream API failure")

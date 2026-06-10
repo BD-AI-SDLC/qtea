@@ -47,9 +47,25 @@ class Workspace:
         return self.root / "doctor-report.md"
 
     def step_dir(self, step: int) -> Path:
+        """Return the step's artifact directory, creating it if missing.
+
+        Use when you're about to WRITE artifacts (typical step body).
+        For read-only path computation BEFORE the step has run, use
+        :meth:`step_dir_path` to avoid eagerly materialising the folder.
+        """
         d = self.artifacts / f"step{step:02d}"
         d.mkdir(parents=True, exist_ok=True)
         return d
+
+    def step_dir_path(self, step: int) -> Path:
+        """Return the step's artifact directory path WITHOUT creating it.
+
+        Use when you only need to read from the directory (e.g. preflight
+        / resume helpers checking for prior artifacts). Avoids the
+        side-effect mkdir that would otherwise materialise empty
+        ``artifacts/stepNN/`` folders before the step itself runs.
+        """
+        return self.artifacts / f"step{step:02d}"
 
     def step_workdir(self, step: int) -> Path:
         return self.root / f"step-{step:02d}"

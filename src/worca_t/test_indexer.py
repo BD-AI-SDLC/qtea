@@ -193,12 +193,18 @@ _TBD_PATTERN = re.compile(
     r"(?P<raw>TBD(?:_LOCATOR)?\b[^\n]*|<<\s*TBD[^\n>]*>>|/\*\s*TBD[^*]*\*/)"
 )
 
-# JIT-runtime sentinel: `tbd("intent")` or `tbd('intent')`. Codegen emits
-# this form for Python+pytest+Playwright stacks (see ui-test-automation.agent.md
-# rule 3a). The intent string IS the marker's `description`; no adjacent
-# comment needed in this style.
+# JIT-runtime sentinels — every supported language has a sentinel-producing
+# helper that takes the intent as its sole string argument. The TS/JS form
+# (`tbd("intent")`) shares the Python pattern verbatim, so one regex covers
+# rule 3a (Python) + rule 3b (TS/JS). Java uses `Tbd.of("intent")` and gets
+# its own pattern. The intent string IS the marker's `description`; no
+# adjacent comment needed in any of the JIT styles.
 _TBD_CALL_PATTERN = re.compile(
     r"""\btbd\s*\(\s*(?P<q>['"])(?P<intent>(?:\\.|(?!(?P=q)).)*)(?P=q)\s*\)""",
+    re.DOTALL,
+)
+_TBD_JAVA_PATTERN = re.compile(
+    r"""\bTbd\s*\.\s*of\s*\(\s*(?P<q>['"])(?P<intent>(?:\\.|(?!(?P=q)).)*)(?P=q)\s*\)""",
     re.DOTALL,
 )
 
@@ -527,23 +533,28 @@ def _scan_tbd(
     # `tbd("…")` call isn't double-counted by both patterns.
     seen_lines: set[int] = set()
 
-    # JIT-runtime style: `tbd("intent")` — intent travels in the call arg.
-    for m in _TBD_CALL_PATTERN.finditer(block):
-        absolute = base_offset + m.start()
-        line_no = _line_of(file_text, absolute)
-        intent = (m.group("intent") or "").strip()
-        if not intent:
-            continue
-        out.append(
-            TBDMarker(
-                line=line_no,
-                raw=block[m.start():m.end()].strip()[:120],
-                context=_snippet_at(file_text, absolute),
-                description=intent,
-                test_function=test_function,
+    # JIT-runtime styles. `tbd("intent")` covers Python (rule 3a) + TS/JS
+    # (rule 3b); `Tbd.of("intent")` covers Java (rule 3c). Both produce
+    # markers whose `description` IS the intent — no adjacent comment needed.
+    for pattern in (_TBD_CALL_PATTERN, _TBD_JAVA_PATTERN):
+        for m in pattern.finditer(block):
+            absolute = base_offset + m.start()
+            line_no = _line_of(file_text, absolute)
+            if line_no in seen_lines:
+                continue
+            intent = (m.group("intent") or "").strip()
+            if not intent:
+                continue
+            out.append(
+                TBDMarker(
+                    line=line_no,
+                    raw=block[m.start():m.end()].strip()[:120],
+                    context=_snippet_at(file_text, absolute),
+                    description=intent,
+                    test_function=test_function,
+                )
             )
-        )
-        seen_lines.add(line_no)
+            seen_lines.add(line_no)
 
     # Legacy style: bare `TBD_LOCATOR` + adjacent `TBD_INTENT:` comment.
     for m in _TBD_PATTERN.finditer(block):

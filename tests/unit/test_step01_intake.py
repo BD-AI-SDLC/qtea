@@ -1,4 +1,5 @@
-"""Step 1 intake tests — source-symmetric (all paths invoke spec-intake agent)."""
+"""Step 1 intake tests — JIRA paths invoke jira-to-ai-spec agent; local
+files and generic URLs are literal passthrough (no LLM call)."""
 
 from __future__ import annotations
 
@@ -55,46 +56,29 @@ def _fake_jira_payload() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Local file path — now ALSO invokes the spec-intake agent
+# Local file path — passthrough; no agent invocation
 # ---------------------------------------------------------------------------
 
 
-async def test_intake_local_file_enriched_via_agent(tmp_path: Path, monkeypatch):
-    """Local file source: agent enriches the markdown, doesn't passthrough."""
+async def test_intake_local_file_passthrough(tmp_path: Path, monkeypatch):
+    """Local file source: write file content verbatim to spec.md, no LLM call."""
     src = tmp_path / "input.md"
     src.write_text("# Hello\n\nLocal raw spec.", encoding="utf-8")
-    install_fake_anthropic(monkeypatch, text=_AGENT_SPEC_MD)
+    # Tripwire: agent must NOT be called for local-file sources.
+    install_fake_anthropic(monkeypatch, text="should not appear")
 
     ctx = _ctx(tmp_path, str(src))
     result = await IntakeStep().run(ctx)
 
     assert result.success is True
     assert result.status == "completed"
-    spec = ctx.workspace.step_dir(1) / "spec.md"
-    # Agent output replaces raw file content (the local file was enriched).
-    assert "Enriched by agent" in spec.read_text(encoding="utf-8")
-    # Provenance stub still records the local source.
+    spec_text = (ctx.workspace.step_dir(1) / "spec.md").read_text(encoding="utf-8")
+    # Verbatim source content (no agent enrichment).
+    assert spec_text == "# Hello\n\nLocal raw spec."
+    assert "should not appear" not in spec_text
+    # Provenance stub records the local source.
     jira_stub = (ctx.workspace.step_dir(1) / "jira-spec.md").read_text(encoding="utf-8")
     assert "Copied from" in jira_stub or "Local spec" in jira_stub
-
-
-async def test_intake_local_file_inlines_raw_into_user_prompt(
-    tmp_path: Path, monkeypatch
-):
-    """Raw file content must reach the LLM via the spec-source.md input."""
-    src = tmp_path / "input.md"
-    src.write_text("# Hello\n\nDISTINCTIVE_LOCAL_MARKER", encoding="utf-8")
-    captured: dict = {}
-    install_fake_anthropic(monkeypatch, text=_AGENT_SPEC_MD, on_call=captured.update)
-
-    ctx = _ctx(tmp_path, str(src))
-    result = await IntakeStep().run(ctx)
-    assert result.success
-
-    user_content = captured["messages"][-1]["content"]
-    assert "DISTINCTIVE_LOCAL_MARKER" in user_content
-    # Shape-B header — the agent uses this to switch templates.
-    assert "spec-source.md" in user_content
 
 
 async def test_intake_missing_local_file_fails(tmp_path: Path):
@@ -107,12 +91,12 @@ async def test_intake_missing_local_file_fails(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Generic URL download — now ALSO invokes the spec-intake agent
+# Generic URL download — passthrough; no agent invocation
 # ---------------------------------------------------------------------------
 
 
-async def test_intake_url_downloaded_content_enriched(tmp_path: Path, monkeypatch):
-    """Generic URL source: download + agent enrichment (same as local file path)."""
+async def test_intake_url_passthrough(tmp_path: Path, monkeypatch):
+    """Generic URL source: write downloaded body verbatim to spec.md, no LLM call."""
     ctx = _ctx(tmp_path, "https://example.invalid/spec.md")
 
     # Patch the downloader at the module boundary instead of mocking httpx.
@@ -121,22 +105,21 @@ async def test_intake_url_downloaded_content_enriched(tmp_path: Path, monkeypatc
         lambda _url: "# Remote\n\nDISTINCTIVE_URL_MARKER\n",
     )
 
-    captured: dict = {}
-    install_fake_anthropic(monkeypatch, text=_AGENT_SPEC_MD, on_call=captured.update)
+    # Tripwire: agent must NOT be called for generic-URL sources.
+    install_fake_anthropic(monkeypatch, text="should not appear")
 
     result = await IntakeStep().run(ctx)
     assert result.success
-    spec = ctx.workspace.step_dir(1) / "spec.md"
-    assert "Enriched by agent" in spec.read_text(encoding="utf-8")
-
-    # Confirm downloaded content was inlined for the agent.
-    user_content = captured["messages"][-1]["content"]
-    assert "DISTINCTIVE_URL_MARKER" in user_content
-    assert "spec-source.md" in user_content
+    spec_text = (ctx.workspace.step_dir(1) / "spec.md").read_text(encoding="utf-8")
+    assert spec_text == "# Remote\n\nDISTINCTIVE_URL_MARKER\n"
+    assert "should not appear" not in spec_text
+    # Provenance stub records the URL source.
+    jira_stub = (ctx.workspace.step_dir(1) / "jira-spec.md").read_text(encoding="utf-8")
+    assert "Downloaded from" in jira_stub or "External source" in jira_stub
 
 
 # ---------------------------------------------------------------------------
-# JIRA path: jira:KEY shorthand → REST + spec-intake agent
+# JIRA path: jira:KEY shorthand → REST + jira-to-ai-spec agent
 # ---------------------------------------------------------------------------
 
 
@@ -291,7 +274,7 @@ async def test_intake_agent_no_output_fails(tmp_path: Path, monkeypatch):
     ctx = _ctx(tmp_path, "jira:PROJ-2")
     result = await IntakeStep().run(ctx)
     assert not result.success
-    assert "spec-intake failed" in (result.error or "") or "no output" in (result.error or "")
+    assert "jira-to-ai-spec failed" in (result.error or "") or "no output" in (result.error or "")
 
 
 async def test_intake_url_download_failure_propagates(tmp_path: Path, monkeypatch):

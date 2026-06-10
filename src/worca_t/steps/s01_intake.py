@@ -1,33 +1,33 @@
 """Step 1: Requirement intake.
 
-Sources (all paths produce a uniformly-enriched ``spec.md`` via the
-``spec-intake`` agent — Step 1 is source-symmetric):
+Behavior is **source-asymmetric**: only JIRA paths invoke the LLM enrichment
+agent. Local files and generic URLs pass through as literal copies / literal
+downloads. Step 2 (`refine-spec`) handles structural refinement uniformly.
+
+Sources:
   - ``jira:KEY-123``                              → fetch via direct Jira REST,
-    inline the JSON payload, enrich via the agent
+    inline the slim JSON payload, enrich via the ``jira-to-ai-spec`` agent
   - ``https://*.atlassian.net/browse/KEY-123``    → same; base URL inferred
-    from the URL host (overrides JIRA_BASE_URL)
+    from the URL host (overrides ``JIRA_BASE_URL``)
   - ``https://rb-tracker.bosch.com/tracker01/browse/KEY-123`` → same, DC path
-  - ``http(s)://...`` (other)                     → download the markdown,
-    inline it, enrich via the agent
-  - file path / relative path                     → read the file, inline it,
-    enrich via the agent
+  - ``http(s)://...`` (other)                     → download the body and write
+    it verbatim to ``spec.md`` (no agent call)
+  - file path / relative path                     → read the file and write
+    it verbatim to ``spec.md`` (no agent call)
 
 Outputs (in ``artifacts/step01/``):
-  - ``spec.md``       — normalized 10-section spec (agent output, downstream input)
+  - ``spec.md``       — JIRA: normalized 10-section spec (agent output).
+                         Non-JIRA: literal source content (passthrough).
   - ``jira-spec.md``  — provenance stub (no downstream consumer, audit only)
 
 Transport: ``worca_t.jira_client.fetch_issue`` for the JIRA REST fetch
-(replaces the Atlassian MCP) and
-``worca_t.llm.reasoning.call_reasoning_llm`` (with the ``spec-intake``
-agent) for the enrichment step. All source paths funnel through the
-same enrichment helper so downstream steps see consistently structured
-input regardless of where the user pointed worca-t.
+(no Atlassian MCP) and ``worca_t.llm.reasoning.call_reasoning_llm`` (with the
+``jira-to-ai-spec`` agent) for JIRA enrichment.
 """
 
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path
 
 import httpx
@@ -74,7 +74,7 @@ def _read_local_text(src: str) -> str:
 
 
 def _slim_jira_payload(payload: dict) -> dict:
-    """Trim a raw Jira payload to the fields the spec-intake agent needs.
+    """Trim a raw Jira payload to the fields the jira-to-ai-spec agent needs.
 
     Raw Jira issue payloads carry dozens of fields the spec template doesn't
     use (avatar URLs, schema metadata, etc.) — these are pure context-window
@@ -101,22 +101,17 @@ def _slim_jira_payload(payload: dict) -> dict:
     return slim
 
 
-async def _enrich_via_agent(
+async def _enrich_jira_via_agent(
     *,
     workdir: Path,
     out_dir: Path,
     source_label: str,
-    input_name: str,
-    input_content: str,
-    source_kind: str,
+    payload_json: str,
 ) -> Path:
-    """Invoke the ``spec-intake`` agent on inlined source content.
+    """Invoke the ``jira-to-ai-spec`` agent on an inlined JIRA payload.
 
-    The agent (`agents/spec-intake.agent.md`) accepts either a JIRA JSON
-    payload (when ``input_name == "jira-issue.json"``) OR raw markdown
-    (when ``input_name == "spec-source.md"``) and produces a normalized
-    10-section spec.md. The orchestrator writes the agent's response
-    directly to ``artifacts/step01/spec.md``.
+    Used ONLY for JIRA sources. Local files and generic URLs bypass this
+    helper and write their content verbatim to ``spec.md``.
 
     Parameters
     ----------
@@ -124,28 +119,16 @@ async def _enrich_via_agent(
         Standard step paths.
     source_label:
         Human-readable provenance string the agent embeds in the spec's
-        ``> Source:`` header line. Examples:
-          * ``"https://bosch-pt.atlassian.net/browse/MEAS-5490"``
-          * ``"jira:MEAS-5490"``
-          * ``"https://example.com/spec.md"``
-          * ``"/path/to/local/spec.md"``
-    input_name:
-        Either ``"jira-issue.json"`` (signals shape A to the agent) or
-        ``"spec-source.md"`` (signals shape B). Used as the fenced section
-        header in the inlined input.
-    input_content:
-        The actual source content (JSON string for JIRA, raw markdown
-        for file/URL).
-    source_kind:
-        Short descriptor for the user-prompt: ``"JIRA payload"``,
-        ``"downloaded URL"``, or ``"local file"``. The agent uses this
-        in its footer line.
+        ``> Source:`` header line. Examples: ``"jira:MEAS-5490"`` or
+        ``"https://bosch-pt.atlassian.net/browse/MEAS-5490"``.
+    payload_json:
+        JSON string of the slimmed JIRA issue payload.
     """
     agents_root = package_resource_root() / "agents"
-    agent = agents_root / "spec-intake.agent.md"
+    agent = agents_root / "jira-to-ai-spec.agent.md"
 
     user_prompt = (
-        f"Enrich the {source_kind} below into the spec.md markdown per "
+        f"Enrich the JIRA payload below into the spec.md markdown per "
         f"your agent template. Use `{source_label}` as the value of the "
         f"`Source:` provenance line in the header. Don't add code fences "
         f"around the spec body, no preamble. Return only the spec.md "
@@ -156,7 +139,7 @@ async def _enrich_via_agent(
         agent,
         workdir=workdir,
         user_prompt=user_prompt,
-        inputs={input_name: input_content},
+        inputs={"jira-issue.json": payload_json},
         output_schema=None,
         timeout_s=step_timeout(1),
         step=1,
@@ -164,7 +147,7 @@ async def _enrich_via_agent(
 
     if not result.success or not result.final_text:
         raise RuntimeError(
-            f"spec-intake failed: {result.error or 'no output'}"
+            f"jira-to-ai-spec failed: {result.error or 'no output'}"
         )
 
     dst = out_dir / "spec.md"
@@ -179,7 +162,7 @@ async def _jira_via_rest(
     out_dir: Path,
     workdir: Path,
 ) -> Path:
-    """Fetch a Jira ticket via direct REST + enrich via the spec-intake agent."""
+    """Fetch a Jira ticket via direct REST + enrich via the jira-to-ai-spec agent."""
     del ctx  # accepted for signature parity with other intake helpers
     try:
         payload = fetch_issue(base_url, ticket_id)
@@ -193,53 +176,32 @@ async def _jira_via_rest(
         payload["fields"]["description"] = normalize_description(payload)
 
     slim = _slim_jira_payload(payload)
-    return await _enrich_via_agent(
+    return await _enrich_jira_via_agent(
         workdir=workdir,
         out_dir=out_dir,
         source_label=f"{base_url}/browse/{ticket_id}",
-        input_name="jira-issue.json",
-        input_content=json.dumps(slim, indent=2, ensure_ascii=False),
-        source_kind="JIRA payload",
+        payload_json=json.dumps(slim, indent=2, ensure_ascii=False),
     )
 
 
-async def _url_via_agent(
-    url: str,
-    out_dir: Path,
-    workdir: Path,
-) -> Path:
-    """Download a generic URL + enrich via the spec-intake agent."""
+def _url_passthrough(url: str, out_dir: Path) -> Path:
+    """Download a generic URL and write the body verbatim to spec.md."""
     try:
         raw_md = _download_text(url)
     except httpx.HTTPError as e:
         raise RuntimeError(f"url download failed: {e}") from e
 
-    return await _enrich_via_agent(
-        workdir=workdir,
-        out_dir=out_dir,
-        source_label=url,
-        input_name="spec-source.md",
-        input_content=raw_md,
-        source_kind="downloaded URL content",
-    )
+    dst = out_dir / "spec.md"
+    dst.write_text(raw_md, encoding="utf-8")
+    return dst
 
 
-async def _file_via_agent(
-    src: str,
-    out_dir: Path,
-    workdir: Path,
-) -> Path:
-    """Read a local file + enrich via the spec-intake agent."""
+def _file_passthrough(src: str, out_dir: Path) -> Path:
+    """Copy a local file's content verbatim to spec.md."""
     raw_md = _read_local_text(src)  # raises FileNotFoundError if missing
-    resolved = str(Path(src).expanduser().resolve())
-    return await _enrich_via_agent(
-        workdir=workdir,
-        out_dir=out_dir,
-        source_label=resolved,
-        input_name="spec-source.md",
-        input_content=raw_md,
-        source_kind="local file",
-    )
+    dst = out_dir / "spec.md"
+    dst.write_text(raw_md, encoding="utf-8")
+    return dst
 
 
 class IntakeStep(Step):
@@ -291,19 +253,19 @@ class IntakeStep(Step):
                     encoding="utf-8",
                 )
             elif _is_url(src):
-                await _url_via_agent(src, out_dir, wd)
+                _url_passthrough(src, out_dir)
                 jira_dst.write_text(
                     f"# External source\n\nDownloaded from: {src}\n\n"
-                    f"Raw download not retained — see `spec.md` for the "
-                    f"enriched content.\n",
+                    f"Raw download written verbatim to `spec.md` — no agent "
+                    f"enrichment was performed at step 1.\n",
                     encoding="utf-8",
                 )
             else:
-                await _file_via_agent(src, out_dir, wd)
+                _file_passthrough(src, out_dir)
                 jira_dst.write_text(
                     f"# Local spec\n\nCopied from: {Path(src).expanduser().resolve()}\n\n"
-                    f"Raw file not retained — see `spec.md` for the "
-                    f"enriched content.\n",
+                    f"Raw file content written verbatim to `spec.md` — no "
+                    f"agent enrichment was performed at step 1.\n",
                     encoding="utf-8",
                 )
         except Exception as e:
@@ -330,12 +292,12 @@ class IntakeStep(Step):
 __all__ = [
     "IntakeStep",
     "_download_text",
-    "_enrich_via_agent",
-    "_file_via_agent",
+    "_enrich_jira_via_agent",
+    "_file_passthrough",
     "_is_jira",
     "_is_url",
     "_jira_via_rest",
     "_read_local_text",
     "_slim_jira_payload",
-    "_url_via_agent",
+    "_url_passthrough",
 ]

@@ -43,7 +43,36 @@
       "Bash(grep -v \"^$\")",
       "Bash(PYTHONPATH=\"c:/MAS/Production_ready/worca-t/src\" python -m pytest tests/ -v -x)",
       "mcp__atlassian__jira_get_issue",
-      "mcp__atlassian__jira_get_myself"
+      "mcp__atlassian__jira_get_myself",
+      "Bash(grep -n \"splitlines\\\\|readlines\\\\|\\\\\\\\.split\" \"c:\\\\MAS\\\\Production_ready\\\\worca-t\\\\src\\\\worca_t\\\\steps\\\\s08_locator_resolution.py\")",
+      "Bash(grep -n \"schema_name\\\\|schema_file\\\\|json$\" \"/c/MAS/Production_ready/worca-t/src/worca_t/schemas.py\")",
+      "Bash(grep -n \"351.*SyntaxWarning\\\\|SyntaxWarning.*351\\\\|\\\\\\\\\\\\\\\\s.*invalid escape\" \"C:\\\\Users\\\\ets1wz\\\\.worca-t\\\\20260601-212148-1050f7/run.log.jsonl\")",
+      "Bash(.venv/Scripts/python -m pytest tests/unit/test_test_runner.py::test_execute_command_does_not_leak_secrets tests/unit/test_test_runner.py::test_prepare_sut_does_not_leak_secrets tests/unit/test_mcp_manager.py::test_probe_server_strips_secrets -x -v)",
+      "Bash(.venv/Scripts/python -m pytest tests/unit/test_test_runner.py tests/unit/test_mcp_manager.py -x -v)",
+      "Bash(.venv/Scripts/python -m pytest tests/unit/test_step06_research.py::test_discover_sut_env_keys_excludes_secrets -x -v)",
+      "Bash(.venv/Scripts/python -m pytest tests/unit/test_step06_research.py -x -q)",
+      "Bash(.venv/Scripts/python -m pytest tests/unit/test_test_runner.py -x -v)",
+      "Bash(.venv/Scripts/python -m pytest tests/unit/test_test_runner.py -x -q)",
+      "Bash(.venv/Scripts/python -m pytest tests/unit/test_step09_execute.py -x -q)",
+      "Bash(.venv/Scripts/python -m pytest tests/unit/test_stack_profile.py -x -q)",
+      "Bash(.venv/Scripts/python -m pytest tests/unit/test_env_resolver.py -x -v)",
+      "Bash(.venv/Scripts/python -m pytest tests/unit/test_step06_research.py::test_materialize_sut_git_clone_uses_double_dash -x -v)",
+      "Bash(.venv/Scripts/python -m pytest tests/unit/test_step01_intake.py -x -q)",
+      "Bash(.venv/Scripts/python -m pytest tests/unit/ -x -q)",
+      "Bash(grep -E \"\\\\.py$\")",
+      "Bash(PYTHONPATH=src python -c \"from worca_t.steps.s08_locator_resolution import LocatorResolutionStep, _is_assignment_line, _hitl_resolve_unresolvable, _audit_snapshot_policy, _apply_line_targeted, _parse_clarification_header, _infer_strategy, _is_spec_gap_answer, _find_item_for_clarification; print\\('ok'\\)\")",
+      "Bash(ls .venv/Scripts/python.exe)",
+      "Bash(ls venv/Scripts/python.exe)",
+      "Bash(poetry add *)",
+      "Bash(poetry config *)",
+      "Bash(curl -sS -o /dev/null -w \"pypi status: %{http_code} time: %{time_total}s\\\\n\" --max-time 15 https://pypi.org/simple/pydantic-settings/)",
+      "Bash(nslookup pypi.org)",
+      "Bash(env)",
+      "Bash(poetry install *)"
     ]
-  }
+  },
+  "enabledMcpjsonServers": [
+    "playwright",
+    "atlassian"
+  ]
 }

@@ -283,6 +283,20 @@ def run(
             "the `<sut>/.worca-t/dev-locators.json` convention path."
         ),
     ),
+    cache: bool = typer.Option(
+        False,
+        "--cache",
+        help=(
+            "Enable Claude Code prompt caching for this run. Default is OFF "
+            "because the Bosch Vertex relay does not preserve cache affinity "
+            "across requests — measured net cost ~+$1.30/run on Step 7 Opus "
+            "turns from the 25% cache-creation surcharge with zero read-side "
+            "payback. Pass --cache when running against a backend that does "
+            "serve cross-request cache reads (direct Vertex / direct "
+            "Anthropic API). Sets DISABLE_PROMPT_CACHING=1 in agent env "
+            "when omitted."
+        ),
+    ),
 ) -> None:
     """Run the full SDLC pipeline."""
     from worca_t.node_env import ensure_node
@@ -315,6 +329,7 @@ def run(
         yes=yes,
         no_auto_deps=no_auto_deps,
         dev_locators=dev_locators,
+        cache=cache,
     )
     rc = asyncio.run(run_pipeline(opts, console=console))
     raise typer.Exit(code=rc)

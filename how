@@ -1,0 +1,148 @@
+[33mcommit 8396e2476f362ee26c37fb2215459c91615fc633[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mworkflow-optimizations-4[m[33m)[m
+Author: Sagui Ettinger <ets1wz@bosch.com>
+Date:   Mon Jun 8 16:32:45 2026 +0200
+
+    migrate(s10): direct SDK for bug classifier
+    
+    First step migration (M2) — replaces the Agent SDK subprocess invocation
+    in Step 10 (bug classification) with a direct AsyncAnthropic call via
+    the new `worca_t.llm.reasoning.call_reasoning_llm()` transport.
+    
+    Why Step 10 first: lowest blast radius. Pure JSON-in/JSON-out reasoning;
+    no MCP, no file tools, single downstream consumer (Step 11 report).
+    Easy to A/B against the Agent SDK version on existing run artifacts.
+    
+    Behavioural changes:
+    
+    - Inputs (bug-candidates.json, run-results.json, heal-log.jsonl,
+      test-strategy.json, plus reference templates / examples) are now
+      inlined as fenced markdown sections in the user prompt instead of
+      staged as files in the agent workdir. The agent sees the same data
+      in the same canonical form; only the transport mechanism changes.
+    - Output is enforced by `output_config.format` (json_schema) at
+      generation time using the existing `bug-reports` schema. The model
+      cannot return a non-conforming response — eliminates the
+      "agent returned invalid JSON" failure mode that previously fell
+      through to fallback synthesis.
+    - The `bug-reports.md` view is now ALWAYS rendered locally from the
+      validated JSON via `_render_markdown`. Previously the agent could
+      emit either both .json + .md, or only .json (with the step
+      rendering .md from JSON). Always-local rendering is more consistent
+      and removes a possible divergence point between the two artifacts.
+    - The user prompt no longer instructs the agent to "emit
+      ./bug-reports.json AND ./bug-reports.md" — those are workdir-file
+      semantics from the Agent SDK era. The new prompt says "respond with
+      the JSON object only" (which structured outputs enforces anyway).
+    
+    Defense-in-depth preserved:
+    - `_agent_report_is_usable()` still validates the parsed payload
+      against the schema (covers the edge case where structured outputs
+      somehow gives valid JSON but wrong bug count).
+    - Deterministic `_synthesize()` fallback unchanged — still kicks in
+      on JSON parse failure, schema mismatch, or count mismatch.
+    - All structural helpers (`_empty_report`, `_categorize_attachments`,
+      `_render_markdown`, `_load_heal_log`, `_synthesize`,
+      `_agent_report_is_usable`) untouched.
+    
+    Tests updated:
+    - Switched mock from `_fake_claude.install_fake_query` to
+      `_fake_anthropic.install_fake_anthropic`.
+    - Existing test cases adapted to the new direct-SDK contract:
+      agent returns JSON as response text (not as a workdir file).
+    - Two new tests added:
+      - `test_step10_passes_bug_reports_schema_to_reasoning_llm`:
+        asserts the step actually enables structured outputs by passing
+        the schema (catches a regression where someone might pass
+        output_schema=None by mistake).
+      - `test_step10_inlines_inputs_into_user_prompt`: asserts inputs
+        show up in the user message (catches regression where someone
+        reverts to file-staging semantics).
+      - `test_step10_falls_back_when_agent_count_mismatches`: validates
+        the defense-in-depth path for structured-but-wrong-count outputs.
+    - Removed `test_step10_renders_md_when_agent_omits_it` — no longer
+      meaningful since markdown is always rendered locally.
+    
+    Pure-helpers tests (6) + step-integration tests (7) = 13 passing
+    in 2.44s. Cross-checked against the reasoning module's 17 tests +
+    test_step11 + test_pipeline (65/65 total, 23.5s).
+    
+    Local-only commit; not pushed.
+
+[1mdiff --git a/src/worca_t/steps/s10_bug_classifier.py b/src/worca_t/steps/s10_bug_classifier.py[m
+[1mindex 4a281d7..f4a0e0a 100644[m
+[1m--- a/src/worca_t/steps/s10_bug_classifier.py[m
+[1m+++ b/src/worca_t/steps/s10_bug_classifier.py[m
+[36m@@ -4,27 +4,32 @@[m [mReads Step 9's `run-results.json` + `bug-candidates.json` and (optionally)[m
+ `heal-log.jsonl`. When no failures exist, emits an empty, schema-valid[m
+ `bug-reports.json` and a trivial markdown summary, skipping the agent.[m
+ [m
+[31m-Otherwise stages the inputs into the agent workdir, invokes the[m
+[31m-`bug-report-classifier` agent, validates its `bug-reports.json` against the[m
+[31m-canonical schema, and falls back to a deterministic synthesis from[m
+[31m-`bug-candidates.json` when the agent output is unusable. The fallback marks[m
+[31m-every bug with a `rationale` of "auto-classified (agent output unusable)" so[m
+[31m-downstream consumers can distinguish.[m
+[32m+[m[32mOtherwise inlines the inputs into the agent prompt, invokes the[m
+[32m+[m[32m`bug-report-classifier` agent via the direct Anthropic SDK with structured[m
+[32m+[m[32moutputs enforcing the `bug-reports` schema at generation time, and falls back[m
+[32m+[m[32mto a deterministic synthesis from `bug-candidates.json` when the agent[m
+[32m+[m[32moutput is unusable. The fallback marks every bug with a `rationale` of[m
+[32m+[m[32m"auto-classified (agent output unusable)" so downstream consumers can[m
+[32m+[m[32mdistinguish.[m
+[32m+[m
+[32m+[m[32mTransport: this step uses `worca_t.llm.reasoning.call_reasoning_llm` (direct[m
+[32m+[m[32mSDK, no subprocess, no MCP). The agent returns JSON in its response text;[m
+[32m+[m[32mthe markdown view is always rendered locally from that JSON via[m
+[32m+[m[32m`_render_markdown` for consistency.[m
+ """[m
+ [m
+ from __future__ import annotations[m
+ [m
+ import json[m
+[31m-import shutil[m
+ from datetime import UTC, datetime[m
+ from pathlib import Path[m
+ from typing import Any[m
+ [m
+[31m-from worca_t.claude_runner import run_agent[m
+ from worca_t.config import package_resource_root, step_timeout[m
+[32m+[m[32mfrom worca_t.llm.reasoning import call_reasoning_llm[m
+ from worca_t.logging_setup import get_logger[m
+ from worca_t.md_parser import slugify[m
+[31m-from worca_t.schemas import is_valid[m
+[32m+[m[32mfrom worca_t.schemas import is_valid, load_schema[m
+ from worca_t.steps.base import Step, StepContext, StepResult[m
+ [m
+ log = get_logger(__name__)[m
+[36m@@ -262,25 +267,26 @@[m [mclass BugClassifierStep(Step):[m
+                 notes="no failures; empty report",[m
+             )[m
+ [m
+[31m-        # Stage inputs for the agent.[m
+[32m+[m[32m        # Build inline inputs for the agent. The direct-SDK transport[m
+[32m+[m[32m        # embeds these as fenced markdown sections in the user prompt[m
+[32m+[m[32m        # instead of staging them as files in the workdir.[m
+[32m+[m[32m        inputs: dict[str, str] = {[m
+[32m+[m[32m            "bug-candidates.json": json.dumps(bug_candidates, indent=2, ensure_ascii=False),[m
+[32m+[m[32m        }[m
+         if run_results is not None:[m
+[31m-            (wd / "run-results.json").write_text([m
+[31m-                json.dumps(run_results, indent=2, ensure_ascii=False), encoding="utf-8"[m
+[31m-            )[m
+[31m-        (wd / "bug-candidates.json").write_text([m
+[31m-            json.dumps(bug_candidates, indent=2, ensure_ascii=False), encoding="utf-8"[m
+[31m-        )[m
+[32m+[m[32m            inputs["run-results.json"] = json.dumps(run_results, indent=2, ensure_ascii=False)[m
+ [m
+         heal_src = ctx.workspace.step_dir(9) / "self-heal" / "heal-log.jsonl"[m
+         heal_map: dict[str, dict] = _load_heal_log(heal_src)[m
+         if heal_src.exists():[m
+[31m-            shutil.copy2(heal_src, wd / "heal-log.jsonl")[m
+[32m+[m[32m            inputs["heal-log.jsonl"] = heal_src.read_text(encoding="utf-8")[m
+ [m
+         strategy_src = ctx.workspace.step_dir(4) / "test-strategy.json"[m
+         if strategy_src.exists():[m
+[31m-            shutil.copy2(strategy_src, wd / "test-strategy.json")[m
+[32m+[m[32m            inputs["test-strategy.json"] = strategy_src.read_text(encoding="utf-8")[m
+ [m
+[31m-        # Stage hel
