@@ -1,28 +1,45 @@
 """Step 1: Requirement intake.
 
-Sources:
-  - `jira:KEY-123`            -> invoke jira-to-ai-spec agent (Atlassian MCP)
-  - https://*.atlassian.net/browse/KEY-123  (or any URL whose path matches
-    `/browse/<KEY-NNN>`)      -> extract ticket key, route through Jira agent
-  - http(s)://... (other)      -> download markdown
-  - file path / relative path  -> copy locally
+Behavior is **source-asymmetric**: only JIRA paths invoke the LLM enrichment
+agent. Local files and generic URLs pass through as literal copies / literal
+downloads. Step 2 (`refine-spec`) handles structural refinement uniformly.
 
-Outputs (in artifacts/step01/):
-  - spec.md       (normalized spec, downstream input)
-  - jira-spec.md  (provenance stub — no downstream consumer, kept for auditing)
+Sources:
+  - ``jira:KEY-123``                              → fetch via direct Jira REST,
+    inline the slim JSON payload, enrich via the ``jira-to-ai-spec`` agent
+  - ``https://*.atlassian.net/browse/KEY-123``    → same; base URL inferred
+    from the URL host (overrides ``JIRA_BASE_URL``)
+  - ``https://rb-tracker.bosch.com/tracker01/browse/KEY-123`` → same, DC path
+  - ``http(s)://...`` (other)                     → download the body and write
+    it verbatim to ``spec.md`` (no agent call)
+  - file path / relative path                     → read the file and write
+    it verbatim to ``spec.md`` (no agent call)
+
+Outputs (in ``artifacts/step01/``):
+  - ``spec.md``       — JIRA: normalized 10-section spec (agent output).
+                         Non-JIRA: literal source content (passthrough).
+  - ``jira-spec.md``  — provenance stub (no downstream consumer, audit only)
+
+Transport: ``worca_t.jira_client.fetch_issue`` for the JIRA REST fetch
+(no Atlassian MCP) and ``worca_t.llm.reasoning.call_reasoning_llm`` (with the
+``jira-to-ai-spec`` agent) for JIRA enrichment.
 """
 
 from __future__ import annotations
 
-import re
-import shutil
+import json
 from pathlib import Path
-from urllib.parse import urlparse
 
 import httpx
 
-from worca_t.claude_runner import run_agent
 from worca_t.config import package_resource_root, step_timeout
+from worca_t.jira_client import (
+    JiraFetchError,
+    fetch_issue,
+    normalize_description,
+    parse_jira_spec_source,
+)
+from worca_t.llm.reasoning import call_reasoning_llm
 from worca_t.logging_setup import get_logger
 from worca_t.proxy import with_proxy_env
 from worca_t.steps.base import Step, StepContext, StepResult
@@ -38,76 +55,152 @@ def _is_url(src: str) -> bool:
     return src.lower().startswith(("http://", "https://"))
 
 
-_JIRA_BROWSE_RE = re.compile(r"/browse/([A-Z][A-Z0-9_]+-\d+)", re.IGNORECASE)
-
-
-def _jira_ticket_from_url(src: str) -> str | None:
-    """Return the ticket key if `src` is a Jira browse URL, else None.
-
-    Matches the canonical permalink shape used by Atlassian Cloud and
-    self-hosted Jira: a path ending in `/browse/<PROJECT>-<NUMBER>`.
-    Query strings and fragments are ignored.
-    """
-    try:
-        parsed = urlparse(src)
-    except ValueError:
-        return None
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        return None
-    m = _JIRA_BROWSE_RE.search(parsed.path)
-    return m.group(1).upper() if m else None
-
-
-def _download(url: str, dst: Path) -> None:
+def _download_text(url: str) -> str:
+    """Fetch a URL and return its body as text (uses corporate proxy env)."""
     proxies_env = with_proxy_env()
     proxy = proxies_env.get("HTTPS_PROXY") or proxies_env.get("HTTP_PROXY")
     with httpx.Client(timeout=30.0, proxy=proxy, follow_redirects=True) as client:
         r = client.get(url)
         r.raise_for_status()
-        dst.write_text(r.text, encoding="utf-8")
+        return r.text
 
 
-def _copy_local(src: str, dst: Path) -> None:
+def _read_local_text(src: str) -> str:
+    """Read a local file and return its content as text."""
     p = Path(src).expanduser().resolve()
     if not p.exists():
         raise FileNotFoundError(f"spec file not found: {p}")
-    shutil.copy2(p, dst)
+    return p.read_text(encoding="utf-8")
 
 
-async def _jira_via_agent(ctx: StepContext, ticket_id: str, out_dir: Path, workdir: Path) -> Path:
+def _slim_jira_payload(payload: dict) -> dict:
+    """Trim a raw Jira payload to the fields the jira-to-ai-spec agent needs.
+
+    Raw Jira issue payloads carry dozens of fields the spec template doesn't
+    use (avatar URLs, schema metadata, etc.) — these are pure context-window
+    noise. We keep:
+      * top-level: key, self, id
+      * fields: summary, status, priority, issuetype, assignee, reporter,
+        created, updated, labels, components, fixVersions, issuelinks,
+        description (already normalized to markdown upstream)
+      * any field whose key starts with ``customfield_`` AND has a
+        non-empty value (those often carry meaningful project-specific data)
+    """
+    slim: dict = {k: payload.get(k) for k in ("key", "self", "id") if k in payload}
+    fields = payload.get("fields") or {}
+    keep_fields = (
+        "summary", "status", "priority", "issuetype", "assignee", "reporter",
+        "created", "updated", "labels", "components", "fixVersions",
+        "issuelinks",
+    )
+    slim_fields = {k: fields.get(k) for k in keep_fields if k in fields}
+    for k, v in fields.items():
+        if k.startswith("customfield_") and v not in (None, "", [], {}):
+            slim_fields[k] = v
+    slim["fields"] = slim_fields
+    return slim
+
+
+async def _enrich_jira_via_agent(
+    *,
+    workdir: Path,
+    out_dir: Path,
+    source_label: str,
+    payload_json: str,
+) -> Path:
+    """Invoke the ``jira-to-ai-spec`` agent on an inlined JIRA payload.
+
+    Used ONLY for JIRA sources. Local files and generic URLs bypass this
+    helper and write their content verbatim to ``spec.md``.
+
+    Parameters
+    ----------
+    workdir, out_dir:
+        Standard step paths.
+    source_label:
+        Human-readable provenance string the agent embeds in the spec's
+        ``> Source:`` header line. Examples: ``"jira:MEAS-5490"`` or
+        ``"https://bosch-pt.atlassian.net/browse/MEAS-5490"``.
+    payload_json:
+        JSON string of the slimmed JIRA issue payload.
+    """
     agents_root = package_resource_root() / "agents"
     agent = agents_root / "jira-to-ai-spec.agent.md"
-    claude_md = package_resource_root() / "CLAUDE.md"
 
-    result = await run_agent(
+    user_prompt = (
+        f"Enrich the JIRA payload below into the spec.md markdown per "
+        f"your agent template. Use `{source_label}` as the value of the "
+        f"`Source:` provenance line in the header. Don't add code fences "
+        f"around the spec body, no preamble. Return only the spec.md "
+        f"markdown content."
+    )
+
+    result = await call_reasoning_llm(
         agent,
         workdir=workdir,
-        inputs={},
-        user_prompt=(
-            f"Fetch Jira ticket `{ticket_id}` and produce a normalized markdown "
-            f"spec following your 10-section structure. Write the spec to "
-            f"`./spec.md` in this directory. This is the ONLY file you need to "
-            f"produce — do not write `jira-spec.md` or any other artifact.\n\n"
-            f"SCOPE — strict: call `mcp__atlassian__jira_get_issue` for "
-            f"`{ticket_id}` exactly once. Do NOT run `jira_search`, do NOT "
-            f"fetch linked/sub-task/parent tickets, do NOT chase referenced "
-            f"keys mentioned in the description or comments. Linked issues "
-            f"belong in Section 5.1 as plain references, not as fetched data. "
-            f"As soon as the main ticket payload is in hand, write `spec.md` "
-            f"and finish."
-        ),
+        user_prompt=user_prompt,
+        inputs={"jira-issue.json": payload_json},
+        output_schema=None,
         timeout_s=step_timeout(1),
         step=1,
-        max_turns=10,
-        claude_md=claude_md if claude_md.exists() else None,
     )
-    if not result.success:
-        raise RuntimeError(f"jira-to-ai-spec failed: {result.error or result.exit_code}")
-    produced = workdir / "spec.md"
-    if not produced.exists():
-        raise FileNotFoundError(f"jira-to-ai-spec did not produce {produced}")
+
+    if not result.success or not result.final_text:
+        raise RuntimeError(
+            f"jira-to-ai-spec failed: {result.error or 'no output'}"
+        )
+
     dst = out_dir / "spec.md"
-    shutil.copy2(produced, dst)
+    dst.write_text(result.final_text, encoding="utf-8")
+    return dst
+
+
+async def _jira_via_rest(
+    ctx: StepContext,
+    base_url: str,
+    ticket_id: str,
+    out_dir: Path,
+    workdir: Path,
+) -> Path:
+    """Fetch a Jira ticket via direct REST + enrich via the jira-to-ai-spec agent."""
+    del ctx  # accepted for signature parity with other intake helpers
+    try:
+        payload = fetch_issue(base_url, ticket_id)
+    except JiraFetchError as e:
+        raise RuntimeError(f"jira fetch failed: {e}") from e
+
+    # Normalize the description in-place: Cloud ADF → markdown, DC wiki
+    # passthrough. The agent template treats description as already-markdown
+    # to keep its instructions transport-agnostic.
+    if "fields" in payload:
+        payload["fields"]["description"] = normalize_description(payload)
+
+    slim = _slim_jira_payload(payload)
+    return await _enrich_jira_via_agent(
+        workdir=workdir,
+        out_dir=out_dir,
+        source_label=f"{base_url}/browse/{ticket_id}",
+        payload_json=json.dumps(slim, indent=2, ensure_ascii=False),
+    )
+
+
+def _url_passthrough(url: str, out_dir: Path) -> Path:
+    """Download a generic URL and write the body verbatim to spec.md."""
+    try:
+        raw_md = _download_text(url)
+    except httpx.HTTPError as e:
+        raise RuntimeError(f"url download failed: {e}") from e
+
+    dst = out_dir / "spec.md"
+    dst.write_text(raw_md, encoding="utf-8")
+    return dst
+
+
+def _file_passthrough(src: str, out_dir: Path) -> Path:
+    """Copy a local file's content verbatim to spec.md."""
+    raw_md = _read_local_text(src)  # raises FileNotFoundError if missing
+    dst = out_dir / "spec.md"
+    dst.write_text(raw_md, encoding="utf-8")
     return dst
 
 
@@ -126,37 +219,53 @@ class IntakeStep(Step):
 
         src = ctx.spec_source
         try:
-            ticket_from_url = _jira_ticket_from_url(src) if _is_url(src) else None
+            # Try parsing as a Jira reference first — handles both
+            # ``jira:KEY`` and full ``https://.../browse/KEY`` URLs.
+            jira_parsed = parse_jira_spec_source(src)
+
             if _is_jira(src):
-                ticket = src.split(":", 1)[1].strip()
+                ticket = src.split(":", 1)[1].strip().upper()
                 if not ticket:
                     raise ValueError("jira: source missing ticket id")
-                await _jira_via_agent(ctx, ticket, out_dir, wd)
+                if jira_parsed is None:
+                    raise ValueError(
+                        "jira:KEY shorthand requires JIRA_BASE_URL env var "
+                        "(or pass the full URL form: "
+                        "https://<tenant>.atlassian.net/browse/<KEY>)"
+                    )
+                base_url, _ = jira_parsed
+                await _jira_via_rest(ctx, base_url, ticket, out_dir, wd)
                 jira_dst.write_text(
                     f"# {ticket}\n\n"
+                    f"Source: {base_url}/browse/{ticket}\n\n"
                     f"Raw Jira capture not retained — see `spec.md` for the "
                     f"normalized content.\n",
                     encoding="utf-8",
                 )
-            elif ticket_from_url:
-                await _jira_via_agent(ctx, ticket_from_url, out_dir, wd)
+            elif jira_parsed is not None:
+                base_url, ticket = jira_parsed
+                await _jira_via_rest(ctx, base_url, ticket, out_dir, wd)
                 jira_dst.write_text(
-                    f"# {ticket_from_url}\n\n"
+                    f"# {ticket}\n\n"
                     f"Source URL: {src}\n\n"
                     f"Raw Jira capture not retained — see `spec.md` for the "
                     f"normalized content.\n",
                     encoding="utf-8",
                 )
             elif _is_url(src):
-                _download(src, spec_dst)
+                _url_passthrough(src, out_dir)
                 jira_dst.write_text(
-                    f"# External source\n\nDownloaded from: {src}\n",
+                    f"# External source\n\nDownloaded from: {src}\n\n"
+                    f"Raw download written verbatim to `spec.md` — no agent "
+                    f"enrichment was performed at step 1.\n",
                     encoding="utf-8",
                 )
             else:
-                _copy_local(src, spec_dst)
+                _file_passthrough(src, out_dir)
                 jira_dst.write_text(
-                    f"# Local spec\n\nCopied from: {Path(src).resolve()}\n",
+                    f"# Local spec\n\nCopied from: {Path(src).expanduser().resolve()}\n\n"
+                    f"Raw file content written verbatim to `spec.md` — no "
+                    f"agent enrichment was performed at step 1.\n",
                     encoding="utf-8",
                 )
         except Exception as e:
@@ -177,3 +286,18 @@ class IntakeStep(Step):
             outputs=[spec_dst, jira_dst],
             notes=f"intake source: {src}",
         )
+
+
+# Re-export legacy helper names for tests/other modules that import them.
+__all__ = [
+    "IntakeStep",
+    "_download_text",
+    "_enrich_jira_via_agent",
+    "_file_passthrough",
+    "_is_jira",
+    "_is_url",
+    "_jira_via_rest",
+    "_read_local_text",
+    "_slim_jira_payload",
+    "_url_passthrough",
+]

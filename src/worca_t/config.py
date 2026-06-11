@@ -16,16 +16,15 @@ MAX_STEP_TIMEOUT_S = 1800
 
 DEFAULT_STEP_TIMEOUTS: dict[int, int] = {
     1: 600,
-    2: 300,
+    2: 600,
     3: 900,
     4: 1500,
-    5: 300,
+    5: 500,
     6: 900,
     7: 1800,
-    8: 1500,
-    9: 1800,
-    10: 600,
-    11: 600,
+    8: 1800,  # execute + self-heal
+    9: 600,   # bug-classifier
+    10: 600,  # report
 }
 
 # Markdown size enforcement.
@@ -38,6 +37,7 @@ SECRET_ENV_KEYS = frozenset(
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
         "JIRA_API_TOKEN",
+        "JIRA_PAT",
         "JIRA_XRAY_CLIENT_SECRET",
         "JIRA_XRAY_API_KEY",
         "JIRA_XRAY_CLIENT_ID",
@@ -109,6 +109,94 @@ def get_settings() -> Settings:
         default_workspace=Path(ws_str),
         max_step_timeout_s=timeout,
     )
+
+
+def anthropic_auth_kwargs() -> dict[str, str]:
+    """Return the auth kwargs to pass to ``anthropic.AsyncAnthropic`` / ``anthropic.Anthropic``.
+
+    The Anthropic Python SDK has TWO mutually exclusive auth parameters and
+    they produce different HTTP headers:
+
+    * ``api_key=<k>``    → ``x-api-key: <k>`` header (raw Anthropic API)
+    * ``auth_token=<t>`` → ``Authorization: Bearer <t>`` header (OAuth / model farm proxies)
+
+    The ``claude`` CLI dispatches based on which env var is set:
+    ``ANTHROPIC_AUTH_TOKEN`` → Bearer, ``ANTHROPIC_API_KEY`` → x-api-key.
+    This helper replicates that logic so direct-SDK callers
+    (``llm/reasoning.py``, ``jit_resolver.py``) authenticate correctly
+    against either the raw Anthropic API OR a model-farm proxy that
+    expects Bearer auth.
+
+    Returns an empty dict when neither env var is set — let the SDK raise
+    its standard "no API key" error rather than masking it here.
+
+    For Vertex-routed setups (Google Cloud Vertex AI, or proxies that
+    mimic the Vertex API like Bosch's model farm), use
+    :func:`use_vertex_backend` + :func:`anthropic_vertex_kwargs` instead.
+    """
+    auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    if auth_token:
+        return {"auth_token": auth_token}
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if api_key:
+        return {"api_key": api_key}
+    return {}
+
+
+def use_vertex_backend() -> bool:
+    """Return True when worca-t should route LLM calls through Vertex AI.
+
+    Detection mirrors the ``claude`` CLI:
+      * ``CLAUDE_CODE_USE_VERTEX=1`` (explicit opt-in), OR
+      * ``ANTHROPIC_VERTEX_BASE_URL`` set (proxies like Bosch's
+        ``aoai-farm.bosch-temp.com/api/google/v1`` that mimic the Vertex API)
+
+    Either signal flips the LLM transport from
+    :class:`anthropic.AsyncAnthropic` to :class:`anthropic.AsyncAnthropicVertex`.
+    The two clients construct URLs differently (Vertex includes
+    region + project in the path) and accept different auth (Vertex uses
+    ``access_token``; standard uses ``api_key`` / ``auth_token``).
+    """
+    if os.environ.get("CLAUDE_CODE_USE_VERTEX") == "1":
+        return True
+    if os.environ.get("ANTHROPIC_VERTEX_BASE_URL"):
+        return True
+    return False
+
+
+def anthropic_vertex_kwargs() -> dict[str, str]:
+    """Return constructor kwargs for ``anthropic.AsyncAnthropicVertex``.
+
+    Reads the standard Vertex env vars (``ANTHROPIC_VERTEX_BASE_URL``,
+    ``ANTHROPIC_VERTEX_PROJECT_ID``, ``CLOUD_ML_REGION``) plus the
+    ``access_token`` from ``ANTHROPIC_AUTH_TOKEN``. For proxy setups
+    (Bosch model farm) ``project_id`` is often a placeholder like ``"_"``
+    and ``region`` is unused because the proxy ignores it.
+
+    Returns only the kwargs that have values in env — the SDK fills in
+    sensible defaults for omitted ones (and raises a clear error if a
+    truly required one is missing, like project_id when ``CLOUD_ML_REGION``
+    isn't set).
+    """
+    kwargs: dict[str, str] = {}
+    base_url = os.environ.get("ANTHROPIC_VERTEX_BASE_URL")
+    if base_url:
+        kwargs["base_url"] = base_url
+    access_token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    if access_token:
+        kwargs["access_token"] = access_token
+    project_id = os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID")
+    if project_id:
+        kwargs["project_id"] = project_id
+    region = os.environ.get("CLOUD_ML_REGION")
+    if region:
+        kwargs["region"] = region
+    elif base_url:
+        # Bosch-style proxy with custom base_url ignores region but the
+        # SDK requires a non-empty value to construct the (then-discarded)
+        # URL template. Provide a safe placeholder.
+        kwargs["region"] = "us-east5"
+    return kwargs
 
 
 @lru_cache(maxsize=1)

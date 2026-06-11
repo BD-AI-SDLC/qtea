@@ -13,6 +13,7 @@ from worca_t.claude_runner import (
     _agent_key,
     _force_cleanup,
     _is_model_unavailable,
+    _stage_inputs,
     run_agent,
 )
 from worca_t.config import get_model_chain
@@ -25,6 +26,66 @@ def test_agent_key_strips_suffixes():
     assert _agent_key(Path("refine-spec.agent.md")) == "refine-spec"
     assert _agent_key(Path("test-manager.prompt.md")) == "test-manager"
     assert _agent_key(Path("plain.md")) == "plain"
+
+
+def test_stage_inputs_skips_same_file_copy(tmp_path: Path):
+    """Regression: if a caller pre-writes a file into the workdir AND adds it
+    to `inputs`, `_stage_inputs` must NOT crash with `[WinError 32]` (Windows)
+    or `SameFileError` (POSIX). The src-equals-dst case is a no-op.
+    """
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    pre_written = workdir / "active_module.json"
+    pre_written.write_text('{"name": "sut"}', encoding="utf-8")
+    # `src` and `dst` resolve to the same absolute path → previously raised.
+    _stage_inputs(workdir, {"active_module.json": pre_written})
+    # File still there, contents unchanged.
+    assert pre_written.read_text(encoding="utf-8") == '{"name": "sut"}'
+
+
+def test_stage_inputs_still_copies_external_files(tmp_path: Path):
+    """The same-file guard must not break the normal staging path."""
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    external = tmp_path / "elsewhere" / "spec.md"
+    external.parent.mkdir()
+    external.write_text("# spec", encoding="utf-8")
+    _stage_inputs(workdir, {"spec.md": external})
+    staged = workdir / "spec.md"
+    assert staged.exists()
+    assert staged.read_text(encoding="utf-8") == "# spec"
+
+
+def test_stage_inputs_raises_on_missing_source(tmp_path: Path):
+    """The missing-source error path stays intact."""
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    with pytest.raises(FileNotFoundError):
+        _stage_inputs(workdir, {"spec.md": tmp_path / "does-not-exist.md"})
+
+
+def test_agent_result_carries_mcp_servers_failed():
+    """Regression: AgentResult must expose `mcp_servers_failed` so Step 8 can
+    fail-fast when Playwright MCP didn't start (otherwise the agent aborts
+    silently and the user gets confusing 'warned, 0 resolutions' output)."""
+    from worca_t.claude_runner import AgentResult
+
+    r = AgentResult(
+        success=True, exit_code=0, duration_s=0.0,
+        transcript_path=Path("x"), stderr_path=Path("y"), metrics_path=Path("z"),
+        mcp_servers_failed=["playwright"],
+    )
+    assert r.mcp_servers_failed == ["playwright"]
+
+
+def test_agent_result_mcp_servers_failed_defaults_empty():
+    from worca_t.claude_runner import AgentResult
+
+    r = AgentResult(
+        success=True, exit_code=0, duration_s=0.0,
+        transcript_path=Path("x"), stderr_path=Path("y"), metrics_path=Path("z"),
+    )
+    assert r.mcp_servers_failed == []
 
 
 async def test_run_agent_happy_path(tmp_path: Path, monkeypatch):

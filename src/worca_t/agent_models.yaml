@@ -9,11 +9,10 @@ test-manager: claude-sonnet-4-6
 
 # -- Phase B: Research & Implementation --
 polyglot-test-researcher: claude-haiku-4-5@20251001
-ui-test-automation: claude-opus-4-6
-playwright-tester: claude-sonnet-4-6
+test-architect: claude-sonnet-4-6
+ui-test-automation: claude-sonnet-4-6
 
 # -- Phase C: Execution & Reporting --
-polyglot-test-tester: claude-haiku-4-5@20251001
 polyglot-test-fixer: claude-sonnet-4-6
 bug-report-classifier: claude-sonnet-4-6
 

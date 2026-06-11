@@ -239,13 +239,13 @@ The pipeline runs all 11 steps. You'll see console output like:
 ```text
 workspace .worca-t/20260523-143012-a1b2c3
 run_id    20260523-143012-a1b2c3
->>> step 01 intake
-step 01 ok  -> 2 outputs
->>> step 02 refine
-step 02 ok  -> 2 outputs
+>>> step 1 intake
+step 1 ok  -> 2 outputs
+>>> step 2 refine
+step 2 ok  -> 2 outputs
 ...
->>> step 11 report
-step 11 ok  -> 2 outputs
+>>> step 10 report
+step 10 ok  -> 2 outputs
 ```
 
 All `run` flags:
@@ -315,11 +315,10 @@ All artifacts are under `.worca-t/<run-id>/artifacts/`:
 │   ├── step04/   test-strategy.md, test-strategy.json
 │   ├── step05/   xray-mapping.json (skipped if no creds)
 │   ├── step06/   research.md, research.json
-│   ├── step07/   generated test files, tests-with-tbd.json
-│   ├── step08/   locator-resolution.json
-│   ├── step09/   run-results.json, screenshots/, traces/
-│   ├── step10/   bug-reports.md, bug-reports.json
-│   └── step11/   index.html, data/run.json, allure-results/
+│   ├── step07/   generated test files, tbd-index.json
+│   ├── step08/   run-results.json, screenshots/, traces/, locator-cache.json
+│   ├── step09/   bug-reports.md, bug-reports.json
+│   └── step10/   index.html, data/run.json, allure-results/
 ├── state.json    checkpoint state
 └── run.log.jsonl structured log
 ```
@@ -328,7 +327,7 @@ All artifacts are under `.worca-t/<run-id>/artifacts/`:
 
 ```bash
 # Built-in HTML (always generated)
-open .worca-t/<run-id>/artifacts/step11/index.html
+open .worca-t/<run-id>/artifacts/step10/index.html
 
 # Or use the --open-report flag to auto-open at end of run
 ```
@@ -338,7 +337,7 @@ open .worca-t/<run-id>/artifacts/step11/index.html
 ### Re-run only the report (after editing bug classifications)
 
 ```bash
-worca-t run --spec ./spec.md --sut ./app --only-step 11
+worca-t run --spec ./spec.md --sut ./app --only-step 10
 ```
 
 ### Resume after a failure
@@ -348,7 +347,7 @@ The pipeline auto-resumes from the last completed step:
 ```bash
 # First run fails at step 7
 worca-t run --spec ./spec.md --sut ./app
-# step 07 FAILED: ...
+# step 7 FAILED: ...
 
 # Fix the issue, then just re-run — steps 1-6 are skipped
 worca-t run --spec ./spec.md --sut ./app

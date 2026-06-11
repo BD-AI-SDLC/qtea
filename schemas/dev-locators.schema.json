@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worca-t/schemas/dev-locators.schema.json",
+  "title": "DevLocators",
+  "description": "Dev-team-supplied (or external-LLM-produced) mapping of locator-constant names to real selectors. When this file is discoverable (via --dev-locators flag, WORCA_T_DEV_LOCATORS env var, or `<sut>/.worca-t/dev-locators.json` convention path), the JIT runtime plugin consults it BEFORE the LLM resolver. Selectors are verified at first use via Playwright `locator.count()`; mismatches fall through to the resolver and log `dev_selector_mismatch`.",
+  "type": "object",
+  "required": ["locators"],
+  "additionalProperties": true,
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "Schema version, e.g. \"1.0\". Allows the loader to handle future shape changes."
+    },
+    "source": {
+      "type": "string",
+      "description": "Free-text identifier of who produced this file (e.g. \"dev-team\", \"external-llm\", \"parent-worca\", \"manual\"). For traceability in the Step 10 report."
+    },
+    "produced_at": { "type": "string", "format": "date-time" },
+    "locators": {
+      "type": "object",
+      "description": "Mapping of constant name (the same name codegen used in the locators module, e.g. LOGIN_BUTTON) to its dev-supplied selector + metadata.",
+      "patternProperties": {
+        "^[A-Za-z_][A-Za-z0-9_]*$": {
+          "type": "object",
+          "required": ["selector"],
+          "properties": {
+            "selector": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The selector to use. XPath is rejected at load time (the loader filters out entries whose selector starts with `//` or `xpath=`)."
+            },
+            "strategy": {
+              "type": ["string", "null"],
+              "enum": ["id", "data-testid", "role", "label", "text", "placeholder", "css", null]
+            },
+            "intent": {
+              "type": ["string", "null"],
+              "description": "Optional human description of what this locator targets. Used for traceability; not required for the runtime to use the selector."
+            },
+            "page_url": {
+              "type": ["string", "null"],
+              "description": "Optional URL/path of the page where this element lives. Informational."
+            },
+            "notes": {
+              "type": ["string", "null"]
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

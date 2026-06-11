@@ -1,4 +1,4 @@
-"""Framework-agnostic test runner used by Step 9.
+"""Framework-agnostic test runner used by Step 8.
 
 Resolves the test-run command for the detected framework, executes it as a
 subprocess (with the corporate proxy + masked secrets), and parses framework-
@@ -17,16 +17,19 @@ Supported result formats (priority order, per framework):
       -> `output.xml`
 
 For tests not present in the parsed output we emit a synthetic `error` entry
-so the run-results.json stays a faithful join with tests-with-tbd.json.
+so the run-results.json stays a faithful join with tbd-index.json.
 """
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
 import shlex
 import subprocess
+import sys
+import tomllib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -34,7 +37,8 @@ from pathlib import Path
 
 from worca_t.logging_setup import get_logger
 from worca_t.md_parser import slugify
-from worca_t.proxy import with_proxy_env
+from worca_t.proxy import safe_subprocess_env, with_proxy_env
+from worca_t.stack_profile import PYTHON_VENV_MANAGERS, StackProfile, wrap_command
 
 log = get_logger(__name__)
 
@@ -106,6 +110,13 @@ class TestRunEntry:
     stdout: str | None = None
     stderr: str | None = None
     attachments: list[dict] = field(default_factory=list)
+    # Set ONLY on synthetic `T-runner-failure` entries when the runner blew
+    # up at collection time (missing module, broken conftest, etc.). Tells
+    # step 8 to skip the self-heal loop — there's no test to patch — and
+    # carries the actionable hint surfaced to the user. Shape:
+    #   {"kind": "missing_module" | "collection_error",
+    #    "module": str | None, "hint": str, "summary": str}
+    runner_failure: dict | None = None
 
     def as_dict(self) -> dict:
         return {
@@ -119,6 +130,7 @@ class TestRunEntry:
             "stdout": self.stdout,
             "stderr": self.stderr,
             "attachments": self.attachments,
+            "runner_failure": self.runner_failure,
         }
 
 
@@ -170,22 +182,111 @@ class RunResult:
 # ---------------------------------------------------------------------------
 
 
+_PYTEST_FRAMEWORKS = frozenset({"pytest", "playwright-py", "selenium-py"})
+
+
+_KNOWN_RUNNER_TOKENS = frozenset({
+    "pytest", "python", "python3", "py",
+    "poetry", "pipenv", "uv", "pdm", "hatch", "rye", "nox", "tox",
+    "npx", "npm", "yarn", "pnpm", "bun", "deno", "node",
+    "mvn", "mvnw", "gradle", "gradlew",
+    "robot", "make", "task", "just",
+    "sh", "bash", "cmd", "powershell", "pwsh",
+})
+
+
+def _looks_like_test_command(s: str) -> bool:
+    """True if `s` plausibly starts with a runner invocation.
+
+    The researcher agent occasionally writes a test *name* (or a markdown
+    snippet) into `research.commands.test` instead of the actual run command.
+    Without this guard we feed that garbage straight to a subprocess and
+    Windows raises `[WinError 2]` / exit 127 — a confusing failure mode that
+    looks like a test failure but is really a code bug.
+    """
+    if not s or not s.strip():
+        return False
+    head = s.strip().split(None, 1)[0]
+    head = head.lstrip("./").lstrip(".\\")
+    # Strip Windows .exe / .bat suffix and any trailing punctuation.
+    head = re.sub(r"\.(exe|bat|cmd|ps1)$", "", head, flags=re.IGNORECASE)
+    return head.lower() in _KNOWN_RUNNER_TOKENS
+
+
+def _inject_pytest_marker(command: str, marker_filter: str | None) -> str:
+    """Append `-m "<filter>"` to a pytest-family command.
+
+    Idempotent: if the command already has `-m` it's left alone so an
+    explicit selector in `detected` (e.g. from a researcher-extracted
+    Makefile target) wins over our default attribution filter.
+    """
+    if not marker_filter:
+        return command
+    if re.search(r"(?:^|\s)-m(?:\s|=)", command):
+        return command
+    return f"{command} -m \"{marker_filter}\""
+
+
 def resolve_command(
     framework: str,
     *,
     detected: str | None,
     cwd: Path,
+    profile: StackProfile | None = None,
+    marker_filter: str | None = None,
 ) -> tuple[str, str]:
-    """Pick command + parser id. Prefer detected command from Step 6 when given."""
-    if detected:
+    """Pick command + parser id.
+
+    Resolution order (first non-empty wins):
+      1. `detected` — the command the researcher agent extracted from
+         README / CI / pyproject. Used verbatim *if it passes
+         `_looks_like_test_command`*; we only append the junit flag when
+         the parser expects it and the command doesn't already have one.
+         The researcher is expected to include the package-manager wrapper
+         itself (e.g. ``poetry run pytest …``).
+      2. Framework default from `_DEFAULT_COMMANDS`, wrapped with the
+         package-manager prefix from `profile` (e.g. ``pytest …`` becomes
+         ``poetry run pytest …``). This is the load-bearing fallback when
+         the researcher fails to extract a runnable command OR when the
+         extracted command fails the runner-token sanity check.
+      3. Bare ``pytest --junitxml=…`` as the universal fallback.
+
+    `marker_filter` (pytest-family frameworks only): appended as
+    ``-m "<filter>"`` so callers can scope a run to a subset of tests
+    by marker. Step 8 uses this to select worca-generated tests
+    (e.g. ``worca_smoke or worca_regression``) and exclude the SUT's
+    native suite. No-op on non-pytest frameworks (Cypress / Jest /
+    Playwright-TS) and when the command already carries an explicit
+    ``-m`` selector.
+    """
+    apply_marker = framework in _PYTEST_FRAMEWORKS
+    if detected and _looks_like_test_command(detected):
         parser = _DEFAULT_COMMANDS.get(framework, ("", "auto"))[1]
         if parser == "junit" and "--junitxml" not in detected:
             detected = f"{detected} --junitxml={(cwd / 'worca-junit.xml').as_posix()}"
+        if apply_marker:
+            detected = _inject_pytest_marker(detected, marker_filter)
         return detected, parser
+    if detected:
+        log.warning(
+            "test_runner.detected_command_rejected",
+            detected=detected[:200],
+            reason="does not start with a known runner token "
+                   "(pytest / poetry / npx / mvn / ...) — falling back to "
+                   "framework default. Likely a researcher hallucination.",
+        )
     if framework in _DEFAULT_COMMANDS:
         template, parser = _DEFAULT_COMMANDS[framework]
-        return _expand_command(template, cwd), parser
-    return _expand_command("pytest --junitxml={junit}", cwd), "junit"
+        bare = _expand_command(template, cwd)
+        wrapped = wrap_command(profile, bare)
+        if apply_marker:
+            wrapped = _inject_pytest_marker(wrapped, marker_filter)
+        return wrapped, parser
+    bare = _expand_command("pytest --junitxml={junit}", cwd)
+    wrapped = wrap_command(profile, bare)
+    if apply_marker:
+        wrapped = _inject_pytest_marker(wrapped, marker_filter)
+    return wrapped, "junit"
 
 
 def _expand_command(template: str, cwd: Path) -> str:
@@ -194,6 +295,34 @@ def _expand_command(template: str, cwd: Path) -> str:
         json_out=str((cwd / "worca-results.json").as_posix()),
         robot_xml=str((cwd / "worca-output.xml").as_posix()),
     )
+
+
+# Match `--headless`, `--headless=true`, and `--headless true` forms. Bounded
+# on the right by whitespace, `=`, or end-of-string so we don't accidentally
+# strip a flag like `--headless-mode` (hypothetical, but defensive).
+_HEADLESS_FLAG_RE = re.compile(
+    r"\s+--headless(?:=(?:true|false|0|1))?(?=\s|$)",
+    re.IGNORECASE,
+)
+_HEADLESS_WITH_VALUE_RE = re.compile(
+    r"\s+--headless\s+(?:true|false|0|1)(?=\s|$)",
+    re.IGNORECASE,
+)
+
+
+def _strip_headless_flag(command: str) -> str:
+    """Best-effort removal of `--headless` from a shell-style command string.
+
+    Handles the common variants: bare flag, `--headless=true|false|0|1`, and
+    space-separated `--headless true|false|0|1`. Leaves the command unchanged
+    when no such flag is present. We deliberately do NOT insert `--headed` —
+    Playwright-TS / Cypress / pytest-playwright all default to headed when
+    `--headless` is absent, and some frameworks (notably plain pytest with a
+    custom conftest hook) reject `--headed` as an unknown option.
+    """
+    out = _HEADLESS_WITH_VALUE_RE.sub("", command)
+    out = _HEADLESS_FLAG_RE.sub("", out)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -214,9 +343,9 @@ def execute_command(
     cwd: Path,
     timeout_s: int,
     env_extra: dict[str, str] | None = None,
+    isolate_venv: bool = False,
 ) -> tuple[int, str, str, float]:
-    env = dict(os.environ)
-    env.update(with_proxy_env())
+    env = safe_subprocess_env(isolate_venv=isolate_venv)
     if env_extra:
         env.update(env_extra)
 
@@ -515,11 +644,48 @@ def run_tests(
     detected_command: str | None = None,
     timeout_s: int = 1800,
     env_extra: dict[str, str] | None = None,
+    profile: StackProfile | None = None,
+    headless: bool = True,
+    marker_filter: str | None = None,
 ) -> RunResult:
-    command, parser = resolve_command(framework, detected=detected_command, cwd=cwd)
+    command, parser = resolve_command(
+        framework, detected=detected_command, cwd=cwd, profile=profile,
+        marker_filter=marker_filter,
+    )
+
+    # The CLI `--headed` flag is meant to give the user a visible browser
+    # while the SUT tests run, so they can watch the test execute live.
+    # Two complementary mechanisms cover the bulk of real-world SUTs:
+    #   1) Set the HEADLESS env var (1/0). Most polyglot SUTs check an env
+    #      var of this name in their conftest / playwright.config / similar
+    #      to toggle the browser's head state. The AskBosch SUT for example
+    #      lists HEADLESS in its `.env.example`.
+    #   2) Strip a literal `--headless` argument from the test command when
+    #      we want headed. This covers SUTs that bake `--headless` directly
+    #      into their pytest / playwright invocation. We never *add*
+    #      `--headed` because not all frameworks accept it (and headed is
+    #      the default for most when `--headless` is absent).
+    runtime_env = dict(env_extra or {})
+    runtime_env["HEADLESS"] = "1" if headless else "0"
+    if not headless:
+        command = _strip_headless_flag(command)
+
+    # Force a clean SUT-specific venv for Python managers that own a venv
+    # (poetry, uv, pdm, pipenv). Without this, a worca-t process that was
+    # itself launched from a venv (typical for `uv tool install --editable`)
+    # leaks `VIRTUAL_ENV` into the child, and the manager reuses worca-t's
+    # venv as the SUT's "active" venv whenever the Python version satisfies
+    # the SUT's constraint. The symptom: every SUT install command reports
+    # "in sync" but pytest fails on SUT-specific imports (e.g. allure-pytest,
+    # pydantic-settings) because they were never installed into the borrowed
+    # venv. Node managers (npm/yarn/pnpm) and bare-pip flows don't need this
+    # — node install targets `node_modules/` and bare-pip is path-prefixed
+    # to the SUT's `.venv/bin/pip` upstream.
+    isolate_venv = bool(profile and (profile.package_manager or "").lower() in PYTHON_VENV_MANAGERS)
     started = datetime.now(UTC)
     exit_code, stdout, stderr, duration = execute_command(
-        command, cwd=cwd, timeout_s=timeout_s, env_extra=env_extra
+        command, cwd=cwd, timeout_s=timeout_s, env_extra=runtime_env,
+        isolate_venv=isolate_venv,
     )
     finished = datetime.now(UTC)
 
@@ -539,15 +705,27 @@ def run_tests(
 
     if not results and exit_code != 0:
         # Synthesise a single 'error' entry so callers see *something*.
+        # When the failure is a missing-module / collection error, attach
+        # the classifier output so step 8 can skip the self-heal loop —
+        # there is no per-test patch site to fix, and the user just needs
+        # to be told which dependency to install.
+        runner_failure = classify_runner_failure(
+            stderr,
+            package_manager=profile.package_manager if profile else None,
+        )
+        msg = f"command exited with code {exit_code}; no results parsed"
+        if runner_failure:
+            msg += f" — {runner_failure['summary']}; fix: {runner_failure['hint']}"
         results = [
             TestRunEntry(
                 id="T-runner-failure",
                 name="<runner-failure>",
                 file=str(cwd),
                 status="error",
-                message=f"command exited with code {exit_code}; no results parsed",
+                message=msg,
                 stdout=stdout[-4000:],
                 stderr=stderr[-4000:],
+                runner_failure=runner_failure,
             )
         ]
 
@@ -570,6 +748,178 @@ _FAIL_PATTERN_FALLBACK = re.compile(
 )
 
 
+# Patterns that identify "the test runner couldn't even load the test files"
+# class of failure — collection / import errors, missing deps, broken conftest.
+# When matched, step 8 skips the self-heal loop (no test to patch) and the
+# user gets a one-line actionable fix message instead of 10 timed-out heal
+# attempts on a synthetic `T-runner-failure` entry.
+#
+# Order matters: the more specific `ModuleNotFoundError` runs first so its
+# captured module name flows into the hint. The generic "ImportError while
+# loading conftest" / "collected 0 items / errors during collection"
+# fallback only fires when nothing more specific matched.
+_MODULE_NOT_FOUND_RE = re.compile(
+    r"(?im)^\s*E?\s*(?:ModuleNotFoundError|ImportError)\s*:\s*"
+    r"No module named\s+['\"](?P<module>[^'\"]+)['\"]"
+)
+_CONFTEST_IMPORT_ERROR_RE = re.compile(
+    r"(?im)ImportError while loading conftest"
+)
+_PYTEST_COLLECTION_ERRORS_RE = re.compile(
+    r"(?im)^\s*(?:errors during collection|=+\s*ERRORS\s*=+)"
+)
+
+
+# Package-manager install hint by detected package_manager name. Best-effort
+# — when the pm is unknown we fall back to a generic pip command and let the
+# user adapt.
+_INSTALL_HINT_BY_PM = {
+    "poetry": "poetry add --group test {module}",
+    "uv":     "uv add --dev {module}",
+    "pdm":    "pdm add --dev {module}",
+    "hatch":  "hatch run pip install {module}",
+    "pip":    "pip install {module}",
+    "pipenv": "pipenv install --dev {module}",
+    "npm":    "npm install --save-dev {module}",
+    "yarn":   "yarn add --dev {module}",
+    "pnpm":   "pnpm add --save-dev {module}",
+    "maven":  "add {module} to pom.xml <dependencies>",
+    "gradle": "add {module} to build.gradle dependencies",
+}
+
+# Map a Python module name to the install package when the two differ
+# (e.g. `import allure` → `allure-pytest`). The full table would be huge —
+# we cover the handful of pytest plugins that come up routinely in the QA
+# stacks the pipeline generates against. Unknown imports fall back to the
+# module name verbatim and the hint says "install <module> (or its providing
+# package)".
+_PYTEST_PLUGIN_PROVIDERS = {
+    "allure":          "allure-pytest",
+    "xdist":           "pytest-xdist",
+    "pytest_xdist":    "pytest-xdist",
+    "pytest_asyncio":  "pytest-asyncio",
+    "pytest_bdd":      "pytest-bdd",
+    "pytest_html":     "pytest-html",
+    "pytest_mock":     "pytest-mock",
+    "pytest_cov":      "pytest-cov",
+    "pytest_playwright": "pytest-playwright",
+    "playwright":      "playwright",
+    "selenium":        "selenium",
+    "robot":           "robotframework",
+    "Browser":         "robotframework-browser",
+}
+
+
+def _install_hint_for(module: str, package_manager: str | None) -> str:
+    """Build a one-line install hint for the user. Always returns *something*."""
+    pkg = _PYTEST_PLUGIN_PROVIDERS.get(module, module)
+    template = _INSTALL_HINT_BY_PM.get(
+        (package_manager or "").lower(), "install {module}",
+    )
+    return template.format(module=pkg)
+
+
+# Argv-list templates for package managers we'll execute programmatically on
+# behalf of the user (Step 8 missing-dep auto-recovery). Returning a list
+# (never a shell string) keeps the runner safe from injection via crafted
+# package names. Managers that can't be reduced to a single non-shell argv
+# (maven/gradle need pom.xml edits; `hatch run pip install` chains commands)
+# are deliberately omitted — they remain prose-hint-only via _install_hint_for.
+#
+# `pip` uses `{venv_bin}/pip` rather than bare `pip` so the install lands in
+# the SUT's own venv. Without the path prefix, bare pip would resolve via
+# PATH to either worca-t's own venv (when VIRTUAL_ENV is inherited) or the
+# system Python (when it's not) — neither matches the env the test runner
+# uses. The caller is responsible for supplying `venv_bin`.
+_INSTALL_ARGV_BY_PM: dict[str, list[str]] = {
+    "poetry": ["poetry", "add", "--group", "test", "{package}"],
+    "uv":     ["uv", "add", "--dev", "{package}"],
+    "pdm":    ["pdm", "add", "--dev", "{package}"],
+    "pip":    ["{venv_bin}/pip", "install", "{package}"],
+    "pipenv": ["pipenv", "install", "--dev", "{package}"],
+    "npm":    ["npm", "install", "--save-dev", "{package}"],
+    "yarn":   ["yarn", "add", "--dev", "{package}"],
+    "pnpm":   ["pnpm", "add", "--save-dev", "{package}"],
+}
+
+
+def install_command_for(
+    package_manager: str | None,
+    package: str,
+    *,
+    venv_bin: str | None = None,
+) -> list[str] | None:
+    """Build an argv list to install *package* via *package_manager*.
+
+    `venv_bin` is the SUT's venv binary directory (e.g. ``.venv/bin`` or
+    ``.venv\\Scripts``) — required for ``pip`` so the install can target the
+    SUT's own venv. Other managers ignore it.
+
+    Returns ``None`` when we have no safe programmatic install path for that
+    manager (maven, gradle, hatch, unknown), or when ``pip`` was requested
+    without a ``venv_bin`` — caller should fall back to the prose hint.
+    """
+    pm = (package_manager or "").lower()
+    template = _INSTALL_ARGV_BY_PM.get(pm)
+    if template is None:
+        return None
+    if pm == "pip" and not venv_bin:
+        return None
+    return [arg.format(package=package, venv_bin=venv_bin or "") for arg in template]
+
+
+def classify_runner_failure(
+    stderr: str, *, package_manager: str | None = None,
+) -> dict | None:
+    """Inspect stderr for collection-/import-time failures.
+
+    Returns a dict describing the failure when one is detected, else None.
+    Shape:
+        {
+            "kind": "missing_module" | "collection_error",
+            "module": str | None,        # name of the missing module if known
+            "hint":   str,               # human-readable one-line fix command
+            "summary": str,              # short headline for the step error
+        }
+
+    The kinds:
+      - `missing_module` — `ModuleNotFoundError: No module named 'X'` (or the
+        older `ImportError: No module named X`). `module` is filled in and
+        `hint` is package-manager-aware. This is the common case (pytest
+        plugin not installed, e.g. allure-pytest missing from pyproject).
+      - `collection_error` — pytest blew up at collection time (broken
+        conftest, syntax error in a test file, fixture-resolution failure)
+        with no specific missing-module signal. `module` is None; `hint`
+        points the user at the stderr tail.
+    """
+    if not stderr:
+        return None
+
+    m = _MODULE_NOT_FOUND_RE.search(stderr)
+    if m:
+        module = m.group("module")
+        return {
+            "kind": "missing_module",
+            "module": module,
+            "hint": _install_hint_for(module, package_manager),
+            "summary": f"missing dependency: {module!r}",
+        }
+
+    if _CONFTEST_IMPORT_ERROR_RE.search(stderr) or _PYTEST_COLLECTION_ERRORS_RE.search(stderr):
+        return {
+            "kind": "collection_error",
+            "module": None,
+            "hint": (
+                "fix the conftest / test-collection error reported in stderr "
+                "(check for syntax errors, broken fixtures, or import-time "
+                "side effects)"
+            ),
+            "summary": "test collection failed before any test ran",
+        }
+
+    return None
+
+
 def fallback_status_from_stdout(stdout: str) -> dict[str, str]:
     """Last-resort parser if framework output gave us nothing.
 
@@ -580,3 +930,355 @@ def fallback_status_from_stdout(stdout: str) -> dict[str, str]:
     for m in _FAIL_PATTERN_FALLBACK.finditer(stdout):
         out[m.group("name").strip()] = "failed"
     return out
+
+
+@dataclass
+class PrepareResult:
+    """Outcome of `prepare_sut`."""
+
+    ran: bool                # did we actually invoke the install command?
+    command: str | None      # the command that was run (None if skipped)
+    exit_code: int | None    # subprocess return code (None if skipped)
+    duration_s: float | None
+    stdout: str = ""
+    stderr: str = ""
+    skip_reason: str | None = None  # set when ran=False
+
+    def ok(self) -> bool:
+        return self.exit_code == 0 if self.ran else True
+
+
+def _run_subprocess_step(
+    cmd: str,
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout_s: int,
+) -> tuple[int, str, str, float]:
+    """Run a single command as a list-form subprocess (never ``shell=True``).
+
+    Returns ``(exit_code, stdout, stderr, duration_s)``.
+    """
+    started = datetime.now(UTC)
+    try:
+        proc = subprocess.run(
+            _split_command(cmd), cwd=str(cwd), env=env,
+            capture_output=True, text=True,
+            timeout=timeout_s, check=False,
+        )
+    except subprocess.TimeoutExpired as e:
+        dur = (datetime.now(UTC) - started).total_seconds()
+        return 124, _coerce_stream(e.stdout), _coerce_stream(e.stderr) + f"\n[timeout after {timeout_s}s]", dur
+    except FileNotFoundError as e:
+        dur = (datetime.now(UTC) - started).total_seconds()
+        return 127, "", f"command not found: {e}", dur
+    dur = (datetime.now(UTC) - started).total_seconds()
+    return proc.returncode, proc.stdout or "", proc.stderr or "", dur
+
+
+def prepare_sut(
+    profile: StackProfile | None,
+    *,
+    cwd: Path,
+    timeout_s: int = 900,
+    env_extra: dict[str, str] | None = None,
+) -> PrepareResult:
+    """Run ``profile.install_command`` in *cwd*. Idempotent at the manager level.
+
+    When ``profile.pre_install_command`` is set (e.g. venv creation for pip
+    projects), it runs first; failure there aborts before the install step.
+
+    Returns a ``PrepareResult``.  Caller decides what to do with a non-zero
+    exit; test_runner does NOT raise.  When *profile* is ``None`` or has no
+    install command, this is a no-op that returns ``ran=False``.
+    """
+    if profile is None or not profile.install_command:
+        return PrepareResult(
+            ran=False, command=None, exit_code=None, duration_s=None,
+            skip_reason="no install_command on profile",
+        )
+
+    # See `run_tests` for the rationale on stripping VIRTUAL_ENV here.
+    isolate_venv = (profile.package_manager or "").lower() in PYTHON_VENV_MANAGERS
+    env = safe_subprocess_env(isolate_venv=isolate_venv)
+    if env_extra:
+        env.update(env_extra)
+
+    all_stdout: list[str] = []
+    all_stderr: list[str] = []
+    total_duration = 0.0
+    commands_label = profile.install_command
+
+    # Phase 1: pre_install_command (e.g. venv creation)
+    if profile.pre_install_command:
+        pre_cmd = profile.pre_install_command
+        commands_label = f"{pre_cmd} && {profile.install_command}"
+        log.info("prepare_sut.pre_install", command=pre_cmd, cwd=str(cwd))
+        rc, out, err, dur = _run_subprocess_step(pre_cmd, cwd=cwd, env=env, timeout_s=timeout_s)
+        all_stdout.append(out)
+        all_stderr.append(err)
+        total_duration += dur
+        if rc != 0:
+            return PrepareResult(
+                ran=True, command=commands_label, exit_code=rc,
+                duration_s=total_duration,
+                stdout="\n".join(all_stdout), stderr="\n".join(all_stderr),
+            )
+
+    # Phase 2: install_command
+    cmd = profile.install_command
+    log.info("prepare_sut.start", command=cmd, cwd=str(cwd))
+
+    has_shell_chain = "&&" in cmd or "||" in cmd or " ; " in cmd
+    if has_shell_chain:
+        log.warning(
+            "prepare_sut.shell_chain_detected",
+            command=cmd,
+            hint="install_command contains shell operators; use pre_install_command instead",
+        )
+
+    rc, out, err, dur = _run_subprocess_step(cmd, cwd=cwd, env=env, timeout_s=timeout_s)
+    all_stdout.append(out)
+    all_stderr.append(err)
+    total_duration += dur
+
+    log.info(
+        "prepare_sut.end",
+        command=cmd,
+        exit_code=rc,
+        duration_s=round(total_duration, 2),
+    )
+    return PrepareResult(
+        ran=True,
+        command=commands_label,
+        exit_code=rc,
+        duration_s=total_duration,
+        stdout="\n".join(all_stdout),
+        stderr="\n".join(all_stderr),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Missing-dep audit — Step 6 emits warnings; Step 8 pre-installs known-safe
+# ones and runtime-recovers the rest. Both steps call this for a shared view.
+# ---------------------------------------------------------------------------
+
+# Top-level test imports of these names are never flagged as missing. `src`
+# and `tests` are common SUT layout conventions; the SUT's own package name
+# is added at call time.
+_AUDIT_ALWAYS_OK = frozenset({"src", "tests", "test", "conftest"})
+_REQ_HEAD_SPLIT = re.compile(r"[<>=!~;\[\s]")
+_PKG_NAME_NORM = re.compile(r"[-_]+")
+
+
+def _norm_pkg(name: str) -> str:
+    """PEP 503 normalize for comparing import names to declared dep names."""
+    return _PKG_NAME_NORM.sub("-", name.strip().lower())
+
+
+def _split_req(spec: str) -> str:
+    """`requests>=2.30,<3 ; python_version>='3.9'` -> `requests`."""
+    head = _REQ_HEAD_SPLIT.split(spec, maxsplit=1)[0]
+    return head.strip()
+
+
+def _python_test_files(sut_root: Path) -> list[Path]:
+    tests_dir = sut_root / "tests"
+    if not tests_dir.is_dir():
+        return []
+    out: list[Path] = []
+    for path in tests_dir.rglob("*.py"):
+        # Skip dotfile dirs *inside* the tests tree (.venv, .tox, .pytest_cache),
+        # NOT dotfile parents on the way to it (e.g. workspaces under ~/.worca-t).
+        rel_parts = path.relative_to(tests_dir).parts
+        if any(part.startswith(".") for part in rel_parts):
+            continue
+        out.append(path)
+    return out
+
+
+def _python_prod_files(sut_root: Path) -> list[Path]:
+    """The SUT's own production-source `.py` files.
+
+    Resolves the SUT's own package directory via `_sut_own_package_name`,
+    preferring the PEP 517 `src/` layout over the flat layout. Returns
+    `[]` when the project name is unknown or neither layout directory
+    exists. The walk uses the same dotfile-skip discipline as
+    `_python_test_files` so transient caches inside the package tree
+    (`__pycache__` is already excluded by the `*.py` glob; `.mypy_cache`,
+    `.ruff_cache`, etc. inside the package would be skipped here).
+    """
+    own_pkg = _sut_own_package_name(sut_root)
+    if not own_pkg:
+        return []
+    snake_pkg = _norm_pkg(own_pkg).replace("-", "_")
+    for base in (sut_root / "src" / snake_pkg, sut_root / snake_pkg):
+        if base.is_dir():
+            pkg_dir = base
+            break
+    else:
+        return []
+    out: list[Path] = []
+    for path in pkg_dir.rglob("*.py"):
+        rel_parts = path.relative_to(pkg_dir).parts
+        if any(part.startswith(".") for part in rel_parts):
+            continue
+        out.append(path)
+    return out
+
+
+def _top_level_imports(py_file: Path) -> set[str]:
+    """Top-level absolute imports only. Relative `from . import x` is skipped."""
+    try:
+        tree = ast.parse(py_file.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError):
+        return set()
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".", 1)[0]
+                if top:
+                    names.add(top)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level and node.level > 0:
+                continue
+            if not node.module:
+                continue
+            top = node.module.split(".", 1)[0]
+            if top:
+                names.add(top)
+    return names
+
+
+def _declared_python_deps(sut_root: Path) -> set[str]:
+    """Union of all declared deps across pyproject.toml + requirements*.txt.
+
+    Best-effort — names are PEP 503 normalized. Returns an empty set when
+    nothing parseable is found (so audit conservatively flags everything,
+    relegated to ``confidence == "guessed"``).
+    """
+    declared: set[str] = set()
+
+    pyproject = sut_root / "pyproject.toml"
+    if pyproject.is_file():
+        try:
+            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError):
+            data = {}
+        # PEP 621
+        for spec in (data.get("project", {}).get("dependencies") or []):
+            declared.add(_norm_pkg(_split_req(spec)))
+        opt = data.get("project", {}).get("optional-dependencies") or {}
+        for specs in opt.values():
+            for spec in specs:
+                declared.add(_norm_pkg(_split_req(spec)))
+        # Poetry
+        poetry = data.get("tool", {}).get("poetry", {})
+        for name in (poetry.get("dependencies") or {}):
+            if name.lower() == "python":
+                continue
+            declared.add(_norm_pkg(name))
+        for grp in (poetry.get("group") or {}).values():
+            for name in (grp.get("dependencies") or {}):
+                declared.add(_norm_pkg(name))
+        # PDM legacy dev-dependencies table
+        for specs in (data.get("tool", {}).get("pdm", {}).get("dev-dependencies") or {}).values():
+            for spec in specs:
+                declared.add(_norm_pkg(_split_req(spec)))
+
+    for req in sut_root.glob("requirements*.txt"):
+        try:
+            for line in req.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith(("#", "-")):
+                    continue
+                declared.add(_norm_pkg(_split_req(line)))
+        except OSError:
+            continue
+
+    declared.discard("")
+    return declared
+
+
+def _sut_own_package_name(sut_root: Path) -> str | None:
+    pyproject = sut_root / "pyproject.toml"
+    if not pyproject.is_file():
+        return None
+    try:
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    return (
+        data.get("project", {}).get("name")
+        or data.get("tool", {}).get("poetry", {}).get("name")
+    )
+
+
+def audit_missing_deps(
+    sut_root: Path, *, package_manager: str | None = None
+) -> list[dict]:
+    """Find top-level imports that aren't in declared deps.
+
+    Scans both the SUT's ``tests/`` tree AND its own production source
+    package (resolved via :func:`_sut_own_package_name`, preferring the
+    ``src/`` layout). The prod-side walk catches deps reached transitively
+    through the SUT's source — pytest collection fails the same way on a
+    missing dep whether the test file imports it directly or via a
+    ``conftest.py`` → ``src/<pkg>/...`` chain.
+
+    Returns one dict per missing import, with:
+      - ``module``: the imported top-level name
+      - ``suggested_package``: pip-installable name (from _PYTEST_PLUGIN_PROVIDERS
+        when mapped; else the module name verbatim)
+      - ``source_file``: relative path of the first file importing it
+        (test files are scanned first so they win ties — the operator's
+        mental entry point is the test, not the prod module)
+      - ``confidence``: ``"known"`` when the module is in the curated mapping
+        table (high-confidence: Step 8 will auto-install). ``"guessed"`` for
+        everything else (Step 8 will HITL-prompt or warn).
+      - ``suggested_install``: prose hint from :func:`_install_hint_for`.
+
+    Best-effort and conservative: unparsable files are skipped, dynamic
+    imports are missed. Returns ``[]`` when there is no ``tests/`` dir at
+    all — Step 8 has nothing to run in that case.
+    """
+    test_files = _python_test_files(sut_root)
+    if not test_files:
+        return []
+    prod_files = _python_prod_files(sut_root)
+
+    declared = _declared_python_deps(sut_root)
+    own_pkg = _sut_own_package_name(sut_root)
+    skip_top = set(_AUDIT_ALWAYS_OK)
+    if own_pkg:
+        # Imports may use either the kebab project name or its snake_case form.
+        skip_top.add(own_pkg)
+        skip_top.add(_norm_pkg(own_pkg).replace("-", "_"))
+    stdlib = getattr(sys, "stdlib_module_names", frozenset())
+
+    # First-seen wins so we can point the user at the file that needs the dep.
+    # Iterate test files first so they win ties (operator's mental entry point).
+    seen: dict[str, Path] = {}
+    for tf in (*test_files, *prod_files):
+        for name in _top_level_imports(tf):
+            if name in skip_top or name in stdlib:
+                continue
+            norm = _norm_pkg(name)
+            mapped = _PYTEST_PLUGIN_PROVIDERS.get(name)
+            mapped_norm = _norm_pkg(mapped) if mapped else None
+            if norm in declared or (mapped_norm and mapped_norm in declared):
+                continue
+            seen.setdefault(name, tf)
+
+    warnings: list[dict] = []
+    for module, source_file in sorted(seen.items()):
+        suggested = _PYTEST_PLUGIN_PROVIDERS.get(module, module)
+        warnings.append({
+            "module": module,
+            "suggested_package": suggested,
+            "source_file": str(source_file.relative_to(sut_root)).replace("\\", "/"),
+            "confidence": "known" if module in _PYTEST_PLUGIN_PROVIDERS else "guessed",
+            "suggested_install": _install_hint_for(module, package_manager),
+        })
+    return warnings

@@ -15,7 +15,12 @@ from worca_t.steps.s03_plan import (
 )
 from worca_t.workspace import create_workspace
 
-from ._fake_claude import install_fake_query
+from ._fake_anthropic import (
+    FakeResponse,
+    FakeTextBlock,
+    FakeUsage,
+    install_fake_anthropic,
+)
 
 PLAN_MD = """\
 # Test Implementation Plan
@@ -124,11 +129,7 @@ def _ctx(tmp_path: Path, *, with_research: bool = True, with_refined: bool = Tru
 
 
 async def test_plan_step_writes_md_and_json(tmp_path: Path, monkeypatch):
-    install_fake_query(
-        monkeypatch,
-        messages=[{"type": "result", "result": "ok"}],
-        files={"plan.md": PLAN_MD},
-    )
+    install_fake_anthropic(monkeypatch, text=PLAN_MD)
 
     ctx = _ctx(tmp_path)
     result = await PlanStep().run(ctx)
@@ -139,6 +140,27 @@ async def test_plan_step_writes_md_and_json(tmp_path: Path, monkeypatch):
     assert len(proj["phases"]) == 2
 
 
+async def test_plan_step_inlines_refined_spec_into_user_prompt(
+    tmp_path: Path, monkeypatch
+):
+    """The refined-spec content must reach the LLM via the user message inputs."""
+    captured: dict = {}
+    install_fake_anthropic(monkeypatch, text=PLAN_MD, on_call=captured.update)
+
+    ctx = _ctx(tmp_path)
+    # Overwrite the seeded refined-spec with a distinctive marker.
+    (ctx.workspace.step_dir(2) / "refined-spec.md").write_text(
+        "# refined\n\nREFINED_INLINE_MARKER_ABC\n", encoding="utf-8"
+    )
+
+    result = await PlanStep().run(ctx)
+    assert result.success
+
+    user_content = captured["messages"][-1]["content"]
+    assert "REFINED_INLINE_MARKER_ABC" in user_content
+    assert "refined-spec.md" in user_content
+
+
 async def test_plan_step_requires_inputs(tmp_path: Path):
     ctx = _ctx(tmp_path, with_research=False, with_refined=False)
     result = await PlanStep().run(ctx)
@@ -147,7 +169,7 @@ async def test_plan_step_requires_inputs(tmp_path: Path):
 
 
 async def test_plan_step_agent_no_output_fails(tmp_path: Path, monkeypatch):
-    install_fake_query(monkeypatch, messages=[{"type": "result", "result": "ok"}], files={})
+    install_fake_anthropic(monkeypatch, text="")
 
     ctx = _ctx(tmp_path)
     result = await PlanStep().run(ctx)
@@ -190,31 +212,51 @@ Foundation tests.
 """
 
 
-async def test_plan_step_hitl_loop_prompts_user_and_reruns(tmp_path: Path, monkeypatch):
-    call_count = {"n": 0}
-    outputs = [PLAN_MD_WITH_BLOCKERS, PLAN_MD]
+def _install_scripted_anthropic(monkeypatch, texts: list[str]):
+    """Install an AsyncAnthropic that returns ``texts[i]`` on call i."""
+    calls = {"n": 0}
 
-    def on_call(_prompt, options):
-        idx = call_count["n"]
-        call_count["n"] = idx + 1
-        cwd = Path(options.cwd)
-        (cwd / "plan.md").write_text(outputs[min(idx, len(outputs) - 1)], encoding="utf-8")
+    async def _create(**_kwargs):
+        i = calls["n"]
+        calls["n"] = i + 1
+        return FakeResponse(
+            content=[FakeTextBlock(text=texts[min(i, len(texts) - 1)])],
+            usage=FakeUsage(),
+        )
 
-    install_fake_query(
-        monkeypatch,
-        messages=[{"type": "result", "result": "ok"}],
-        files={},
-        on_call=on_call,
-    )
+    class FakeMessages:
+        create = staticmethod(_create)
+
+    class FakeClient:
+        def __init__(self, **_kw):
+            self.messages = FakeMessages()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return None
+
+    # Patch BOTH client classes — Vertex env may be set globally on the dev machine.
+    monkeypatch.setattr("anthropic.AsyncAnthropic", FakeClient)
+    monkeypatch.setattr("anthropic.AsyncAnthropicVertex", FakeClient)
+    return calls
+
+
+async def test_plan_step_hitl_loop_prompts_user_and_reruns(
+    tmp_path: Path, monkeypatch
+):
+    calls = _install_scripted_anthropic(monkeypatch, [PLAN_MD_WITH_BLOCKERS, PLAN_MD])
 
     monkeypatch.setattr(
-        "worca_t.steps.base.prompt_user",
+        "worca_t.hitl.prompt_user",
         lambda questions, *, agent_label: {q.id: "use mock IdP" for q in questions},
     )
 
     ctx = _ctx(tmp_path)
     result = await PlanStep().run(ctx)
     assert result.success, result.error
-    assert call_count["n"] == 2
-    wd = ctx.workspace.step_workdir(3)
-    assert (wd / "user-answers.md").exists()
+    assert calls["n"] == 2
+
+    hitl_dir = ctx.workspace.step_workdir(3).parent / ".hitl-step03"
+    assert hitl_dir.exists() and any(hitl_dir.iterdir())

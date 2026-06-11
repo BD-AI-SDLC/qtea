@@ -5,11 +5,20 @@ from __future__ import annotations
 from pathlib import Path
 
 from worca_t.hitl import (
+    HitlDecision,
     Question,
+    append_ledger,
+    distinctive_tokens,
     extract_questions,
+    find_prior_decision,
     format_answers_md,
     has_not_ready_verdict,
+    ledger_path,
+    load_ledger,
+    looks_like_skip_intent,
     question_key,
+    render_prior_decisions_md,
+    resolve_against_ledger,
     write_answers_file,
 )
 
@@ -246,6 +255,62 @@ DE dup [CLARIFICATION NEEDED: exact DE string — see blocker #2]
     assert all(q.kind == "blocker" for q in qs)
 
 
+def test_dedup_merges_blocker_and_inline_clarification_by_ac_id():
+    """The step-2 real-world case: agent emits both a Blocker (with
+    'Affected ACs: AC-5' column) AND leaves an inline `[CLARIFICATION
+    NEEDED: exact URL]` on the AC-5 line. The blocker's question and the
+    terse inline placeholder describe the same gap — user should be asked
+    only once."""
+    md = """\
+# Spec
+
+## Blockers
+
+| ID | Question | Description | Severity | Affected ACs |
+|----|----------|-------------|----------|--------------|
+| BLOCK-001 | What is the exact target URL for the Gemini Enterprise link? | AC-5 states "Correct URL is used" but no concrete URL is specified. | high | AC-5 |
+| BLOCK-002 | What are the exact EN and DE translation strings? | AC-10/AC-11 reference EN/DE translations but no strings are provided. | high | AC-10, AC-11 |
+
+## Acceptance Criteria
+
+- [ ] **AC-5:** Given the button is visible, When the user clicks it, Then the URL that opens is [CLARIFICATION NEEDED: exact URL] with Bosch domain authentication applied. `[AUTOMATABLE]`
+- [ ] **AC-10:** Given English locale, When navigation renders, Then label is [CLARIFICATION NEEDED: exact EN strings]. `[AUTOMATABLE]`
+- [ ] **AC-11:** Given German locale, When navigation renders, Then label is [CLARIFICATION NEEDED: exact DE strings]. `[AUTOMATABLE]`
+"""
+    qs = extract_questions(md)
+    # Only the two blockers should survive; all three inline CLARs are
+    # subsumed by the AC-ID overlap pass.
+    assert len(qs) == 2
+    assert all(q.kind == "blocker" for q in qs)
+    assert {q.id for q in qs} == {"BLOCK-01", "BLOCK-02"}
+
+
+def test_dedup_keeps_clarification_when_ac_not_covered_by_any_blocker():
+    """Conservative subset-check: a CLAR on an AC that no blocker covers
+    must survive. Guards against the AC-ID pass over-firing."""
+    md = """\
+# Spec
+
+## Blockers
+
+| ID | Question | Description | Severity | Affected ACs |
+|----|----------|-------------|----------|--------------|
+| BLOCK-001 | What is the exact URL? | URL undefined. | high | AC-5 |
+
+## Acceptance Criteria
+
+- [ ] **AC-5:** URL is [CLARIFICATION NEEDED: exact URL]. `[AUTOMATABLE]`
+- [ ] **AC-7:** Aria-label is [CLARIFICATION NEEDED: exact aria-label text]. `[MANUAL ONLY]`
+"""
+    qs = extract_questions(md)
+    # BLOCK-001 + CLAR for AC-7 survive; CLAR for AC-5 is dropped.
+    assert len(qs) == 2
+    kinds = sorted(q.kind for q in qs)
+    assert kinds == ["blocker", "clarification"]
+    surviving_clar = next(q for q in qs if q.kind == "clarification")
+    assert "aria-label" in surviving_clar.prompt_text
+
+
 def test_extract_blockers_prefers_description_column():
     """When both 'Blocker' and 'Description' columns exist, use Description."""
     md = """\
@@ -284,6 +349,63 @@ def test_dedup_merges_blocker_and_open_question_by_tc_id():
     assert qs[0].kind == "blocker"
 
 
+def test_extract_blockers_prefers_question_column_over_description():
+    """When a `Question` column exists, use it raw — no boilerplate prefix."""
+    md = """\
+# Plan
+
+## Blockers
+
+| ID | Question | Description | Affected TCs | Severity |
+|----|----------|-------------|--------------|----------|
+| BLOCK-001 | Which GA SDK should we intercept — `gtag.js` or custom? | GA integration detail unconfirmed. | TC-GNAV-010 | high |
+"""
+    qs = extract_questions(md)
+    blockers = [q for q in qs if q.kind == "blocker"]
+    assert len(blockers) == 1
+    prompt = blockers[0].prompt_text
+    assert prompt.startswith("Which GA SDK")
+    assert "How should we resolve this blocker" not in prompt
+    assert "GA integration detail" not in prompt  # description column not used
+
+
+def test_extract_blockers_no_redundant_prefix_when_desc_is_interrogative():
+    """Even without a Question column, drop the prefix when the description
+    is already phrased as a question — avoids `'How should we resolve this
+    blocker: What is the ...?'` doubling."""
+    md = """\
+# Plan
+
+## Blockers
+
+| Blocker | Affected TCs | Severity |
+|---------|--------------|----------|
+| What is the expected GA event payload schema? | TC-GNAV-011 | high |
+"""
+    qs = extract_questions(md)
+    blockers = [q for q in qs if q.kind == "blocker"]
+    assert len(blockers) == 1
+    assert blockers[0].prompt_text == "What is the expected GA event payload schema?"
+
+
+def test_extract_blockers_keeps_prefix_for_statement_descriptions():
+    """Legacy statement-form descriptions still get the boilerplate prefix
+    so the user at least sees them framed as a decision request."""
+    md = """\
+# Plan
+
+## Blockers
+
+| Blocker | Affected TCs | Severity |
+|---------|--------------|----------|
+| SSO config unavailable | TC-AUTH-005 | high |
+"""
+    qs = extract_questions(md)
+    blockers = [q for q in qs if q.kind == "blocker"]
+    assert len(blockers) == 1
+    assert blockers[0].prompt_text.startswith("How should we resolve this blocker:")
+
+
 def test_dedup_step3_full_scenario_six_to_three():
     """Reproduce the step 3 problem: 6 questions should merge to 3."""
     md = """\
@@ -306,3 +428,274 @@ def test_dedup_step3_full_scenario_six_to_three():
     qs = extract_questions(md)
     assert len(qs) == 3
     assert all(q.kind == "blocker" for q in qs)
+
+
+# ---------------------------------------------------------------------------
+# Skip-intent text detection
+# ---------------------------------------------------------------------------
+
+
+def test_looks_like_skip_intent_matches_common_skip_phrases():
+    """The user typed "i'm not sure. skip this" in step 2 and it was treated
+    as a real answer — that's the bug. These all need to read as skip."""
+    skips = [
+        "skip",
+        "Skip this",
+        "skip me",
+        "SKIP THIS",
+        "n/a",
+        "N/A",
+        "na",
+        "none",
+        "idk",
+        "IDK",
+        "i don't know",
+        "I do not know",
+        "dunno",
+        "unknown",
+        "not sure",
+        "i'm not sure",
+        "i'm not sure. skip this",
+        "I'm not sure, skip this",
+        "no idea",
+        "pass",
+    ]
+    for s in skips:
+        assert looks_like_skip_intent(s), f"should be skip-intent: {s!r}"
+
+
+def test_looks_like_skip_intent_rejects_real_answers():
+    """Real, substantive answers must NOT be classified as skip-intent —
+    silently dropping them would be worse than the original bug."""
+    real = [
+        "gtag.js",
+        "https://example.com/foo",
+        "use feature flag X",
+        "yes",  # short but a real answer
+        "no",
+        "Go to Gemini Enterprise",
+        "the en label is 'Go to Gemini Enterprise', de is 'Zu Gemini Enterprise wechseln'",
+        "skip the second one but use option A for the first",  # context-bearing
+    ]
+    for s in real:
+        assert not looks_like_skip_intent(s), f"should NOT be skip-intent: {s!r}"
+
+
+# ---------------------------------------------------------------------------
+# Distinctive-token paraphrase matching
+# ---------------------------------------------------------------------------
+
+
+def test_distinctive_tokens_keeps_tech_identifiers():
+    """Tokens with digits and dotted/slashed identifiers must survive — those
+    are the highest-signal tokens for matching technical questions."""
+    toks = distinctive_tokens(
+        "Which GA SDK is used — gtag.js, @google-analytics/ga4, or custom?"
+    )
+    assert "gtag.js" in toks
+    # Slash/dot/dash composites stay glued, which is fine — the same composite
+    # appears in the step-3 paraphrase so paraphrase matching still works.
+    assert any("google-analytics" in t for t in toks)
+    assert "custom" in toks
+
+
+def test_distinctive_tokens_drops_stopwords_and_short_alpha():
+    """Stopwords and short pure-alpha tokens are dropped; substantive words
+    (even single ones like ``important``) survive — we want the signal."""
+    toks = distinctive_tokens("Which is the most for this?")
+    assert toks == frozenset()
+    # Short alpha-only ("GA", "is") gone; "GA" is 2 chars + alpha-only.
+    toks2 = distinctive_tokens("GA is the SDK")
+    assert "ga" not in toks2  # 2 chars, alpha → dropped
+
+
+def test_find_prior_decision_matches_ga_sdk_paraphrase_from_user_run():
+    """The exact scenario from run 20260609-160856-dd086a: step 2 asked one
+    GA-SDK question; step 3's planner paraphrased it. Must match."""
+    step2_text = (
+        "Which Google Analytics SDK/wrapper is in use — `gtag.js`, "
+        "`@google-analytics/ga4`, a custom AskBosch wrapper, or something "
+        "else — and what are the full event payload fields (event name, "
+        "category, label, value)?"
+    )
+    step2_context = (
+        "BLOCK-002 | Which Google Analytics SDK/wrapper is in use — "
+        "`gtag.js`, `@google-analytics/ga4`, a custom AskBosch wrapper, "
+        "or something else — and what are the full event payload fields "
+        "(event name, category, label, value)? | AC-6 mentions GA event "
+        "`gemini_enterprise` but does not specify the SDK, the tracking "
+        "call signature, or any additional payload fields required."
+    )
+    step3_question = Question(
+        id="BLOCK-01",
+        kind="blocker",
+        prompt_text=(
+            "Which GA SDK is used in this project — `gtag.js`, "
+            "`@google-analytics/ga4`, or a custom wrapper?"
+        ),
+        context=(
+            "BLOCK-001 | Which GA SDK is used in this project — `gtag.js`, "
+            "`@google-analytics/ga4`, or a custom wrapper? | The correct "
+            "stub/spy setup for GA event assertions depends on the SDK."
+        ),
+    )
+
+    prior = HitlDecision.from_question(
+        Question(id="BLOCK-02", kind="blocker", prompt_text=step2_text, context=step2_context),
+        step=2,
+        agent_label="refine-spec",
+        resolution="skipped",
+    )
+    match = find_prior_decision(step3_question, [prior])
+    assert match is not None, "GA paraphrase across steps must match the ledger"
+    assert match.question_id == "BLOCK-02"
+    assert match.resolution == "skipped"
+
+
+def test_find_prior_decision_does_not_match_unrelated_question():
+    """The fuzzy match must NOT collapse genuinely different questions —
+    false positives silently drop real blockers."""
+    prior = HitlDecision.from_question(
+        Question(
+            id="BLOCK-01",
+            kind="blocker",
+            prompt_text="Which Google Analytics SDK is used — gtag.js or ga4?",
+        ),
+        step=2,
+        agent_label="refine-spec",
+        resolution="skipped",
+    )
+    unrelated = Question(
+        id="BLOCK-99",
+        kind="blocker",
+        prompt_text=(
+            "What is the German translation for the 'Go to Gemini "
+            "Enterprise' button label?"
+        ),
+    )
+    assert find_prior_decision(unrelated, [prior]) is None
+
+
+def test_find_prior_decision_returns_none_for_empty_ledger():
+    q = Question(id="BLOCK-01", kind="blocker", prompt_text="anything?")
+    assert find_prior_decision(q, []) is None
+
+
+def test_resolve_against_ledger_splits_novel_and_resolved():
+    prior = HitlDecision.from_question(
+        Question(
+            id="BLOCK-OLD",
+            kind="blocker",
+            prompt_text="Which GA SDK — gtag.js, @google-analytics/ga4, or custom wrapper?",
+        ),
+        step=2,
+        agent_label="refine-spec",
+        resolution="answered",
+        answer="gtag.js",
+    )
+    paraphrase = Question(
+        id="BLOCK-NEW",
+        kind="blocker",
+        prompt_text="Which GA SDK is in use in this project — gtag.js, @google-analytics/ga4, or a custom wrapper?",
+    )
+    novel = Question(
+        id="BLOCK-XYZ",
+        kind="blocker",
+        prompt_text="Does the DSSF SideNavigationButton accept an external-link prop?",
+    )
+    novel_out, resolved = resolve_against_ledger([paraphrase, novel], [prior])
+    assert len(novel_out) == 1
+    assert novel_out[0].id == "BLOCK-XYZ"
+    assert len(resolved) == 1
+    assert resolved[0][0].id == "BLOCK-NEW"
+    assert resolved[0][1].answer == "gtag.js"
+
+
+# ---------------------------------------------------------------------------
+# Ledger persistence
+# ---------------------------------------------------------------------------
+
+
+def test_ledger_roundtrip_through_disk(tmp_path: Path):
+    """append_ledger → load_ledger preserves every field, including tokens."""
+    decisions = [
+        HitlDecision.from_question(
+            Question(id="BLOCK-01", kind="blocker", prompt_text="Which GA SDK — gtag.js or ga4?"),
+            step=2,
+            agent_label="refine-spec",
+            resolution="skipped",
+        ),
+        HitlDecision.from_question(
+            Question(id="OPENQ-01", kind="open_question", prompt_text="What is the German label?"),
+            step=2,
+            agent_label="refine-spec",
+            resolution="answered",
+            answer="Zu Gemini Enterprise wechseln",
+        ),
+    ]
+    append_ledger(tmp_path, decisions)
+    assert ledger_path(tmp_path).exists()
+
+    loaded = load_ledger(tmp_path)
+    assert len(loaded) == 2
+    assert loaded[0].question_id == "BLOCK-01"
+    assert loaded[0].resolution == "skipped"
+    assert loaded[1].answer == "Zu Gemini Enterprise wechseln"
+    # Tokens must round-trip so paraphrase matching still works after resume.
+    assert "gtag.js" in loaded[0].tokens
+
+
+def test_ledger_append_is_additive(tmp_path: Path):
+    """Each append adds lines without truncating prior decisions."""
+    d1 = HitlDecision.from_question(
+        Question(id="Q1", kind="blocker", prompt_text="first?"),
+        step=2, agent_label="a", resolution="skipped",
+    )
+    d2 = HitlDecision.from_question(
+        Question(id="Q2", kind="blocker", prompt_text="second?"),
+        step=3, agent_label="b", resolution="answered", answer="yes",
+    )
+    append_ledger(tmp_path, [d1])
+    append_ledger(tmp_path, [d2])
+    loaded = load_ledger(tmp_path)
+    assert [d.question_id for d in loaded] == ["Q1", "Q2"]
+
+
+def test_load_ledger_missing_file_returns_empty(tmp_path: Path):
+    assert load_ledger(tmp_path) == []
+
+
+def test_render_prior_decisions_md_contains_answer_and_skip_directives():
+    decisions = [
+        HitlDecision.from_question(
+            Question(id="BLOCK-01", kind="blocker", prompt_text="Which GA SDK?"),
+            step=2, agent_label="refine-spec", resolution="answered",
+            answer="gtag.js",
+        ),
+        HitlDecision.from_question(
+            Question(id="BLOCK-02", kind="blocker", prompt_text="Tracking call args?"),
+            step=2, agent_label="refine-spec", resolution="skipped",
+        ),
+    ]
+    md = render_prior_decisions_md(decisions)
+    assert "gtag.js" in md
+    assert "User answer" in md
+    assert "skip" in md.lower()
+    assert "do NOT" in md or "do not" in md.lower()
+
+
+def test_format_answers_md_renders_ledger_resolved_section():
+    prior = HitlDecision.from_question(
+        Question(id="BLOCK-OLD", kind="blocker", prompt_text="Which GA SDK?"),
+        step=2, agent_label="refine-spec", resolution="answered", answer="gtag.js",
+    )
+    paraphrase = Question(
+        id="BLOCK-NEW", kind="blocker", prompt_text="What's the GA SDK?"
+    )
+    md = format_answers_md(
+        questions=[], answers={}, ledger_resolved=[(paraphrase, prior)]
+    )
+    assert "Previously Resolved" in md
+    assert "gtag.js" in md
+    assert "BLOCK-NEW" in md
+    assert "BLOCK-OLD" in md

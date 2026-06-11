@@ -1,24 +1,28 @@
 """Step 3: Test plan generation via polyglot-test-planner.
 
-Reads research.md + refined-spec.md, invokes the planner agent, parses its
-output into a phase-structured plan.json (best-effort projection).
+Reads refined-spec.md, invokes the planner agent via the direct-SDK HITL
+transport, parses its output into a phase-structured plan.json (best-effort
+projection).
 
 Outputs (artifacts/step03/):
   - plan.md
   - plan.json
+
+Transport: ``worca_t.llm.reasoning.call_reasoning_llm_with_hitl`` (direct
+Anthropic SDK, no subprocess, no MCP).
 """
 
 from __future__ import annotations
 
 import json
 import re
-import shutil
 
 from worca_t.config import package_resource_root, step_timeout
+from worca_t.llm.reasoning import call_reasoning_llm_with_hitl
 from worca_t.logging_setup import get_logger
 from worca_t.md_parser import extract_bullets, extract_tables, parse_markdown
 from worca_t.schemas import is_valid
-from worca_t.steps.base import Step, StepContext, StepResult, run_agent_with_hitl
+from worca_t.steps.base import Step, StepContext, StepResult
 
 log = get_logger(__name__)
 
@@ -134,32 +138,32 @@ class PlanStep(Step):
                 outputs=[],
                 error="step 3 requires refined-spec.md (step 2)",
             )
-        inputs: dict = {"refined-spec.md": refined}
 
         agents_root = package_resource_root() / "agents"
         agent = agents_root / "polyglot-test-planner.agent.md"
-        claude_md = package_resource_root() / "CLAUDE.md"
 
-        result = await run_agent_with_hitl(
+        # Inline refined-spec into the user prompt (replaces file staging).
+        refined_text = refined.read_text(encoding="utf-8")
+
+        result = await call_reasoning_llm_with_hitl(
+            agent,
             ctx=ctx,
-            agent_path=agent,
             workdir=wd,
-            inputs=inputs,
             user_prompt=(
-                "Read the staged `./refined-spec.md` and produce a phased "
-                "test implementation plan at `./plan.md` following the "
-                "structure in your agent prompt."
+                "The refined spec is provided in the inputs section below. "
+                "Produce a phased test implementation plan following the "
+                "structure in your agent prompt. Return only the plan "
+                "markdown body — no preamble, no code fences."
             ),
+            inputs={"refined-spec.md": refined_text},
             output_filename="plan.md",
-            agent_label="polyglot-test-planner",
+            output_schema=None,  # markdown output; schema validates projection only
             timeout_s=self.timeout_s,
             step=3,
-            max_turns=15,
-            claude_md=claude_md if claude_md.exists() else None,
+            agent_label="polyglot-test-planner",
         )
 
-        produced = wd / "plan.md"
-        if not result.success or not produced.exists():
+        if not result.success or not result.final_text:
             return StepResult(
                 success=False,
                 status="failed",
@@ -168,7 +172,7 @@ class PlanStep(Step):
             )
 
         md_dst = out_dir / "plan.md"
-        shutil.copy2(produced, md_dst)
+        md_dst.write_text(result.final_text, encoding="utf-8")
         projection = _project_plan(md_dst.read_text(encoding="utf-8"))
         json_dst = out_dir / "plan.json"
         json_dst.write_text(json.dumps(projection, indent=2, ensure_ascii=False), encoding="utf-8")

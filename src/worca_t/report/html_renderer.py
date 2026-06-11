@@ -61,6 +61,11 @@ th{background:#f8fafc;font-size:.75rem;text-transform:uppercase;color:#64748b}
 .filters button.active{background:#3b82f6;color:#fff;border-color:#3b82f6}
 .bug-card{background:#fff;border-radius:.5rem;padding:1rem 1.25rem;box-shadow:0 1px 3px rgba(0,0,0,.1);margin-bottom:1rem;border-left:4px solid #e2e8f0}
 .attachment-img{max-width:480px;margin:.5rem 0;border:1px solid #e2e8f0;border-radius:.25rem}
+.bug-attachments{display:flex;flex-wrap:wrap;gap:.5rem;align-items:flex-start;margin-top:.5rem}
+.bug-thumb{max-width:240px;max-height:160px;border:1px solid #e2e8f0;border-radius:.25rem}
+.traceback{background:#0f172a;color:#e2e8f0;padding:.75rem 1rem;border-radius:.375rem;overflow-x:auto;font-size:.75rem;line-height:1.4;white-space:pre-wrap;word-break:break-word;margin:.5rem 0}
+.details-row td{background:#fafafa;padding:.25rem .75rem .5rem}
+tr[data-status="failed"] td:first-child,tr[data-status="error"] td:first-child{border-left:3px solid #ef4444}
 details{margin:.5rem 0}
 summary{cursor:pointer;font-weight:600;color:#3b82f6}
 .empty{color:#64748b;font-style:italic}
@@ -122,6 +127,9 @@ def _severity_badge(severity: str) -> str:
     return f'<span class="badge" style="background:{color}">{_escape(severity)}</span>'
 
 
+_FAILURE_STATUSES = frozenset({"failed", "error"})
+
+
 def _render_test_rows(results: list[dict], inline_images: bool) -> str:
     if not results:
         return '<p class="empty">No test results.</p>'
@@ -134,12 +142,18 @@ def _render_test_rows(results: list[dict], inline_images: bool) -> str:
         status = r.get("status", "unknown")
         dur = r.get("duration_s")
         dur_str = f"{dur:.2f}s" if dur is not None else "-"
+        is_failure = status in _FAILURE_STATUSES
 
+        # Attachment filter: screenshots on passing tests are noise. Only
+        # render screenshot attachments for failures/errors. Logs / traces /
+        # videos are still shown for any status (they're rare and useful).
         attachments_html = ""
         for a in r.get("attachments") or []:
             a_path = a.get("path", "")
             a_type = a.get("type", "other")
-            if inline_images and a_type == "screenshot" and a_path:
+            if a_type == "screenshot" and not is_failure:
+                continue
+            if inline_images and a_type == "screenshot" and a_path and is_failure:
                 img_data = _try_inline_image(a_path)
                 if img_data:
                     attachments_html += f'<img class="attachment-img" src="{img_data}" alt="screenshot">'
@@ -149,11 +163,26 @@ def _render_test_rows(results: list[dict], inline_images: bool) -> str:
                 href = abs_path.as_uri()
                 attachments_html += f'<a href="{href}">{_escape(a_type)}: {_escape(a_path)}</a><br>'
 
+        # Traceback panel: only emit for failures/errors, only when present.
+        traceback_text = (r.get("traceback") or "").strip()
+        message_text = (r.get("message") or "").strip()
+        details_html = ""
+        if is_failure and (traceback_text or message_text):
+            tb_block = (
+                f"<pre class=\"traceback\">{_escape(traceback_text or message_text)}</pre>"
+            )
+            details_html = (
+                f"<tr class=\"details-row\" data-status=\"{_escape(status)}\">"
+                f"<td colspan=\"6\"><details><summary>Failure details</summary>"
+                f"{tb_block}</details></td></tr>"
+            )
+
         row = (
             f'<tr data-status="{_escape(status)}">'
             f"<td>{tid}</td><td>{name}</td><td>{file}</td>"
             f"<td>{_status_badge(status)}</td><td>{dur_str}</td>"
             f"<td>{attachments_html}</td></tr>"
+            f"{details_html}"
         )
         rows.append(row)
 
@@ -180,6 +209,61 @@ def _try_inline_image(path_str: str) -> str | None:
         return f"data:{mime};base64,{data}"
     except OSError:
         return None
+
+
+# Map bug-reports.json's `attachments` dict keys to display-type labels used
+# elsewhere in the renderer (must match the values produced by
+# `_attachment_glob` in s09_execute.py so e.g. screenshots inline consistently).
+_BUG_ATTACHMENT_KEY_TO_TYPE = {
+    "screenshots": "screenshot",
+    "traces": "trace",
+    "videos": "video",
+    "logs": "log",
+}
+
+
+def _normalize_bug_attachments(attachments: object) -> list[tuple[str, str]]:
+    """Coerce bug-report `attachments` into a uniform list of `(path, type)`.
+
+    Tolerates three input shapes seen in the wild:
+      1. dict-of-arrays — the canonical bug-reports.json schema:
+         ``{"screenshots": ["a.png"], "traces": [], ...}``
+      2. list-of-dicts — the run-results.json style: ``[{"path": ..., "type": ...}]``
+      3. list-of-strings — bare paths: ``["a.png", "b.zip"]``
+
+    Empty paths are dropped. Unknown dict keys are kept with type=`other`.
+    """
+    out: list[tuple[str, str]] = []
+    if not attachments:
+        return out
+    if isinstance(attachments, dict):
+        for key, items in attachments.items():
+            a_type = _BUG_ATTACHMENT_KEY_TO_TYPE.get(key, "other")
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if isinstance(item, dict):
+                    p = (item.get("path") or "").strip()
+                elif isinstance(item, str):
+                    p = item.strip()
+                else:
+                    p = ""
+                if p:
+                    out.append((p, a_type))
+        return out
+    if isinstance(attachments, list):
+        for item in attachments:
+            if isinstance(item, dict):
+                p = (item.get("path") or "").strip()
+                t = str(item.get("type") or "other")
+            elif isinstance(item, str):
+                p = item.strip()
+                t = "other"
+            else:
+                continue
+            if p:
+                out.append((p, t))
+    return out
 
 
 def _render_bug_cards(bugs: list[dict]) -> str:
@@ -220,6 +304,45 @@ def _render_bug_cards(bugs: list[dict]) -> str:
                 if v:
                     card += f"<li><strong>{_escape(k)}:</strong> {_escape(v)}</li>"
             card += "</ul></details>"
+
+        # Attachments: screenshots, traces, videos, logs captured at test time
+        # carry the most diagnostic value of any field on the bug card. Link
+        # them out (or inline the first screenshot when small enough) so the
+        # report reader doesn't have to grep the filesystem.
+        #
+        # The bug-reports.json schema stores attachments as a typed dict
+        # ({"screenshots": [...], "traces": [...], "videos": [...], "logs": [...]}),
+        # NOT as the flat list of {path, type} dicts used in run-results.json.
+        # `_normalize_bug_attachments` accepts both shapes (plus string-only
+        # entries) and yields uniform `(path, type)` pairs.
+        attachment_pairs = _normalize_bug_attachments(b.get("attachments"))
+        if attachment_pairs:
+            card += "<details open><summary>Evidence</summary><div class=\"bug-attachments\">"
+            for a_path, a_type in attachment_pairs:
+                if a_type == "screenshot":
+                    inline = _try_inline_image(a_path)
+                    if inline:
+                        card += (
+                            f'<a href="{Path(a_path).resolve().as_uri()}">'
+                            f'<img class="bug-thumb" src="{inline}" alt="screenshot">'
+                            f"</a>"
+                        )
+                        continue
+                href = Path(a_path).resolve().as_uri()
+                card += (
+                    f'<div><a href="{href}">{_escape(a_type)}: '
+                    f"{_escape(Path(a_path).name)}</a></div>"
+                )
+            card += "</div></details>"
+
+        # Stack trace (if classifier preserved it from the failing test).
+        traceback_text = (b.get("traceback") or "").strip()
+        if traceback_text:
+            card += (
+                f"<details><summary>Stack trace</summary>"
+                f"<pre class=\"traceback\">{_escape(traceback_text)}</pre>"
+                f"</details>"
+            )
 
         card += "</div>"
         cards.append(card)

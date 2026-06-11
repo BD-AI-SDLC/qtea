@@ -108,17 +108,22 @@ def check_mcp_config(target: Path) -> Check:
 
 
 def check_mcp_servers(target: Path) -> list[Check]:
-    """Smoke-probe each MCP server (best-effort, ~8s per server)."""
+    """Smoke-probe each MCP server (best-effort, ~8s per server).
+
+    A probe failure is a real failure — broken MCPs make the pipeline's
+    MCP preflight (run_pipeline) abort with exit code 2. Doctor must
+    report the same severity, not hide it behind a softer ``warn``.
+    """
     try:
         local = target / ".mcp.json"
         cfg_path = local if local.exists() else (package_resource_root() / ".mcp.json")
         servers = load_mcp_config(cfg_path)
     except Exception as e:
-        return [Check("mcp servers", "warn", f"could not load: {e}")]
+        return [Check("mcp servers", "fail", f"could not load: {e}")]
     out: list[Check] = []
     for name, srv in servers.items():
         ok, detail = probe_server(srv)
-        out.append(Check(f"mcp:{name}", "ok" if ok else "warn", detail))
+        out.append(Check(f"mcp:{name}", "ok" if ok else "fail", detail))
     return out
 
 
@@ -180,24 +185,24 @@ def check_ruff() -> Check:
 def run_all_checks(
     target: Path,
     workspace: Path | None = None,
-    *,
-    probe_mcp: bool = False,
 ) -> list[Check]:
-    base: list[Check] = [
+    # MCP probes always run. Skipping them by default is how a broken
+    # `npx`/MCP setup escapes doctor unnoticed; the per-server probe is
+    # the only authoritative signal that the pipeline can actually launch
+    # agents on this machine.
+    return [
         check_claude_cli(),
         check_npx(),
         check_anthropic_key(),
         check_proxy(),
         check_mcp_config(target),
+        *check_mcp_servers(target),
         check_schemas(),
         check_workspace_writable(workspace),
         check_allure(),
         check_uv(),
         check_ruff(),
     ]
-    if probe_mcp:
-        base.extend(check_mcp_servers(target))
-    return base
 
 
 _SEVERITY_STYLE = {"ok": "green", "warn": "yellow", "fail": "red", "info": "cyan"}
@@ -208,10 +213,9 @@ def run_doctor(
     workspace: Path | None = None,
     console: Console | None = None,
     json_out: bool = False,
-    probe_mcp: bool = False,
 ) -> int:
     console = console or Console()
-    checks = run_all_checks(Path.cwd(), workspace=workspace, probe_mcp=probe_mcp)
+    checks = run_all_checks(Path.cwd(), workspace=workspace)
 
     if json_out:
         console.print_json(data=[asdict(c) for c in checks])

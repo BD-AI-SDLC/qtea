@@ -21,7 +21,7 @@ from worca_t.steps.s10_bug_classifier import (
 )
 from worca_t.workspace import create_workspace
 
-from ._fake_claude import install_fake_query
+from ._fake_anthropic import disable_vertex_env, install_fake_anthropic
 
 # ---------------------------------------------------------------------------
 # Pure helpers
@@ -151,6 +151,7 @@ async def test_step10_short_circuits_when_no_candidates(tmp_path: Path):
 
 
 async def test_step10_uses_agent_output_when_valid(tmp_path: Path, monkeypatch):
+    """Agent returns schema-valid JSON via structured outputs; step uses it."""
     ctx = _ctx(tmp_path)
     candidates = [
         {"test_id": "T-a", "title": "logs in", "status": "failed", "message": "x"},
@@ -160,14 +161,8 @@ async def test_step10_uses_agent_output_when_valid(tmp_path: Path, monkeypatch):
     # Build a schema-valid agent payload referencing the run id.
     agent_payload = _synthesize(ctx.workspace.run_id, candidates, {})
     agent_payload["bugs"][0]["rationale"] = "agent-classified"
-    install_fake_query(
-        monkeypatch,
-        messages=[{"type": "result", "result": "ok"}],
-        files={
-            "bug-reports.json": json.dumps(agent_payload),
-            "bug-reports.md": "# Agent-rendered report\n",
-        },
-    )
+    # Direct SDK returns JSON as the response text (structured outputs).
+    install_fake_anthropic(monkeypatch, text=json.dumps(agent_payload))
 
     result = await BugClassifierStep().run(ctx)
     assert result.success, result.error
@@ -175,23 +170,85 @@ async def test_step10_uses_agent_output_when_valid(tmp_path: Path, monkeypatch):
     out = ctx.workspace.step_dir(10)
     rep = json.loads((out / "bug-reports.json").read_text(encoding="utf-8"))
     assert rep["bugs"][0]["rationale"] == "agent-classified"
+    # Markdown is now ALWAYS rendered locally from the JSON for consistency.
     md = (out / "bug-reports.md").read_text(encoding="utf-8")
-    assert "Agent-rendered report" in md
+    assert "T-a" in md
+    assert "logs in" in md
 
 
-async def test_step10_falls_back_when_agent_output_invalid(tmp_path: Path, monkeypatch):
+async def test_step10_passes_bug_reports_schema_to_reasoning_llm(
+    tmp_path: Path, monkeypatch
+):
+    """On the standard Anthropic API, the step enables structured outputs by
+    passing the bug-reports schema via ``output_config.format``. (Vertex
+    backends suppress this — see ``test_output_config_skipped_on_vertex``
+    in test_reasoning_module.py.)"""
+    disable_vertex_env(monkeypatch)
+    ctx = _ctx(tmp_path)
+    candidates = [{"test_id": "T-a", "title": "t", "status": "failed"}]
+    _seed_run(ctx, candidates=candidates)
+
+    agent_payload = _synthesize(ctx.workspace.run_id, candidates, {})
+    captured: dict = {}
+    install_fake_anthropic(
+        monkeypatch, text=json.dumps(agent_payload), on_call=captured.update
+    )
+
+    result = await BugClassifierStep().run(ctx)
+    assert result.success
+
+    # The reasoning module sets output_config when output_schema is provided.
+    assert "output_config" in captured, (
+        "step09 must pass a JSON schema to enable structured outputs"
+    )
+    fmt = captured["output_config"]["format"]
+    assert fmt["type"] == "json_schema"
+    # Bug-reports schema requires these fields — quick smoke check.
+    schema = fmt["schema"]
+    assert set(schema.get("required", [])) >= {
+        "run_id", "generated_at", "summary", "bugs"
+    }
+
+
+async def test_step10_inlines_inputs_into_user_prompt(
+    tmp_path: Path, monkeypatch
+):
+    """Inputs (bug-candidates.json, run-results.json) are inlined into the
+    user message, not staged in the workdir (the latter is the old run_agent
+    pattern; direct SDK uses inlining)."""
+    ctx = _ctx(tmp_path)
+    candidates = [
+        {"test_id": "T-zzz-distinctive", "title": "t", "status": "failed"},
+    ]
+    _seed_run(ctx, candidates=candidates)
+
+    agent_payload = _synthesize(ctx.workspace.run_id, candidates, {})
+    captured: dict = {}
+    install_fake_anthropic(
+        monkeypatch, text=json.dumps(agent_payload), on_call=captured.update
+    )
+
+    result = await BugClassifierStep().run(ctx)
+    assert result.success
+
+    user_content = captured["messages"][-1]["content"]
+    # The distinctive test_id only appears in bug-candidates.json — if
+    # it's in the prompt, inlining worked.
+    assert "T-zzz-distinctive" in user_content
+    assert "bug-candidates.json" in user_content
+
+
+async def test_step10_falls_back_when_agent_output_invalid(
+    tmp_path: Path, monkeypatch
+):
+    """Agent returns garbage text — fallback path emits deterministic synthesis."""
     ctx = _ctx(tmp_path)
     candidates = [
         {"test_id": "T-a", "title": "logs in", "status": "failed", "message": "x"},
     ]
     _seed_run(ctx, candidates=candidates)
 
-    # Agent writes garbage JSON.
-    install_fake_query(
-        monkeypatch,
-        messages=[{"type": "result", "result": "ok"}],
-        files={"bug-reports.json": "not json{"},
-    )
+    install_fake_anthropic(monkeypatch, text="not json{")
 
     result = await BugClassifierStep().run(ctx)
     assert result.success
@@ -205,16 +262,15 @@ async def test_step10_falls_back_when_agent_output_invalid(tmp_path: Path, monke
     assert rep["bugs"][0]["rationale"].startswith("auto-classified")
 
 
-async def test_step10_falls_back_when_agent_omits_file(tmp_path: Path, monkeypatch):
+async def test_step10_falls_back_when_agent_returns_empty(
+    tmp_path: Path, monkeypatch
+):
+    """Agent returns empty text — fallback path kicks in."""
     ctx = _ctx(tmp_path)
     candidates = [{"test_id": "T-a", "title": "t", "status": "failed"}]
     _seed_run(ctx, candidates=candidates)
 
-    install_fake_query(
-        monkeypatch,
-        messages=[{"type": "result", "result": "ok"}],
-        files={},
-    )
+    install_fake_anthropic(monkeypatch, text="")
 
     result = await BugClassifierStep().run(ctx)
     assert result.success
@@ -225,20 +281,28 @@ async def test_step10_falls_back_when_agent_omits_file(tmp_path: Path, monkeypat
     assert rep["bugs"][0]["rationale"].startswith("auto-classified")
 
 
-async def test_step10_renders_md_when_agent_omits_it(tmp_path: Path, monkeypatch):
-    """Agent produced valid JSON but no .md: step must render one from JSON."""
+async def test_step10_falls_back_when_agent_count_mismatches(
+    tmp_path: Path, monkeypatch
+):
+    """Agent returns valid JSON but wrong bug count — usability check rejects it."""
     ctx = _ctx(tmp_path)
-    candidates = [{"test_id": "T-a", "title": "t", "status": "failed"}]
+    candidates = [
+        {"test_id": "T-a", "title": "t", "status": "failed"},
+        {"test_id": "T-b", "title": "u", "status": "failed"},
+    ]
     _seed_run(ctx, candidates=candidates)
 
-    agent_payload = _synthesize(ctx.workspace.run_id, candidates, {})
-    install_fake_query(
-        monkeypatch,
-        messages=[{"type": "result", "result": "ok"}],
-        files={"bug-reports.json": json.dumps(agent_payload)},
-    )
+    # Agent classifies only one of the two candidates — schema-valid but
+    # count-wrong. _agent_report_is_usable rejects this.
+    short_payload = _synthesize(ctx.workspace.run_id, candidates[:1], {})
+    install_fake_anthropic(monkeypatch, text=json.dumps(short_payload))
 
     result = await BugClassifierStep().run(ctx)
     assert result.success
-    md = (ctx.workspace.step_dir(10) / "bug-reports.md").read_text(encoding="utf-8")
-    assert "T-a" in md
+    assert result.status == "warned"
+    rep = json.loads(
+        (ctx.workspace.step_dir(10) / "bug-reports.json").read_text(encoding="utf-8")
+    )
+    # Fallback emits BOTH candidates with auto-classified rationale.
+    assert rep["summary"]["total_failures"] == 2
+    assert all(b["rationale"].startswith("auto-classified") for b in rep["bugs"])

@@ -23,10 +23,10 @@ You will provide guidance on:
 
 When technical debt is incurred or identified:
 
-- **MUST** offer to create GitHub Issues using the `create_issue` tool to track remediation
-- Clearly document consequences and remediation plans
-- Regularly recommend GitHub Issues for requirements gaps, quality issues, or design improvements
-- Assess long-term impact of untended technical debt
+- **MUST** emit a `fix-proposal.md` at `artifacts/stepNN/fix-proposal.md` listing tech-debt items for the operator to triage downstream. No GitHub MCP is wired into worca-t; the operator decides whether to file issues, tickets, or just track in the proposal itself.
+- Clearly document consequences and remediation plans inside `fix-proposal.md`.
+- For each item include: title, root cause, impact, recommended remediation, effort estimate, and the file/symbol surface affected.
+- Assess long-term impact of untended technical debt.
 
 ## Deliverables
 
@@ -34,4 +34,4 @@ When technical debt is incurred or identified:
 - Risk assessments with mitigation strategies
 - Edge case identification and testing strategies
 - Explicit documentation of assumptions and decisions
-- Technical debt remediation plans with GitHub Issue creation
+- A `fix-proposal.md` capturing every tech-debt item — the canonical hand-off to the operator

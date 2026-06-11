@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worca-t/schemas/locator-cache.schema.json",
+  "title": "LocatorCache",
+  "description": "Per-run cache of resolved TBD locators populated by the JIT runtime plugin during Step 8 test execution. Survives across `--from-step 8` re-runs. Each entry records how the selector was sourced (dev-supplied file vs cached vs LLM-resolved vs HITL) for downstream reporting and traceability.",
+  "type": "object",
+  "required": ["entries"],
+  "additionalProperties": true,
+  "properties": {
+    "run_id": { "type": "string" },
+    "produced_at": { "type": "string", "format": "date-time" },
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["key", "constant_name", "intent", "selector", "source"],
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "Stable hash of (test_file, constant_name, intent) used for cache lookup."
+          },
+          "test_file": {
+            "type": ["string", "null"],
+            "description": "SUT-relative path of the test/POM file that owns the TBD constant. Null when the cache entry was pre-resolved without a specific test context."
+          },
+          "constant_name": {
+            "type": "string",
+            "description": "Locator constant name as declared in the SUT (e.g. LOGIN_BUTTON)."
+          },
+          "intent": {
+            "type": "string",
+            "description": "Human-readable description of the locator's purpose, passed to tbd(...) at codegen time."
+          },
+          "selector": {
+            "type": ["string", "null"],
+            "description": "Resolved selector. Null when the entry represents an unresolvable TBD (resolver returned no match)."
+          },
+          "strategy": {
+            "type": ["string", "null"],
+            "enum": ["id", "data-testid", "role", "label", "text", "placeholder", "css", null]
+          },
+          "confidence": {
+            "type": ["number", "null"],
+            "minimum": 0,
+            "maximum": 1
+          },
+          "source": {
+            "type": "string",
+            "enum": ["dev_verified", "dev_unverified", "cached", "agent", "hitl", "unresolvable"],
+            "description": "Where this entry came from. `dev_verified` = supplied by the dev file AND confirmed by Playwright count()>0 at first access. `dev_unverified` = present in dev file, not yet exercised at runtime. `cached` = hit on a previous run. `agent` = LLM-resolved via `worca-t resolve`. `hitl` = user-supplied via interactive prompt. `unresolvable` = resolver gave up after bounded retry."
+          },
+          "page_url": {
+            "type": ["string", "null"],
+            "description": "URL of the page at resolution time (best-effort; aids debugging)."
+          },
+          "snapshot_hash": {
+            "type": ["string", "null"],
+            "description": "sha256 of the AOM snapshot that was the basis for the resolution. Lets the report show whether two resolutions reused the same snapshot."
+          },
+          "resolved_at": {
+            "type": ["string", "null"],
+            "format": "date-time"
+          }
+        }
+      }
+    }
+  }
+}

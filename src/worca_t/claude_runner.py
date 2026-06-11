@@ -51,6 +51,17 @@ class _DriveState:
     # PIDs that were children of our process at agent.start, so cleanup can
     # avoid killing siblings if `run_agent` is ever invoked concurrently.
     pre_existing_children: set[int] = field(default_factory=set)
+    # Names of MCP servers whose status was reported as `failed` / `needs-auth`
+    # in the SDK init message. Steps that depend on a specific MCP (e.g. Step 8
+    # on `playwright`) check this to fail fast rather than burning agent budget
+    # on an agent that can't see its primary tools.
+    mcp_servers_failed: list[str] = field(default_factory=list)
+    # Consecutive SDK `api_retry` SystemMessages with no intervening
+    # AssistantMessage / ResultMessage / UserMessage. When this hits the
+    # active circuit-breaker threshold (`_api_retry_storm_threshold()`,
+    # default 5, env-overridable via WORCA_T_API_RETRY_THRESHOLD),
+    # `_drive_query` raises `_ApiRetryStorm`.
+    api_retry_count: int = 0
 
 
 @dataclass
@@ -66,6 +77,11 @@ class AgentResult:
     error: str | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
     metrics: AgentMetrics = field(default_factory=AgentMetrics)
+    # MCP server names that failed to start (status `failed` / `needs-auth`
+    # in the SDK init message). Callers that depend on a specific MCP should
+    # check this to distinguish "agent produced empty output" from "agent had
+    # no tools to do its job".
+    mcp_servers_failed: list[str] = field(default_factory=list)
     # SDK session_id from the init SystemMessage. Pass this back via the
     # `resume=` parameter on a follow-up run_agent call to continue the same
     # conversation and benefit from cache_read on the already-cached prefix.
@@ -83,6 +99,83 @@ _MCP_ALLOWLIST: tuple[str, ...] = (
 
 # Sanity threshold for an unusually large agent file (informational only).
 _AGENT_PROMPT_WARN_BYTES = 30_000
+
+# Abort the agent after this many consecutive SDK `api_retry` events with
+# no intervening AssistantMessage / ResultMessage / UserMessage. Insurance
+# against the silent-retry-storm failure mode: run 20260603-205851-2d359f
+# burned ~95 s of SDK-internal exponential backoff before colliding with
+# the 1800 s step timeout — diagnostics from that run pinned the cumulative
+# wait at each retry as: 1→0.5 s, 2→1.7 s, 3→4.0 s, 4→8.6 s, 5→17.9 s,
+# 6→35.9 s, 7→67.9 s, 8→100.8 s (Anthropic SDK exp-backoff w/ jitter,
+# default `max_retries=10`).
+#
+# Threshold sizing:
+#   - too low (e.g. 3 → 4 s wait) aborts on routine Anthropic/Vertex
+#     transient 529s that normally recover within 2-4 retries; observed
+#     as false-positive aborts on long-running steps where the agent had
+#     made hundreds of real tool calls (worca-t run 20260603 step-07
+#     attempt 1: 434 events of real progress, then the API stuttered).
+#   - too high (e.g. 10 → 5 min wait) re-creates the original silent-burn
+#     pattern this guard exists to prevent.
+#   - 5 → ~18 s caps wall-clock waste at <20 s while giving the SDK enough
+#     headroom to ride out typical transient bursts.
+#
+# Overridable via env: WORCA_T_API_RETRY_THRESHOLD. Useful when:
+#   - ops sees a sustained-flake window in upstream and wants to ride longer;
+#   - a developer is debugging an agent loop and wants to abort sooner.
+# Values are clamped to [1, 10] (above 10 the SDK has already given up).
+_API_RETRY_STORM_THRESHOLD_DEFAULT = 5
+
+
+def _api_retry_storm_threshold() -> int:
+    """Resolve the active circuit-breaker threshold (env override + clamp).
+
+    Returns an int in [1, 10]. Invalid env values (non-numeric, <1, >10)
+    fall back to the default with a warning log so misconfiguration is
+    visible at agent start rather than silently masked.
+    """
+    raw = os.environ.get("WORCA_T_API_RETRY_THRESHOLD")
+    if raw is None or raw == "":
+        return _API_RETRY_STORM_THRESHOLD_DEFAULT
+    try:
+        n = int(raw)
+    except ValueError:
+        log.warning(
+            "agent.api_retry_threshold.invalid",
+            value=raw,
+            default=_API_RETRY_STORM_THRESHOLD_DEFAULT,
+        )
+        return _API_RETRY_STORM_THRESHOLD_DEFAULT
+    if n < 1 or n > 10:
+        log.warning(
+            "agent.api_retry_threshold.out_of_range",
+            value=n,
+            allowed="[1, 10]",
+            default=_API_RETRY_STORM_THRESHOLD_DEFAULT,
+        )
+        return _API_RETRY_STORM_THRESHOLD_DEFAULT
+    return n
+
+
+class _ApiRetryStorm(Exception):
+    """Raised inside `_drive_query` when SDK api_retry events spam without progress."""
+
+    def __init__(self, count: int, threshold: int) -> None:
+        super().__init__(
+            f"SDK api_retry storm ({count} consecutive retries with no "
+            f"intervening progress; threshold={threshold}). The upstream "
+            f"Anthropic/Vertex API is returning transient errors that did "
+            f"not recover within the configured retry budget. "
+            f"This is usually a temporary upstream incident — re-run the "
+            f"step (`worca-t run --from-step <N> --run-id <id>`). If it "
+            f"persists across re-runs, the agent may be stuck in a "
+            f"tool-error feedback loop; inspect the transcript's last "
+            f"~10 tool calls before the retries began. To tolerate longer "
+            f"transient windows, set WORCA_T_API_RETRY_THRESHOLD=<1..10> "
+            f"(default 5)."
+        )
+        self.count = count
+        self.threshold = threshold
 
 _MODEL_UNAVAILABLE_INDICATORS = (
     "overloaded",
@@ -114,11 +207,29 @@ def _agent_key(agent_path: Path) -> str:
 
 
 def _stage_inputs(workdir: Path, inputs: dict[str, Path]) -> None:
-    """Copy each input artifact into the agent workdir under its target name."""
+    """Copy each input artifact into the agent workdir under its target name.
+
+    When `src` already equals `dst` (caller pre-wrote the file into the
+    workdir and then also registered it in `inputs`), this is a no-op rather
+    than an error. Without this guard, `shutil.copy2(x, x)` raises on
+    Windows (`[WinError 32]: file in use`) and `SameFileError` on POSIX —
+    both surface as unhandled exceptions that fail the step on attempt 1
+    with no useful diagnosis.
+    """
     for target_name, src in inputs.items():
         if not src.exists():
             raise FileNotFoundError(f"Input artifact missing: {src} (label: {target_name})")
         dst = workdir / target_name
+        try:
+            same = src.resolve() == dst.resolve()
+        except OSError:
+            same = False
+        if same:
+            log.debug(
+                "stage_inputs.skip_same_file",
+                target=target_name, path=str(src),
+            )
+            continue
         dst.parent.mkdir(parents=True, exist_ok=True)
         if src.is_dir():
             if dst.exists():
@@ -235,6 +346,7 @@ async def _drive_query(
     progress (events, tokens, session_id) survives if this coroutine is
     cancelled mid-stream — e.g. by a timeout.
     """
+    storm_threshold = _api_retry_storm_threshold()
     with transcript_path.open("w", encoding="utf-8") as transcript_fp:
         async for message in query(prompt=user_prompt, options=options):
             evt = _message_to_dict(message)
@@ -253,21 +365,57 @@ async def _drive_query(
                         if isinstance(sid, str) and sid:
                             state.session_id = sid
 
-            if isinstance(message, SystemMessage) and getattr(message, "subtype", None) == "init":
-                data = getattr(message, "data", {}) or {}
-                servers = data.get("mcp_servers") or []
-                # SDK status enum: connected | failed | needs-auth | pending | disabled.
-                # `pending` is transient (server still starting at init-message time)
-                # and `disabled` is intentional, so only flag the genuinely bad states.
-                bad = [s for s in servers
-                       if isinstance(s, dict) and s.get("status") in ("failed", "needs-auth")]
-                if bad:
-                    log.warning("agent.mcp.failed_servers", failed=bad)
+            if isinstance(message, SystemMessage):
+                subtype = getattr(message, "subtype", None)
+                if subtype == "init":
+                    data = getattr(message, "data", {}) or {}
+                    servers = data.get("mcp_servers") or []
+                    # SDK status enum: connected | failed | needs-auth | pending | disabled.
+                    # `pending` is transient (server still starting at init-message time)
+                    # and `disabled` is intentional, so only flag the genuinely bad states.
+                    bad = [s for s in servers
+                           if isinstance(s, dict) and s.get("status") in ("failed", "needs-auth")]
+                    if bad:
+                        log.warning("agent.mcp.failed_servers", failed=bad)
+                        state.mcp_servers_failed = [
+                            s.get("name", "") for s in bad if s.get("name")
+                        ]
+                elif subtype == "api_retry":
+                    state.api_retry_count += 1
+                    # Always log so a transient flake is visible in real
+                    # time, not just buried in the post-mortem transcript.
+                    data = getattr(message, "data", {}) or {}
+                    # Dump the FULL data dict (not just cherry-picked fields)
+                    # so opaque "error: unknown / error_status: None" cases
+                    # surface whatever the SDK actually populated — exception
+                    # class, response body, request id, attempt metadata.
+                    # The cherry-picked fields stay for any structured-log
+                    # consumer that already reads them.
+                    log.warning(
+                        "agent.api_retry",
+                        count=state.api_retry_count,
+                        threshold=storm_threshold,
+                        attempt=data.get("attempt"),
+                        retry_delay_ms=data.get("retry_delay_ms"),
+                        error_status=data.get("error_status"),
+                        error=data.get("error"),
+                        data_keys=sorted(data.keys()) if isinstance(data, dict) else None,
+                        data=data,
+                    )
+                    if state.api_retry_count >= storm_threshold:
+                        log.error(
+                            "agent.api_retry_storm",
+                            count=state.api_retry_count,
+                            threshold=storm_threshold,
+                        )
+                        raise _ApiRetryStorm(state.api_retry_count, storm_threshold)
             elif isinstance(message, AssistantMessage):
+                state.api_retry_count = 0
                 text = _extract_text_from_blocks(getattr(message, "content", None))
                 if text:
                     state.final_text = text
             elif isinstance(message, ResultMessage):
+                state.api_retry_count = 0
                 result = getattr(message, "result", None)
                 if isinstance(result, str) and result:
                     state.final_text = result
@@ -285,6 +433,7 @@ async def _drive_query(
                 state.metrics.cost_usd += m.cost_usd
                 state.metrics.num_turns += m.num_turns
             elif isinstance(message, UserMessage):
+                state.api_retry_count = 0
                 # User-turn echo from the SDK (e.g., tool-result feedback).
                 pass
 
@@ -303,40 +452,15 @@ def _current_child_pids() -> set[int]:
         return set()
 
 
-async def _force_cleanup(
-    task: asyncio.Task,
-    pre_existing_children: set[int],
-    grace_s: float,
-) -> None:
-    """Cancel *task* and kill any SDK subprocess tree it spawned.
+def _kill_children(pre_existing_children: set[int]) -> None:
+    """Terminate then kill child processes spawned after *pre_existing_children*.
 
-    The Claude Agent SDK's ``query()`` async generator wraps a ``claude`` CLI
-    subprocess, which itself may spawn MCP server children (e.g. ``npx``).
-    On ``CancelledError``, the generator's ``__aexit__`` awaits the
-    subprocess to exit — which can block indefinitely if an MCP child is
-    hung (e.g. mid-``npx``-install).
-
-    The fix: cancel the task with a bounded wait, then forcibly terminate
-    any process tree that appeared while the task was running. Only NEW
-    children (i.e. PIDs not in ``pre_existing_children``) are killed, so
-    concurrent sibling agents — if any are ever introduced — are spared.
-
-    All cleanup failures are swallowed and logged. Cleanup must never raise
-    into the caller's error path.
+    Runs on a thread (via ``run_in_executor``) so it never blocks the
+    asyncio event loop — even when ``psutil.wait_procs`` stalls on
+    Windows waiting for a Playwright/browser process tree to exit.
     """
-    if not task.done():
-        task.cancel()
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=grace_s)
-        except (TimeoutError, asyncio.CancelledError):
-            pass
-        except Exception as e:  # noqa: BLE001
-            log.warning("agent.cleanup_task_error", error=str(e))
-
     try:
         me = psutil.Process(os.getpid())
-        # Snapshot AFTER cancel so we catch any children spawned during the
-        # cancellation grace window too.
         children = [
             c for c in me.children(recursive=True)
             if c.pid not in pre_existing_children
@@ -364,6 +488,41 @@ async def _force_cleanup(
             proc.kill()
 
 
+async def _force_cleanup(
+    task: asyncio.Task,
+    pre_existing_children: set[int],
+    grace_s: float,
+) -> None:
+    """Kill the SDK subprocess tree, then cancel *task*.
+
+    The Claude Agent SDK's ``query()`` async generator wraps a ``claude`` CLI
+    subprocess, which itself may spawn MCP server children (e.g. ``npx``,
+    Playwright browser).  On ``CancelledError``, the generator's
+    ``__aexit__`` awaits the subprocess to exit — which can block the
+    event loop indefinitely if the subprocess is hung on an MCP child.
+
+    The fix: kill the process tree FIRST (on a thread so the event loop
+    stays responsive), then cancel the task.  With its subprocess already
+    dead, the SDK cleanup completes promptly.  Only NEW children (PIDs
+    not in ``pre_existing_children``) are killed, so concurrent sibling
+    agents are spared.
+
+    All cleanup failures are swallowed and logged. Cleanup must never raise
+    into the caller's error path.
+    """
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _kill_children, pre_existing_children)
+
+    if not task.done():
+        task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=grace_s)
+        except (TimeoutError, asyncio.CancelledError):
+            pass
+        except Exception as e:  # noqa: BLE001
+            log.warning("agent.cleanup_task_error", error=str(e))
+
+
 async def run_agent(
     agent_path: Path,
     *,
@@ -376,6 +535,7 @@ async def run_agent(
     max_turns: int | None = 25,
     permission_mode: str = "acceptEdits",
     extra_paths: list[Path] | None = None,
+    add_dirs: list[Path] | None = None,
     mcp_source: Path | None = None,
     claude_md: Path | None = None,
     on_event: Any | None = None,
@@ -404,6 +564,12 @@ async def run_agent(
     max_turns: cap on assistant turns (None to disable).
     permission_mode: claude permission mode for tool use.
     extra_paths: dirs/files to copy into the workdir (skills, docs, ...).
+    add_dirs: extra directories the agent may read/write outside its cwd.
+        Mapped to ``ClaudeAgentOptions.add_dirs``. Use this to grant the agent
+        access to ``<workspace>/sut/`` (or any other dir) without copying its
+        contents into the workdir — the SDK widens the filesystem sandbox in
+        place. Paths must be absolute. None / empty list leaves the agent
+        confined to ``cwd``.
     mcp_source: override .mcp.json source path.
     claude_md: path to CLAUDE.md to stage at the workdir root.
     on_event: optional callback invoked for each parsed event.
@@ -417,7 +583,7 @@ async def run_agent(
     del debug_live  # accepted for API compat
     workdir.mkdir(parents=True, exist_ok=True)
     # Number each call's audit files so multi-call steps (HITL retries,
-    # step 9 self-heal) don't overwrite each other's transcript/metrics/stderr.
+    # step 8 self-heal) don't overwrite each other's transcript/metrics/stderr.
     # `transcript-00.jsonl` is call 0, `transcript-01.jsonl` is call 1, etc.
     call_idx = len(list(workdir.glob("transcript-*.jsonl")))
     suffix = f"-{call_idx:02d}"
@@ -484,6 +650,20 @@ async def run_agent(
         for k in full_env
         if k.startswith(("WORCA_", "ANTHROPIC_", "HTTP", "HTTPS", "NO_PROXY"))
     }
+    # Claude Code's prompt-cache disable knobs (DISABLE_PROMPT_CACHING and
+    # per-model DISABLE_PROMPT_CACHING_{OPUS,SONNET,HAIKU}) don't match the
+    # prefix filter above but must reach the subprocess to take effect.
+    # `pipeline.run_pipeline` sets DISABLE_PROMPT_CACHING=1 by default
+    # (cleared by --cache); forward whichever variants are set so the CLI
+    # honours them.
+    for k in (
+        "DISABLE_PROMPT_CACHING",
+        "DISABLE_PROMPT_CACHING_OPUS",
+        "DISABLE_PROMPT_CACHING_SONNET",
+        "DISABLE_PROMPT_CACHING_HAIKU",
+    ):
+        if k in full_env:
+            forwarded_env[k] = full_env[k]
 
     sdk_options_kwargs: dict[str, Any] = {
         "cwd": str(workdir),
@@ -505,6 +685,12 @@ async def run_agent(
         sdk_options_kwargs["max_turns"] = max_turns
     if resume:
         sdk_options_kwargs["resume"] = resume
+    if add_dirs:
+        # Widen the SDK's filesystem sandbox beyond `cwd` to these absolute
+        # paths. Used by steps 7-9 to grant read/write access to
+        # `<workspace>/sut/` (where generated tests are written in place) and
+        # by step 6 to grant read-only access without a copytree duplicate.
+        sdk_options_kwargs["add_dirs"] = [str(Path(p).resolve()) for p in add_dirs]
 
     # Build the model fallback chain for resilience against model outages.
     model_chain = get_model_chain(resolved_model) if resolved_model else [resolved_model]
@@ -517,9 +703,38 @@ async def run_agent(
     error: str | None = None
     exit_code = -1
 
-    # Initialise stderr file (SDK doesn't surface a stderr stream the way the
-    # subprocess did; we still create the file for forensic-artifact contract).
-    stderr_path.write_text("", encoding="utf-8")
+    # Capture stderr from the `claude` CLI subprocess into stderr_path. The
+    # CLI always runs with `--verbose` (see
+    # claude_agent_sdk/_internal/transport/subprocess_cli.py:225), so it
+    # emits the underlying error behind each `api_retry` event, the raw
+    # HTTP status / body when an API call fails, MCP-server boot diagnostics,
+    # and Node-side stack traces. Without a registered callback the transport
+    # discards stderr (line 472 of the same file: `stderr_dest = PIPE if
+    # self._options.stderr is not None else None`) — leaving us blind to
+    # root causes when retries / failures happen. Wiring this changes the
+    # post-mortem signature for runs like 20260603-205851-2d359f from
+    # `error: "unknown"` to the actual exception text.
+    #
+    # `buffering=1` is line-buffered: every line is flushed to disk
+    # immediately, so a SIGKILL / OOM still leaves a complete log. The
+    # file is closed by Python's GC when `run_agent` returns; the SDK
+    # transport may invoke the callback after `query()` exits during
+    # async cleanup, and the try/except absorbs the resulting ValueError
+    # on a closed file rather than crashing the SDK's stderr-reader task.
+    stderr_fp = stderr_path.open("w", encoding="utf-8", buffering=1)
+
+    def _stderr_sink(line: str) -> None:
+        """Forward one stderr line from the claude CLI subprocess to disk."""
+        try:
+            stderr_fp.write(line if line.endswith("\n") else line + "\n")
+        except (OSError, ValueError):
+            # File was closed by GC during async cleanup; the SDK's
+            # stderr-reader task is racing our return. Drop the line
+            # rather than propagate — losing a tail line on a clean
+            # exit is preferable to crashing the stream-reader.
+            pass
+
+    sdk_options_kwargs["stderr"] = _stderr_sink
 
     # Declare state outside the loop so post-loop code always has a reference.
     state = _DriveState()
@@ -566,9 +781,30 @@ async def run_agent(
             error = f"timeout after {resolved_timeout}s"
             log.error("agent.timeout", agent=agent_path.name, timeout_s=resolved_timeout)
             await _force_cleanup(drive_task, state.pre_existing_children, grace_s=5.0)
+        except _ApiRetryStorm as e:
+            # SDK retried `_API_RETRY_STORM_THRESHOLD` consecutive times with
+            # no intervening progress. Bail out fast rather than waiting for
+            # the full step timeout to fire.
+            exit_code = -10
+            error = str(e)
+            await _force_cleanup(drive_task, state.pre_existing_children, grace_s=2.0)
         except Exception as e:
-            error = f"sdk error: {e}"
-            log.exception("agent.sdk_error", agent=agent_path.name, error=str(e))
+            # The SDK's exception text is often opaque (e.g.
+            # "Claude Code returned an error result: success"). The real
+            # cause — Anthropic API 4xx, quota exhaustion, OAuth refresh
+            # failure, ... — is in `state.final_text` (the `ResultMessage.result`
+            # body). Surface both so users don't have to grep transcripts.
+            api_detail = (state.final_text or "").strip()
+            if api_detail:
+                error = f"sdk error: {e} | api: {api_detail[:500]}"
+            else:
+                error = f"sdk error: {e}"
+            log.exception(
+                "agent.sdk_error",
+                agent=agent_path.name,
+                error=str(e),
+                api_detail=api_detail[:500] if api_detail else None,
+            )
             await _force_cleanup(drive_task, state.pre_existing_children, grace_s=2.0)
 
             error_context = f"{e} {state.final_text}"
@@ -590,6 +826,7 @@ async def run_agent(
     final_text = state.final_text
     agent_metrics = state.metrics
     session_id = state.session_id
+    mcp_servers_failed = list(state.mcp_servers_failed)
     used_model = models_attempted[-1] if models_attempted else resolved_model
 
     duration = time.monotonic() - started
@@ -624,8 +861,26 @@ async def run_agent(
         "call_idx": call_idx,
     }
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    if error and not stderr_path.read_text(encoding="utf-8"):
-        stderr_path.write_text(error, encoding="utf-8")
+    if error:
+        # Close the CLI-stderr sink first so the append below isn't racing
+        # with the still-open write handle (matters on Windows). Late
+        # writes from the SDK's stderr-reader task during async cleanup
+        # are absorbed by the sink's try/except.
+        try:
+            stderr_fp.close()
+        except (OSError, ValueError):
+            pass
+        # Append the runner's diagnostic banner as a footer so it doesn't
+        # overwrite the CLI's own --verbose stderr (which contains the
+        # underlying exception text behind `api_retry` events). When the
+        # CLI was silent the banner is all we have; when it wrote
+        # something the banner sits below it as added context, not as a
+        # replacement. Prior behavior dropped the banner whenever the CLI
+        # had written anything, and dropped the CLI text whenever it
+        # hadn't — see RCA in run 20260610-082950-6a887f.
+        cli_stderr = stderr_path.read_text(encoding="utf-8")
+        separator = "\n--- worca-t runner ---\n" if cli_stderr else ""
+        stderr_path.write_text(cli_stderr + separator + error, encoding="utf-8")
 
     log.info(
         "agent.end",
@@ -657,4 +912,5 @@ async def run_agent(
         events=events,
         metrics=agent_metrics,
         session_id=session_id,
+        mcp_servers_failed=mcp_servers_failed,
     )

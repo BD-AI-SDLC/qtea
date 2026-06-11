@@ -1,68 +1,96 @@
-# UI Test Automation Specialist — Workflow Reference
+# UI Test Automation Specialist — Reference Data
 
-Authoritative procedural reference for the `ui-test-automation.agent.md`, which holds the persona, mission, non-negotiable rules, scope, and high-level workflow. This file holds the detail: stack detection table, user-confirmation prompt, locator priority, AOM snapshot protocol, production CI/CD examples, accessibility playbook, parallel-execution configs, retry policy.
+On-demand lookup tables, code templates, locator strategy, production examples, and worked scenarios for the `ui-test-automation.agent.md`. The agent reads specific sections of this file via the Read tool when it needs framework-specific detail — it is NOT loaded into the system prompt.
 
-The orchestrator wires this file in as a referenced input (read on demand, not inlined) so its bulk does not burn tokens unless the agent actually needs a specific section.
+Persona, mission, non-negotiable rules, and the high-level workflow (including the stack-resolution reading procedure) live in `ui-test-automation.agent.md`.
 
 ---
 
-## §1 — Stack Detection ("Polyglot Check")
+## §1 — Per-Language Idiom Table
 
-Before generating code, scan the root directory to determine the language and framework:
+Use the value of `language` from `./sut_inventory.json` at `modules[active_module]` to select naming and framework:
 
-| Manifest signal | Detected framework | Mode |
+| `language` value | Test file naming | Common framework |
 |---|---|---|
-| `pyproject.toml` / `requirements.txt` contains `pytest-playwright` | Python + Playwright | Python + Playwright |
-| `pyproject.toml` / `requirements.txt` contains `selenium` | Python + Selenium | Python + Selenium |
-| `*.robot`, `*.resource`, `robot.yaml` present | Robot Framework | (see Browser/Selenium sub-check) |
-| Above + `robotframework-browser` | Robot + Browser Library | RF + Browser (Playwright-based) |
-| Above + `robotframework-seleniumlibrary` | Robot + SeleniumLibrary | RF + SeleniumLibrary |
-| `pom.xml` / `build.gradle` with `testng` + `selenium-java` | Java + Selenium | Java + Selenium |
-| `package.json` / `playwright.config.ts` with `playwright` | TS/JS + Playwright | TypeScript + Playwright |
-| `package.json` with `cypress` | TS/JS + Cypress | Cypress |
-| `*.csproj` with `Microsoft.Playwright` | C# + Playwright | C# + Playwright |
+| `python` | `test_*.py` (worca prefix: `worca_test_*.py`) | pytest + pytest-playwright OR selenium |
+| `typescript` | `*.spec.ts` (worca: `worca_*.spec.ts`) | Playwright OR Cypress OR WebdriverIO |
+| `javascript` | `*.spec.js` (worca: `worca_*.spec.js`) | same as TS |
+| `java` | `*Test.java` (worca: `Worca*Test.java`) | TestNG / JUnit + Selenium OR Playwright-Java |
+| `csharp` | `*Tests.cs` (worca: `Worca*Tests.cs`) | NUnit / xUnit + Playwright OR Selenium |
+| `robot` | `*.robot` (worca: `worca_*.robot`) | RF + Browser Library OR SeleniumLibrary |
 
-### §1B — User Confirmation (REQUIRED when no stack detected)
-
-If NO existing codebase is found (no `package.json`, `pom.xml`, `requirements.txt`, `*.csproj`, `*.py`, `*.ts`, `*.js` files):
-
-- **MUST ASK** the user the following question before generating ANY code.
-- **DO NOT** proceed with any default — wait for user response.
-
-### Language & Framework Selection
-
-In case language and\or framework couldn't be detected, ask the user what is his stack to use for implementation from below choices:
-
-**Preferred Language:**
-- [ ] JavaScript
-- [ ] TypeScript
-- [ ] Python
-- [ ] Java
-
-**Preferred Framework:**
-- [ ] Playwright (Modern, auto-waiting, cross-browser)
-- [ ] Selenium (Legacy, widely used)
-- [ ] Cypress (JavaScript-only)
-- [ ] WebdriverIO (JavaScript/TypeScript)
-- [ ] Robot Framework + Browser Library (Playwright-based)
-- [ ] Robot Framework + SeleniumLibrary
-
-**Design Pattern:**
-- [ ] Page Object Model (POM)
-- [ ] Screenplay Pattern
-- [ ] Component Objects
-- [ ] Keyword-Driven Testing (Robot Framework)
-
-
-**Critical rules:**
-- ALWAYS wait for user input when no stack is detected.
-- NEVER assume / default to any language/framework without explicit user confirmation.
-- If the user explicitly specifies (e.g., "Generate Python pytest tests"), skip detection and use that directly.
-- Document the user's choice in the generated code comments at the top of each file.
+Detailed per-framework patterns (imports, fixtures, test syntax): see `agents/polyglot-test-researcher.prompt.md` §2 — it's the canonical catalog, do not duplicate here.
 
 ---
 
-## §2 — Framework Templates (per-stack starting points)
+## §2 — Owning-Page Heuristic (when to extend vs create a new POM)
+
+A new feature very often lives **inside an existing page** of the SUT — not in a brand-new page that needs its own POM, locators, fixtures, and `open()` method. A common mistake is creating a parallel `<NewFeature>Page` class with its own locator constants, its own collapse/toggle/locale helpers, and its own `open(base_url)` — when the feature is actually one or two widgets on a page the SUT already models.
+
+**The signal — selector prefix family.** Scan `sut_inventory.json` → `modules[active].existing_locators[].constants`. If the SUT's existing constants share a structural prefix (a `data-testid` namespace, an `id=` family, a Robot/CSS group) with the selectors you'd write for the new feature, the feature lives on the page that owns those locators.
+
+Examples of "structural prefix" — all hypothetical, the rule applies whenever you see this shape regardless of the actual prefix or SUT:
+
+- Existing constants all use `data-testid="Header-*"` and your new feature's selectors are `data-testid="Header-NewBadge"` → it lives on the page that owns `*HeaderLocators`.
+- Existing constants all use `id="checkout-*"` and your new selector is `id="checkout-promo-code"` → extend the checkout-page POM.
+- Existing constants share a parent container selector (`.app-shell .sidebar > *`) and your new widget renders inside the same container → extend the page that owns that container.
+
+**The signal — overlapping helpers.** If the SUT's existing page object already has methods you'd otherwise need to re-implement (e.g. `toggle_side_bar`, `switch_locale`, `open_settings`, navigation helpers, fixture chains that authenticate and land on the page), the new feature lives there. **Never** redefine an existing helper under a new name — import and call it.
+
+### When the signal fires, follow these three rules:
+
+1. **Reuse locator constants — never byte-duplicate.** If the existing locator class is the canonical owner and editable, append your new constants there. If you can't (or shouldn't) modify the SUT's file, create a thin `Worca<NewFeature>Locators` that **imports / subclasses the existing class** and only adds the genuinely new constants:
+   ```python
+   # in src/<pkg>/pages/locators/worca_<new_feature>_locators.py (new)
+   from .<existing>_locators import <Existing>Locators
+
+   class Worca<NewFeature>Locators(<Existing>Locators):
+       """New: only adds <NewFeature>-specific constants; reuses everything in <Existing>Locators."""
+       def __init__(self):
+           super().__init__()
+           self.<NEW_CONSTANT> = "<selector you genuinely added>"
+           # NO redeclaration of selectors that already exist in <Existing>Locators.
+   ```
+   Equivalent patterns in other languages: TS `extends`, Java inheritance, C# `: <Existing>Locators`, Robot `Resource <existing>.resource`.
+
+2. **Reuse page methods — extend or compose, don't fork.** When you need behavior the existing page already provides (collapse/expand, locale switch, navigation, modal open/close), call its method. If you must add new behavior, either subclass or compose:
+   ```python
+   # Subclass — when the new feature is a strict superset of the existing page's surface
+   class Worca<NewFeature>Page(<Existing>Page):
+       """New: only adds <NewFeature>-specific actions; reuses every <Existing>Page method."""
+       def <new_action>(self) -> None:
+           self.click_on_element(self.locators.<NEW_CONSTANT>)
+   ```
+   ```python
+   # Composition — when the new feature is a collaborator that operates on the existing page
+   class Worca<NewFeature>Page:
+       def __init__(self, existing: <Existing>Page) -> None:
+           self.existing = existing
+           self.locators = Worca<NewFeature>Locators()
+       def <new_action>(self) -> None:
+           self.existing.click_on_element(self.locators.<NEW_CONSTANT>)
+   ```
+
+3. **Reuse the existing fixture chain.** Don't write a new `open()` that calls `page.goto(base_url)` if the SUT already has an authenticated fixture (`chat_setup`, `dashboard_setup`, whatever the SUT calls it) that lands you on the page. Compose your fixture from the existing one:
+   ```python
+   @pytest.fixture()
+   def <new_feature>_page(<existing>_page: <Existing>Page) -> Worca<NewFeature>Page:
+       return Worca<NewFeature>Page(<existing>_page)
+   ```
+
+### When NOT to extend
+
+Create a brand-new POM only when **all** of these are true:
+
+- The new feature is on a distinct URL or DOM root from any existing page object.
+- No existing locator class's constants share a prefix family with your selectors.
+- No existing page object's methods overlap with the helpers you'd need (auth, navigation, common widget controls).
+
+Document the call with a one-line docstring on the new class: `"""New: <Feature> is a standalone <modal|page|widget>, not part of <ExistingPage>."""`.
+
+---
+
+## §3 — Framework Templates (per-stack starting points)
 
 Use the catalog in `agents/polyglot-test-researcher.prompt.md` §2 as the canonical reference for per-framework idioms (imports, fixtures, test syntax). Add the following UI-specific additions per stack:
 
@@ -75,16 +103,18 @@ Use the catalog in `agents/polyglot-test-researcher.prompt.md` §2 as the canoni
 
 ---
 
-## §3 — Locator Strategy (Strict Priority)
+## §4 — Locator Strategy (Strict Priority)
+
+Authoritative order — must match `ui-test-automation.agent.md` rule 1, `qa-orchestrator.instructions.md` §6, and `CLAUDE.md`. Keep these in sync; any change here must be mirrored in all three.
 
 When defining elements, use the **first available** option from this list:
 
-1. **Test ID** — `data-testid`, `data-cy`, `data-qa` (if present)
-2. **ID** — `id="submit-btn"` (if stable)
+1. **ID** — `id="submit-btn"` (if stable)
+2. **Test ID** — `data-testid`, `data-cy`, `data-qa` (if present)
 3. **Accessible Role** — `getByRole('button', { name: 'Submit' })`
 4. **Label** — `getByLabel('Email Address')`
-5. **Placeholder** — `getByPlaceholder('Email')` (if present)
-6. **Text Content** — `getByText('Welcome')` (only if unique)
+5. **Text Content** — `getByText('Welcome')` (only if unique)
+6. **Placeholder** — `getByPlaceholder('Email')` (if present)
 7. **CSS** — short, component-scoped chains only (e.g., `.card > .submit`)
 8. **Shadow DOM** — Playwright/Cypress shadow-piercing selectors (e.g., `button >> text=Submit`)
 
@@ -92,38 +122,7 @@ When defining elements, use the **first available** option from this list:
 
 ---
 
-## §4 — Snapshot Strategy (Token Optimization)
-
-When analyzing a page state (for static analysis or post-execution healing):
-
-- **Action:** Request `page.accessibility.snapshot()`.
-- **Reasoning:** Returns condensed JSON Tree (AOM) showing only interactive elements and labels.
-- **Prohibition:** **NEVER** request `page.content()` (raw HTML) unless explicitly asked for deep debugging. Wastes tokens, confuses the model.
-
----
-
-## §5 — Quality Gates
-
-### Assertion Best Practices
-
-Always provide clear assertion messages.
-
-- ❌ `expect(element).toBeVisible()`
-- ✅ `expect(element, 'Submit button should be visible after form validation').toBeVisible()`
-
-### Naming Standards
-
-- Functional: `test_should_<action>_when_<condition>_then_<outcome>`
-  - Example: `test_should_display_error_when_password_too_short()`
-- Negative: `test_should_reject_<action>_when_<invalid_condition>`
-  - Example: `test_should_reject_login_when_account_locked()`
-- BDD: native `Given/When/Then` in test descriptions when using Cucumber/SpecFlow.
-- Robot Framework: sentence-case, space-separated (no underscores).
-  - Functional: `Should <Action> When <Condition>` → `Should Display Error When Password Is Too Short`
-  - Negative: `Should Reject <Action> When <Condition>` → `Should Reject Login When Account Is Locked`
-  - BDD: native `Given`/`When`/`Then` keyword prefix support.
-
-### Retry Policy (CI only)
+## §5 — Retry Policy (CI only)
 
 | Failure type | Retries | Notes |
 |---|---|---|
@@ -260,33 +259,21 @@ export default defineConfig({
 
 ---
 
-## §7 — Cross-Browser Testing Strategy
+## §7 — Example Scenarios
 
-- **Tier 1 (every commit):** Chromium
-- **Tier 2 (nightly):** Chrome, Firefox, Edge
-- **Tier 3 (pre-release):** Safari, Mobile Safari
+All scenarios assume the normal worca-t pipeline path: `./sut_inventory.json` is staged in your workdir by Step 7's orchestration code, and `modules[active_module]` holds the active module record.
 
-Handling browser-specific issues:
-- Feature detection over browser detection.
-- Polyfills for older browsers (if required).
-- Separate test suites for browser-specific behaviors.
-- Tag tests: `@chromium-only`, `@firefox-only`, `@webkit-only`.
+**Scenario A (Python + Playwright):** `sut_inventory.json["modules"][active]` shows `language: "python"`, `package_manager: "poetry"`, and lists existing page objects under `pages/object/`.
+→ Generate `worca_test_<feature>.py` placed in `sut_inventory.modules[active].test_directory_layout.default_target` (e.g., `tests/regression/`). Import existing `SignInPage` / `<Feature>Page` from the SUT instead of redefining them. Use `pytest-playwright` synchronous fixtures. **Before creating a new `*Page` / `*Locators` class, run the §2 Owning-Page check** — if the SUT's existing locator constants share a `data-testid` prefix family with the selectors you'd write, extend the owning page object instead of forking.
 
----
+**Scenario B (Java + Selenium):** `sut_inventory.json["modules"][active]` shows `language: "java"`, `package_manager: "maven"`.
+→ Generate `Worca<Feature>Test.java` under `src/test/java/`. Use TestNG `@Test` annotations and `@FindBy` page-object pattern. Reuse any existing `*Page.java` from `sut_inventory.existing_page_objects`.
 
-## §8 — Example Scenarios
+**Scenario C (`active_module` null or `modules` empty — rare):** Step 6 hard-failed and operator pushed through anyway.
+→ The fallback language/framework/pattern prompt is presented by the agent (see `ui-test-automation.agent.md` workflow). **WAIT** for explicit selection. Do NOT scan the SUT root yourself.
 
-**Scenario A (Python):** User uploads `requirements.txt` with `pytest-playwright`.
-→ Generate `conftest.py` with fixtures and `test_login.py` using synchronous or async Playwright based on existing code patterns.
+**Scenario D (User explicitly overrides):** User states "Generate Python pytest tests" in the task prompt even though `sut_inventory.json["modules"][active]` says TypeScript.
+→ Trust the explicit override but document it: top-of-file comment `# Stack: python+pytest (user override; sut_inventory.json detected typescript)`. This is rare and intentional.
 
-**Scenario B (Java):** User uploads `pom.xml` with `selenium-java`.
-→ Generate `LoginPage.java` using WebDriver and `@FindBy` annotations.
-
-**Scenario C (No existing stack detected):** User provides only a requirement document with no codebase files.
-→ **MUST WAIT** for user to explicitly specify language/framework preference before generating ANY code. Present the §1B prompt and wait.
-
-**Scenario D (User explicitly specifies):** User states "Generate Python pytest tests".
-→ Skip detection and generate Python/pytest code directly.
-
-**Scenario E (Robot Framework):** User has `robotframework-browser` in `requirements.txt`.
-→ Generate `Resources/keywords.resource` (reusable keywords) and `Tests/login_tests.robot` using Browser Library locators (`id=`, `css=`, `role=`, `text=`). Include `robot.yaml` if Robocorp/RCC is detected. CI artifact step uploads `output.xml`, `log.html`, `report.html`.
+**Scenario E (Robot Framework):** `sut_inventory.json["modules"][active]` shows `language: "robot"`, `existing_page_objects` may be empty (Tier 3 LLM-augmented from researcher).
+→ Generate `Tests/worca_<feature>.robot` and `Resources/<feature>_keywords.resource` using Browser Library locators (`id=`, `css=`, `role=`, `text=`). Reuse existing `*.resource` keywords listed in `sut_inventory.existing_helpers`.

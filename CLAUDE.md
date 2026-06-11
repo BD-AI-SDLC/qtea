@@ -10,7 +10,7 @@
 
 | Purpose | File |
 | --- | --- |
-| Operational playbook (all 11 steps, phases, protocols) | `agents/qa-orchestrator.instructions.md` |
+| Operational playbook (all 10 steps, phases, protocols) | `agents/qa-orchestrator.instructions.md` |
 | Orchestrator agent definition | `agents/qa-orchestrator.agent.md` |
 | Debug agent (RCA on failure) | `agents/debug.agent.md` |
 | Python pipeline entry | `src/worca_t/pipeline.py` |
@@ -35,7 +35,7 @@
 
 ## The 11-Step Pipeline
 
-**Phases:** A = Requirements & Planning (1–4) · B = Research & Implementation (5–8) · C = Execution & Reporting (9–11)
+**Phases:** A = Requirements & Planning (1–4) · B = Research & Implementation (5–7) · C = Execution & Reporting (8–10)
 
 | # | Name | Phase | Step File | Agent | Schema | On Failure |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -45,9 +45,9 @@
 | 4 | Test Strategy | A | `s04_strategy.py` | `test-manager` | `test-strategy` | abort |
 | 5 | Xray Upload | B | `s05_xray.py` | None (pure code) | `xray-mapping` | compensate |
 | 6 | Repo Discovery | B | `s06_research.py` | `polyglot-test-researcher` | `research` | abort |
-| 7 | TDD Codegen | B | `s07_codegen.py` | `ui-test-automation` | `tests-with-tbd` | abort |
-| 8 | Locator Discovery | B | `s08_locator_resolution.py` | `playwright-tester` | `locator-resolution` | abort |
-| 9 | Execute + Self-Heal | C | `s09_execute.py` | `polyglot-test-tester` + `polyglot-test-fixer` | `run-results` | abort |
+| 7 | Test Architect. Reads `test-strategy.md` + `sut_inventory.json` and emits `code-modification-plan.json` — a structural mapping from each test case to placement decisions (fixtures reuse vs create, POM methods to reuse vs add, locators to reuse vs emit as TBD). After the phase gate, `pipeline.py` runs a lightweight human review gate (`src/worca_t/review_gate.py`) that surfaces the plan and offers `[a]pprove` / `[e]dit plan` / `[q]uit`. Auto-skipped in non-TTY / `--no-hitl`. On `edit`, the plan is re-validated against the schema and re-rendered. | B | `s07_test_architect.py` | `test-architect` | `code-modification-plan` | abort |
+| 8 | TDD Codegen. Transpiles `code-modification-plan.json` into executable test code: imports for `reuse` entries, new files at `at:` paths for `create` entries, extends existing POMs with `missing_methods` signatures, emits `tbd("intent")` / `Tbd.of("intent")` / `TBD_LOCATOR` sentinels for `create_tbd` locators. The plan is authoritative for placement; the writer agent does not re-derive. Vendors the per-language JIT runtime into the SUT for Playwright stacks (Python/TS/JS/Java). | B | `s08_codegen.py` | `ui-test-automation` | `tbd-index` | abort |
+| 9 | Execute + Self-Heal. **For Playwright stacks (Python/TS/JS/Java)**: starts a parent-side `ResolverServer` on a loopback TCP port and exports `WORCA_T_RESOLVER_PORT`/`WORCA_T_RESOLVER_TOKEN` into the pytest env. The vendored runtime plugin intercepts `tbd("…")` / `Tbd.of("…")` sentinels via the tier ladder: dev-locators → cache → in-process heuristic → ResolverServer (LLM) → HITL/fail-fast. ANTHROPIC_API_KEY stays in the parent process — never enters the SUT subprocess. Unresolved TBDs flow into `bug-candidates.json` as `locator-unresolvable` entries for Step 10, or get prompted on a TTY (answer → `.worca-t/dev-locators.json` for next run). **For non-Playwright stacks (Selenium/Cypress/Robot)**: `polyglot-test-fixer` on-failure heal handles `TBD_LOCATOR` markers via Playwright MCP observation (or a one-off native source-capture path per stack — `driver.page_source` / `cy.document()` / `Get Source` — when MCP can't reach the page state). `WORCA_T_NO_LLM_RESOLVE=1` disables both the runtime LLM tier AND the heal agent for symmetric zero-LLM-spend in CI. | C | `s09_execute.py` | `polyglot-test-fixer` (heal only — test execution is pure code) | `run-results` (+ `locator-cache` when JIT) | abort |
 | 10 | Bug Classification | C | `s10_bug_classifier.py` | `bug-report-classifier` | `bug-reports` | compensate |
 | 11 | Report | C | `s11_report.py` | None (pure code) | `report-data` | warn + continue |
 
@@ -57,18 +57,16 @@
 
 1. `worca-t run --spec <source> --sut <path>` — `cli.py` parses flags into `PipelineOptions`
 2. `run_pipeline()` creates workspace `~/.worca-t/<run-id>/`, loads or creates `RunState`
-3. SUT is materialized eagerly (cloned/linked into `<workspace>/sut/`) **before** the step loop, so Step 6 has no data dependency on Steps 1–5.
-4. `_select_steps()` builds the step list (honoring `--from-step`, `--only-step`, `--skip-step`, `--force`)
-5. **Step 6 (Repo Discovery) runs concurrently with Steps 2–5 in the background** when (a) Step 6 is selected, (b) `--only-step` is not used, and (c) at least one of Steps 2–5 is also selected (`_should_parallelize_research` in `pipeline.py`). The main loop runs 2→5 sequentially in the foreground while Step 6 executes in parallel. **Rendezvous is at the start of Step 7** — the loop awaits the background task there, since Step 7 (codegen) requires `research.md`. As a consequence, Step 6 may finish wall-clock-before Steps 3/4/5 — this is intentional, not a bug. Step 3's research input is best-effort under parallelization (Step 3 falls back to `refined-spec.md` alone if `research.md` is not yet available).
-6. For each foreground step: instantiate step class from `steps/sNN_*.py`, call `step.run(StepContext)`
-7. Step invokes agent via `claude_runner.run_agent()` (subprocess: `claude` CLI) or runs pure code
-8. Agent writes artifacts to `~/.worca-t/<run-id>/artifacts/stepNN/`
-9. Step validates output via `schemas.py`, returns `StepResult`
-10. On failure: retry (attempt 2) with `debug.agent.md` co-running
-11. Retries exhausted + `--fix`: `critical-thinking` → `principal-software-engineer` → `fix-proposal.md`
-12. Retries exhausted without `--fix`: mark step `failed`, abort pipeline
-
-Concurrent checkpoint writes from the foreground loop and the background Step 6 task are serialized by an `asyncio.Lock` in `save_state_async` (`checkpoints.py`).
+3. **SUT preflight.** SUT is materialized eagerly (cloned/linked into `<workspace>/sut/`) and put on the worca-t isolation branch before any step runs.
+4. **MCP preflight.** Every server in `.mcp.json` is cold-started via `mcp_manager.probe_server()`. If any fails, an interactive HITL prompt offers retry; non-TTY / `--no-hitl` / `--yes` fail fast with exit code 2. Side effect: warms the npx cache so the first agent call doesn't pay the bootstrap cost.
+5. `_select_steps()` builds the step list (honoring `--from-step`, `--only-step`, `--skip-step`, `--force`).
+6. **Steps run strictly sequentially: 1 → 2 → ... → 11.** No background tasks, no cross-step concurrency. For each step: instantiate from `steps/sNN_*.py`, call `step.execute(StepContext)`, validate outputs, persist checkpoint, move on.
+7. Step invokes agent via `claude_runner.run_agent()` (subprocess: `claude` CLI) or runs pure code.
+8. Agent writes artifacts to `~/.worca-t/<run-id>/artifacts/stepNN/`.
+9. Step validates output via `schemas.py`, returns `StepResult`.
+10. On failure: retry (attempt 2) with `debug.agent.md` co-running.
+11. Retries exhausted + `--fix`: `critical-thinking` → `principal-software-engineer` → `fix-proposal.md`.
+12. Retries exhausted without `--fix`: mark step `failed`, abort pipeline.
 
 ---
 
@@ -76,25 +74,64 @@ Concurrent checkpoint writes from the foreground loop and the background Step 6 
 
 - **Schema-first.** Every artifact validated against its JSON Schema before hand-off.
 - **Locator priority:** `id > data-testid > role > label > text > placeholder > scoped CSS`. **Never XPath.**
-- **AOM snapshots only** (`page.accessibility.snapshot()`). Never `page.content()`.
+- **Snapshot discipline.**
+  - **In generated test code (Step 8 output):** AOM only (via the framework's accessibility-tree API, e.g. Playwright `page.accessibility.snapshot()`). Raw page-source dumps (`page.content()`, `driver.page_source`, equivalents) are forbidden in tests.
+  - **In Step 9 runtime (JIT ResolverServer + non-PW self-heal):** the AOM (`page.accessibility.snapshot()` for Playwright stacks, Playwright MCP `browser_snapshot` for the non-PW heal agent) is the primary truth source for locator resolution. Raw-DOM capture (`browser_evaluate(() => document.documentElement.outerHTML)`, `driver.page_source`, `cy.document()`, `Get Source`) is a scoped fallback ONLY when the target is missing from the AOM, non-semantic, or screen-reader-hidden — and each fallback resolution must record `snapshot_source="raw_dom_fallback"` plus a `fallback_reason` in `locator-cache.json` or the heal agent's diff log.
 - **No hard waits** in generated tests (`time.sleep`, `cy.wait(<n>)`, etc.).
 - **No secrets in code.** Env vars only. Masked in logs: `ANTHROPIC_API_KEY`, `JIRA_API_TOKEN`, `JIRA_XRAY_API_KEY`, `JIRA_XRAY_CLIENT_ID`, `JIRA_XRAY_CLIENT_SECRET`.
 - **Self-heal scope** (step 9): locators only — never assertions, never business logic.
 - **F.I.R.S.T.** test principles.
 - **Markdown size:** ~200 lines target, 500 hard cap (CI-enforced).
 - **Retry policy:** `MAX_ATTEMPTS=2`. Debug agent co-runs on attempt 2.
-- **Max step timeout:** 1800 s.
+- **Max step timeout:** 1800 s. *This file is the single source of the timeout number; every agent file should defer to `src/worca_t/config.py` (`MAX_STEP_TIMEOUT_S`) rather than restating it.*
 
 ---
+
+## JIT Locator Resolution (Playwright stacks — Python / TS / JS / Java)
+
+For SUTs where the active module's framework is Playwright (Python+pytest, TS/JS+Playwright Test / Jest / Vitest, Java+JUnit5 / TestNG), Step 8 (codegen) vendors a per-language runtime into the SUT and emits unresolved locators using the appropriate sentinel helper. Python/TS/JS use `tbd("intent")` (returns `__WORCA_T_TBD__::<intent>`); Java uses `Tbd.of("intent")`. At test runtime, the runtime patches `Page.locator` / `Frame.locator` / `Locator.locator` (Python + TS/JS, on the sync API) or wraps `Page` via `WorcaT.wrap(page)` returning a dynamic-proxy (Java) to intercept sentinels against the live page (already authenticated, already on the right URL because the test's own POMs navigated there).
+
+**Resolution tier ladder (all stacks):**
+
+1. Dev-supplied locator file (zero LLM, zero tokens)
+2. Runtime cache (zero LLM)
+3. In-process AOM heuristic — exact `role + name` match against `page.accessibility.snapshot()`. Zero LLM, free at runtime; conservative thresholds (≥0.9 confidence, no near-tie) so false positives fall through cleanly. Typically resolves 50-70% of conventional CRUD/auth UIs without any LLM call.
+4. LLM via parent-side `ResolverServer` over loopback TCP (one LLM call per cold miss)
+5. HITL prompt on TTY / fail-fast with `locator-unresolvable` bug-candidate entry for Step 10 on non-TTY / `--no-hitl`
+
+**Security: parent-side ResolverServer.** Step 9 spawns a `ResolverServer` (TCP loopback, per-run shared secret) BEFORE invoking pytest. The pytest plugin connects to the server using `WORCA_T_RESOLVER_PORT` + `WORCA_T_RESOLVER_TOKEN` env vars and ships AOM + intent over the wire. The server makes the Anthropic API call in the trusted parent process. **`ANTHROPIC_API_KEY` never enters the SUT subprocess** — `safe_subprocess_env()` strips it. Leaked tokens are useless after the run completes (the server is bound to the Step 8 context manager).
+
+**Cache-invalidate-and-retry on TimeoutError.** Every returned `Locator` is wrapped in a retry proxy. When an action (click / fill / hover / etc.) raises `TimeoutError`, the proxy invalidates the cache, re-resolves via the LLM (skipping the dev file + cache + heuristic that produced the stale selector), and replays the action once. If the second attempt also fails, the original `TimeoutError` propagates and Step 9's `polyglot-test-fixer` self-heal agent picks it up (a slower path that edits POM source files).
+
+**Dev-supplied locator file** (the parent-worca handover protocol):
+
+- CLI flag: `worca-t run --dev-locators /path/to/file.json …`
+- Env var: `WORCA_T_DEV_LOCATORS=/path` (in the worca-t child process env)
+- Convention path: `<sut>/.worca-t/dev-locators.json`
+
+HITL answers from Tier 5 prompts are merged into the same `dev-locators.json` so the next run's Tier 1 picks them up without re-prompting.
+
+**Async Python Playwright (`playwright.async_api`)** is fully patched alongside the sync API. The async path returns an `_AsyncLazyLocator` synchronously from `page.locator(SENTINEL)` whose action methods (`.click()`, `.fill()`, …) await resolution + the underlying action on first call. Codegen mirrors the SUT's existing API style — sync if the SUT uses `pytest-playwright`'s sync fixture, async if it uses `pytest-asyncio` + `playwright.async_api`.
+
+**JIT runtime env vars** (set automatically by Step 9 — listed here for debugging / opt-out):
+
+- `WORCA_T_CACHE_DIR` — directory for `locator-cache.json` (auto-set to `<workspace>/locator-cache/`)
+- `WORCA_T_DEV_LOCATORS` — dev-supplied locator file path (when `--dev-locators` or env is set)
+- `WORCA_T_RESOLVER_PORT` / `WORCA_T_RESOLVER_TOKEN` — loopback TCP coordinates for the parent ResolverServer (preferred LLM path)
+- `WORCA_T_RESOLVER_CMD` — legacy subprocess fallback, defaults to `worca-t resolve`; only used when `WORCA_T_RESOLVER_PORT` is not set
+- `WORCA_T_RESOLVER_MODEL` — defaults to `claude-sonnet-4-6`; override for cost/quality trade-offs
+- `WORCA_T_DEFAULT_TIMEOUT_MS` — Playwright default timeout the plugin inflates to (default 60000)
+- `WORCA_T_INFLATE_TIMEOUTS` — set to `0` to opt out of the 60s timeout inflation
+- `WORCA_T_DISABLE_JIT` — set to `1` to disable the runtime monkey-patch entirely
+- `WORCA_T_NO_LLM_RESOLVE` — set to `1` to disable Tier 4 (LLM) AND the self-heal agent symmetrically; cache + dev-locators + heuristic only. CI default for zero-LLM-spend determinism.
 
 ## MCP Servers
 
 | Server | Used by | Purpose |
 | --- | --- | --- |
-| `playwright` | Steps 8, 9 | AOM snapshots, locator discovery, test browser control |
-| `atlassian` | Step 1 | Jira ticket intake (optional) |
+| `playwright` | Step 9 (`polyglot-test-fixer` heal mode, non-Playwright stacks only) | AOM snapshots + locator discovery during on-failure self-heal |
 
-All MCPs are launched by the `claude` CLI per project-local `.mcp.json`.
+All MCPs are launched by the `claude` CLI per project-local `.mcp.json`. JIT runtime resolution (Playwright stacks) does NOT use Playwright MCP — it consumes the live page's AOM in-process and dispatches to the parent `ResolverServer` over loopback TCP. Step 1 Jira intake uses direct REST (`worca_t.jira_client.fetch_issue`), not the retired Atlassian MCP.
 
 ---
 

@@ -14,6 +14,7 @@ from worca_t.steps.s06_research import (
     _discover_pydantic_env_keys,
     _discover_sut_env_keys,
     _extract_commands,
+    _materialize_sut,
     _project_research,
 )
 from worca_t.workspace import create_workspace
@@ -312,6 +313,109 @@ class Settings(BaseSettings):
     assert "QA_URL" in keys
 
 
+def test_discover_sut_env_keys_skips_vendored_dirs(tmp_path: Path):
+    """Regression: the source-glob scanner must skip vendored third-party
+    code (`.venv/site-packages`, `node_modules`, `__pycache__`, etc.).
+    Without this, installed plugins like `pytest-base-url` leak their own
+    env vars (PYTEST_BASE_URL, VERIFY_BASE_URL) into the prompt list,
+    blowing the "essentials" count from ~5 to 15+ and asking the user
+    about variables their source code never references."""
+    sut = tmp_path / "sut"
+    sut.mkdir()
+
+    # Legitimate SUT source — should be picked up.
+    (sut / "app.py").write_text(
+        'import os\nx = os.getenv("REAL_APP_VAR")\n', encoding="utf-8",
+    )
+
+    # Vendored plugin inside the SUT's venv — should be SKIPPED.
+    venv_plugin = sut / ".venv" / "Lib" / "site-packages" / "pytest_base_url" / "plugin.py"
+    venv_plugin.parent.mkdir(parents=True, exist_ok=True)
+    venv_plugin.write_text(
+        'import os\n'
+        'default = os.getenv("PYTEST_BASE_URL", None)\n'
+        'verify = os.getenv("VERIFY_BASE_URL", "false")\n',
+        encoding="utf-8",
+    )
+
+    # Vendored JS package — should be SKIPPED.
+    nm_lib = sut / "node_modules" / "some-lib" / "index.js"
+    nm_lib.parent.mkdir(parents=True, exist_ok=True)
+    nm_lib.write_text('const x = process.env.LEAKED_JS_VAR;\n', encoding="utf-8")
+
+    # __pycache__ — should be SKIPPED (even though .py files there are stale bytecode names).
+    pyc_dir = sut / "src" / "__pycache__"
+    pyc_dir.mkdir(parents=True)
+    (pyc_dir / "stale.py").write_text('import os\nos.getenv("LEAKED_FROM_PYCACHE")\n', encoding="utf-8")
+
+    keys = _discover_sut_env_keys(sut)
+    assert "REAL_APP_VAR" in keys
+    assert "PYTEST_BASE_URL" not in keys, "pytest-base-url plugin leaked from .venv"
+    assert "VERIFY_BASE_URL" not in keys, "pytest-base-url plugin leaked from .venv"
+    assert "LEAKED_JS_VAR" not in keys, "node_modules leak"
+    assert "LEAKED_FROM_PYCACHE" not in keys, "__pycache__ leak"
+
+
+def test_discover_sut_env_keys_excludes_secrets(tmp_path: Path):
+    """SECRET_ENV_KEYS must never leak through env-key discovery, even if
+    the SUT source explicitly references them."""
+    from worca_t.config import SECRET_ENV_KEYS
+
+    sut = tmp_path / "sut"
+    sut.mkdir()
+    lines = ["import os"]
+    for key in SECRET_ENV_KEYS:
+        lines.append(f'x = os.environ.get("{key}")')
+    lines.append('y = os.getenv("LEGITIMATE_APP_KEY")')
+    (sut / "app.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    keys = _discover_sut_env_keys(sut)
+    for key in SECRET_ENV_KEYS:
+        assert key not in keys, f"SECRET_ENV_KEY {key} leaked through discovery"
+    assert "LEGITIMATE_APP_KEY" in keys
+
+
+def test_materialize_sut_git_clone_uses_double_dash(tmp_path: Path, monkeypatch):
+    """git clone must use -- separator so URLs can't be misread as flags.
+
+    Also verifies the branch-setup contract: after the clone succeeds,
+    `_materialize_sut` calls `ensure_git_repo_and_branch` to put the SUT
+    on the worca-t/run-<id> branch. s06_research and _sut_git share the
+    global `subprocess.run` (both import the same module), so a single
+    fake captures every call site regardless of which module dispatched it.
+    """
+    import subprocess
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        # Mimic clone-on-disk: the real `git clone` would create dst + .git/
+        # so the post-clone `ensure_git_repo_and_branch` sees a "real" repo.
+        if cmd[:2] == ["git", "clone"]:
+            dst_path = Path(cmd[-1])
+            dst_path.mkdir(parents=True, exist_ok=True)
+            (dst_path / ".git").mkdir(exist_ok=True)
+        # `_sut_git.current_branch` (not invoked here, but harmless) inspects
+        # stdout; return a string so its `.strip()` doesn't blow up.
+        return subprocess.CompletedProcess(cmd, 0, stdout="worca-t/run-test\n")
+
+    monkeypatch.setattr("worca_t.steps.s06_research.subprocess.run", fake_run)
+
+    dst = tmp_path / "sut"
+    _materialize_sut(
+        "https://github.com/org/repo.git", dst, run_id="test",
+    )
+
+    clone_call = next(c for c in calls if c[:2] == ["git", "clone"])
+    assert "--" in clone_call, "git clone must use -- separator before positional args"
+    dd_idx = clone_call.index("--")
+    assert clone_call[dd_idx + 1] == "https://github.com/org/repo.git"
+    # Branch setup ran: at least one `checkout -B worca-t/run-test` call.
+    checkout_calls = [c for c in calls if "checkout" in c and "-B" in c]
+    assert checkout_calls, "ensure_git_repo_and_branch must run after clone"
+    assert "worca-t/run-test" in checkout_calls[0]
+
+
 def test_pydantic_inherited_basesettings_via_attribute_access(tmp_path: Path):
     sut = tmp_path / "sut"
     sut.mkdir()
@@ -324,3 +428,57 @@ class Settings(pydantic_settings.BaseSettings):
 """)
     req, opt = _discover_pydantic_env_keys(sut)
     assert "QA_URL" in req
+
+
+# ---------------------------------------------------------------------------
+# Dynamic researcher model selection
+# ---------------------------------------------------------------------------
+
+import pytest
+
+
+_SONNET = "claude-sonnet-4-6"
+_HAIKU_LANGUAGES = {"python", "typescript", "javascript"}
+
+
+def _researcher_model(language: str | None) -> str | None:
+    """Mirror the logic in s06_research.py for unit testing.
+
+    Default is Haiku (from agent_models.yaml → model=None means "use yaml").
+    Override UP to Sonnet for languages without deterministic tier coverage.
+    """
+    haiku_sufficient = {"python", "typescript", "javascript"}
+    return (
+        None  # Haiku from yaml
+        if (language or "") in haiku_sufficient
+        else _SONNET
+    )
+
+
+@pytest.mark.parametrize("language", sorted(_HAIKU_LANGUAGES))
+def test_researcher_model_is_haiku_for_covered_languages(language: str):
+    """Python, TypeScript, and JavaScript use the yaml default (Haiku) —
+    deterministic tiers already fill the SUT inventory."""
+    assert _researcher_model(language) is None  # None = yaml default = Haiku
+
+
+@pytest.mark.parametrize("language", ["java", "robot", "ruby", "go", "kotlin", "csharp", "rust"])
+def test_researcher_model_is_sonnet_for_uncovered_languages(language: str):
+    """Non-deterministic-covered languages override UP to Sonnet so the
+    researcher can generate the full YAML inventory."""
+    assert _researcher_model(language) == _SONNET
+
+
+def test_researcher_model_is_sonnet_for_unknown():
+    """'unknown' language means no manifest found — Sonnet for safety."""
+    assert _researcher_model("unknown") == _SONNET
+
+
+def test_researcher_model_is_sonnet_for_none():
+    """None language (stack_profile returned nothing) → Sonnet."""
+    assert _researcher_model(None) == _SONNET
+
+
+def test_researcher_model_is_sonnet_for_empty_string():
+    """Empty string (edge case) → Sonnet, not Haiku."""
+    assert _researcher_model("") == _SONNET

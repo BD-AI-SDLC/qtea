@@ -44,8 +44,10 @@ substantive content:
 3. Discard everything else: issue summary tables, attachments, issue links,
    sub-tasks, comments, UX-design tables of Figma links, image-only rows,
    sprint/label/assignee metadata.
-4. Overwrite `./spec.md` with this cleaned version, then proceed to Step 1
-   below. The rest of the refinement runs on the cleaned text.
+4. Overwrite the workdir's `./spec.md` (your local working copy — the canonical
+   Step 1 artifact at `artifacts/step01/spec.md` is read-only and is not touched
+   by this pass). Then proceed to Step 1 below. The rest of the refinement runs
+   on the cleaned text.
 
 **If clean:** skip this pass and go straight to Step 1.
 
@@ -68,7 +70,7 @@ is to remove tracker boilerplate, not to second-guess the author.
 12. Provide NFRs: performance targets, security constraints, accessibility, compatibility.
 13. Suggest effort estimation based on complexity indicators.
 14. Run the Definition-of-Ready checklist and emit a readiness verdict.
-15. Write the refined spec back to the same file (or a new `-refined.md` suffix if instructed).
+15. Write the refined spec to `./refined-spec.md` in the workdir. The Python pipeline at `src/worca_t/steps/s02_refine.py:120` copies it to `artifacts/step02/refined-spec.md`. Do not overwrite `spec.md`.
 
 ## Output Format
 
@@ -79,6 +81,17 @@ The refined spec retains the original structure and appends/replaces sections:
 
 **Requirement ID:** REQ-<slug>
 **Readiness:** READY | NOT READY (n blockers)
+
+## Blockers
+| ID | Question | Description | Severity | Affected ACs |
+|----|----------|-------------|----------|--------------|
+| BLOCK-001 | What is the exact target URL for the deep-link? | Target URL is referenced in AC-3 but never specified. | high | AC-3 |
+
+(If no blockers, write a single row: `| — | — | No blockers identified. | — | — |`.)
+
+## Open Questions
+- What is the expected aria-label text for the close button?
+- (or "No open questions.")
 
 ## Description
 <enriched description>
@@ -150,13 +163,25 @@ The refined spec retains the original structure and appends/replaces sections:
   Pre-clean Pass above, tracker boilerplate (Jira/Confluence metadata,
   attachment lists, issue links, sub-tasks, comments, Figma-link tables) may
   and should be stripped so refinement runs on the substantive requirement.
-- Mark assumptions explicitly with `[ASSUMPTION]` tag.
+- Never assume, always ask by involving HITL.
+- **Concrete emit-triggers — if ANY of the following is true for the source spec, emit a Blocker (preferred) or `[CLARIFICATION NEEDED]` tag rather than silently choosing a default:**
+  - An identifier referenced in an AC is not defined (URL, env var, route, selector, copy string, error code, translation key).
+  - A behavior described as "depending on", "based on", or "configurable" has no concrete value.
+  - An integration is named (analytics, SSO, payments, etc.) but the SDK/library/wrapper is unspecified.
+  - An AC mentions visible UI (label, tooltip, aria-label, error message) without giving the exact text.
+  - Test data shape, environment URL, or credentials path is not stated.
+  - A risk/edge-case is tagged `[NEEDS INVESTIGATION]`.
 - Flag ambiguities with `[CLARIFICATION NEEDED]` tag for upstream resolution. Involve user to answer if needed.
+- **Question form is mandatory.** Every entry in the Blockers `Question` column and every bullet under Open Questions MUST be phrased as an actionable interrogative ending in `?` — something the user can directly answer. Examples: ✅ "Which GA SDK should we intercept — `gtag.js`, `@google-analytics/ga4`, or a custom wrapper?" / ❌ "GA integration detail unconfirmed." Statements describing the gap belong in the `Description` column or context, never as the prompt to the user.
 - All acceptance criteria must use Given/When/Then and be tagged with automation feasibility.
 - Each AC must trace back to a user flow.
 - Requirement ID (`REQ-<slug>`) is mandatory — generate one if the source spec lacks it.
-- Emit `READY` verdict only when all Definition-of-Ready items pass. Otherwise emit `NOT READY` with blocker list.
-- Each unresolved item must appear in exactly ONE canonical location. If an item is listed in the Blockers table, do NOT also emit a `[CLARIFICATION NEEDED]` inline tag for the same item. Keep the item solely in the Blockers table.
+- Emit `READY` verdict only when all Definition-of-Ready items pass AND the Blockers table is empty AND the Open Questions section is empty AND no `[CLARIFICATION NEEDED]` tags remain. Otherwise emit `NOT READY` with the blocker list.
+- **Single canonical location per item.** Each unresolved item must appear in exactly ONE of: Blockers table, Open Questions bullets, or inline `[CLARIFICATION NEEDED]` tag. Priority order when classifying a new item: (1) if it blocks at least one specific AC or TC → Blockers; (2) if it is a general product/PO question not tied to a specific AC → Open Questions; (3) inline `[CLARIFICATION NEEDED]` only for ambiguity that is purely local to one sentence and not worth a top-level entry. Do NOT restate the same concern across two locations even with different wording. If you find yourself writing the same gap in two places, delete the lower-priority duplicate.
 - No GitHub/Jira API calls — this agent works on local markdown files only.
 - The refined spec has to be unique and not contain any duplicate content.
-- If there are any Blockers or `[CLARIFICATION NEEDED]` tags, the agent must ask the user to resolve them before finalizing the refined spec.
+- If there are any Blockers, Open Questions, or `[CLARIFICATION NEEDED]` tags, the agent must ask the user to resolve them before finalizing the refined spec.
+
+## Non-interactive mode
+
+If the orchestrator runs with `--no-hitl` / `--yes` (HITL disabled — see `src/worca_t/steps/base.py:222`), do not block on user input. Emit the refined spec with `Readiness: NOT READY` and the full blocker list intact. The orchestrator decides whether to halt the pipeline or proceed. Never invent answers to clarifications you would otherwise have asked.

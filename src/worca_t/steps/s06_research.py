@@ -20,14 +20,24 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
+from worca_t._sut_git import ensure_git_repo_and_branch
 from worca_t.claude_runner import run_agent
-from worca_t.config import package_resource_root, step_timeout
+from worca_t.config import SECRET_ENV_KEYS, package_resource_root, step_timeout
 from worca_t.logging_setup import get_logger
 from worca_t.md_parser import extract_bullets, parse_markdown, section_to_dict
 from worca_t.proxy import with_proxy_env
 from worca_t.schemas import is_valid
+from worca_t.stack_profile import detect_stack_profile
 from worca_t.steps.base import Step, StepContext, StepResult
+from worca_t.sut_inventory import (
+    detect_sut_inventory,
+    merge_llm_inventory,
+    parse_llm_inventory_yaml,
+    resolve_active_module,
+)
+from worca_t.url_resolver import detect_qa_base_url
 
 log = get_logger(__name__)
 
@@ -62,14 +72,31 @@ def _rmtree_safe(path: Path) -> None:
     shutil.rmtree(path, onerror=_on_error)
 
 
-def _materialize_sut(src: str, dst: Path) -> None:
+def _materialize_sut(src: str, dst: Path, *, run_id: str) -> None:
+    """Bring the SUT onto disk at ``dst`` and put it on the worca-t branch.
+
+    Three sources:
+      - Git URL → ``git clone --depth=1``. Already a git repo afterwards.
+      - Local directory → ``shutil.copytree(..., ignore=patterns('.git'))``
+        which strips the source's ``.git/`` (so worca-t never writes back
+        into the user's actual repo) and produces a fresh non-git tree.
+      - Local file → ``shutil.copy2`` (rare; degenerate single-file SUT).
+
+    After materialization, ``ensure_git_repo_and_branch`` runs to:
+      - ``git init`` + baseline commit on non-git copies, and
+      - force-create ``worca-t/run-<run_id>`` so every downstream step has
+        a writable, isolated branch to commit into.
+
+    The branch is the deliverable: a human reviews it via ``git diff`` or
+    a PR; nothing worca-t writes ever touches the upstream's ``main``.
+    """
     if _is_git_url(src):
         if dst.exists():
             _rmtree_safe(dst)
         dst.parent.mkdir(parents=True, exist_ok=True)
         log.info("sut.clone", url=src, dst=str(dst))
         subprocess.run(
-            ["git", "clone", "--depth=1", src, str(dst)],
+            ["git", "clone", "--depth=1", "--", src, str(dst)],
             check=True,
             capture_output=True,
             env=with_proxy_env(),
@@ -86,6 +113,13 @@ def _materialize_sut(src: str, dst: Path) -> None:
         else:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(p, dst)
+
+    # Single-file SUT: nothing meaningful to branch from. Skip git setup —
+    # downstream steps would fail anyway and the preflight in pipeline.py
+    # surfaces the message clearly.
+    if dst.is_file():
+        return
+    ensure_git_repo_and_branch(dst, run_id)
 
 
 def _run_scan_skill(sut: Path, out_path: Path) -> bool:
@@ -411,7 +445,16 @@ def _discover_sut_env_keys(sut_path: Path) -> list[str]:
         for src_file in sut_path.glob(glob_pat):
             if not src_file.is_file() or src_file.stat().st_size > 512_000:
                 continue
-            if "node_modules" in src_file.parts or ".git" in src_file.parts:
+            # Skip vendored / installed third-party code. Without this we
+            # descend into .venv/site-packages and harvest every os.getenv
+            # call in pytest/playwright/allure/etc. plugin code — turning a
+            # 10-key SUT into a 150+-key prompt. Matches the exclusion set
+            # in _discover_pydantic_env_keys (above) so both scanners agree
+            # on what counts as "the SUT".
+            if any(part in (".git", "node_modules", ".venv", "venv",
+                            "__pycache__", "site-packages", "dist-packages",
+                            "vendor", "target", "build", "dist")
+                   for part in src_file.parts):
                 continue
             try:
                 text = src_file.read_text(encoding="utf-8", errors="replace")
@@ -428,7 +471,8 @@ def _discover_sut_env_keys(sut_path: Path) -> list[str]:
     keys.update(pyd_optional)
 
     return sorted(k for k in keys
-                  if not any(k.startswith(p) for p in _INTERNAL_PREFIXES))
+                  if k not in SECRET_ENV_KEYS
+                  and not any(k.startswith(p) for p in _INTERNAL_PREFIXES))
 
 
 _FRAMEWORK_HINTS = (
@@ -498,7 +542,11 @@ class ResearchStep(Step):
         sut_ready = ctx.workspace.sut.exists() and any(ctx.workspace.sut.iterdir())
         if not sut_ready:
             try:
-                _materialize_sut(ctx.sut_source, ctx.workspace.sut)
+                _materialize_sut(
+                    ctx.sut_source,
+                    ctx.workspace.sut,
+                    run_id=ctx.workspace.run_id,
+                )
             except Exception as e:
                 return StepResult(
                     success=False,
@@ -520,6 +568,102 @@ class ResearchStep(Step):
             )
         scan_text = scan_out.read_text(encoding="utf-8") if scan_out.exists() else None
 
+        # Deterministic toolchain + URL discovery. Run before the agent so its
+        # prompt can reference the pre-computed artifacts; the agent's role
+        # narrows from "infer the package manager" to "refine if the lockfile
+        # signal is misleading."
+        stack_profile = detect_stack_profile(ctx.workspace.sut)
+        url_resolution = detect_qa_base_url(ctx.workspace.sut)
+
+        # Best-effort: read the refined spec from Step 2's output to seed the
+        # active-module auto-detect heuristic. None on first-time monorepo
+        # runs without --module — resolve_active_module will surface a clear
+        # error and Step 6 will fail with that message.
+        refined_spec_text: str | None = None
+        refined_spec_path = ctx.workspace.step_dir(2) / "refined-spec.md"
+        if refined_spec_path.exists():
+            try:
+                refined_spec_text = refined_spec_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                refined_spec_text = None
+
+        sut_inventory = detect_sut_inventory(
+            ctx.workspace.sut,
+            module_hint=getattr(ctx.options, "module", None),
+            spec_text=refined_spec_text,
+        )
+
+        stack_profile_path = wd / "stack_profile.json"
+        url_resolution_path = wd / "url_resolution.json"
+        sut_inventory_path = wd / "sut_inventory.json"
+        stack_profile_path.write_text(
+            json.dumps(stack_profile.as_dict(), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        url_resolution_path.write_text(
+            json.dumps(url_resolution.as_dict(), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        sut_inventory_path.write_text(
+            json.dumps(sut_inventory.as_dict(), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        # Also stage an `active_module.json` for the codegen / locator-resolution
+        # agents that consume the inventory but want a single-fact pointer.
+        active = sut_inventory.active()
+        if active is not None:
+            (wd / "active_module.json").write_text(
+                json.dumps({"name": active.name, "path": active.path,
+                            "language": active.language,
+                            "package_manager": active.package_manager}, indent=2),
+                encoding="utf-8",
+            )
+
+        log.info(
+            "step06.stack_profile",
+            package_manager=stack_profile.package_manager,
+            wrapper=stack_profile.wrapper_prefix,
+            language=stack_profile.language,
+        )
+        log.info(
+            "step06.url_resolution",
+            key=url_resolution.key,
+            source=url_resolution.source,
+            confidence=url_resolution.confidence,
+        )
+        log.info(
+            "step06.sut_inventory",
+            is_monorepo=sut_inventory.is_monorepo,
+            modules=[m.name for m in sut_inventory.modules],
+            active_module=sut_inventory.active_module,
+            page_object_count=sum(len(m.existing_page_objects) for m in sut_inventory.modules),
+        )
+
+        # Fail-fast when no active module could be resolved (monorepo + no
+        # --module + no clear auto-detect winner). The notes carry the error
+        # message produced by `resolve_active_module`.
+        if sut_inventory.modules and sut_inventory.active_module is None:
+            return StepResult(
+                success=False,
+                status="failed",
+                outputs=[],
+                error=(
+                    "active module unresolved; "
+                    + (sut_inventory.notes[-1] if sut_inventory.notes else "pass --module <name>")
+                ),
+            )
+
+        # Default model is Haiku (agent_models.yaml). For languages NOT covered
+        # by the deterministic tiers (Python AST / TS-JS regex), the researcher
+        # must generate the full SUT Inventory YAML block from scratch — upgrade
+        # to Sonnet for that heavier task.
+        _HAIKU_SUFFICIENT_LANGUAGES = {"python", "typescript", "javascript"}
+        researcher_model: str | None = (
+            None  # Haiku from agent_models.yaml — deterministic tiers handle inventory
+            if (stack_profile.language or "") in _HAIKU_SUFFICIENT_LANGUAGES
+            else "claude-sonnet-4-6"  # override UP for languages without deterministic coverage
+        )
+
         agents_root = package_resource_root() / "agents"
         skills_root = package_resource_root() / "skills"
         agent = agents_root / "polyglot-test-researcher.agent.md"
@@ -530,26 +674,51 @@ class ResearchStep(Step):
             sp = skills_root / skill
             if sp.exists():
                 extras.append(sp)
-        # Stage the SUT next to the agent so it can grep/read it.
-        extras.append(ctx.workspace.sut)
+
+        # Read-only access to the canonical SUT clone — no copy. Before this,
+        # `extras.append(ctx.workspace.sut)` triggered a full `shutil.copytree`
+        # inside `_stage_resources`, producing a redundant `<workspace>/step-06/sut/`
+        # duplicate on every run.
+        sut_abs = ctx.workspace.sut.resolve()
 
         result = await run_agent(
             agent,
             workdir=wd,
             inputs={},
             user_prompt=(
-                "Follow the procedure in `./polyglot-test-researcher.prompt.md`. "
-                "The repository under test is in `./sut/`. A pre-computed "
-                "deterministic scan is at `./scan.txt` — read it first to seed "
-                "your discovery. Produce the Discovery Summary at "
-                "`./research.md` with explicit Build, Test, and Lint commands "
-                "and a clearly labelled detected stack."
+                f"Follow the procedure in `./polyglot-test-researcher.prompt.md`. "
+                f"The repository under test is at the absolute path "
+                f"`{sut_abs}` — read files there directly (no copy is staged "
+                f"under the working directory). A pre-computed deterministic "
+                f"scan is at `./scan.txt` — read it first to seed your "
+                f"discovery. Three more pre-computed artifacts are also "
+                f"authoritative: `./stack_profile.json` (package manager, "
+                f"wrapper prefix, install command), `./url_resolution.json` "
+                f"(canonical QA URL key + value), and `./sut_inventory.json` "
+                f"(per-module test directory layout, existing page objects, "
+                f"helpers, fixtures, auth flow). Echo their values in the "
+                f"Discovery Summary — only override a field when you have "
+                f"concrete evidence (README/CI text) that contradicts the "
+                f"deterministic detection. For any field in `sut_inventory.json` "
+                f"that is empty for a non-Python / non-TypeScript module, emit "
+                f"a fenced ```yaml block whose top-level key is "
+                f"`sut_inventory_module:` and whose body matches the template "
+                f"in `./polyglot-test-researcher.prompt.md`. Produce the "
+                f"Discovery Summary at `./research.md` with explicit Build, "
+                f"Test, and Lint commands and a clearly labelled detected stack."
             ),
             extra_paths=extras,
+            add_dirs=[sut_abs],
             timeout_s=self.timeout_s,
             step=6,
             max_turns=25,
+            model=researcher_model,
             claude_md=claude_md if claude_md.exists() else None,
+        )
+        log.info(
+            "step06.researcher_model",
+            language=stack_profile.language,
+            model=researcher_model or "agent_models.yaml default",
         )
 
         produced = wd / "research.md"
@@ -564,6 +733,50 @@ class ResearchStep(Step):
         md_dst = out_dir / "research.md"
         shutil.copy2(produced, md_dst)
 
+        # Tier 3 merge: parse `## SUT Inventory` YAML blocks from research.md
+        # and per-field-merge into the deterministic inventory (existing values
+        # win; LLM fills gaps). After merge, re-resolve the active module in
+        # case the LLM revealed modules we couldn't enumerate deterministically.
+        llm_blocks = parse_llm_inventory_yaml(md_dst.read_text(encoding="utf-8"))
+        if llm_blocks:
+            for block in llm_blocks:
+                module_name = str(block.get("name", "")).strip()
+                if not module_name:
+                    continue
+                existing = sut_inventory.module_by_name(module_name)
+                if existing is None:
+                    # New module the deterministic tier didn't see (e.g. Java
+                    # module in a Java+Python mono). Synthesize a stub.
+                    from worca_t.sut_inventory import ModuleInventory  # local import to avoid cycle
+                    stub = ModuleInventory(
+                        name=module_name,
+                        path=str(block.get("path", ".")),
+                        source="llm_only",
+                    )
+                    merged = merge_llm_inventory(stub, block)
+                    sut_inventory.modules.append(merged)
+                else:
+                    idx = sut_inventory.modules.index(existing)
+                    sut_inventory.modules[idx] = merge_llm_inventory(existing, block)
+            # Re-resolve active module after merge.
+            active_name, _err = resolve_active_module(
+                sut_inventory,
+                explicit=getattr(ctx.options, "module", None),
+                spec_text=refined_spec_text,
+            )
+            if active_name:
+                sut_inventory.active_module = active_name
+            # Re-persist sut_inventory.json with merged content.
+            sut_inventory_path.write_text(
+                json.dumps(sut_inventory.as_dict(), indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            log.info(
+                "step06.sut_inventory_merged",
+                blocks=len(llm_blocks),
+                modules=[m.name for m in sut_inventory.modules],
+            )
+
         sut_env_keys = _discover_sut_env_keys(ctx.workspace.sut)
         if sut_env_keys:
             log.info("step06.sut_env_keys", count=len(sut_env_keys), keys=sut_env_keys)
@@ -572,6 +785,22 @@ class ResearchStep(Step):
         # `.env.example` membership for classifying a key as required. Pass
         # the required set as `extra_required` so HITL prompts for them.
         pyd_required, _pyd_optional = _discover_pydantic_env_keys(ctx.workspace.sut)
+
+        # Make sure the canonical URL key surfaced by `url_resolver` is in
+        # the discovered set so the resolver cascade attempts to resolve it.
+        if url_resolution.key and url_resolution.key not in sut_env_keys:
+            sut_env_keys = sorted(set(sut_env_keys) | {url_resolution.key})
+
+        # If url_resolver recovered a literal default value, seed os.environ
+        # so ProcessEnvStrategy picks it up first (lowest-confidence values
+        # still get overridden by an explicit .env file via DotenvFileStrategy).
+        if url_resolution.key and url_resolution.value and not os.environ.get(url_resolution.key):
+            os.environ[url_resolution.key] = url_resolution.value
+            log.info(
+                "step06.seed_url_default",
+                key=url_resolution.key,
+                source=url_resolution.source,
+            )
 
         # Resolve SUT env vars via multi-strategy cascade.
         env_resolution_audit: dict | None = None
@@ -598,13 +827,57 @@ class ResearchStep(Step):
                 "missing_optional": resolved.missing_optional,
             }
 
+            # Mirror the resolved canonical URL into SUT_BASE_URL so Step 8's
+            # `os.environ.get("SUT_BASE_URL")` picks it up without the user
+            # having to set SUT_BASE_URL directly. The QA-first invariant is
+            # already encoded in `url_resolver.detect_qa_base_url`.
+            chosen_key = url_resolution.key
+            if (
+                chosen_key
+                and chosen_key in resolved.values
+                and not os.environ.get("SUT_BASE_URL")
+            ):
+                os.environ["SUT_BASE_URL"] = resolved.values[chosen_key]
+                log.info(
+                    "step06.sut_base_url_mirrored",
+                    from_key=chosen_key,
+                    source=resolved.sources.get(chosen_key, "?"),
+                )
+
         projection = _project_research(
             md_dst.read_text(encoding="utf-8"), scan_text, sut_env_keys=sut_env_keys,
         )
+        projection["stack_profile"] = stack_profile.as_dict()
+        projection["url_resolution"] = url_resolution.as_dict()
+        projection["sut_inventory"] = sut_inventory.as_dict()
         if env_resolution_audit is not None:
             projection["env_resolution"] = env_resolution_audit
+
+        # Cross-check test-folder imports vs declared deps. Surfaces gaps
+        # (e.g. `import allure` with no `allure-pytest` in pyproject) so Step 8
+        # can pre-install the known-safe ones before the first pytest run
+        # instead of bailing at collection time.
+        from worca_t.test_runner import audit_missing_deps
+        dep_warnings = audit_missing_deps(
+            ctx.workspace.sut, package_manager=stack_profile.package_manager,
+        )
+        if dep_warnings:
+            projection["dependency_warnings"] = dep_warnings
+            log.info(
+                "step06.dependency_warnings",
+                count=len(dep_warnings),
+                known=sum(1 for w in dep_warnings if w["confidence"] == "known"),
+                guessed=sum(1 for w in dep_warnings if w["confidence"] == "guessed"),
+                modules=[w["module"] for w in dep_warnings],
+            )
         json_dst = out_dir / "research.json"
         json_dst.write_text(json.dumps(projection, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        # Persist the pre-computed artifacts next to research.json for
+        # downstream consumers that load them independently.
+        shutil.copy2(stack_profile_path, out_dir / "stack_profile.json")
+        shutil.copy2(url_resolution_path, out_dir / "url_resolution.json")
+        shutil.copy2(sut_inventory_path, out_dir / "sut_inventory.json")
 
         ok, err = is_valid(projection, "research")
         status = "completed" if ok else "warned"
@@ -619,3 +892,105 @@ class ResearchStep(Step):
             outputs=[md_dst, json_dst],
             notes=notes,
         )
+
+
+def replay_env_from_artifacts(workspace: Any, options: Any) -> bool:
+    """Re-populate `os.environ` from existing Step 6 artifacts.
+
+    Step 6's `resolve_sut_env()` call loads the SUT's `.env` file into
+    `os.environ` and mirrors the canonical URL key (e.g. `QA_URL`) into
+    `SUT_BASE_URL`. Those injections are **in-process only** — they vanish
+    on process restart. When the user re-runs `worca-t run --from-step 7+`,
+    Step 6 doesn't fire, so downstream steps that depend on `SUT_BASE_URL`
+    (8, 9) see it as unset and abort or warn.
+
+    This helper replays only the env-resolution slice of Step 6 (no LLM, no
+    new discovery) by reading the persisted `research.json` and
+    `url_resolution.json` and rerunning the same env resolver cascade.
+
+    Returns True when at least one env var was re-injected, False otherwise
+    (no artifacts on disk or nothing to resolve). Never raises; logs errors
+    and continues.
+    """
+    # Use the read-only path helper here — replay runs at pipeline preflight
+    # BEFORE Step 6 has had a chance to execute. Using `step_dir(6)` would
+    # mkdir an empty `artifacts/step06/` folder on every fresh run even when
+    # no prior research artifacts exist.
+    research_json = workspace.step_dir_path(6) / "research.json"
+    if not research_json.exists():
+        return False
+
+    try:
+        research = json.loads(research_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        log.warning("env_replay.research_unreadable", error=str(e))
+        return False
+
+    sut_env_keys = research.get("sut_env_keys") or []
+    url_resolution = research.get("url_resolution") or {}
+    url_key = url_resolution.get("key")
+    if url_key and url_key not in sut_env_keys:
+        sut_env_keys = list(sut_env_keys) + [url_key]
+    if not sut_env_keys:
+        return False
+
+    # Skip keys already in process env to avoid clobbering values set by
+    # the user's shell or by --env-file (which pipeline.py loaded already).
+    needed = [k for k in sut_env_keys if not os.environ.get(k)]
+    resolved_count = 0
+    resolved_keys: list[str] = []
+    resolved_sources: dict[str, str] = {}
+
+    if needed:
+        from worca_t.env_resolver import EnvResolverConfig, resolve_sut_env
+
+        resolver_config = EnvResolverConfig(
+            env_file=getattr(options, "env_file", None),
+            sut_path=workspace.sut,
+            no_hitl=True,  # never prompt during replay; Step 6 already did that
+            azdo_org=os.environ.get("AZDO_ORG"),
+            azdo_project=os.environ.get("AZDO_PROJECT"),
+            azdo_variable_group=os.environ.get("AZDO_VARIABLE_GROUP"),
+            azdo_pat=os.environ.get("AZDO_PAT"),
+        )
+        resolved = resolve_sut_env(resolver_config, needed, workspace.sut)
+        if resolved.values:
+            resolved_count = len(resolved.values)
+            resolved_keys = list(resolved.values.keys())
+            resolved_sources = dict(resolved.sources)
+        else:
+            log.info("env_replay.no_values_found", requested=needed)
+
+    # Mirror the canonical URL key to SUT_BASE_URL whenever it ends up
+    # available — whether already in process env (user's shell / --env-file
+    # / pipeline.load_env) or newly resolved by the cascade above. This
+    # MUST run as a final step regardless of `needed`/`resolved.values`,
+    # because the common "URL already in env, optional keys absent" case
+    # leaves `resolved.values` empty but SUT_BASE_URL still needs setting.
+    mirrored = False
+    if url_key and not os.environ.get("SUT_BASE_URL"):
+        url_value = os.environ.get(url_key)
+        source = "process_env"
+        if not url_value:
+            # Fallback: just-resolved value (should already be in os.environ
+            # via env_resolver, but check explicitly for clarity).
+            url_value = resolved_sources.get(url_key)
+            source = resolved_sources.get(url_key, "?")
+        if url_value:
+            os.environ["SUT_BASE_URL"] = url_value
+            mirrored = True
+            log.info(
+                "env_replay.sut_base_url_mirrored",
+                from_key=url_key,
+                source=source,
+            )
+
+    if resolved_count > 0 or mirrored:
+        log.info(
+            "env_replay.complete",
+            replayed=resolved_keys,
+            sources=resolved_sources,
+            sut_base_url_mirrored=mirrored,
+        )
+        return True
+    return False
