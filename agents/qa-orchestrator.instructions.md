@@ -86,7 +86,7 @@ For each step in `_select_steps()` (respecting `--from-step`, `--only-step`, `--
 
 1. Confirm every expected output artifact exists (see section 3).
 2. Validate each JSON output against its schema in `schemas/` via `schemas.py`.
-3. For step 7, additionally scan `tbd-index.json` for `violations[]`.
+3. For step 8 (codegen), additionally scan `tbd-index.json` for `violations[]`.
    Any violation with rule `xpath`, `hard-wait`, `page-content`, or
    `raw-secret` is a hard failure -- reject the output.
 4. If validation fails, treat as a step failure (go to 2.5).
@@ -243,21 +243,78 @@ traceability backbone -- they propagate through every downstream artifact.
 3. The agent discovers the test automation stack using 3-signal detection:
    dependency files + imports + config files.
 4. **Critical output**: `detected_stack` determines which polyglot codegen
-   path step 7 takes. If `null`, step 7 falls back to HITL.
+   path step 8 takes. If `null`, step 8 falls back to HITL.
 
 **Phase gate:** `sections` array is non-empty. If `detected_stack` is
 null, involve HITL.
 
 ---
 
-#### Step 7 -- TDD codegen
+#### Step 7 -- Test Architect
+
+| Field | Value |
+|---|---|
+| Agent | `test-architect` |
+| Input | `artifacts/step04/test-strategy.md`, `artifacts/step06/sut_inventory.json`, `artifacts/step06/research.md` |
+| Output | `artifacts/step07/code-modification-plan.json`, `code-modification-plan.md` |
+| Schema | `schemas/code-modification-plan.schema.json` |
+
+**Procedure.** Read `test-strategy.md` + `sut_inventory.json`. For each test
+case, emit explicit structural decisions: `test_file_target`, per-test
+`test_functions[]` (with markers + uses_fixtures), fixtures classified as
+`reuse` (with `from: "<file>:<symbol>"`) or `create` (with `at:`, `yields`,
+`scope`), page_objects classified the same plus optional `missing_methods[]`
+with signatures, and locators classified as `reuse` or `create_tbd` (with an
+`intent` string ≤120 chars). The plan is structural — no method bodies, no
+assertion text, no selector strings (those belong to Step 8 and the Step 9
+JIT resolver respectively).
+
+**Phase gate.**
+- Plan validates against `schemas/code-modification-plan.schema.json`.
+- Every `reuse` reference's `from` field points to a file:symbol that exists
+  in `sut_inventory.json`.
+- Every `create` / `create_tbd` `at` target lands in an inventory-approved
+  directory (matches `test_directory_layout` / `src_directory_layout`).
+- Every `missing_methods` entry has a `signature`.
+- Every `create_tbd` locator has an `intent` of ≤120 chars.
+- Marker names match `worca_<phase>` convention exactly.
+
+**Human review gate (post-step-7).** After the phase gate passes,
+`pipeline.py` invokes `review_step_7_plan` (`src/worca_t/review_gate.py`):
+- Renders a table per test case: target file, function names + markers,
+  fixtures (reuse vs create), page objects (reuse vs create + count of
+  missing methods), locators (reuse vs create_tbd with intent). Footer
+  shows totals + reuse-vs-create breakdown per category.
+- Prompts: `[a]pprove` / `[e]dit plan` / `[q]uit`.
+- On `edit`: prints the plan JSON path, blocks on `Enter`, then re-validates
+  the (potentially edited) plan against the schema and re-renders.
+  `record.output_hashes` is refreshed so a later `--resume` does not treat
+  the manual edits as drift.
+- On `quit`: pipeline aborts with exit code 1.
+- Auto-approves (no prompt) when stdin is not a TTY or `--no-hitl` is set.
+
+---
+
+#### Step 8 -- TDD codegen
 
 | Field | Value |
 |---|---|
 | Agent | `ui-test-automation` |
-| Input | `artifacts/step04/test-strategy.json`, `artifacts/step06/research.json`, `--sut` path |
-| Output | Test source files in `sut/`, `artifacts/step07/tbd-index.json` |
+| Input | `artifacts/step07/code-modification-plan.json` (authoritative), `artifacts/step06/sut_inventory.json` (style mimicry + dedup), `--sut` path |
+| Output | Test source files in `sut/`, `artifacts/step08/tbd-index.json`, `generated-files.json` |
 | Schema | `schemas/tbd-index.schema.json` |
+
+**Procedure.** Transpile the plan into code: for every `reuse` entry → emit
+an import; for every `create` entry → write a new file at the `at:` path;
+for every `missing_methods` entry → extend the existing POM file in place
+with the given signature; for every `create_tbd` locator → emit the
+language-appropriate sentinel (`tbd("<intent>")` for Python/TS/JS,
+`Tbd.of("<intent>")` for Java, `TBD_LOCATOR` + `TBD_INTENT:` comment for
+other stacks). The plan is authoritative — do not re-derive placement.
+
+Step 8 also vendors the per-language JIT runtime into the SUT (Playwright
+stacks only — Python/TS/JS/Java) so that Step 9 can intercept sentinels at
+test runtime.
 
 **Phase gate:**
 - `framework` is a recognized enum value.
@@ -266,60 +323,10 @@ null, involve HITL.
   or `raw-secret` violation is a **hard rejection** -- return to agent for correction.
 - Every test has `tc_refs` linking back to `TC-*` IDs from step 4.
 
-**Human review gate (post-step-7).** After the phase gate passes,
-`pipeline.py` invokes `review_step_7_tests` (`src/worca_t/review_gate.py`):
-- Renders a lightweight table — one row per test (name, `tc_refs`,
-  `file:line`, one-line description extracted from the test's docstring /
-  leading comment / Javadoc / Robot `[Documentation]` line) plus a footer
-  with totals (tests, support files, tbd locators, violations). Per-locator
-  detail is deliberately omitted — that belongs to step 8.
-- Prompts: `[a]pprove` / `[e]dit files` / `[q]uit`.
-- On `edit`: prints the SUT root, blocks on `Enter`, then re-runs
-  `index_tests` + `_filter_index_to_worca` to rewrite `tbd-index.json`
-  in place and refresh `record.output_hashes` (so a later `--resume` does
-  not treat the manual edits as drift). Re-renders and re-prompts.
-- On `quit`: pipeline aborts with exit code 1.
-- Auto-approves (no prompt) when stdin is not a TTY or `--no-hitl` is set.
-
-No agent re-invocation here — manual edits flow through to Step 9 because
-the JIT runtime (Playwright stacks) and the `polyglot-test-fixer` heal
-agent (other stacks) read test bytes from the SUT disk at execution time.
-
----
-
-#### Step 8 -- Locator resolution (soft-deleted)
-
-| Field | Value |
-|---|---|
-| Agent | None |
-| Input | (n/a) |
-| Output | `artifacts/step08/locator-resolution.json` — stub `{ "mode": "soft-deleted", "status": "skipped", "resolutions": [] }` |
-| Schema | `schemas/locator-resolution.schema.json` (stub-only payload) |
-
-**Soft-deleted as of the JIT-runtime refactor.** `s08_locator_resolution.py`
-is a no-op stub that always writes the stub artifact above and returns
-`status: skipped`. Locator resolution moved to Step 9 runtime for every
-stack:
-
-- **Playwright stacks (Python, TypeScript, JavaScript, Java):** Step 7
-  vendors a per-language JIT runtime (`tests/worca_t_runtime.py` for
-  Python+pytest; `worca-t-runtime.js` for TS/JS; `Tbd.java` +
-  `WorcaT.java` + `WorcaTResolver.java` for Java). The runtime intercepts
-  `tbd("intent")` / `Tbd.of("intent")` sentinels against the live page at
-  test time via the tier ladder defined in CLAUDE.md § JIT.
-- **Non-Playwright stacks (Selenium, Cypress, Robot, etc.):** Step 9's
-  on-failure `polyglot-test-fixer` self-heal flow handles `TBD_LOCATOR`
-  markers — either via Playwright MCP observation or a one-off native
-  source capture (`driver.page_source` / `cy.document()` / `Get Source`)
-  when MCP can't reach the page state.
-
-The step is kept registered so existing `state.json` checkpoints resume
-cleanly and `pipeline.py`'s 11-step list doesn't need to renumber.
-Removing it (10-step pipeline) is a deferred follow-up; see the
-soft-delete docstring in `s08_locator_resolution.py`.
-
-**Phase gate:** stub artifact exists; `status: "skipped"` is always
-accepted.
+Locator resolution happens at Step 9 runtime via the vendored JIT runtime
+(Playwright stacks — Python, TS, JS, Java) or via the on-failure
+`polyglot-test-fixer` heal flow (Selenium, Cypress, Robot, etc.). There is
+no separate locator-resolution step.
 
 ---
 
@@ -329,13 +336,13 @@ accepted.
 
 | Field | Value |
 |---|---|
-| Agents | `polyglot-test-tester` for execution, `polyglot-test-fixer` for self-heal |
-| Input | `artifacts/step07/tbd-index.json` (TBDs resolved), `--sut` path, `--parallelism N`, `--headless\|--headed` |
+| Agents | `polyglot-test-fixer` for self-heal (test execution itself is pure code via `worca_t.test_runner.run_tests`) |
+| Input | `artifacts/step08/tbd-index.json` (TBDs resolved), `--sut` path, `--parallelism N`, `--headless\|--headed` |
 | Output | `artifacts/step09/run-results.json`, screenshots, traces, `bugs/*.md` candidates, `locator-cache.json` (when JIT runtime ran) |
 | Schema | `schemas/run-results.schema.json` (+ `schemas/locator-cache.schema.json` for the JIT cache) |
 
 **JIT runtime (Playwright stacks — Python, TypeScript, JavaScript, Java).**
-For SUTs whose active module is a Playwright stack (Python+pytest, TS/JS+Playwright Test / Jest / Vitest, Java+JUnit5 / TestNG), Step 7 has vendored a per-language runtime into the SUT. Before launching the test command, Step 9:
+For SUTs whose active module is a Playwright stack (Python+pytest, TS/JS+Playwright Test / Jest / Vitest, Java+JUnit5 / TestNG), Step 8 has vendored a per-language runtime into the SUT. Before launching the test command, Step 9:
 
 - Starts a parent-side `ResolverServer` (TCP loopback, per-run shared secret) and exports `WORCA_T_RESOLVER_PORT` + `WORCA_T_RESOLVER_TOKEN` into the test subprocess env.
 - Sets the rest of the `WORCA_T_*` env vars: `WORCA_T_CACHE_DIR`, `WORCA_T_RUN_ID`, `WORCA_T_RESOLVER_MODEL`, `WORCA_T_DEFAULT_TIMEOUT_MS`, optionally `WORCA_T_DEV_LOCATORS` (when `--dev-locators` or env is set), `WORCA_T_NO_LLM_RESOLVE=1` (when CI opts out of LLM spend).
@@ -355,10 +362,10 @@ Resolutions are cached to `<workspace>/locator-cache/locator-cache.json`; Step 9
 **Non-Playwright stacks (Selenium, Cypress, Robot, etc.):** JIT does not apply; `polyglot-test-fixer` heal mode handles `TBD_LOCATOR` markers on failure as the procedure below describes. `WORCA_T_NO_LLM_RESOLVE=1` disables both the runtime LLM tier AND the heal agent symmetrically — zero LLM spend in CI.
 
 **Procedure (all stacks):**
-1. Invoke `polyglot-test-tester` to run the test command. The command comes from
-   `research.json.commands.test`, passed by `s09_execute.py:_detected_command()`.
-   The tester does NOT self-discover the command from project files (that path is
-   a fallback only when `research.json` has no `commands.test`).
+1. Run the test command via `worca_t.test_runner.run_tests` (pure code, no
+   agent). The command comes from `research.json.commands.test`, passed by
+   `s09_execute.py:_detected_command()`. Falls back to a per-framework
+   default only when `research.json` has no `commands.test`.
 2. Collect results, screenshots (on failure), and traces.
 3. If tests fail due to locator drift, invoke `polyglot-test-fixer`
    to self-heal: patch POM/page-object files with current selectors
@@ -418,13 +425,15 @@ failed test.
 Step 1  --> spec.md -----------------------> Step 2
 Step 2  --> refined-spec.md/json ----------> Step 3
 Step 3  --> plan.md/json ------------------> Step 4
-Step 4  --> test-strategy.md/json ---------> Steps 7, 9, 10, 11
+Step 4  --> test-strategy.md/json ---------> Steps 7, 8, 9, 10, 11
 Step 5  --> xray-mapping.json            (stand-alone; no downstream dependency)
-Step 6  --> research.md/json --------------> Steps 7, 9
-Step 7  --> tbd-index.json ----------------> Step 9
+Step 6  --> research.md/json --------------> Steps 7, 8, 9
+         -> sut_inventory.json ------------> Steps 7, 8
+Step 7  --> code-modification-plan.json --> Step 8
+         -> code-modification-plan.md       (review-gate surface)
+Step 8  --> tbd-index.json ----------------> Step 9
          -> test source files in sut/
          -> vendored JIT runtime in sut/    (Playwright stacks only)
-Step 8  --> locator-resolution.json (stub, soft-deleted)
 Step 9  --> run-results.json --------------> Steps 10, 11
          -> bugs/*.md
 Step 10 --> bug-reports.md/json -----------> Step 11
@@ -441,10 +450,11 @@ Every artifact links back to the requirement that spawned it:
 ```
 REQ-<slug>  (step 2: refine-spec assigns)
   --> TC-<slug>  (step 4: test-manager creates test cases)
-      --> test files with tc_refs  (step 7: ui-test-automation)
-          --> run-results per test  (step 9: polyglot-test-tester)
-              --> BUG-<run-id>-<seq> with requirement_id  (step 10)
-                  --> report links all layers  (step 11)
+      --> code-modification-plan entry (step 7: test-architect maps TC → code)
+          --> test files with tc_refs  (step 8: ui-test-automation transpiles)
+              --> run-results per test  (step 9: execute + self-heal)
+                  --> BUG-<run-id>-<seq> with requirement_id  (step 10)
+                      --> report links all layers  (step 11)
 ```
 
 If a requirement ID is missing or broken at any step, flag it and halt.
@@ -457,17 +467,18 @@ These are non-negotiable. Violations trigger step rejection and the retry/fix cy
 
 | Gate | Enforced at | Constraint |
 |---|---|---|
-| Locator priority | Step 8 agent | `id > data-testid > role > label > text > placeholder > css` |
-| No XPath | Steps 7, 8 | `xpath` in `violations[]` is a hard rejection |
+| Locator priority | Step 9 agent | `id > data-testid > role > label > text > placeholder > css` |
+| No XPath | Steps 8, 9 | `xpath` in `violations[]` is a hard rejection |
 | No XPath (self-heal) | Step 9 | Any XPath selector introduced by `polyglot-test-fixer` in heal mode (`By.XPATH`, `xpath=`, `//`, `getByXPath(`) is rejected; the heal patch is reverted and the test stays `status: failed`. |
-| No hard waits | Step 7 | `hard-wait` in `violations[]` is a hard rejection |
-| No `page.content()` | Steps 8, 9 | `page-content` in `violations[]` is a hard rejection |
-| No raw secrets | Step 7 | `raw-secret` in `violations[]` is a hard rejection |
-| TC traceability | Step 7 | Every test must have `tc_refs` linking to `TC-*` IDs |
-| REQ traceability | Steps 2, 10 | Every requirement links to a `REQ-*` ID. Every bug whose `test_id` resolves to a known TC links to that TC's `requirement_id`; orphan failures (test_id not in strategy) may omit it but must include `rationale: "orphan failure"`. |
+| No hard waits | Step 8 | `hard-wait` in `violations[]` is a hard rejection |
+| No `page.content()` | Steps 9, 10 | `page-content` in `violations[]` is a hard rejection |
+| No raw secrets | Step 8 | `raw-secret` in `violations[]` is a hard rejection |
+| TC traceability | Step 8 | Every test must have `tc_refs` linking to `TC-*` IDs |
+| REQ traceability | Steps 2, 11 | Every requirement links to a `REQ-*` ID. Every bug whose `test_id` resolves to a known TC links to that TC's `requirement_id`; orphan failures (test_id not in strategy) may omit it but must include `rationale: "orphan failure"`. |
 | Self-heal scope | Step 9 | Locators ONLY -- never assertions, never business logic |
+| Plan reuse-vs-create | Step 7 | Every `reuse` reference points to an inventory entry; every `create`/`create_tbd` target is in an inventory-approved directory |
 | Schema-first | Every step | Every JSON artifact validated via `schemas.py` before hand-off |
-| AOM snapshot only | Steps 8, 9 | Generated test code: AOM only — `page.content()` / raw page-source dumps are forbidden. Step 8a runtime: AOM via `browser_snapshot` is the default; raw-DOM via `browser_evaluate(... outerHTML)` is permitted ONLY when the target element is missing from the AOM, non-semantic, or screen-reader-hidden, AND the fallback is annotated per-item with `snapshot_source="raw_dom_fallback"` + a `fallback_reason`. Unjustified raw captures are logged as advisory violations. |
+| AOM snapshot only | Steps 9, 10 | Generated test code: AOM only — `page.content()` / raw page-source dumps are forbidden. Step 9 runtime: AOM via `browser_snapshot` is the default; raw-DOM via `browser_evaluate(... outerHTML)` is permitted ONLY when the target element is missing from the AOM, non-semantic, or screen-reader-hidden, AND the fallback is annotated per-item with `snapshot_source="raw_dom_fallback"` + a `fallback_reason`. Unjustified raw captures are logged as advisory violations. |
 
 ---
 
@@ -495,5 +506,5 @@ Secrets are always masked before writing to any log or artifact.
 After step 11 completes (or after abort):
 1. Set `finished_at` in `state.json` and persist via `save_state()`.
 2. Log a summary line: total steps completed, total duration, pass rate.
-3. Success = all 11 steps `completed` (or `skipped` for step 5 / step 8).
+3. Success = all 11 steps `completed` (or `skipped` for step 5 / step 9).
    Any `failed` step → run is partial.

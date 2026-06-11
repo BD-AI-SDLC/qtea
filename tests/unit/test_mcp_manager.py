@@ -118,7 +118,7 @@ def test_stage_mcp_config_isolates_per_workdir(tmp_path: Path):
     """Per-call MCP isolation regression: two consecutive stage_mcp_config
     calls into distinct workdirs MUST produce distinct staged config files
     with no shared mutable state. This is what guarantees Step 8a's
-    Playwright browser doesn't leak into Step 8b or Step 9 (see
+    Playwright browser doesn't leak into Step 8b or Step 8 (see
     `mcp_manager` module docstring 'Per-call MCP isolation guarantee')."""
     src = tmp_path / ".mcp.json"
     src.write_text(
@@ -127,8 +127,8 @@ def test_stage_mcp_config_isolates_per_workdir(tmp_path: Path):
         }}}),
         encoding="utf-8",
     )
-    wd_a = tmp_path / "step08-workdir"
-    wd_b = tmp_path / "step09-workdir"
+    wd_a = tmp_path / "step07-workdir"
+    wd_b = tmp_path / "step08-workdir"
 
     staged_a = stage_mcp_config(wd_a, source=src)
     staged_b = stage_mcp_config(wd_b, source=src)
@@ -146,7 +146,7 @@ def test_stage_mcp_config_does_not_rewrite_playwright_args(tmp_path: Path):
     """Regression: worca-t must NOT touch the Playwright MCP's `--headless`
     flag based on the CLI `--headed` option. The MCP is a background tool;
     its head state is controlled solely by `.mcp.json`. The CLI flag instead
-    controls Step 9's SUT test execution (see `test_runner._strip_headless_flag`).
+    controls Step 8's SUT test execution (see `test_runner._strip_headless_flag`).
 
     Earlier versions appended `--headed` to the MCP args when the CLI flag
     was set, which made `@playwright/mcp` exit with

@@ -268,7 +268,7 @@ _RULES: list[tuple[str, list[str], Any]] = [
 def _detect_start_command(sut: Path, language: str | None) -> str | None:
     """Best-effort start_command extraction. Returns None if undetectable.
 
-    Stored for downstream consumption — Step 9 does NOT auto-spawn the server
+    Stored for downstream consumption — Step 8 does NOT auto-spawn the server
     in v1 (see plan: dev-server lifecycle is out of scope). Recorded only so
     the researcher agent and future versions have a reliable signal.
     """

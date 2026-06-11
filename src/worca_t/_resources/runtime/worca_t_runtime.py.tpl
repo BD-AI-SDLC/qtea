@@ -207,7 +207,7 @@ def _load_dev_locators() -> dict[str, _DevLocator]:
 # ---------------------------------------------------------------------------
 #
 # The plugin talks to a small TCP server that the worca-t parent starts in
-# Step 9 (``worca_t.resolver_server.ResolverServer``). The server runs in
+# Step 8 (``worca_t.resolver_server.ResolverServer``). The server runs in
 # the TRUSTED parent process and has access to ``ANTHROPIC_API_KEY``;
 # pytest itself never sees the key. Connection details are passed in via
 # two env vars set by s09_execute:
@@ -217,7 +217,7 @@ def _load_dev_locators() -> dict[str, _DevLocator]:
 #
 # Falls back to the legacy ``worca-t resolve`` subprocess command when
 # those env vars are absent (e.g. tests run outside the worca-t pipeline,
-# or against an older Step 9 that doesn't start the server). The
+# or against an older Step 8 that doesn't start the server). The
 # subprocess path is BROKEN for first-time TBDs in worca-t-managed runs
 # because ``safe_subprocess_env`` strips ``ANTHROPIC_API_KEY``; it is
 # retained ONLY as an escape hatch for ad-hoc local debugging.
@@ -1011,7 +1011,7 @@ class _AsyncLazyLocator:
                 f"worca-t JIT runtime (async): could not resolve locator "
                 f"{parse_sentinel(self._sentinel)!r}. The parent process will "
                 f"surface this via HITL on the next interactive run, or as a "
-                f"`locator-unresolvable` bug candidate for Step 10."
+                f"`locator-unresolvable` bug candidate for Step 9."
             )
         object.__setattr__(self, "_resolved_real",
                            self._rebuild_locator(resolution.selector))
@@ -1096,7 +1096,7 @@ def _append_spend_line(entry: dict[str, Any]) -> None:
 
     Telemetry only — never includes the selector string, page URL, or
     snapshot body (all of which could leak secrets / tenant IDs / PII).
-    Step 9 reads this file at end-of-step and rolls it up into
+    Step 8 reads this file at end-of-step and rolls it up into
     ``run-results.json``'s ``resolver_spend`` summary.
     """
     cache_dir = os.environ.get("WORCA_T_CACHE_DIR")
@@ -1119,9 +1119,9 @@ def _append_spend_line(entry: dict[str, Any]) -> None:
 def _write_hitl_pending(intent: str, constant_name: str,
                         test_file: str | None, page_url: str | None) -> None:
     """Drop a ``hitl-pending-<key>.json`` file in the cache dir for the
-    parent process (Step 9) to pick up after pytest exits. The parent
+    parent process (Step 8) to pick up after pytest exits. The parent
     prompts the user on a TTY or emits a structured ``locator-unresolvable``
-    bug-candidate entry for Step 10 on non-TTY / ``--no-hitl`` runs.
+    bug-candidate entry for Step 9 on non-TTY / ``--no-hitl`` runs.
 
     Best-effort — failure to write the file just means the parent can't
     surface the unresolved TBD as a HITL prompt; pytest will still fail
@@ -1192,7 +1192,7 @@ def _wrap_locator_method(original: Any, _kind: str):
             return original(self, selector, *args, **kwargs)
         resolution = _resolve_sentinel(page, selector)
         if resolution.selector is None:
-            # Drop a hitl-pending file so the parent (Step 9) can surface
+            # Drop a hitl-pending file so the parent (Step 8) can surface
             # the unresolved TBD via HITL prompt or as a structured bug
             # candidate. Failing fast here keeps the test result clean;
             # the parent does the recovery.
@@ -1212,7 +1212,7 @@ def _wrap_locator_method(original: Any, _kind: str):
                 f"worca-t JIT runtime: could not resolve locator "
                 f"{parse_sentinel(selector)!r}. The parent process will "
                 f"surface this via HITL on the next interactive run, or "
-                f"as a `locator-unresolvable` bug candidate for Step 10. "
+                f"as a `locator-unresolvable` bug candidate for Step 9. "
                 f"See run.log for the resolution-tier trace."
             )
         real = original(self, resolution.selector, *args, **kwargs)
@@ -1327,7 +1327,7 @@ def pytest_configure(config):  # noqa: D401 - pytest hook signature
 
     Also registers ``worca_<phase>`` markers so SUTs running with
     ``--strict-markers`` don't reject the attribution decorators that
-    Step 7 codegen applies to every generated test. Step 9 uses these
+    Step 7 codegen applies to every generated test. Step 8 uses these
     markers to scope pytest selection to worca-generated tests only
     (``-m "worca_smoke or worca_regression or ..."``) without dragging
     in the SUT's native suite.

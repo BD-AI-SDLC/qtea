@@ -385,6 +385,12 @@ async def _drive_query(
                     # Always log so a transient flake is visible in real
                     # time, not just buried in the post-mortem transcript.
                     data = getattr(message, "data", {}) or {}
+                    # Dump the FULL data dict (not just cherry-picked fields)
+                    # so opaque "error: unknown / error_status: None" cases
+                    # surface whatever the SDK actually populated — exception
+                    # class, response body, request id, attempt metadata.
+                    # The cherry-picked fields stay for any structured-log
+                    # consumer that already reads them.
                     log.warning(
                         "agent.api_retry",
                         count=state.api_retry_count,
@@ -393,6 +399,8 @@ async def _drive_query(
                         retry_delay_ms=data.get("retry_delay_ms"),
                         error_status=data.get("error_status"),
                         error=data.get("error"),
+                        data_keys=sorted(data.keys()) if isinstance(data, dict) else None,
+                        data=data,
                     )
                     if state.api_retry_count >= storm_threshold:
                         log.error(
@@ -575,7 +583,7 @@ async def run_agent(
     del debug_live  # accepted for API compat
     workdir.mkdir(parents=True, exist_ok=True)
     # Number each call's audit files so multi-call steps (HITL retries,
-    # step 9 self-heal) don't overwrite each other's transcript/metrics/stderr.
+    # step 8 self-heal) don't overwrite each other's transcript/metrics/stderr.
     # `transcript-00.jsonl` is call 0, `transcript-01.jsonl` is call 1, etc.
     call_idx = len(list(workdir.glob("transcript-*.jsonl")))
     suffix = f"-{call_idx:02d}"

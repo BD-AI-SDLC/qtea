@@ -25,7 +25,7 @@ isolation comes from two independent mechanisms:
    PIDs not in `pre_existing_children`, so concurrent siblings are spared).
 
 Consequence: Step 8a's Playwright browser does NOT leak into Step 8b or
-Step 9. Step 9's first heal does not share a session with the last call
+Step 8. Step 8's first heal does not share a session with the last call
 of Step 8. Each call's MCP server children die with that call's subprocess
 tree.
 
@@ -114,7 +114,7 @@ def stage_mcp_config(
     The MCP runs in the background for AOM snapshots / locator discovery and
     its UI is never user-facing. Its head state is controlled entirely by the
     project-local `.mcp.json` (typically `--headless`). The CLI `--headed`
-    flag instead controls Step 9's *SUT test execution* (the real tests the
+    flag instead controls Step 8's *SUT test execution* (the real tests the
     user wants to watch), not the MCP.
     """
     src = source or find_mcp_config()

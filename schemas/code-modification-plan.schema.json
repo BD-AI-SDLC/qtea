@@ -1,0 +1,173 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worca-t/schemas/code-modification-plan.schema.json",
+  "title": "CodeModificationPlan",
+  "description": "Structural mapping from test-strategy.md test cases to the SUT's existing code. Produced by Step 7 (test-architect) and consumed by Step 8 (TDD codegen). Authoritative for placement decisions (which fixtures to reuse, where new POM methods go, what TBD intents to emit). The writer agent transpiles the plan into code; it does not redo placement reasoning.",
+  "type": "object",
+  "required": ["plan_version", "active_module", "test_cases"],
+  "additionalProperties": true,
+  "properties": {
+    "plan_version": { "const": "1.0" },
+    "active_module": { "type": "string", "minLength": 1 },
+    "language": { "type": ["string", "null"] },
+    "framework": { "type": ["string", "null"] },
+    "test_cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/test_case" }
+    },
+    "notes": { "type": "array", "items": { "type": "string" } }
+  },
+  "$defs": {
+    "test_case": {
+      "type": "object",
+      "required": ["id", "test_file_target", "test_functions"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "pattern": "^TC-[A-Za-z0-9\\-_]+$" },
+        "title": { "type": ["string", "null"] },
+        "test_file_target": {
+          "type": "string",
+          "description": "SUT-relative or absolute path where the worca-prefixed test file lands. Must match the active module's test_directory_layout convention."
+        },
+        "test_functions": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/test_function" }
+        },
+        "fixtures": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/fixture_entry" }
+        },
+        "page_objects": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/page_object_entry" }
+        },
+        "helpers": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/helper_entry" }
+        },
+        "locators": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/locator_entry" }
+        }
+      }
+    },
+    "test_function": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": true,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "markers": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^worca_(smoke|regression|e2e|exploratory)$"
+          }
+        },
+        "uses_fixtures": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "fixture_entry": {
+      "type": "object",
+      "required": ["name", "source"],
+      "additionalProperties": true,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "source": { "enum": ["reuse", "create"] },
+        "from": {
+          "type": "string",
+          "description": "Required when source=reuse. File:symbol pointer from sut_inventory (e.g. tests/conftest.py:auth_session)."
+        },
+        "at": {
+          "type": "string",
+          "description": "Required when source=create. SUT-relative file path where the new fixture lands."
+        },
+        "yields": { "type": ["string", "null"] },
+        "scope": {
+          "type": ["string", "null"],
+          "enum": ["function", "class", "module", "session", null]
+        },
+        "depends_on": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "page_object_entry": {
+      "type": "object",
+      "required": ["name", "source"],
+      "additionalProperties": true,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "source": { "enum": ["reuse", "create"] },
+        "from": {
+          "type": "string",
+          "description": "Required when source=reuse. SUT-relative file path of the existing POM class."
+        },
+        "at": {
+          "type": "string",
+          "description": "Required when source=create. SUT-relative file path where the new POM lands."
+        },
+        "missing_methods": {
+          "type": "array",
+          "description": "Methods that the test cases need but don't exist on the (reused or created) POM. The codegen step adds these to the POM file with the given signatures.",
+          "items": {
+            "type": "object",
+            "required": ["name", "signature"],
+            "additionalProperties": true,
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "signature": { "type": "string", "minLength": 1 },
+              "purpose": { "type": ["string", "null"] }
+            }
+          }
+        }
+      }
+    },
+    "helper_entry": {
+      "type": "object",
+      "required": ["name", "source"],
+      "additionalProperties": true,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "source": { "enum": ["reuse", "create"] },
+        "from": { "type": "string" },
+        "at": { "type": "string" },
+        "signature": { "type": ["string", "null"] }
+      }
+    },
+    "locator_entry": {
+      "type": "object",
+      "required": ["name", "owning_page", "source"],
+      "additionalProperties": true,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The locator constant name (e.g. LOGIN_BUTTON). Used as the symbol the writer agent imports or declares."
+        },
+        "owning_page": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Name of the POM class that owns this locator (cross-references page_objects[].name)."
+        },
+        "source": { "enum": ["reuse", "create_tbd"] },
+        "from": {
+          "type": "string",
+          "description": "Required when source=reuse. SUT-relative file path of the existing locator constant."
+        },
+        "intent": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Required when source=create_tbd. Semantic intent string used by the JIT resolver at runtime. Prefer visible role+label (e.g. 'sign in button')."
+        }
+      }
+    }
+  }
+}

@@ -91,7 +91,6 @@ Apply the severity decision tree from `test-manager.prompt.md` §3. Document imp
 ### Step 3: Example Reference
 
 **Reference Files**:
-- `examples/login-feature-test.md` - Test strategy example
 - `examples/bug-classification-example.md` - Bug analysis example
 
 Use these patterns to ensure consistent format and thoroughness.

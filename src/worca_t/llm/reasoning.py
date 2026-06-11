@@ -69,6 +69,20 @@ def _is_model_unavailable(error: str) -> bool:
     return any(ind in lower for ind in _MODEL_UNAVAILABLE_INDICATORS)
 
 
+# Process-level latch for the "structured outputs skipped on Vertex" notice.
+# We surface it once per `worca-t run` invocation so the user knows the
+# Vertex fallback is in effect, then demote subsequent occurrences to debug
+# so the same banner doesn't repeat 5-10× across a pipeline. Reset in
+# tests via ``reset_vertex_structured_outputs_warning_latch()``.
+_VERTEX_STRUCTURED_OUTPUTS_WARNED: bool = False
+
+
+def reset_vertex_structured_outputs_warning_latch() -> None:
+    """Reset the once-per-run warning latch — test-only hook."""
+    global _VERTEX_STRUCTURED_OUTPUTS_WARNED
+    _VERTEX_STRUCTURED_OUTPUTS_WARNED = False
+
+
 def _agent_key(agent_path: Path) -> str:
     """Derive the agent->model lookup key from filename (mirrors claude_runner)."""
     name = agent_path.name
@@ -94,6 +108,33 @@ def _normalize_model_id(model: str, *, for_vertex: bool) -> str:
     if for_vertex:
         return model
     return model.replace("@", "-") if "@" in model else model
+
+
+def _strip_json_wrappers(text: str) -> str:
+    """Strip markdown fences a model may wrap JSON in when structured outputs is off.
+
+    On the standard Anthropic API we use ``output_config.format=json_schema``
+    (structured outputs), so the response is the raw JSON object — no prose,
+    no fences. On Vertex backends (Google Cloud / Bosch model farm) the
+    ``structured_outputs`` feature is sometimes blocked by org policy (the
+    ``constraints/vertexai.allowedPartnerModelFeatures`` constraint). In
+    that fallback path we rely on prompt instructions ("respond with JSON
+    only"), which Claude generally honors — but it occasionally still wraps
+    the response in ```json ... ``` fences. This helper makes downstream
+    ``json.loads`` tolerant of that without each step having to handle it.
+    """
+    s = text.strip()
+    if not s.startswith("```"):
+        return s
+    # Drop the opening fence (which may be ``` or ```json or ```JSON).
+    first_nl = s.find("\n")
+    if first_nl == -1:
+        return s
+    body = s[first_nl + 1:]
+    # Drop the closing fence if present.
+    if body.rstrip().endswith("```"):
+        body = body.rstrip()[:-3].rstrip()
+    return body
 
 
 def _inline_inputs(user_prompt: str, inputs: dict[str, str] | None) -> str:
@@ -231,15 +272,54 @@ async def call_reasoning_llm(
     # Lazy import: don't pay anthropic SDK import cost for non-LLM steps.
     import anthropic  # type: ignore[import-untyped]
 
+    # Backend selection happens once here (was previously inside the
+    # ``async with`` block) so we can also use it to decide whether to
+    # send the structured-outputs `output_config`. Bosch's model farm
+    # (and bare Vertex AI) enforce
+    # ``constraints/vertexai.allowedPartnerModelFeatures`` which usually
+    # does NOT include ``structured_outputs`` for partner Anthropic
+    # models — sending it causes a 400 FAILED_PRECONDITION. On Vertex
+    # we degrade to prompt-only JSON mode and rely on the local
+    # ``is_valid()`` re-check (which every reasoning-step caller
+    # already runs) for schema enforcement.
+    is_vertex = use_vertex_backend()
+
     create_kwargs: dict[str, Any] = {
         "max_tokens": max_tokens,
         "system": system_prompt,
         "messages": messages,
     }
+    schema_enforced_server_side = False
     if output_schema is not None:
-        create_kwargs["output_config"] = {
-            "format": {"type": "json_schema", "schema": output_schema}
-        }
+        if is_vertex:
+            global _VERTEX_STRUCTURED_OUTPUTS_WARNED
+            if not _VERTEX_STRUCTURED_OUTPUTS_WARNED:
+                log.warning(
+                    "reasoning.structured_outputs_skipped_vertex",
+                    agent=agent_path.name,
+                    model=requested_model,
+                    reason=(
+                        "Vertex backend disallows the `structured_outputs` "
+                        "feature for partner Anthropic models via "
+                        "`constraints/vertexai.allowedPartnerModelFeatures`. "
+                        "Falling back to prompt-only JSON mode; "
+                        "schema is still enforced locally by the caller. "
+                        "(This banner is suppressed for subsequent calls "
+                        "in this run; debug-level events still emit.)"
+                    ),
+                )
+                _VERTEX_STRUCTURED_OUTPUTS_WARNED = True
+            else:
+                log.debug(
+                    "reasoning.structured_outputs_skipped_vertex",
+                    agent=agent_path.name,
+                    model=requested_model,
+                )
+        else:
+            create_kwargs["output_config"] = {
+                "format": {"type": "json_schema", "schema": output_schema}
+            }
+            schema_enforced_server_side = True
 
     log.info(
         "reasoning.start",
@@ -248,6 +328,8 @@ async def call_reasoning_llm(
         max_tokens=max_tokens,
         timeout_s=resolved_timeout,
         has_schema=output_schema is not None,
+        schema_enforced_server_side=schema_enforced_server_side,
+        backend="vertex" if is_vertex else "anthropic",
         hitl_history_len=len(hitl_history or []),
     )
 
@@ -264,7 +346,7 @@ async def call_reasoning_llm(
     # model farm) when CLAUDE_CODE_USE_VERTEX=1 or ANTHROPIC_VERTEX_BASE_URL
     # is set; standard Anthropic API otherwise. The two client classes
     # construct URLs / accept auth differently — must match the backend.
-    is_vertex = use_vertex_backend()
+    # ``is_vertex`` was already computed above to gate ``output_config``.
     if is_vertex:
         client_ctx = anthropic.AsyncAnthropicVertex(
             **anthropic_vertex_kwargs(),
@@ -307,6 +389,14 @@ async def call_reasoning_llm(
                 for block in getattr(response, "content", []) or []:
                     if getattr(block, "type", None) == "text":
                         final_text = getattr(block, "text", "") or final_text
+
+                # When a JSON schema was requested but server-side enforcement
+                # was unavailable (Vertex policy), the model may have wrapped
+                # the JSON in ```json fences despite our instructions. Strip
+                # them here so downstream ``json.loads`` works uniformly
+                # regardless of backend.
+                if output_schema is not None and not schema_enforced_server_side:
+                    final_text = _strip_json_wrappers(final_text)
 
                 # Token / cost extraction.
                 # The direct Anthropic SDK doesn't return a cost field in

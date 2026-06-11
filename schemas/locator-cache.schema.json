@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://worca-t/schemas/locator-cache.schema.json",
   "title": "LocatorCache",
-  "description": "Per-run cache of resolved TBD locators populated by the JIT runtime plugin during Step 9 test execution. Survives across `--from-step 9` re-runs. Each entry records how the selector was sourced (dev-supplied file vs cached vs LLM-resolved vs HITL) for downstream reporting and traceability.",
+  "description": "Per-run cache of resolved TBD locators populated by the JIT runtime plugin during Step 8 test execution. Survives across `--from-step 8` re-runs. Each entry records how the selector was sourced (dev-supplied file vs cached vs LLM-resolved vs HITL) for downstream reporting and traceability.",
   "type": "object",
   "required": ["entries"],
   "additionalProperties": true,

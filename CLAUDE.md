@@ -10,7 +10,7 @@
 
 | Purpose | File |
 | --- | --- |
-| Operational playbook (all 11 steps, phases, protocols) | `agents/qa-orchestrator.instructions.md` |
+| Operational playbook (all 10 steps, phases, protocols) | `agents/qa-orchestrator.instructions.md` |
 | Orchestrator agent definition | `agents/qa-orchestrator.agent.md` |
 | Debug agent (RCA on failure) | `agents/debug.agent.md` |
 | Python pipeline entry | `src/worca_t/pipeline.py` |
@@ -35,7 +35,7 @@
 
 ## The 11-Step Pipeline
 
-**Phases:** A = Requirements & Planning (1–4) · B = Research & Implementation (5–8) · C = Execution & Reporting (9–11)
+**Phases:** A = Requirements & Planning (1–4) · B = Research & Implementation (5–7) · C = Execution & Reporting (8–10)
 
 | # | Name | Phase | Step File | Agent | Schema | On Failure |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -45,9 +45,9 @@
 | 4 | Test Strategy | A | `s04_strategy.py` | `test-manager` | `test-strategy` | abort |
 | 5 | Xray Upload | B | `s05_xray.py` | None (pure code) | `xray-mapping` | compensate |
 | 6 | Repo Discovery | B | `s06_research.py` | `polyglot-test-researcher` | `research` | abort |
-| 7 | TDD Codegen. After the phase gate, `pipeline.py` runs a lightweight human review gate (`src/worca_t/review_gate.py`) that surfaces test names + descriptions + counts and offers `[a]pprove` / `[e]dit files` / `[q]uit`. Auto-skipped in non-TTY / `--no-hitl`. On `edit`, the SUT is re-indexed in place so step 8 sees fresh line numbers. | B | `s07_codegen.py` | `ui-test-automation` | `tbd-index` | abort |
-| 8 | **Soft-deleted as of the JIT-runtime refactor.** No-op stub that always returns `status: skipped` with a minimal `locator-resolution.json` payload. Locator resolution now happens at runtime (Step 9) for all stacks. The full 11→10 pipeline renumber is deferred — see refactor plan. | B | `s08_locator_resolution.py` (stub) | none | `locator-resolution` (minimal stub only) | skip |
-| 9 | Execute + Self-Heal. **For Playwright stacks (Python/TS/JS/Java)**: starts a parent-side `ResolverServer` on a loopback TCP port and exports `WORCA_T_RESOLVER_PORT`/`WORCA_T_RESOLVER_TOKEN` into the pytest env. The vendored runtime plugin intercepts `tbd("…")` / `Tbd.of("…")` sentinels via the tier ladder: dev-locators → cache → in-process heuristic → ResolverServer (LLM) → HITL/fail-fast. ANTHROPIC_API_KEY stays in the parent process — never enters the SUT subprocess. Unresolved TBDs flow into `bug-candidates.json` as `locator-unresolvable` entries for Step 10, or get prompted on a TTY (answer → `.worca-t/dev-locators.json` for next run). **For non-Playwright stacks (Selenium/Cypress/Robot)**: existing `polyglot-test-fixer` on-failure heal handles `TBD_LOCATOR` markers via Playwright MCP observation (or a one-off native source-capture path per stack — `driver.page_source` / `cy.document()` / `Get Source` — when MCP can't reach the page state). `WORCA_T_NO_LLM_RESOLVE=1` disables both the runtime LLM tier AND the heal agent for symmetric zero-LLM-spend in CI. | C | `s09_execute.py` | `polyglot-test-tester` + `polyglot-test-fixer` | `run-results` (+ `locator-cache` when JIT) | abort |
+| 7 | Test Architect. Reads `test-strategy.md` + `sut_inventory.json` and emits `code-modification-plan.json` — a structural mapping from each test case to placement decisions (fixtures reuse vs create, POM methods to reuse vs add, locators to reuse vs emit as TBD). After the phase gate, `pipeline.py` runs a lightweight human review gate (`src/worca_t/review_gate.py`) that surfaces the plan and offers `[a]pprove` / `[e]dit plan` / `[q]uit`. Auto-skipped in non-TTY / `--no-hitl`. On `edit`, the plan is re-validated against the schema and re-rendered. | B | `s07_test_architect.py` | `test-architect` | `code-modification-plan` | abort |
+| 8 | TDD Codegen. Transpiles `code-modification-plan.json` into executable test code: imports for `reuse` entries, new files at `at:` paths for `create` entries, extends existing POMs with `missing_methods` signatures, emits `tbd("intent")` / `Tbd.of("intent")` / `TBD_LOCATOR` sentinels for `create_tbd` locators. The plan is authoritative for placement; the writer agent does not re-derive. Vendors the per-language JIT runtime into the SUT for Playwright stacks (Python/TS/JS/Java). | B | `s08_codegen.py` | `ui-test-automation` | `tbd-index` | abort |
+| 9 | Execute + Self-Heal. **For Playwright stacks (Python/TS/JS/Java)**: starts a parent-side `ResolverServer` on a loopback TCP port and exports `WORCA_T_RESOLVER_PORT`/`WORCA_T_RESOLVER_TOKEN` into the pytest env. The vendored runtime plugin intercepts `tbd("…")` / `Tbd.of("…")` sentinels via the tier ladder: dev-locators → cache → in-process heuristic → ResolverServer (LLM) → HITL/fail-fast. ANTHROPIC_API_KEY stays in the parent process — never enters the SUT subprocess. Unresolved TBDs flow into `bug-candidates.json` as `locator-unresolvable` entries for Step 10, or get prompted on a TTY (answer → `.worca-t/dev-locators.json` for next run). **For non-Playwright stacks (Selenium/Cypress/Robot)**: `polyglot-test-fixer` on-failure heal handles `TBD_LOCATOR` markers via Playwright MCP observation (or a one-off native source-capture path per stack — `driver.page_source` / `cy.document()` / `Get Source` — when MCP can't reach the page state). `WORCA_T_NO_LLM_RESOLVE=1` disables both the runtime LLM tier AND the heal agent for symmetric zero-LLM-spend in CI. | C | `s09_execute.py` | `polyglot-test-fixer` (heal only — test execution is pure code) | `run-results` (+ `locator-cache` when JIT) | abort |
 | 10 | Bug Classification | C | `s10_bug_classifier.py` | `bug-report-classifier` | `bug-reports` | compensate |
 | 11 | Report | C | `s11_report.py` | None (pure code) | `report-data` | warn + continue |
 
@@ -75,7 +75,7 @@
 - **Schema-first.** Every artifact validated against its JSON Schema before hand-off.
 - **Locator priority:** `id > data-testid > role > label > text > placeholder > scoped CSS`. **Never XPath.**
 - **Snapshot discipline.**
-  - **In generated test code (Step 7 output):** AOM only (via the framework's accessibility-tree API, e.g. Playwright `page.accessibility.snapshot()`). Raw page-source dumps (`page.content()`, `driver.page_source`, equivalents) are forbidden in tests.
+  - **In generated test code (Step 8 output):** AOM only (via the framework's accessibility-tree API, e.g. Playwright `page.accessibility.snapshot()`). Raw page-source dumps (`page.content()`, `driver.page_source`, equivalents) are forbidden in tests.
   - **In Step 9 runtime (JIT ResolverServer + non-PW self-heal):** the AOM (`page.accessibility.snapshot()` for Playwright stacks, Playwright MCP `browser_snapshot` for the non-PW heal agent) is the primary truth source for locator resolution. Raw-DOM capture (`browser_evaluate(() => document.documentElement.outerHTML)`, `driver.page_source`, `cy.document()`, `Get Source`) is a scoped fallback ONLY when the target is missing from the AOM, non-semantic, or screen-reader-hidden — and each fallback resolution must record `snapshot_source="raw_dom_fallback"` plus a `fallback_reason` in `locator-cache.json` or the heal agent's diff log.
 - **No hard waits** in generated tests (`time.sleep`, `cy.wait(<n>)`, etc.).
 - **No secrets in code.** Env vars only. Masked in logs: `ANTHROPIC_API_KEY`, `JIRA_API_TOKEN`, `JIRA_XRAY_API_KEY`, `JIRA_XRAY_CLIENT_ID`, `JIRA_XRAY_CLIENT_SECRET`.
@@ -89,7 +89,7 @@
 
 ## JIT Locator Resolution (Playwright stacks — Python / TS / JS / Java)
 
-For SUTs where the active module's framework is Playwright (Python+pytest, TS/JS+Playwright Test / Jest / Vitest, Java+JUnit5 / TestNG), Step 7 vendors a per-language runtime into the SUT and codegen emits unresolved locators using the appropriate sentinel helper. Python/TS/JS use `tbd("intent")` (returns `__WORCA_T_TBD__::<intent>`); Java uses `Tbd.of("intent")`. At test runtime, the runtime patches `Page.locator` / `Frame.locator` / `Locator.locator` (Python + TS/JS, on the sync API) or wraps `Page` via `WorcaT.wrap(page)` returning a dynamic-proxy (Java) to intercept sentinels against the live page (already authenticated, already on the right URL because the test's own POMs navigated there).
+For SUTs where the active module's framework is Playwright (Python+pytest, TS/JS+Playwright Test / Jest / Vitest, Java+JUnit5 / TestNG), Step 8 (codegen) vendors a per-language runtime into the SUT and emits unresolved locators using the appropriate sentinel helper. Python/TS/JS use `tbd("intent")` (returns `__WORCA_T_TBD__::<intent>`); Java uses `Tbd.of("intent")`. At test runtime, the runtime patches `Page.locator` / `Frame.locator` / `Locator.locator` (Python + TS/JS, on the sync API) or wraps `Page` via `WorcaT.wrap(page)` returning a dynamic-proxy (Java) to intercept sentinels against the live page (already authenticated, already on the right URL because the test's own POMs navigated there).
 
 **Resolution tier ladder (all stacks):**
 
@@ -99,7 +99,7 @@ For SUTs where the active module's framework is Playwright (Python+pytest, TS/JS
 4. LLM via parent-side `ResolverServer` over loopback TCP (one LLM call per cold miss)
 5. HITL prompt on TTY / fail-fast with `locator-unresolvable` bug-candidate entry for Step 10 on non-TTY / `--no-hitl`
 
-**Security: parent-side ResolverServer.** Step 9 spawns a `ResolverServer` (TCP loopback, per-run shared secret) BEFORE invoking pytest. The pytest plugin connects to the server using `WORCA_T_RESOLVER_PORT` + `WORCA_T_RESOLVER_TOKEN` env vars and ships AOM + intent over the wire. The server makes the Anthropic API call in the trusted parent process. **`ANTHROPIC_API_KEY` never enters the SUT subprocess** — `safe_subprocess_env()` strips it. Leaked tokens are useless after the run completes (the server is bound to the Step 9 context manager).
+**Security: parent-side ResolverServer.** Step 9 spawns a `ResolverServer` (TCP loopback, per-run shared secret) BEFORE invoking pytest. The pytest plugin connects to the server using `WORCA_T_RESOLVER_PORT` + `WORCA_T_RESOLVER_TOKEN` env vars and ships AOM + intent over the wire. The server makes the Anthropic API call in the trusted parent process. **`ANTHROPIC_API_KEY` never enters the SUT subprocess** — `safe_subprocess_env()` strips it. Leaked tokens are useless after the run completes (the server is bound to the Step 8 context manager).
 
 **Cache-invalidate-and-retry on TimeoutError.** Every returned `Locator` is wrapped in a retry proxy. When an action (click / fill / hover / etc.) raises `TimeoutError`, the proxy invalidates the cache, re-resolves via the LLM (skipping the dev file + cache + heuristic that produced the stale selector), and replays the action once. If the second attempt also fails, the original `TimeoutError` propagates and Step 9's `polyglot-test-fixer` self-heal agent picks it up (a slower path that edits POM source files).
 

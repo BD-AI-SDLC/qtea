@@ -29,6 +29,7 @@ worca-junit.xml
 worca-t-reports/
 .env
 .env.local
+/.hitl-ledger.jsonl
 
 # Allure
 allure-report/

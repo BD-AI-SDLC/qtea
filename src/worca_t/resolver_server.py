@@ -14,7 +14,7 @@ Consequence: the previous design — having the pytest plugin shell out to
 ``worca-t resolve`` — silently failed at LLM time because the resolver
 subprocess inherited the same scrubbed env. Resolution worked on cache
 hits + dev-locators only; cold runs hit ``AuthenticationError`` (see
-the comment block at ``steps/s09_execute.py:578-584``).
+the comment block at ``steps/s09_execute.py``).
 
 The bridge
 ----------

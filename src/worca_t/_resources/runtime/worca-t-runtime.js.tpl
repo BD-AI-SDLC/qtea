@@ -23,7 +23,7 @@
  *   - Jest:             `jest.config.{js,ts}` → `setupFiles: ["<rootDir>/tests/worca-t-runtime.js"]`
  *   - Vitest:           `vitest.config.{ts,js}` → `test.setupFiles: ["./tests/worca-t-runtime.js"]`
  *
- * ENV VARS (mirror the Python runtime — set by Step 9):
+ * ENV VARS (mirror the Python runtime — set by Step 8):
  *
  *   - WORCA_T_CACHE_DIR        directory holding locator-cache.json (required)
  *   - WORCA_T_RESOLVER_PORT    TCP port of parent ResolverServer (preferred)

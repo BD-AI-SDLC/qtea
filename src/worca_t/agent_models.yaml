@@ -9,22 +9,11 @@ test-manager: claude-sonnet-4-6
 
 # -- Phase B: Research & Implementation --
 polyglot-test-researcher: claude-haiku-4-5@20251001
-ui-test-automation: claude-opus-4-6
-# Note: `playwright-tester` (the old Step 8a agent) is retired as of the
-# JIT-runtime refactor. Step 8 is a no-op stub; runtime tiers (dev-locators,
-# cache, in-process heuristic, ResolverServer LLM bridge) handle locator
-# resolution for Playwright stacks, and Step 9's self-heal flow handles
-# the rest. The agent.md still ships for archaeology / rollback but is
-# never invoked.
+test-architect: claude-sonnet-4-6
+ui-test-automation: claude-sonnet-4-6
 
 # -- Phase C: Execution & Reporting --
-polyglot-test-tester: claude-haiku-4-5@20251001
 polyglot-test-fixer: claude-sonnet-4-6
-# `polyglot-test-fixer-audit` (the old Step 8b audit-mode model) was used
-# when Step 8's two-agent flow was active. With Step 8 soft-deleted, the
-# audit-mode prompt is never sent — keep the entry only for backward compat
-# with old `state.json` files that might reference it during resume.
-polyglot-test-fixer-audit: claude-haiku-4-5@20251001
 bug-report-classifier: claude-sonnet-4-6
 
 # -- Infrastructure / Support --

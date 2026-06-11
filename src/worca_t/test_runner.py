@@ -1,4 +1,4 @@
-"""Framework-agnostic test runner used by Step 9.
+"""Framework-agnostic test runner used by Step 8.
 
 Resolves the test-run command for the detected framework, executes it as a
 subprocess (with the corporate proxy + masked secrets), and parses framework-
@@ -112,7 +112,7 @@ class TestRunEntry:
     attachments: list[dict] = field(default_factory=list)
     # Set ONLY on synthetic `T-runner-failure` entries when the runner blew
     # up at collection time (missing module, broken conftest, etc.). Tells
-    # step 9 to skip the self-heal loop — there's no test to patch — and
+    # step 8 to skip the self-heal loop — there's no test to patch — and
     # carries the actionable hint surfaced to the user. Shape:
     #   {"kind": "missing_module" | "collection_error",
     #    "module": str | None, "hint": str, "summary": str}
@@ -253,7 +253,7 @@ def resolve_command(
 
     `marker_filter` (pytest-family frameworks only): appended as
     ``-m "<filter>"`` so callers can scope a run to a subset of tests
-    by marker. Step 9 uses this to select worca-generated tests
+    by marker. Step 8 uses this to select worca-generated tests
     (e.g. ``worca_smoke or worca_regression``) and exclude the SUT's
     native suite. No-op on non-pytest frameworks (Cypress / Jest /
     Playwright-TS) and when the command already carries an explicit
@@ -706,7 +706,7 @@ def run_tests(
     if not results and exit_code != 0:
         # Synthesise a single 'error' entry so callers see *something*.
         # When the failure is a missing-module / collection error, attach
-        # the classifier output so step 9 can skip the self-heal loop —
+        # the classifier output so step 8 can skip the self-heal loop —
         # there is no per-test patch site to fix, and the user just needs
         # to be told which dependency to install.
         runner_failure = classify_runner_failure(
@@ -750,7 +750,7 @@ _FAIL_PATTERN_FALLBACK = re.compile(
 
 # Patterns that identify "the test runner couldn't even load the test files"
 # class of failure — collection / import errors, missing deps, broken conftest.
-# When matched, step 9 skips the self-heal loop (no test to patch) and the
+# When matched, step 8 skips the self-heal loop (no test to patch) and the
 # user gets a one-line actionable fix message instead of 10 timed-out heal
 # attempts on a synthetic `T-runner-failure` entry.
 #
@@ -820,7 +820,7 @@ def _install_hint_for(module: str, package_manager: str | None) -> str:
 
 
 # Argv-list templates for package managers we'll execute programmatically on
-# behalf of the user (Step 9 missing-dep auto-recovery). Returning a list
+# behalf of the user (Step 8 missing-dep auto-recovery). Returning a list
 # (never a shell string) keeps the runner safe from injection via crafted
 # package names. Managers that can't be reduced to a single non-shell argv
 # (maven/gradle need pom.xml edits; `hatch run pip install` chains commands)
@@ -1059,7 +1059,7 @@ def prepare_sut(
 
 
 # ---------------------------------------------------------------------------
-# Missing-dep audit — Step 6 emits warnings; Step 9 pre-installs known-safe
+# Missing-dep audit — Step 6 emits warnings; Step 8 pre-installs known-safe
 # ones and runtime-recovers the rest. Both steps call this for a shared view.
 # ---------------------------------------------------------------------------
 
@@ -1235,13 +1235,13 @@ def audit_missing_deps(
         (test files are scanned first so they win ties — the operator's
         mental entry point is the test, not the prod module)
       - ``confidence``: ``"known"`` when the module is in the curated mapping
-        table (high-confidence: Step 9 will auto-install). ``"guessed"`` for
-        everything else (Step 9 will HITL-prompt or warn).
+        table (high-confidence: Step 8 will auto-install). ``"guessed"`` for
+        everything else (Step 8 will HITL-prompt or warn).
       - ``suggested_install``: prose hint from :func:`_install_hint_for`.
 
     Best-effort and conservative: unparsable files are skipped, dynamic
     imports are missed. Returns ``[]`` when there is no ``tests/`` dir at
-    all — Step 9 has nothing to run in that case.
+    all — Step 8 has nothing to run in that case.
     """
     test_files = _python_test_files(sut_root)
     if not test_files:

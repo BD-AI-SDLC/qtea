@@ -21,8 +21,19 @@ from tests.unit._fake_anthropic import (
     enable_vertex_env,
     install_fake_anthropic,
 )
-from worca_t.llm.reasoning import call_reasoning_llm
+from worca_t.llm.reasoning import (
+    call_reasoning_llm,
+    reset_vertex_structured_outputs_warning_latch,
+)
 from worca_t.metrics import CURRENT_STEP_METRICS, StepMetricsAccumulator
+
+
+@pytest.fixture(autouse=True)
+def _reset_vertex_warning_latch():
+    """Reset the once-per-run latch so each test sees a clean slate."""
+    reset_vertex_structured_outputs_warning_latch()
+    yield
+    reset_vertex_structured_outputs_warning_latch()
 
 
 def _write_agent_file(tmp_path: Path, name: str = "test-agent.agent.md") -> Path:
@@ -152,6 +163,7 @@ async def test_agent_md_loaded_as_system_prompt(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 async def test_output_schema_passed_when_provided(tmp_path, monkeypatch):
+    disable_vertex_env(monkeypatch)
     captured: dict = {}
     install_fake_anthropic(monkeypatch, text="ok", on_call=captured.update)
     agent = _write_agent_file(tmp_path)
@@ -176,6 +188,7 @@ async def test_output_schema_passed_when_provided(tmp_path, monkeypatch):
 
 
 async def test_no_output_config_when_schema_is_none(tmp_path, monkeypatch):
+    disable_vertex_env(monkeypatch)
     captured: dict = {}
     install_fake_anthropic(monkeypatch, text="ok", on_call=captured.update)
     agent = _write_agent_file(tmp_path)
@@ -188,6 +201,144 @@ async def test_no_output_config_when_schema_is_none(tmp_path, monkeypatch):
     )
 
     assert "output_config" not in captured
+
+
+async def test_output_config_skipped_on_vertex(tmp_path, monkeypatch):
+    """Vertex backends enforce
+    ``constraints/vertexai.allowedPartnerModelFeatures`` which usually does
+    not include ``structured_outputs`` for partner Anthropic models. Sending
+    ``output_config`` triggers a 400 FAILED_PRECONDITION, so
+    ``call_reasoning_llm`` must omit it on the Vertex path and rely on the
+    caller's local ``is_valid()`` re-check for schema enforcement."""
+    enable_vertex_env(monkeypatch)
+    captured: dict = {}
+    install_fake_anthropic(monkeypatch, text='{"x": "y"}', on_call=captured.update)
+    agent = _write_agent_file(tmp_path)
+    schema = {
+        "type": "object",
+        "properties": {"x": {"type": "string"}},
+        "required": ["x"],
+    }
+
+    await call_reasoning_llm(
+        agent_path=agent,
+        workdir=tmp_path / "wd",
+        user_prompt="x",
+        output_schema=schema,
+        model="claude-sonnet-4-6",
+    )
+
+    assert "output_config" not in captured, (
+        "Vertex backend disallows structured outputs; output_config "
+        "must not be sent"
+    )
+
+
+async def test_vertex_structured_outputs_warning_fires_once_per_run(
+    tmp_path, monkeypatch, caplog
+):
+    """The "structured outputs skipped on Vertex" banner is a one-time
+    notice per process. Subsequent calls demote to debug-level so the same
+    warning doesn't repeat for every reasoning step in a pipeline."""
+    import logging
+
+    enable_vertex_env(monkeypatch)
+    install_fake_anthropic(monkeypatch, text='{"x": "y"}')
+    agent = _write_agent_file(tmp_path)
+    schema = {"type": "object", "properties": {"x": {"type": "string"}}}
+
+    with caplog.at_level(logging.WARNING, logger="worca_t.llm.reasoning"):
+        for _ in range(3):
+            await call_reasoning_llm(
+                agent_path=agent,
+                workdir=tmp_path / "wd",
+                user_prompt="x",
+                output_schema=schema,
+                model="claude-sonnet-4-6",
+            )
+
+    warnings = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and "structured_outputs_skipped_vertex" in r.getMessage()
+    ]
+    assert len(warnings) == 1, (
+        f"expected exactly one warning across 3 calls; got {len(warnings)}"
+    )
+
+
+async def test_vertex_structured_outputs_warning_resets_between_runs(
+    tmp_path, monkeypatch, caplog
+):
+    """After the explicit reset (simulating a fresh process / `worca-t run`),
+    the banner fires again on the next call."""
+    import logging
+
+    enable_vertex_env(monkeypatch)
+    install_fake_anthropic(monkeypatch, text='{"x": "y"}')
+    agent = _write_agent_file(tmp_path)
+    schema = {"type": "object"}
+
+    with caplog.at_level(logging.WARNING, logger="worca_t.llm.reasoning"):
+        await call_reasoning_llm(
+            agent_path=agent, workdir=tmp_path / "wd",
+            user_prompt="x", output_schema=schema, model="claude-sonnet-4-6",
+        )
+        reset_vertex_structured_outputs_warning_latch()
+        await call_reasoning_llm(
+            agent_path=agent, workdir=tmp_path / "wd",
+            user_prompt="x", output_schema=schema, model="claude-sonnet-4-6",
+        )
+
+    warnings = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and "structured_outputs_skipped_vertex" in r.getMessage()
+    ]
+    assert len(warnings) == 2
+
+
+async def test_vertex_fallback_strips_json_fences(tmp_path, monkeypatch):
+    """When structured outputs is unavailable (Vertex), models sometimes
+    wrap JSON in ```json ... ``` fences despite prompt instructions. The
+    reasoning module strips them so downstream ``json.loads`` works."""
+    enable_vertex_env(monkeypatch)
+    payload = {"x": "y"}
+    fenced = f"```json\n{json.dumps(payload)}\n```"
+    install_fake_anthropic(monkeypatch, text=fenced)
+    agent = _write_agent_file(tmp_path)
+
+    result = await call_reasoning_llm(
+        agent_path=agent,
+        workdir=tmp_path / "wd",
+        user_prompt="x",
+        output_schema={"type": "object", "properties": {"x": {"type": "string"}}},
+        model="claude-sonnet-4-6",
+    )
+
+    assert result.success
+    # final_text is the stripped JSON, ready for json.loads.
+    assert json.loads(result.final_text) == payload
+
+
+async def test_vertex_fallback_leaves_unfenced_json_intact(tmp_path, monkeypatch):
+    """If the model correctly returns bare JSON (no fences), the stripper
+    is a no-op."""
+    enable_vertex_env(monkeypatch)
+    payload = {"x": "y"}
+    install_fake_anthropic(monkeypatch, text=json.dumps(payload))
+    agent = _write_agent_file(tmp_path)
+
+    result = await call_reasoning_llm(
+        agent_path=agent,
+        workdir=tmp_path / "wd",
+        user_prompt="x",
+        output_schema={"type": "object"},
+        model="claude-sonnet-4-6",
+    )
+
+    assert result.success
+    assert json.loads(result.final_text) == payload
 
 
 # ---------------------------------------------------------------------------

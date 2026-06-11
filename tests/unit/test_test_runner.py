@@ -681,7 +681,7 @@ def test_normalize_id_is_stable() -> None:
 
 # ---------------------------------------------------------------------------
 # classify_runner_failure — detects collection/import failures in stderr so
-# step 9 can skip the self-heal loop on the synthetic T-runner-failure entry
+# step 8 can skip the self-heal loop on the synthetic T-runner-failure entry
 # ---------------------------------------------------------------------------
 
 
@@ -749,7 +749,7 @@ def test_classify_runner_failure_collection_error_without_specific_module() -> N
 
 
 def test_classify_runner_failure_returns_none_for_normal_test_failures() -> None:
-    # A real test assertion failure must NOT trigger the classifier — step 9
+    # A real test assertion failure must NOT trigger the classifier — step 8
     # should still self-heal in that case.
     stderr = (
         "FAILED tests/test_login.py::test_login - AssertionError: 1 != 2\n"

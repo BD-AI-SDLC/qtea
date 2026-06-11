@@ -1,7 +1,7 @@
-"""Auth-context helpers shared by Step 8 (now a stub) and Step 9 (execute).
+"""Auth-context helpers used by Step 8 (execute).
 
-Extracted from the previous ``steps/s08_locator_resolution.py`` location
-so Step 9 no longer imports from the soft-deleted Step 8 module. Pure
+Extracted from the legacy locator-resolution step (now removed) so the
+executor doesn't carry an import dependency on a deleted module. Pure
 helpers — no side effects, no I/O. Operate on the `active_module` dict
 that Step 6 (research) emits and downstream steps consume.
 """

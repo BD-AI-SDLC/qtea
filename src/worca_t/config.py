@@ -22,10 +22,9 @@ DEFAULT_STEP_TIMEOUTS: dict[int, int] = {
     5: 500,
     6: 900,
     7: 1800,
-    8: 1800,
-    9: 1800,
-    10: 600,
-    11: 600,
+    8: 1800,  # execute + self-heal
+    9: 600,   # bug-classifier
+    10: 600,  # report
 }
 
 # Markdown size enforcement.

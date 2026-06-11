@@ -119,7 +119,7 @@
     },
     "dependency_warnings": {
       "type": "array",
-      "description": "Top-level imports in the SUT's test files that are not in the declared dependency set. Step 9 uses confidence=known entries to pre-install before the first pytest run; confidence=guessed entries surface as console warnings only.",
+      "description": "Top-level imports in the SUT's test files that are not in the declared dependency set. Step 8 uses confidence=known entries to pre-install before the first pytest run; confidence=guessed entries surface as console warnings only.",
       "items": {
         "type": "object",
         "required": ["module", "suggested_package", "source_file", "confidence", "suggested_install"],

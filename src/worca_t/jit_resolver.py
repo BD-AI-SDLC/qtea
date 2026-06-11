@@ -26,8 +26,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-# Locator-priority chain. Mirrors `s08_locator_resolution._PRIORITY` exactly
-# so JIT resolutions honour the same gate downstream tooling enforces.
+# Locator-priority chain. Canonical authority for the JIT path; downstream
+# tooling (Step 7 codegen rules, Step 8 self-heal scope) honours the same
+# order. Keep in sync with CLAUDE.md § Locator priority.
 _PRIORITY = ("id", "data-testid", "role", "label", "text", "placeholder", "css")
 
 # Default model. `claude-sonnet-4-6` balances quality and speed for selector
@@ -39,7 +40,8 @@ _DEFAULT_MODEL = "claude-sonnet-4-6"
 _MAX_API_RETRIES = 2
 _API_RETRY_BACKOFF_S = (1.0, 3.0)  # one entry per retry attempt
 
-# XPath detection — mirrors `s08_locator_resolution._is_xpath_replacement`.
+# XPath detection — reject any LLM-proposed selector that downgrades to
+# XPath. Mirrors the Step 9 self-heal quality gate in `s09_execute.py`.
 _XPATH_PATTERNS = ("xpath=", "By.XPATH", "by_xpath")
 
 
@@ -51,7 +53,7 @@ class ResolutionResult:
     Cost-tracking fields (``input_tokens`` / ``output_tokens`` / ``model`` /
     ``duration_ms``) are populated for tier 4 (LLM) results; for ``cached``
     they're zero / null. The runtime plugin reads these and appends one
-    line per resolution to ``<cache_dir>/resolver-spend.jsonl`` so Step 9
+    line per resolution to ``<cache_dir>/resolver-spend.jsonl`` so Step 8
     can aggregate them into a ``resolver_spend`` summary on
     ``run-results.json``.
     """

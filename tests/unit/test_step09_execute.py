@@ -50,7 +50,7 @@ def test_run_dep_install_poetry_noop_treated_as_failure(tmp_path, monkeypatch):
     """`poetry add <pkg>` returns exit 0 even when <pkg> is already declared
     in pyproject.toml — the stdout reads 'already present ... Nothing to add'
     and nothing gets installed. We must catch that and report failure so the
-    caller (Step 9 runtime dep-recovery) doesn't claim success and re-run the
+    caller (Step 8 runtime dep-recovery) doesn't claim success and re-run the
     same broken test suite expecting a different outcome."""
     import subprocess as sp
 
@@ -264,7 +264,7 @@ def test_apply_fixer_outputs_no_match_returns_false(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Integration: step 9 end-to-end with fake pytest + fake fixer agent
+# Integration: step 8 end-to-end with fake pytest + fake fixer agent
 # ---------------------------------------------------------------------------
 
 
@@ -321,7 +321,7 @@ def _make_flaky_pytest(script_path: Path, marker_path: Path) -> str:
 def _ctx(tmp_path: Path, *, seed_sut_repo: bool = True) -> StepContext:
     ws = create_workspace(tmp_path / ".ws")
     if seed_sut_repo:
-        # Step 9 now requires `<workspace>/sut/` to be a git repo on the
+        # Step 8 now requires `<workspace>/sut/` to be a git repo on the
         # worca-t branch — pipeline.py + _materialize_sut do this in
         # production. seed_sut() mirrors that end-state for tests.
         seed_sut(ws)
@@ -332,9 +332,9 @@ def _ctx(tmp_path: Path, *, seed_sut_repo: bool = True) -> StepContext:
 
 def _seed_minimal_inputs(ctx: StepContext, *, command: str, framework: str = "pytest") -> None:
     # Step 7 manifest (the new contract; replaces the old tests/ mirror).
-    step7 = ctx.workspace.step_dir(7)
-    step7.mkdir(parents=True, exist_ok=True)
-    (step7 / "generated-files.json").write_text(
+    step8 = ctx.workspace.step_dir(8)
+    step8.mkdir(parents=True, exist_ok=True)
+    (step8 / "generated-files.json").write_text(
         json.dumps({"sut_root": str(ctx.workspace.sut), "files": ["tests/a.py"]}),
         encoding="utf-8",
     )
@@ -367,9 +367,9 @@ async def test_step09_requires_step78_outputs(tmp_path: Path):
 async def test_step09_requires_sut(tmp_path: Path):
     # Build a workspace WITHOUT the SUT git seed, then drop the SUT dir.
     ctx = _ctx(tmp_path, seed_sut_repo=False)
-    step7 = ctx.workspace.step_dir(7)
-    step7.mkdir(parents=True, exist_ok=True)
-    (step7 / "generated-files.json").write_text(
+    step8 = ctx.workspace.step_dir(8)
+    step8.mkdir(parents=True, exist_ok=True)
+    (step8 / "generated-files.json").write_text(
         json.dumps({"sut_root": str(ctx.workspace.sut), "files": []}),
         encoding="utf-8",
     )
@@ -454,7 +454,7 @@ async def test_step09_fails_when_only_runner_failure_results(tmp_path: Path):
     """Regression: when pytest aborts in conftest (missing dep, syntax error,
     exit code 4) it produces no junit XML and the test_runner emits a single
     synthesised `T-runner-failure` entry. Previously that yielded `warned`
-    status and Step 10/11 ran on garbage. The new contract: this is an
+    status and Step 9/11 ran on garbage. The new contract: this is an
     environment failure → step `failed` → pipeline halts.
     """
     ctx = _ctx(tmp_path)
@@ -533,7 +533,7 @@ async def test_step09_missing_module_surfaces_install_hint_and_skips_heal(
 
 
 # ---------------------------------------------------------------------------
-# Auto-install of missing test deps (Step 9 runtime recovery)
+# Auto-install of missing test deps (Step 8 runtime recovery)
 # ---------------------------------------------------------------------------
 
 
@@ -547,9 +547,9 @@ def _seed_with_stack_profile(
 ) -> None:
     """Like _seed_minimal_inputs but adds a stack_profile + (optional)
     dependency_warnings to research.json so the auto-install path engages."""
-    step7 = ctx.workspace.step_dir(7)
-    step7.mkdir(parents=True, exist_ok=True)
-    (step7 / "generated-files.json").write_text(
+    step8 = ctx.workspace.step_dir(8)
+    step8.mkdir(parents=True, exist_ok=True)
+    (step8 / "generated-files.json").write_text(
         json.dumps({"sut_root": str(ctx.workspace.sut), "files": ["tests/a.py"]}),
         encoding="utf-8",
     )
@@ -608,7 +608,7 @@ async def test_step09_recovery_auto_installs_known_missing_dep(
     tmp_path: Path, monkeypatch
 ):
     """Default path: runner fails with missing_module on a name in the curated
-    table → Step 9 runs the install (stubbed), commits, re-runs once, and the
+    table → Step 8 runs the install (stubbed), commits, re-runs once, and the
     re-run passes. Step completes successfully."""
     ctx = _ctx(tmp_path)
     marker = tmp_path / "marker"
@@ -664,7 +664,7 @@ async def test_step09_no_auto_deps_flag_disables_recovery(
 async def test_step09_install_failure_falls_through_to_heal_skip(
     tmp_path: Path, monkeypatch
 ):
-    """When the install command itself fails, Step 9 must NOT loop — fall
+    """When the install command itself fails, Step 8 must NOT loop — fall
     through to today's heal_skip behavior with both the install error and
     the original hint visible in artifacts."""
     ctx = _ctx(tmp_path)
@@ -723,7 +723,7 @@ async def test_step09_unknown_dep_non_tty_skips_install(
 
 
 # ---------------------------------------------------------------------------
-# B-3: Step 9 XPath rejection in the self-heal flow
+# B-3: Step 8 XPath rejection in the self-heal flow
 # ---------------------------------------------------------------------------
 
 
@@ -821,7 +821,7 @@ async def test_step09_rejects_xpath_heal_and_reverts(tmp_path: Path, monkeypatch
 
 def test_pre_attempt_cleanup_rotates_heal_log(tmp_path: Path):
     """ExecuteStep.pre_attempt_cleanup archives a populated heal-log so attempt
-    2 starts with a clean slate. Step 10 reads only the current heal-log;
+    2 starts with a clean slate. Step 9 reads only the current heal-log;
     prior attempts move to heal-log.attempt-N.jsonl."""
     ctx = _ctx(tmp_path, seed_sut_repo=False)
     step = ExecuteStep()

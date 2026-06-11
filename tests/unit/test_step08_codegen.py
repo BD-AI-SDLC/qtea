@@ -1,4 +1,4 @@
-"""Step 7 codegen tests.
+"""Step 8 codegen tests.
 
 After the SUT-as-branch refactor, the agent writes worca-prefixed files
 DIRECTLY into `<workspace>/sut/` on the `worca-t/run-<id>` branch (via
@@ -18,7 +18,7 @@ from pathlib import Path
 from worca_t.checkpoints import RunState
 from worca_t.pipeline import PipelineOptions
 from worca_t.steps.base import StepContext
-from worca_t.steps.s07_codegen import CodegenStep
+from worca_t.steps.s08_codegen import CodegenStep
 from worca_t.workspace import create_workspace
 
 from ._fake_claude import install_fake_query
@@ -44,6 +44,17 @@ test('xpath bad', async ({ page }) => {
 """
 
 
+_MINIMAL_CODE_MOD_PLAN = {
+    "plan_version": "1.0",
+    "active_module": "test-module",
+    "test_cases": [{
+        "id": "TC-STUB",
+        "test_file_target": "tests/worca_stub.spec.ts",
+        "test_functions": [{"name": "test_stub", "markers": ["worca_smoke"]}],
+    }],
+}
+
+
 def _ctx(
     tmp_path: Path,
     *,
@@ -52,6 +63,7 @@ def _ctx(
     with_plan: bool = True,
     with_refined: bool = True,
     with_strategy: bool = True,
+    with_code_mod_plan: bool = True,
     seed_inventory: bool = True,
 ) -> StepContext:
     ws = create_workspace(tmp_path / ".ws")
@@ -68,6 +80,14 @@ def _ctx(
             )
     if with_refined:
         (ws.step_dir(2) / "refined-spec.md").write_text("# refined\n", encoding="utf-8")
+    if with_code_mod_plan:
+        # Stub plan: the pre-flight needs the file to exist; the writer's
+        # phase gate doesn't yet enforce plan-vs-generated consistency, so a
+        # minimal valid plan keeps the existing tests focused on codegen
+        # behaviour rather than plan content.
+        (ws.step_dir(7) / "code-modification-plan.json").write_text(
+            json.dumps(_MINIMAL_CODE_MOD_PLAN), encoding="utf-8",
+        )
     # SUT lives at ws.sut as a git repo on the worca-t branch — same as
     # production. `include_default_inventory` writes a no-active-module
     # stub so Step 7's pre-flight passes without requiring real SUT files.
@@ -83,14 +103,14 @@ def _sut_file(workspace, rel: str) -> str:
     return str(workspace.sut / rel)
 
 
-async def test_step07_requires_strategy(tmp_path: Path):
+async def test_step08_requires_strategy(tmp_path: Path):
     ctx = _ctx(tmp_path, with_strategy=False)
     result = await CodegenStep().run(ctx)
     assert not result.success
     assert "test-strategy.md" in (result.error or "")
 
 
-async def test_step07_happy_path_indexes_and_validates(tmp_path: Path, monkeypatch):
+async def test_step08_happy_path_indexes_and_validates(tmp_path: Path, monkeypatch):
     ctx = _ctx(tmp_path)
     install_fake_query(
         monkeypatch,
@@ -102,7 +122,7 @@ async def test_step07_happy_path_indexes_and_validates(tmp_path: Path, monkeypat
     assert result.success, result.error
     # Test file lives in the SUT on the worca-t branch, NOT in artifacts/.
     assert (ctx.workspace.sut / "tests" / "worca_test_login.spec.ts").exists()
-    out = ctx.workspace.step_dir(7)
+    out = ctx.workspace.step_dir(8)
     # Artifact dir holds only metadata (no test bytes mirror).
     assert not (out / "tests").exists()
     assert (out / "generated-files.json").exists()
@@ -115,7 +135,7 @@ async def test_step07_happy_path_indexes_and_validates(tmp_path: Path, monkeypat
     assert not index["violations"]
 
 
-async def test_step07_rejects_xpath_violation(tmp_path: Path, monkeypatch):
+async def test_step08_rejects_xpath_violation(tmp_path: Path, monkeypatch):
     ctx = _ctx(tmp_path)
     install_fake_query(
         monkeypatch,
@@ -126,13 +146,13 @@ async def test_step07_rejects_xpath_violation(tmp_path: Path, monkeypatch):
     result = await CodegenStep().run(ctx)
     assert not result.success
     assert "violation" in (result.error or "")
-    out = ctx.workspace.step_dir(7)
+    out = ctx.workspace.step_dir(8)
     assert (out / "violations.log").exists()
     # Index file still written so operators can inspect.
     assert (out / "tbd-index.json").exists()
 
 
-async def test_step07_rejects_hard_wait_violation(tmp_path: Path, monkeypatch):
+async def test_step08_rejects_hard_wait_violation(tmp_path: Path, monkeypatch):
     bad = """import time\ndef test_x(page):\n    time.sleep(3)\n"""
     ctx = _ctx(tmp_path, detected_stack="pytest")
     install_fake_query(
@@ -146,7 +166,7 @@ async def test_step07_rejects_hard_wait_violation(tmp_path: Path, monkeypatch):
     assert "violation" in (result.error or "")
 
 
-async def test_step07_empty_tests_dir_fails(tmp_path: Path, monkeypatch):
+async def test_step08_empty_tests_dir_fails(tmp_path: Path, monkeypatch):
     ctx = _ctx(tmp_path)
     install_fake_query(
         monkeypatch,
@@ -161,7 +181,7 @@ async def test_step07_empty_tests_dir_fails(tmp_path: Path, monkeypatch):
     assert "worca" in err or "agent did not produce" in err
 
 
-async def test_step07_zero_indexed_tests_fails(tmp_path: Path, monkeypatch):
+async def test_step08_zero_indexed_tests_fails(tmp_path: Path, monkeypatch):
     # File exists but contains no recognisable test function.
     ctx = _ctx(tmp_path)
     install_fake_query(
@@ -175,7 +195,7 @@ async def test_step07_zero_indexed_tests_fails(tmp_path: Path, monkeypatch):
     assert "0 worca_*-prefixed test functions" in (result.error or "")
 
 
-async def test_step07_uses_extension_fallback_when_no_stack(tmp_path: Path, monkeypatch):
+async def test_step08_uses_extension_fallback_when_no_stack(tmp_path: Path, monkeypatch):
     ctx = _ctx(tmp_path, detected_stack=None)
     install_fake_query(
         monkeypatch,
@@ -188,11 +208,11 @@ async def test_step07_uses_extension_fallback_when_no_stack(tmp_path: Path, monk
 
     result = await CodegenStep().run(ctx)
     assert result.success, result.error
-    index = json.loads((ctx.workspace.step_dir(7) / "tbd-index.json").read_text(encoding="utf-8"))
+    index = json.loads((ctx.workspace.step_dir(8) / "tbd-index.json").read_text(encoding="utf-8"))
     assert index["framework"] == "pytest"
 
 
-async def test_step07_fails_fast_when_sut_inventory_missing(tmp_path: Path):
+async def test_step08_fails_fast_when_sut_inventory_missing(tmp_path: Path):
     """Regression: step 7 burned 30+ minutes (full 1800s timeout) when called
     on a workspace without sut_inventory.json. New behavior: fail in <1 s
     with an actionable error pointing the user at `--from-step 6`."""
@@ -204,7 +224,7 @@ async def test_step07_fails_fast_when_sut_inventory_missing(tmp_path: Path):
     assert "step 6" in err.lower()
 
 
-async def test_step07_fails_fast_when_inventory_files_unreachable(tmp_path: Path):
+async def test_step08_fails_fast_when_inventory_files_unreachable(tmp_path: Path):
     """When sut_inventory says files exist but ZERO of them resolve under
     `<workspace>/sut/`, the clone is incomplete — fail fast instead of
     letting the agent flail."""
@@ -236,6 +256,11 @@ async def test_step07_fails_fast_when_inventory_files_unreachable(tmp_path: Path
         }),
         encoding="utf-8",
     )
+    # Plan must exist so the inventory-unreachable pre-flight (the one under
+    # test) actually fires, instead of bailing out on the plan pre-flight first.
+    (ws.step_dir(7) / "code-modification-plan.json").write_text(
+        json.dumps(_MINIMAL_CODE_MOD_PLAN), encoding="utf-8",
+    )
     state = RunState(run_id=ws.run_id, workspace=str(ws.root), spec_source="x", sut_source=".")
     opts = PipelineOptions(spec="x", sut=".", workspace_base=ws_path)
     ctx = StepContext(workspace=ws, state=state, spec_source="x", sut_source=".", options=opts)
@@ -260,7 +285,7 @@ async def test_step07_fails_fast_when_inventory_files_unreachable(tmp_path: Path
 # ---------------------------------------------------------------------------
 
 
-async def test_step07_does_not_stage_active_module_json(tmp_path: Path, monkeypatch):
+async def test_step08_does_not_stage_active_module_json(tmp_path: Path, monkeypatch):
     """active_module.json must NOT be written into the agent workdir — it
     duplicates sut_inventory.json["modules"][active_module] byte-for-byte."""
     ctx = _ctx(tmp_path)
@@ -271,7 +296,7 @@ async def test_step07_does_not_stage_active_module_json(tmp_path: Path, monkeypa
     )
     await CodegenStep().run(ctx)
 
-    wd = ctx.workspace.step_dir(7)
+    wd = ctx.workspace.step_dir(8)
     assert not (wd / "active_module.json").exists(), (
         "active_module.json must not be staged — it duplicates "
         "sut_inventory.json[\"modules\"][active_module] byte-for-byte and "
@@ -279,7 +304,7 @@ async def test_step07_does_not_stage_active_module_json(tmp_path: Path, monkeypa
     )
 
 
-async def test_step07_does_not_stage_research_md(tmp_path: Path, monkeypatch):
+async def test_step08_does_not_stage_research_md(tmp_path: Path, monkeypatch):
     """research.md must NOT be staged into the agent workdir even when
     step 6 produced it. Every datum the codegen agent needed (env vars,
     frameworks, layout) is already in env_hint / sut_inventory.json."""
@@ -291,7 +316,7 @@ async def test_step07_does_not_stage_research_md(tmp_path: Path, monkeypatch):
     )
     await CodegenStep().run(ctx)
 
-    wd = ctx.workspace.step_dir(7)
+    wd = ctx.workspace.step_dir(8)
     assert not (wd / "research.md").exists(), (
         "research.md must not be staged into step 7's workdir. The agent "
         "gets env vars via env_hint and frameworks via sut_inventory.json; "
@@ -299,13 +324,13 @@ async def test_step07_does_not_stage_research_md(tmp_path: Path, monkeypatch):
     )
 
 
-async def test_step07_prompt_references_sut_inventory_path_not_separate_files(
+async def test_step08_prompt_leads_with_code_modification_plan(
     tmp_path: Path, monkeypatch,
 ):
-    """The user_prompt must instruct the agent to navigate
-    sut_inventory.json["modules"][active_module] and must NOT name the
-    dropped files (./active_module.json, ./research.md). Drift here =
-    agent tries to Read files that aren't staged → failed turn."""
+    """The user_prompt must establish code-modification-plan.json as the
+    PRIMARY input and must NOT reference the dropped files (./active_module.json,
+    ./research.md). Drift here = agent tries to Read files that aren't staged
+    → failed turn — or worse, re-derives placement instead of consuming the plan."""
     captured: dict[str, str] = {}
 
     def _capture(prompt, options):  # noqa: ARG001
@@ -324,24 +349,26 @@ async def test_step07_prompt_references_sut_inventory_path_not_separate_files(
     assert prompt, "fake query should have captured the user_prompt"
 
     # Negative guards: no references to the dropped files anywhere in
-    # the prompt body. (We allow the substring `active_module` since the
-    # JSON-path notation `modules[active_module]` contains it.)
+    # the prompt body.
     assert "./active_module.json" not in prompt, (
         "Prompt still references the dropped ./active_module.json file"
     )
     assert "active_module.json" not in prompt, (
-        "Prompt still references active_module.json — must use the JSON-"
-        "path notation modules[active_module] instead"
+        "Prompt still references active_module.json — placement decisions "
+        "now live in code-modification-plan.json (the dropped file was a "
+        "byte-identical duplicate of sut_inventory.json[\"modules\"][...]"
     )
     assert "./research.md" not in prompt, (
         "Prompt still references the dropped ./research.md file"
     )
 
-    # Positive guard: the new JSON-path navigation wording is present.
-    assert "modules[active_module]" in prompt, (
-        "Prompt must tell the agent to navigate "
-        "sut_inventory.json[\"modules\"][active_module] for the active "
-        "module record"
+    # Positive guards: the new plan-first contract is present.
+    assert "code-modification-plan.json" in prompt, (
+        "Prompt must reference code-modification-plan.json as the primary "
+        "input (Step 7 produces it; Step 8 transpiles it)."
+    )
+    assert "authoritative" in prompt.lower(), (
+        "Prompt must establish the plan as the authoritative placement contract."
     )
 
 
@@ -358,7 +385,7 @@ async def test_step07_prompt_references_sut_inventory_path_not_separate_files(
 # ---------------------------------------------------------------------------
 
 
-async def test_step07_vendors_jit_runtime_before_agent_runs(
+async def test_step08_vendors_jit_runtime_before_agent_runs(
     tmp_path: Path, monkeypatch,
 ):
     """When `detected_stack` is set, the JIT runtime must be on disk in the
@@ -392,7 +419,7 @@ async def test_step07_vendors_jit_runtime_before_agent_runs(
     )
 
 
-async def test_step07_prompt_contains_runtime_location_when_vendored(
+async def test_step08_prompt_contains_runtime_location_when_vendored(
     tmp_path: Path, monkeypatch,
 ):
     """The user_prompt must tell the agent EXACTLY where the runtime is and
@@ -423,7 +450,7 @@ async def test_step07_prompt_contains_runtime_location_when_vendored(
     )
 
 
-async def test_step07_prompt_contains_discovery_discipline_block(
+async def test_step08_prompt_contains_discovery_discipline_block(
     tmp_path: Path, monkeypatch,
 ):
     """The DISCOVERY DISCIPLINE block tells the agent: no Bash for filesystem
@@ -452,7 +479,7 @@ async def test_step07_prompt_contains_discovery_discipline_block(
     assert "Batch independent `Write` calls" in prompt
 
 
-async def test_step07_vendored_runtime_excluded_from_index(
+async def test_step08_vendored_runtime_excluded_from_index(
     tmp_path: Path, monkeypatch,
 ):
     """Pre-vendored runtime files live under worca-prefixed names so the
@@ -471,7 +498,7 @@ async def test_step07_vendored_runtime_excluded_from_index(
     assert result.success, result.error
 
     index = json.loads(
-        (ctx.workspace.step_dir(7) / "tbd-index.json").read_text(encoding="utf-8")
+        (ctx.workspace.step_dir(8) / "tbd-index.json").read_text(encoding="utf-8")
     )
     indexed_paths = [f for f in index["files"]]
     # The runtime file exists on disk (rglob will see it) but must not
@@ -484,7 +511,7 @@ async def test_step07_vendored_runtime_excluded_from_index(
     assert index["totals"]["tests"] == 1
 
 
-async def test_step07_vendored_runtime_included_in_manifest(
+async def test_step08_vendored_runtime_included_in_manifest(
     tmp_path: Path, monkeypatch,
 ):
     """Even though the runtime is excluded from the tbd-index, it MUST
@@ -501,7 +528,7 @@ async def test_step07_vendored_runtime_included_in_manifest(
     assert result.success, result.error
 
     manifest = json.loads(
-        (ctx.workspace.step_dir(7) / "generated-files.json").read_text(encoding="utf-8")
+        (ctx.workspace.step_dir(8) / "generated-files.json").read_text(encoding="utf-8")
     )
     assert any("worca-t-runtime" in f for f in manifest["files"]), (
         f"Pre-vendored runtime missing from generated-files.json: "
@@ -509,7 +536,7 @@ async def test_step07_vendored_runtime_included_in_manifest(
     )
 
 
-async def test_step07_pre_vendor_does_not_mask_agent_no_writes(
+async def test_step08_pre_vendor_does_not_mask_agent_no_writes(
     tmp_path: Path, monkeypatch,
 ):
     """Subtle failure mode: pre-vendoring writes runtime files into the SUT.

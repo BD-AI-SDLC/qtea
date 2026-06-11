@@ -21,7 +21,7 @@ from worca_t.steps.s10_bug_classifier import (
 )
 from worca_t.workspace import create_workspace
 
-from ._fake_anthropic import install_fake_anthropic
+from ._fake_anthropic import disable_vertex_env, install_fake_anthropic
 
 # ---------------------------------------------------------------------------
 # Pure helpers
@@ -179,7 +179,11 @@ async def test_step10_uses_agent_output_when_valid(tmp_path: Path, monkeypatch):
 async def test_step10_passes_bug_reports_schema_to_reasoning_llm(
     tmp_path: Path, monkeypatch
 ):
-    """The step must enable structured outputs by passing the bug-reports schema."""
+    """On the standard Anthropic API, the step enables structured outputs by
+    passing the bug-reports schema via ``output_config.format``. (Vertex
+    backends suppress this — see ``test_output_config_skipped_on_vertex``
+    in test_reasoning_module.py.)"""
+    disable_vertex_env(monkeypatch)
     ctx = _ctx(tmp_path)
     candidates = [{"test_id": "T-a", "title": "t", "status": "failed"}]
     _seed_run(ctx, candidates=candidates)
@@ -195,7 +199,7 @@ async def test_step10_passes_bug_reports_schema_to_reasoning_llm(
 
     # The reasoning module sets output_config when output_schema is provided.
     assert "output_config" in captured, (
-        "step10 must pass a JSON schema to enable structured outputs"
+        "step09 must pass a JSON schema to enable structured outputs"
     )
     fmt = captured["output_config"]["format"]
     assert fmt["type"] == "json_schema"

@@ -854,7 +854,7 @@ class ResearchStep(Step):
             projection["env_resolution"] = env_resolution_audit
 
         # Cross-check test-folder imports vs declared deps. Surfaces gaps
-        # (e.g. `import allure` with no `allure-pytest` in pyproject) so Step 9
+        # (e.g. `import allure` with no `allure-pytest` in pyproject) so Step 8
         # can pre-install the known-safe ones before the first pytest run
         # instead of bailing at collection time.
         from worca_t.test_runner import audit_missing_deps

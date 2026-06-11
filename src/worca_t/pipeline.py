@@ -19,7 +19,7 @@ from worca_t.checkpoints import RunState, StepRecord, is_step_complete, load_sta
 from worca_t.config import load_env
 from worca_t.logging_setup import configure_logging, get_logger
 from worca_t.metrics import format_cost, format_tokens
-from worca_t.review_gate import review_step_7_tests
+from worca_t.review_gate import review_step_7_plan
 from worca_t.steps.base import Step, StepContext
 from worca_t.steps.s01_intake import IntakeStep
 from worca_t.steps.s02_refine import RefineStep
@@ -27,8 +27,8 @@ from worca_t.steps.s03_plan import PlanStep
 from worca_t.steps.s04_strategy import StrategyStep
 from worca_t.steps.s05_xray import XrayUploadStep
 from worca_t.steps.s06_research import ResearchStep
-from worca_t.steps.s07_codegen import CodegenStep
-from worca_t.steps.s08_locator_resolution import LocatorResolutionStep
+from worca_t.steps.s07_test_architect import TestArchitectStep
+from worca_t.steps.s08_codegen import CodegenStep
 from worca_t.steps.s09_execute import ExecuteStep
 from worca_t.steps.s10_bug_classifier import BugClassifierStep
 from worca_t.steps.s11_report import ReportStep
@@ -81,8 +81,8 @@ def _build_registry() -> dict[int, Step]:
         StrategyStep(),
         XrayUploadStep(),
         ResearchStep(),
+        TestArchitectStep(),
         CodegenStep(),
-        LocatorResolutionStep(),
         ExecuteStep(),
         BugClassifierStep(),
         ReportStep(),
@@ -390,7 +390,7 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
     # Step 6's `resolve_sut_env()` writes into `os.environ` in-process only;
     # those writes are gone on a fresh `worca-t run` invocation. Without this
     # replay, re-running `--from-step 7+` leaves SUT_BASE_URL unset and the
-    # locator-resolution agent (Step 8) aborts with BASE_URL_UNRESOLVED.
+    # JIT resolver (Step 8 runtime) aborts with BASE_URL_UNRESOLVED.
     try:
         from worca_t.steps.s06_research import replay_env_from_artifacts
         replay_env_from_artifacts(ws, opts)
@@ -439,11 +439,11 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
             exit_code = 1
             break
 
-        # Lightweight human review of the generated TDD before step 8 patches
-        # locators in place. Skipped automatically in non-TTY / `--no-hitl`
-        # contexts. On manual edits the gate re-indexes the SUT in-place so
-        # downstream steps see fresh line numbers and refreshed hashes.
-        if step_num == 7 and not review_step_7_tests(ctx, result, console):
+        # Lightweight human review of the test architect's plan before step 8
+        # transpiles it into code. Skipped automatically in non-TTY /
+        # `--no-hitl` contexts. On manual edits the gate re-validates the
+        # plan against the schema and re-renders.
+        if step_num == 7 and not review_step_7_plan(ctx, result, console):
             save_state(state, ws.state_file)
             console.print("[yellow]step 07 rejected by reviewer — aborting[/]")
             exit_code = 1

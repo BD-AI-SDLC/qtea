@@ -2,8 +2,8 @@
 
 Workflow:
   1. Load Step 6 research and resolve the SUT tests directory (no mirror —
-     Steps 7 & 8 already wrote/patched files in `<workspace>/sut/` on the
-     worca-t branch).
+     Step 9 already wrote files in `<workspace>/sut/` on the worca-t branch
+     based on the Step 8 plan).
   2. Resolve test-run command (research.commands.test or per-framework default).
   3. Execute via `test_runner.run_tests` with `cwd=<workspace>/sut/`. Capture
      per-test status + attachments.
@@ -226,7 +226,7 @@ def _load_stack_profile(ctx: StepContext) -> StackProfile | None:
     """Load Step 6's stack_profile.json into a `StackProfile` dataclass.
 
     Returns None when the artifact is missing (older workspaces re-run from
-    Step 7+) or when the JSON is unparseable. Step 9 falls back to bare
+    Step 8+) or when the JSON is unparseable. Step 9 falls back to bare
     framework commands in that case.
     """
     p = ctx.workspace.step_dir(6) / "stack_profile.json"
@@ -273,9 +273,6 @@ def _framework(research: dict, index: dict) -> str:
 
 def _load_index(ctx: StepContext) -> dict:
     p = ctx.workspace.step_dir(8) / "tbd-index.json"
-    if not p.exists():
-        # fallback to step 7 if step 8 was skipped (no TBD case)
-        p = ctx.workspace.step_dir(7) / "tbd-index.json"
     if not p.exists():
         return {}
     try:
@@ -598,7 +595,7 @@ def _hitl_resolve_unresolvable(
     print(
         f"\n[worca-t] {len(pendings)} locator(s) the JIT runtime could not "
         f"resolve. You can supply a selector for each, or press ENTER to skip "
-        f"(skipped TBDs become bug-candidate entries for Step 10).\n",
+        f"(skipped TBDs become bug-candidate entries for Step 9).\n",
         flush=True,
     )
     for entry in pendings:
@@ -676,7 +673,7 @@ def _append_resolved_to_dev_locators(
 
 def _bug_candidates_for_unresolvable_tbds(remaining: list[dict]) -> list[dict]:
     """Emit a ``locator-unresolvable`` bug-candidate per HITL-unanswered
-    TBD. Step 10's classifier sees these alongside test failures.
+    TBD. Step 9's classifier sees these alongside test failures.
     """
     now = datetime.now(UTC).isoformat()
     out: list[dict] = []
@@ -714,7 +711,7 @@ class ExecuteStep(Step):
 
     def pre_attempt_cleanup(self, ctx: StepContext, attempt: int) -> None:
         """Rotate ``heal-log.jsonl`` so attempt 2 doesn't append on top of
-        attempt 1's entries. Step 10 reads only the current heal-log; prior
+        attempt 1's entries. Step 9 reads only the current heal-log; prior
         attempts are archived to ``heal-log.attempt-N.jsonl`` so the forensic
         trail survives without polluting the classifier's input."""
         out_dir = self.out_dir(ctx.workspace)
@@ -738,8 +735,8 @@ class ExecuteStep(Step):
         heal_log_path = out_dir / "self-heal" / "heal-log.jsonl"
         heal_log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Pre-flight: SUT must be present + on the worca-t branch. Steps 7
-        # and 8 already wrote into it; step 9 runs tests + heals against it.
+        # Pre-flight: SUT must be present + on the worca-t branch. Step 8
+        # already wrote into it; step 9 runs tests + heals against it.
         if not ctx.workspace.sut.exists():
             return StepResult(
                 success=False,
@@ -758,21 +755,21 @@ class ExecuteStep(Step):
                 ),
             )
 
-        # Step 7 (and optionally Step 8) committed worca_*-prefixed files
-        # into the SUT on the worca-t branch. We don't need a separate
-        # codegen_root anymore; the SUT itself is the source of truth.
-        # Sanity-check that step 7's manifest exists so we fail fast when
+        # Step 8 committed worca_*-prefixed files into the SUT on the
+        # worca-t branch. We don't need a separate codegen_root anymore;
+        # the SUT itself is the source of truth.
+        # Sanity-check that step 8's manifest exists so we fail fast when
         # someone runs --only-step 9 on a fresh workspace.
-        step7_manifest = ctx.workspace.step_dir(7) / "generated-files.json"
-        if not step7_manifest.exists():
+        step8_manifest = ctx.workspace.step_dir(8) / "generated-files.json"
+        if not step8_manifest.exists():
             return StepResult(
                 success=False,
                 status="failed",
                 outputs=[],
                 error=(
-                    "step 9 requires step 7's generated-files.json manifest. "
-                    "Run step 7 first (drop --only-step 9, or use "
-                    "--from-step 7)."
+                    "step 9 requires step 8's generated-files.json manifest. "
+                    "Run step 8 first (drop --only-step 9, or use "
+                    "--from-step 8)."
                 ),
             )
 
@@ -1128,7 +1125,7 @@ class ExecuteStep(Step):
             # CI runs that need cost determinism set it once and get symmetric
             # behaviour across runtime resolution and post-failure heal. Tier 5
             # (HITL/fail-fast with locator-unresolvable bug candidate) still
-            # applies — unresolved TBDs surface in run-results.json for Step 10.
+            # applies — unresolved TBDs surface in run-results.json for Step 9.
             no_llm_resolve = os.environ.get("WORCA_T_NO_LLM_RESOLVE") == "1"
             if failing and no_llm_resolve:
                 log.info(
@@ -1347,7 +1344,7 @@ class ExecuteStep(Step):
             # On a TTY (and unless --no-hitl) we prompt for a selector and
             # write it to dev-locators.json so the next run skips Tier 4 for
             # that key; otherwise the unresolved TBDs flow into the bug
-            # candidates as `locator-unresolvable` entries for Step 10.
+            # candidates as `locator-unresolvable` entries for Step 9.
             hitl_pendings = _collect_hitl_pending(jit_cache_dir)
             hitl_dev_locators_path = (
                 ctx.workspace.sut / ".worca-t" / "dev-locators.json"
@@ -1399,11 +1396,11 @@ class ExecuteStep(Step):
             #   - `failed` when EVERY result is a synthesised `T-runner-failure`
             #     (the test runner didn't even produce parseable output — typically
             #     a conftest import error, missing dep, exit code 4, etc.). The
-            #     prior "warned" status hid this and Step 10/11 ran on garbage;
-            #     Step 11 then crashed rendering an environment-bug card.
+            #     prior "warned" status hid this and Step 9/11 ran on garbage;
+            #     Step 10 then crashed rendering an environment-bug card.
             #     This is an environment failure, not a real test failure.
             #   - `warned` when real failures or errors remain alongside passing
-            #     tests — Step 10 will classify them as bug candidates.
+            #     tests — Step 9 will classify them as bug candidates.
             runner_only_failure = (
                 len(first.results) > 0
                 and all(r.id == "T-runner-failure" for r in first.results)

@@ -13,7 +13,7 @@
     },
     "source": {
       "type": "string",
-      "description": "Free-text identifier of who produced this file (e.g. \"dev-team\", \"external-llm\", \"parent-worca\", \"manual\"). For traceability in the Step 11 report."
+      "description": "Free-text identifier of who produced this file (e.g. \"dev-team\", \"external-llm\", \"parent-worca\", \"manual\"). For traceability in the Step 10 report."
     },
     "produced_at": { "type": "string", "format": "date-time" },
     "locators": {

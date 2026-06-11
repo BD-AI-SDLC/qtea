@@ -83,10 +83,10 @@ pre-commit hook.
 - `schemas/xray-mapping.schema.json`.
 - Tests: `test_step05_xray.py` (18). **188/188 passing**, ruff clean.
 
-### Added (M7.5 - step 11 reporting)
+### Added (M7.5 - step 10 reporting)
 - `src/worca_t/report/` package: `data_builder.py`, `html_renderer.py`,
   `allure_writer.py`.
-  - `data_builder.py`: joins step 9 `run-results.json` + step 10
+  - `data_builder.py`: joins step 8 `run-results.json` + step 9
     `bug-reports.json` + optional step 3 `plan.json` + step 4
     `test-strategy.json` into a normalized `RunReport` dataclass.
     Serialises to `data/run.json` (validated against `report-data` schema).
@@ -98,15 +98,15 @@ pre-commit hook.
     `allure-results/`; shells out to `allure generate` when CLI present.
     Auto-skips gracefully when `allure` not on PATH.
 - `src/worca_t/steps/s11_report.py`: `ReportStep` (pure code, no agent).
-  Short-circuits with `status="skipped"` when step 9 outputs missing.
+  Short-circuits with `status="skipped"` when step 8 outputs missing.
   Respects `--report {auto|allure|builtin|both}`, `--open-report`,
   `--report-inline-images`.
 - `schemas/report-data.schema.json`.
 - Tests: `test_step11_report.py` (18). **170/170 passing**, ruff clean.
 
-### Added (M7 - step 10 bug classifier)
+### Added (M7 - step 9 bug classifier)
 - `src/worca_t/steps/s10_bug_classifier.py`: `BugClassifierStep`.
-  - Short-circuits with an empty, schema-valid report when step 9 produced
+  - Short-circuits with an empty, schema-valid report when step 8 produced
     no `bug-candidates`.
   - Stages `run-results.json`, `bug-candidates.json`, `heal-log.jsonl`,
     `test-strategy.json`, and the bug-report template/example/edge-case
@@ -122,7 +122,7 @@ pre-commit hook.
 - Tests: `test_step10_bug_classifier.py` (11 - 6 unit, 5 integration).
   **152/152 passing**, ruff clean.
 
-### Added (M6 - step 9 execution + self-heal)
+### Added (M6 - step 8 execution + self-heal)
 - `src/worca_t/test_runner.py`: framework-agnostic subprocess runner with
   parsers for JUnit XML, Playwright `--reporter=json`, Jest JSON, Mocha JSON,
   Robot `output.xml`, and Maven Surefire reports. Default commands per
@@ -143,10 +143,10 @@ pre-commit hook.
     authoritative when it produces parseable results.
   - Emits `run-results.json` (incl. `self_heal` totals) and
     `bug-candidates.json`. Step status is `completed` on a clean run and
-    `warned` when failures remain - test failures are surfaced via step 10,
+    `warned` when failures remain - test failures are surfaced via step 9,
     not as orchestrator failures.
 - Schemas: `run-results.schema.json`, `bug-candidates.schema.json`.
-- Pipeline registry now includes step 9.
+- Pipeline registry now includes step 8.
 - Tests: `test_test_runner.py` (21) + `test_step09_execute.py` (13).
   **141/141 passing**, ruff clean.
 
@@ -161,7 +161,7 @@ pre-commit hook.
   - Auto-fills `file` field from `test_id` when the agent omits it.
   - Short-circuits with no agent call when no TBD markers exist in step 7.
   - Re-indexes patched tests; any new rule violation fails the step.
-  - Warns (rather than fails) on unresolved TBD markers - downstream step 9
+  - Warns (rather than fails) on unresolved TBD markers - downstream step 8
     surfaces test failures.
 - `schemas/locator-resolution.schema.json`.
 - Tests: `test_step08_locator_resolution.py` (17 - 4 unit, 5 patcher,
