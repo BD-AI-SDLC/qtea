@@ -23,6 +23,9 @@ htmlcov/
 .idea/
 .vscode/
 
+# Claude Code — per-user local overrides (permissions, env, hooks)
+.claude/settings.local.json
+
 # Worca-T runtime
 .worca-t/
 worca-junit.xml
