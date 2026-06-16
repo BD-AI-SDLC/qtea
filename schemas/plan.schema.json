@@ -21,6 +21,7 @@
     },
     "phases": {
       "type": "array",
+      "minItems": 1,
       "items": {
         "type": "object",
         "required": ["number", "title"],
@@ -45,6 +46,65 @@
           },
           "success_criteria": { "type": "array", "items": { "type": "string" } }
         }
+      }
+    },
+    "test_cases": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/planTestCase" }
+    },
+    "acceptance_criteria_structured": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/acceptanceCriterion" }
+    },
+    "coverage_notes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/coverageNote" }
+    }
+  },
+  "$defs": {
+    "planTestCase": {
+      "type": "object",
+      "required": ["id", "title", "priority", "req_id", "ac_ids"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "pattern": "^TC-[A-Za-z0-9][A-Za-z0-9\\-_]*$" },
+        "title": { "type": "string", "minLength": 1 },
+        "type": { "type": ["string", "null"] },
+        "priority": { "type": "string", "enum": ["P0", "P1", "P2", "P3", "UNKNOWN"] },
+        "req_id": { "type": "string" },
+        "ac_ids": { "type": "array", "items": { "type": "string" } },
+        "ec_ids": { "type": "array", "items": { "type": "string" } },
+        "nfr_ids": { "type": "array", "items": { "type": "string" } },
+        "automation": { "type": "string", "enum": ["automation", "manual", "needs_investigation", "UNKNOWN"] },
+        "phase": { "type": ["integer", "null"] },
+        "parametrized_over": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "acceptanceCriterion": {
+      "type": "object",
+      "required": ["id", "text"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "pattern": "^AC-[A-Za-z0-9][A-Za-z0-9\\-_]*$" },
+        "text": { "type": "string", "minLength": 1 },
+        "given": { "type": ["string", "null"] },
+        "when": { "type": ["string", "null"] },
+        "then": { "type": ["string", "null"] },
+        "priority": { "type": "string", "enum": ["P0", "P1", "P2", "P3", "UNKNOWN"] },
+        "automation": { "type": "string", "enum": ["AUTOMATABLE", "MANUAL_ONLY", "NEEDS_INVESTIGATION", "UNKNOWN"] },
+        "user_flow": { "type": ["string", "null"] },
+        "requires_tc": { "type": "boolean" },
+        "promoted_from_nfr": { "type": "boolean" }
+      }
+    },
+    "coverageNote": {
+      "type": "object",
+      "required": ["item_id", "reason", "resolution"],
+      "additionalProperties": true,
+      "properties": {
+        "item_id": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string" },
+        "resolution": { "type": "string", "enum": ["dropped", "scope_excluded", "accepted_risk", "legacy_assumption"] }
       }
     }
   }

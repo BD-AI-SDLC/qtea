@@ -180,31 +180,57 @@ async def test_run_pipeline_debug_sets_extras(tmp_path: Path, monkeypatch):
     assert captured_ctx["debug_live"] is True
 
 
-async def test_cache_flag_off_by_default_sets_disable_env(tmp_path: Path, monkeypatch):
-    """Default --cache=False must set DISABLE_PROMPT_CACHING=1 in the parent
-    process env before any step runs, so claude_runner forwards it into
-    every Claude Code subprocess and suppresses the CLI's auto-caching.
-
-    RCA: run 20260610-082950-6a887f Step 7 — cache_create kept paying
-    the 25% surcharge while cache_read stayed stuck at 0 due to the Bosch
-    Vertex relay's lack of cross-request cache affinity. Default-off saves
-    ~$1.30/run on this environment.
-    """
+async def test_cache_default_none_without_sticky_disables(tmp_path: Path, monkeypatch):
+    """Default cache=None without BMF sticky-session header must disable
+    prompt caching (DISABLE_PROMPT_CACHING=1)."""
     import os
     monkeypatch.delenv("DISABLE_PROMPT_CACHING", raising=False)
+    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
     monkeypatch.setattr("worca_t.pipeline.STEP_REGISTRY", {})
 
     opts = PipelineOptions(spec="x", sut=".", workspace_base=tmp_path / ".ws")
-    assert opts.cache is False  # default
+    assert opts.cache is None  # tri-state default
 
     await run_pipeline(opts)
     assert os.environ.get("DISABLE_PROMPT_CACHING") == "1"
 
 
+async def test_cache_default_none_with_sticky_enables(tmp_path: Path, monkeypatch):
+    """Default cache=None with BMF sticky-session header must auto-enable
+    prompt caching (clear DISABLE_PROMPT_CACHING)."""
+    import os
+    monkeypatch.setenv("DISABLE_PROMPT_CACHING", "1")
+    monkeypatch.setenv(
+        "ANTHROPIC_CUSTOM_HEADERS", "x-bmf-sticky-session-instance: 01"
+    )
+    monkeypatch.setattr("worca_t.pipeline.STEP_REGISTRY", {})
+
+    opts = PipelineOptions(spec="x", sut=".", workspace_base=tmp_path / ".ws")
+    await run_pipeline(opts)
+    assert "DISABLE_PROMPT_CACHING" not in os.environ
+
+
+async def test_cache_explicit_false_overrides_sticky(tmp_path: Path, monkeypatch):
+    """Explicit --no-cache (cache=False) must disable caching even when
+    the sticky-session header is present."""
+    import os
+    monkeypatch.delenv("DISABLE_PROMPT_CACHING", raising=False)
+    monkeypatch.setenv(
+        "ANTHROPIC_CUSTOM_HEADERS", "x-bmf-sticky-session-instance: 02"
+    )
+    monkeypatch.setattr("worca_t.pipeline.STEP_REGISTRY", {})
+
+    opts = PipelineOptions(
+        spec="x", sut=".", workspace_base=tmp_path / ".ws", cache=False,
+    )
+    await run_pipeline(opts)
+    assert os.environ.get("DISABLE_PROMPT_CACHING") == "1"
+
+
 async def test_cache_flag_on_clears_disable_env(tmp_path: Path, monkeypatch):
-    """--cache must clear any pre-existing DISABLE_PROMPT_CACHING so the
-    Claude Code CLI's auto-caching is restored for this run. Important
-    when a parent process or earlier session left the var set."""
+    """Explicit --cache (cache=True) must clear any pre-existing
+    DISABLE_PROMPT_CACHING so the Claude Code CLI's auto-caching is
+    restored for this run."""
     import os
     monkeypatch.setenv("DISABLE_PROMPT_CACHING", "1")
     monkeypatch.setattr("worca_t.pipeline.STEP_REGISTRY", {})
@@ -233,3 +259,46 @@ def test_claude_runner_forwards_disable_prompt_caching():
     assert '"DISABLE_PROMPT_CACHING_OPUS"' in src
     assert '"DISABLE_PROMPT_CACHING_SONNET"' in src
     assert '"DISABLE_PROMPT_CACHING_HAIKU"' in src
+
+
+def test_parse_custom_headers(monkeypatch):
+    from worca_t.config import _parse_custom_headers
+
+    monkeypatch.setenv(
+        "ANTHROPIC_CUSTOM_HEADERS",
+        "x-bmf-sticky-session-instance: 01",
+    )
+    assert _parse_custom_headers() == {"x-bmf-sticky-session-instance": "01"}
+
+
+def test_parse_custom_headers_empty(monkeypatch):
+    from worca_t.config import _parse_custom_headers
+
+    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
+    assert _parse_custom_headers() == {}
+
+
+def test_auth_kwargs_include_custom_headers(monkeypatch):
+    from worca_t.config import anthropic_auth_kwargs
+
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv(
+        "ANTHROPIC_CUSTOM_HEADERS",
+        "x-bmf-sticky-session-instance: 02",
+    )
+    kwargs = anthropic_auth_kwargs()
+    assert kwargs["api_key"] == "sk-test"
+    assert kwargs["default_headers"] == {
+        "x-bmf-sticky-session-instance": "02",
+    }
+
+
+def test_auth_kwargs_no_custom_headers(monkeypatch):
+    from worca_t.config import anthropic_auth_kwargs
+
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
+    kwargs = anthropic_auth_kwargs()
+    assert "default_headers" not in kwargs

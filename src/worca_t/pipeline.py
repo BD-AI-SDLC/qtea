@@ -8,6 +8,7 @@ milestones remain runnable end-to-end.
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,8 +19,13 @@ from rich.table import Table
 from worca_t.checkpoints import RunState, StepRecord, is_step_complete, load_state, outputs_match, save_state
 from worca_t.config import load_env
 from worca_t.logging_setup import configure_logging, get_logger
+
+# Module-level logger for helpers that run outside the `run_pipeline` scope
+# where the run-id-bound `log` local is constructed. Helpers inside
+# `run_pipeline` may continue to use the local for run-id-bound output.
+_log = get_logger(__name__)
 from worca_t.metrics import format_cost, format_tokens
-from worca_t.review_gate import review_step_7_plan
+from worca_t.review_gate import review_step_7_plan, review_step_8_intents
 from worca_t.steps.base import Step, StepContext
 from worca_t.steps.s01_intake import IntakeStep
 from worca_t.steps.s02_refine import RefineStep
@@ -63,13 +69,20 @@ class PipelineOptions:
     yes: bool = False
     no_auto_deps: bool = False
     dev_locators: Path | None = None
-    # Claude Code prompt-cache toggle. Default is OFF because on the Bosch
-    # Vertex relay (aoai-farm.bosch-temp.com) cache_read never fires across
-    # requests — measured net cost ~+$1.30/run on Step 7 Opus turns from the
-    # 25% cache-creation surcharge with no read-side payback (probe data in
-    # run 20260610-082950-6a887f RCA). Set --cache to opt in when running
-    # against a relay or backend that does serve cross-request cache reads.
-    cache: bool = False
+    # Playwright `storageState.json` for Step 9 heal-agent reuse. CLI
+    # override; lower-priority sources (env var, SUT convention path,
+    # workspace auto-capture) are resolved inside Step 9 via
+    # `worca_t.storage_state.resolve()`.
+    storage_state: Path | None = None
+    # Claude Code prompt-cache toggle.  None = auto-detect (enabled when
+    # BMF sticky-session routing is active, disabled otherwise); True =
+    # force on; False = force off.
+    cache: bool | None = None
+    # Disable automatic cleanup of step artifacts and debug directories when
+    # using --from-step. Default is ON (--from-step cleans step-NN/,
+    # artifacts/stepNN/, and debug/step-NN-attempt* directories from the
+    # target step onward).
+    no_cleanup: bool = False
 
 
 def _build_registry() -> dict[int, Step]:
@@ -133,7 +146,7 @@ def _validate_resume_prerequisites(
     missing: list[int] = []
     for prior in range(1, from_step):
         rec = state.steps.get(prior)
-        if not rec or rec.status not in ("completed", "skipped"):
+        if not rec or rec.status not in ("completed", "skipped", "warned"):
             missing.append(prior)
     if missing:
         listing = ", ".join(str(n) for n in missing)
@@ -157,6 +170,98 @@ def _reset_steps_from(state: RunState, from_step: int) -> None:
     state.finished_at = None
 
 
+def _cleanup_step_artifacts(ws: Workspace, from_step: int, console: Console | None = None) -> None:
+    """Delete step-specific directories from from_step onward to ensure clean state.
+
+    Removes both work directories (step-NN/) and artifact directories 
+    (artifacts/stepNN/) for the specified step and all subsequent steps,
+    plus debug files and directories for each step. This prevents artifact pollution
+    when re-running with --from-step and ensures accurate log analysis.
+
+    Args:
+        ws: Workspace containing the directories to clean
+        from_step: First step number to clean (inclusive), all later steps also cleaned
+        console: Optional console for user prompts (hitl confirmation)
+    """
+    if console is None:
+        console = Console()
+
+    # Collect items to clean first for confirmation
+    items_to_clean = []
+    
+    for step in range(from_step, TOTAL_STEPS + 1):
+        work_dir = ws.root / f"step-{step:02d}"
+        artifact_dir = ws.artifacts / f"step{step:02d}"
+
+        if work_dir.exists():
+            items_to_clean.append(("dir", work_dir))
+        if artifact_dir.exists():
+            items_to_clean.append(("dir", artifact_dir))
+
+        # Collect debug items for this step (both files and directories)
+        debug_dir = ws.debug
+        if debug_dir.exists():
+            for debug_entry in debug_dir.glob(f"step-{step:02d}-attempt*"):
+                if debug_entry.is_file():
+                    items_to_clean.append(("file", debug_entry))
+                elif debug_entry.is_dir():
+                    items_to_clean.append(("dir", debug_entry))
+
+    # Skip if nothing to clean
+    if not items_to_clean:
+        console.print("[dim]cleanup:[/] no step-specific artifacts to remove")
+        return
+
+    # Confirm with user
+    console.print(f"[yellow]cleanup:[/] found {len(items_to_clean)} artifact(s) from step {from_step:02d} onward:")
+    for item_type, path in items_to_clean[:10]:
+        relative = path.relative_to(ws.root)
+        console.print(f"  [dim]-[/] {item_type}: {relative}")
+    if len(items_to_clean) > 10:
+        console.print(f"  [dim]... and {len(items_to_clean) - 10} more[/]")
+
+    response = console.input("[yellow]Proceed with deletion? [Y/n]: ").strip().lower()
+    if response not in ("", "y", "yes"):
+        console.print("[yellow]cleanup:[/] cancelled by user")
+        return
+
+    # Perform cleanup
+    deleted_count = 0
+    failed_count = 0
+
+    for item_type, path in items_to_clean:
+        try:
+            if item_type == "dir":
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+            deleted_count += 1
+        except (OSError, PermissionError) as e:
+            failed_count += 1
+            _log.warning(
+                "cleanup.delete_failed",
+                item_type=item_type,
+                path=str(path.relative_to(ws.root)),
+                error=str(e),
+            )
+
+    if deleted_count > 0:
+        _log.info(
+            "cleanup.completed",
+            from_step=from_step,
+            deleted_count=deleted_count,
+            failed_count=failed_count,
+        )
+        console.print(
+            f"[green]cleanup:[/] removed {deleted_count} artifact(s) from step {from_step:02d} onward"
+        )
+
+    if failed_count > 0:
+        console.print(
+            f"[yellow]cleanup:[/] failed to remove {failed_count} artifact(s) (see logs for details)"
+        )
+
+
 def _select_steps(opts: PipelineOptions) -> list[int]:
     if opts.only_step is not None:
         return [opts.only_step]
@@ -164,24 +269,132 @@ def _select_steps(opts: PipelineOptions) -> list[int]:
     return [i for i in range(start, TOTAL_STEPS + 1) if i not in opts.skip_steps]
 
 
+def _mcp_preflight_for_step(
+    step: Step,
+    *,
+    opts: PipelineOptions,
+    console: Console,
+) -> bool:
+    """Probe the MCP servers this step declares it needs, just before it runs.
+
+    Lazy replacement for the legacy pipeline-start preflight. Skipped silently
+    when the step's `mcp_servers_required` is empty (most steps). Probing
+    contiguously with the step's agent invocation also fixes the
+    "playwright reports `pending` at SDK init" race — the npx cache and
+    server-side lazy init stay warm long enough for the next SDK spawn to
+    catch a connected server. Returns False to abort the pipeline.
+    """
+    required = getattr(step, "mcp_servers_required", frozenset()) or frozenset()
+    if not required:
+        return True
+
+    import sys
+    from worca_t.mcp_manager import load_mcp_config, probe_server
+
+    while True:
+        try:
+            all_servers = load_mcp_config()
+        except (FileNotFoundError, OSError, ValueError) as e:
+            console.print(
+                f"[red]mcp preflight (step {step.number:02d}):[/] "
+                f"could not load .mcp.json: {e}"
+            )
+            _log.error(
+                "step.mcp_preflight_failed",
+                step=step.number,
+                error=str(e),
+            )
+            return False
+
+        scoped = {n: s for n, s in all_servers.items() if n in required}
+        missing = sorted(required - scoped.keys())
+        if missing:
+            console.print(
+                f"[red]mcp preflight (step {step.number:02d}):[/] "
+                f"required server(s) not declared in .mcp.json: "
+                f"{', '.join(missing)}"
+            )
+            _log.error(
+                "step.mcp_preflight_missing",
+                step=step.number,
+                missing=missing,
+            )
+            return False
+
+        console.print(
+            f"[dim]mcp:[/] warming "
+            f"{', '.join(sorted(scoped.keys()))} for step "
+            f"{step.number:02d}…"
+        )
+        results = [(name, *probe_server(server)) for name, server in scoped.items()]
+        failed = [(n, msg) for n, ok, msg in results if not ok]
+
+        if not failed:
+            ok_names = sorted(n for n, ok, _ in results if ok)
+            console.print("[dim]mcp:[/] " + ", ".join(f"{n} ok" for n in ok_names))
+            _log.info(
+                "step.mcp_preflight_ok",
+                step=step.number,
+                servers=ok_names,
+            )
+            return True
+
+        console.print(
+            f"[red]mcp preflight (step {step.number:02d}):[/] "
+            f"one or more required servers failed to start:"
+        )
+        for name, msg in failed:
+            console.print(f"  [red]{name}[/]: {msg}")
+        _log.error(
+            "step.mcp_preflight_failed",
+            step=step.number,
+            failed=[{"name": n, "error": m} for n, m in failed],
+        )
+
+        if not sys.stdin.isatty() or opts.no_hitl or opts.yes:
+            console.print(
+                "[yellow]Non-interactive mode: fix MCP setup and re-run "
+                "(or omit --no-hitl / --yes to enable the retry prompt).[/yellow]"
+            )
+            return False
+
+        from rich.prompt import Confirm
+
+        if not Confirm.ask(
+            "Retry MCP initialization?", default=True, console=console
+        ):
+            console.print("[dim]Aborted by user.[/]")
+            return False
+
+
 async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None) -> int:
     console = console or Console()
 
-    # Translate the --cache toggle into the Claude Code subprocess env knob.
-    # Setting DISABLE_PROMPT_CACHING=1 in the parent suppresses the CLI's
-    # automatic cache_control breakpoints on the system prompt + tools +
-    # CLAUDE.md for every agent invocation in this run. claude_runner
-    # forwards this var into the subprocess env explicitly (see its
-    # forwarded_env block). Default off because cross-request cache_read
-    # never fires on the Bosch Vertex relay — paying the 25% cache-
-    # creation surcharge for zero read-side payback is net cost-negative
-    # there. Pass --cache to opt back in when the backend supports it.
-    if not opts.cache:
+    # Resolve the tri-state cache toggle (None / True / False) into a
+    # concrete boolean.  When the user didn't pass --cache or --no-cache
+    # (None), auto-detect: enable caching iff BMF sticky-session routing is
+    # active (the header that makes prompt-cache reads actually hit).
+    # Without sticky sessions the BMF relay does not honour cache_control —
+    # callers pay the 25% creation surcharge with zero read-side payback.
+    cache_enabled = opts.cache
+    if cache_enabled is None:
+        headers = os.environ.get("ANTHROPIC_CUSTOM_HEADERS", "")
+        cache_enabled = "x-bmf-sticky-session-instance" in headers
+        if cache_enabled:
+            console.print(
+                "[dim]prompt caching auto-enabled "
+                "(BMF sticky-session header detected)[/]"
+            )
+        else:
+            console.print("[dim]prompt caching disabled (no sticky-session header)[/]")
+    elif cache_enabled:
+        console.print("[dim]prompt caching force-enabled (--cache)[/]")
+    else:
+        console.print("[dim]prompt caching disabled (--no-cache)[/]")
+
+    if not cache_enabled:
         os.environ["DISABLE_PROMPT_CACHING"] = "1"
     else:
-        # Re-enable explicitly: if a parent process or prior session set
-        # the disable flag, --cache should clear it so the CLI's auto-
-        # caching is restored for this run.
         os.environ.pop("DISABLE_PROMPT_CACHING", None)
 
     try:
@@ -253,6 +466,11 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
         _reset_steps_from(state, opts.from_step)
         save_state(state, ws.state_file)
 
+        # Clean up step artifacts and debug directories to prevent pollution
+        # across multiple --from-step runs. Can be disabled with --no-cleanup.
+        if not opts.no_cleanup:
+            _cleanup_step_artifacts(ws, opts.from_step, console)
+
     log.info(
         "pipeline.start",
         spec=opts.spec,
@@ -272,29 +490,66 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
     # No clone-confirmation prompt: worca-t's entire purpose is to fetch the
     # SUT, install its dependencies, and run its tests. The user supplied the
     # URL on the command line — that IS the consent. Asking again is noise.
+    #
+    # Guard: skip materialization on --from-step resume when the SUT is
+    # already on the expected branch with step 8's commits intact.
+    # Re-materializing would wipe those commits (the generated test files).
     import subprocess
     import sys
 
+    from worca_t._sut_git import branch_name as _branch_name_early
+    from worca_t._sut_git import current_branch as _current_branch_early
     from worca_t.steps.s06_research import _materialize_sut
 
-    console.print("[dim]sut:[/] materializing…")
-    try:
-        _materialize_sut(opts.sut, ws.sut, run_id=ws.run_id)
-    except subprocess.CalledProcessError as e:
-        stderr = (e.stderr or b"").decode(errors="replace").strip()
-        console.print(f"[red]sut error:[/] failed to clone [cyan]{opts.sut}[/cyan]")
-        if stderr:
-            console.print(f"[red]  {stderr}[/]")
-        log.error("pipeline.sut_failed", sut=opts.sut, error=stderr)
-        return 2
-    except FileNotFoundError as e:
-        console.print(f"[red]sut error:[/] {e}")
-        log.error("pipeline.sut_failed", sut=opts.sut, error=str(e))
-        return 2
-    except Exception as e:
-        console.print(f"[red]sut error:[/] {e}")
-        log.error("pipeline.sut_failed", sut=opts.sut, error=str(e))
-        return 2
+    sut_git_exists = (ws.sut / ".git").exists()
+    is_step_resume = (
+        opts.from_step is not None
+        and opts.from_step > 1
+        and sut_git_exists
+    )
+    step8_rec = state.steps.get(8)
+    step8_done = step8_rec is not None and step8_rec.status in (
+        "completed", "warned",
+    )
+    skip_materialize = is_step_resume and step8_done
+
+    if skip_materialize:
+        expected = _branch_name_early(ws.run_id)
+        try:
+            actual = _current_branch_early(ws.sut)
+        except Exception:
+            actual = None
+        if actual == expected:
+            console.print(
+                f"[dim]sut:[/] reusing (branch [cyan]{expected}[/cyan])"
+            )
+            log.info("pipeline.sut_reuse", branch=expected)
+        else:
+            console.print(
+                f"[yellow]sut:[/] branch mismatch "
+                f"({actual} != {expected}), re-materializing"
+            )
+            skip_materialize = False
+
+    if not skip_materialize:
+        console.print("[dim]sut:[/] materializing…")
+        try:
+            _materialize_sut(opts.sut, ws.sut, run_id=ws.run_id)
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or b"").decode(errors="replace").strip()
+            console.print(f"[red]sut error:[/] failed to clone [cyan]{opts.sut}[/cyan]")
+            if stderr:
+                console.print(f"[red]  {stderr}[/]")
+            log.error("pipeline.sut_failed", sut=opts.sut, error=stderr)
+            return 2
+        except FileNotFoundError as e:
+            console.print(f"[red]sut error:[/] {e}")
+            log.error("pipeline.sut_failed", sut=opts.sut, error=str(e))
+            return 2
+        except Exception as e:
+            console.print(f"[red]sut error:[/] {e}")
+            log.error("pipeline.sut_failed", sut=opts.sut, error=str(e))
+            return 2
 
     # Post-materialize preflight: catch the silent-failure shape where the
     # clone "succeeded" but didn't put a usable repo on disk. Both checks fire
@@ -336,55 +591,14 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
         f"(branch [cyan]{expected_branch}[/cyan])"
     )
 
-    # MCP preflight — cold-start every server in .mcp.json once up front.
-    # Doing this here (instead of letting each step's `claude` subprocess
-    # bootstrap its own MCPs in parallel) avoids the npx/node contention
-    # that previously starved Step 2 into a 300s timeout, and warms the
-    # npx cache for all downstream agent calls.
-    from worca_t.mcp_manager import load_mcp_config, probe_server
-
-    while True:
-        console.print("[dim]mcp:[/] verifying servers…")
-        try:
-            servers = load_mcp_config()
-        except (FileNotFoundError, OSError, ValueError) as e:
-            console.print(f"[red]mcp preflight:[/] could not load .mcp.json: {e}")
-            log.error("pipeline.mcp_preflight_failed", error=str(e))
-            return 2
-
-        results = [(name, *probe_server(server)) for name, server in servers.items()]
-        failed = [(n, msg) for n, ok, msg in results if not ok]
-
-        if not failed:
-            ok_names = [n for n, ok, _ in results if ok]
-            console.print(
-                "[dim]mcp:[/] " + ", ".join(f"{n} ok" for n in ok_names)
-            )
-            log.info("pipeline.mcp_preflight_ok", servers=ok_names)
-            break
-
-        console.print("[red]mcp preflight:[/] one or more servers failed to start:")
-        for name, msg in failed:
-            console.print(f"  [red]{name}[/]: {msg}")
-        log.error(
-            "pipeline.mcp_preflight_failed",
-            failed=[{"name": n, "error": m} for n, m in failed],
-        )
-
-        if not sys.stdin.isatty() or opts.no_hitl or opts.yes:
-            console.print(
-                "[yellow]Non-interactive mode: fix MCP setup and re-run "
-                "(or omit --no-hitl / --yes to enable the retry prompt).[/yellow]"
-            )
-            return 2
-
-        from rich.prompt import Confirm
-
-        if not Confirm.ask(
-            "Retry MCP initialization?", default=True, console=console
-        ):
-            console.print("[dim]Aborted by user.[/]")
-            return 2
+    # MCP preflight is now lazy: each step declares its `mcp_servers_required`
+    # (see `Step` base class) and `_mcp_preflight_for_step` probes those
+    # servers just before the step runs (see the step loop below). Steps
+    # that don't use MCP pay zero preflight cost. The previous always-on
+    # preflight was wasteful (all 11 steps paid the cost when only Step 9
+    # uses MCP) and the warmup was 18 minutes stale by the time the
+    # consumer ran. See the `mcp_servers_required` docstring in
+    # `steps/base.py`.
 
     # Replay env resolution from existing Step 6 artifacts (if any).
     # Step 6's `resolve_sut_env()` writes into `os.environ` in-process only;
@@ -428,6 +642,10 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
             continue
 
         console.print(f"[cyan]>>> step {step_num:02d} {step.name}[/]")
+        if not _mcp_preflight_for_step(step, opts=opts, console=console):
+            log.error("step.mcp_preflight_abort", step=step_num)
+            exit_code = 2
+            break
         result = await step.execute(ctx)
         record = state.steps.get(step_num)
 
@@ -443,11 +661,24 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
         # transpiles it into code. Skipped automatically in non-TTY /
         # `--no-hitl` contexts. On manual edits the gate re-validates the
         # plan against the schema and re-renders.
-        if step_num == 7 and not review_step_7_plan(ctx, result, console):
+        if step_num == 7 and not await review_step_7_plan(ctx, result, console):
             save_state(state, ws.state_file)
             console.print("[yellow]step 07 rejected by reviewer — aborting[/]")
             exit_code = 1
             break
+
+        # Phase-D follow-up: when Step 8 stashed WARN/FAIL intent entries on
+        # ctx.extras, surface them for human review on TTY. FAILs that should
+        # block already aborted Step 8 itself; what reaches here is the
+        # WARN-tier (plus FAILs when WORCA_T_INTENT_FAIL_AS_WARN=1).
+        if step_num == 8 and ctx.extras.get("step8_intent_warnings"):
+            if not await review_step_8_intents(ctx, result, console):
+                save_state(state, ws.state_file)
+                console.print(
+                    "[yellow]step 08 rejected at intent-review gate — aborting[/]"
+                )
+                exit_code = 1
+                break
 
         save_state(state, ws.state_file)
 
@@ -474,13 +705,23 @@ def _format_step_metrics_line(record: StepRecord) -> str:
     tokens_in = format_tokens(record.tokens_input)
     tokens_out = format_tokens(record.tokens_output)
     cost = format_cost(record.cost_usd)
-    return f"[elapsed {duration} | {tokens_in}->{tokens_out} tok | {cost}]"
+    cache_part = ""
+    if record.tokens_cache_read or record.tokens_cache_creation:
+        parts = []
+        if record.tokens_cache_read:
+            parts.append(f"{format_tokens(record.tokens_cache_read)} read")
+        if record.tokens_cache_creation:
+            parts.append(f"{format_tokens(record.tokens_cache_creation)} write")
+        cache_part = f" | cache: {', '.join(parts)}"
+    return f"[elapsed {duration} | {tokens_in}->{tokens_out} tok{cache_part} | {cost}]"
 
 
 def _pipeline_totals(state: RunState) -> dict[str, float | int]:
     total_duration = 0.0
     total_in = 0
     total_out = 0
+    total_cache_create = 0
+    total_cache_read = 0
     total_cost = 0.0
     total_calls = 0
     for rec in state.steps.values():
@@ -488,12 +729,16 @@ def _pipeline_totals(state: RunState) -> dict[str, float | int]:
             total_duration += rec.duration_s
         total_in += rec.tokens_input
         total_out += rec.tokens_output
+        total_cache_create += rec.tokens_cache_creation
+        total_cache_read += rec.tokens_cache_read
         total_cost += rec.cost_usd
         total_calls += rec.agent_calls
     return {
         "total_duration_s": round(total_duration, 3),
         "total_tokens_input": total_in,
         "total_tokens_output": total_out,
+        "total_tokens_cache_creation": total_cache_create,
+        "total_tokens_cache_read": total_cache_read,
         "total_cost_usd": round(total_cost, 6),
         "total_agent_calls": total_calls,
     }
@@ -511,6 +756,8 @@ def _render_summary_table(state: RunState, console: Console) -> None:
     table.add_column("Time", justify="right", no_wrap=True)
     table.add_column("In tok", justify="right", no_wrap=True)
     table.add_column("Out tok", justify="right", no_wrap=True)
+    table.add_column("Cache Read", justify="right", no_wrap=True)
+    table.add_column("Cache Write", justify="right", no_wrap=True)
     table.add_column("Calls", justify="right", no_wrap=True)
     table.add_column("Cost", justify="right", no_wrap=True)
 
@@ -527,6 +774,8 @@ def _render_summary_table(state: RunState, console: Console) -> None:
         rec = state.steps[step_num]
         color = status_color.get(rec.status, "white")
         duration = f"{rec.duration_s:.1f}s" if rec.duration_s is not None else "-"
+        cache_read = format_tokens(rec.tokens_cache_read) if rec.tokens_cache_read else "-"
+        cache_write = format_tokens(rec.tokens_cache_creation) if rec.tokens_cache_creation else "-"
         table.add_row(
             f"{step_num:02d}",
             rec.name or "",
@@ -534,11 +783,15 @@ def _render_summary_table(state: RunState, console: Console) -> None:
             duration,
             format_tokens(rec.tokens_input),
             format_tokens(rec.tokens_output),
+            cache_read,
+            cache_write,
             str(rec.agent_calls),
             format_cost(rec.cost_usd),
         )
 
     totals = _pipeline_totals(state)
+    total_cache_read = int(totals["total_tokens_cache_read"])
+    total_cache_write = int(totals["total_tokens_cache_creation"])
     table.add_section()
     table.add_row(
         "",
@@ -547,6 +800,8 @@ def _render_summary_table(state: RunState, console: Console) -> None:
         f"[bold]{totals['total_duration_s']:.1f}s[/]",
         f"[bold]{format_tokens(int(totals['total_tokens_input']))}[/]",
         f"[bold]{format_tokens(int(totals['total_tokens_output']))}[/]",
+        f"[bold]{format_tokens(total_cache_read)}[/]" if total_cache_read else "-",
+        f"[bold]{format_tokens(total_cache_write)}[/]" if total_cache_write else "-",
         f"[bold]{totals['total_agent_calls']}[/]",
         f"[bold]{format_cost(float(totals['total_cost_usd']))}[/]",
     )

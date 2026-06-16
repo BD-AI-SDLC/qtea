@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worca-t/schemas/reconcile-result.schema.json",
+  "title": "ReconciliationResult",
+  "description": "Audit artifact for Phase B.5 of Step 8 codegen: static reconciliation between generated test files and the post-extension POMs they import. Records every call site checked and every mismatch (method not found, arity mismatch, parse error) discovered. Persisted to `artifacts/step08/reconcile-result.json` regardless of whether auto-patch succeeded.",
+  "type": "object",
+  "required": ["test_files_scanned", "call_sites_checked", "pom_files_scanned", "mismatches"],
+  "additionalProperties": true,
+  "properties": {
+    "test_files_scanned": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of generated test files parsed for `<obj>.<method>(...)` call sites."
+    },
+    "fixture_files_scanned": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of distinct fixture files referenced by the plan that were inspected for symbol presence (Phase B.5 fixture check)."
+    },
+    "fixture_mismatches": {
+      "type": "array",
+      "description": "Plan-declared fixtures that are absent on disk after Phase A4. Each mismatch records the expected file + fixture name + which test_cases referenced it. `fixture_symbol_missing` means the file exists but the named `@pytest.fixture` function is absent (typical race-condition victim). `fixture_file_missing` means the file itself is absent. Empty array means every fixture the plan declared is resolvable.",
+      "items": {
+        "type": "object",
+        "required": ["kind", "name", "expected_file", "source"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": ["fixture_symbol_missing", "fixture_file_missing"]
+          },
+          "name": { "type": "string" },
+          "expected_file": { "type": "string" },
+          "source": { "type": "string", "enum": ["create", "reuse"] },
+          "referenced_by": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "test_case IDs whose `uses_fixtures` declaration referenced this fixture. Surfaced in failure anchors so the human sees which TCs would break at runtime."
+          },
+          "existing_symbols": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "All `@pytest.fixture`-decorated function names found in `expected_file` at the time of reconciliation. Empty when `kind == fixture_file_missing` or when the file defines no fixtures."
+          }
+        }
+      }
+    },
+    "call_sites_checked": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of POM method invocations resolved through the import manifest and checked against the corresponding POM source on disk."
+    },
+    "pom_files_scanned": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of POM source files read from disk to enumerate their actually-defined public methods."
+    },
+    "mismatches": {
+      "type": "array",
+      "description": "Every detected discrepancy between a test call site and the resolved POM. Empty array means the generated tests are statically consistent with the post-extension POMs.",
+      "items": {
+        "type": "object",
+        "required": ["kind", "call_site", "resolved_pom", "pom_file", "existing_methods"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": ["method_not_found", "arity_mismatch", "parse_error", "likely_typo"],
+            "description": "method_not_found: the called method does not exist on the resolved POM. arity_mismatch: method exists but the call site's positional+keyword arg count is incompatible with the definition. parse_error: the test or POM file could not be parsed and was skipped. likely_typo: the called name is within edit distance of an existing method (see `suggested_method`); auto-patch is intentionally skipped so the human can fix the typo instead of getting a stub that masks the test bug."
+          },
+          "call_site": {
+            "type": "object",
+            "required": ["test_file", "line", "obj_name", "method_name", "arity", "kw_names", "snippet"],
+            "properties": {
+              "test_file": {
+                "type": "string",
+                "description": "SUT-relative path to the generated test file containing the call."
+              },
+              "line": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "1-based line number of the call expression in the test file."
+              },
+              "obj_name": {
+                "type": "string",
+                "description": "Name of the object being called (e.g. `login_page`). Resolved through the test file's import manifest to a POM class."
+              },
+              "method_name": {
+                "type": "string",
+                "description": "Attribute being invoked on `obj_name` (e.g. `click_save`)."
+              },
+              "arity": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Total positional + keyword argument count observed at the call site."
+              },
+              "kw_names": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Names of keyword arguments passed at the call site, in source order. Empty when only positional arguments are used."
+              },
+              "snippet": {
+                "type": "string",
+                "description": "One-line source context of the call, used for human-readable error anchors and auto-patch task `purpose` synthesis."
+              }
+            }
+          },
+          "resolved_pom": {
+            "type": "string",
+            "description": "Class name of the POM that `obj_name` resolves to via the test file's imports (e.g. `LoginPage`)."
+          },
+          "pom_file": {
+            "type": "string",
+            "description": "SUT-relative path to the POM source file scanned for `existing_methods`."
+          },
+          "existing_methods": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "All public method names defined on `resolved_pom` at the time of reconciliation. Included verbatim in failure anchors so the agent / human can see what was actually generated."
+          },
+          "suggested_method": {
+            "type": ["string", "null"],
+            "description": "Only populated when `kind == \"likely_typo\"`: the unique existing method name within `_TYPO_MAX_DIST` (=2) edit distance of `call_site.method_name`. Surface as 'did you mean X?' in the failure anchor."
+          }
+        }
+      }
+    }
+  }
+}

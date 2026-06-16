@@ -34,7 +34,7 @@ def test_workspace_layout(tmp_path: Path):
 
 def test_agent_model_map_loaded():
     m = agent_model_map()
-    assert m["ui-test-automation"] == "claude-opus-4-6"
+    assert m["ui-test-automation"] == "claude-sonnet-4-6"
     assert model_for_agent("polyglot-test-fixer") == "claude-sonnet-4-6"
     assert model_for_agent("does-not-exist") is None
 

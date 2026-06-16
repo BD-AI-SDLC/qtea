@@ -58,13 +58,18 @@ _EXT_FALLBACK = {
 # Test-file glob predicates per framework.
 #
 # `worca_*test*` patterns are deliberately included alongside the standard
-# `test_*` / `*_test` / `*.spec` / `*.test` conventions: the Step 7 codegen
+# `test_*` / `*_test` / `*.spec` / `*.test` conventions: the Step 8 codegen
 # agent prefixes every generated file with `worca_` (see
-# `agents/ui-test-automation.agent.md`, "Reuse is the default" rule) to avoid colliding with the
+# `agents/codegen-rules.md`) to avoid colliding with the
 # SUT's own tests when integrating into the SUT's test folder. Without these
-# extra globs, files like `worca_test_login.py` are invisible to the indexer,
+# extra globs, files like `worca_login_test.py` are invisible to the indexer,
 # Step 7 reports `tests=0` for the actual test file, and Step 8's TBD detection
 # falls back to the locator-module misclassification path.
+#
+# Canonical Python name is `worca_<feature>_test.py` (matches pytest's default
+# `*_test.py` discovery). The legacy `worca_test_*.py` glob is retained ONLY so
+# re-runs over older clones still index; it is NOT pytest-collectable under a
+# stock `python_files` config and must not be emitted by new codegen.
 _TEST_FILE_GLOBS: dict[str, tuple[str, ...]] = {
     "playwright-ts": (
         "**/*.spec.ts", "**/*.test.ts",
@@ -72,11 +77,11 @@ _TEST_FILE_GLOBS: dict[str, tuple[str, ...]] = {
     ),
     "playwright-py": (
         "**/test_*.py", "**/*_test.py",
-        "**/worca_test_*.py", "**/worca_*_test.py",
+        "**/worca_*_test.py", "**/worca_test_*.py",
     ),
     "pytest": (
         "**/test_*.py", "**/*_test.py",
-        "**/worca_test_*.py", "**/worca_*_test.py",
+        "**/worca_*_test.py", "**/worca_test_*.py",
     ),
     "cypress": (
         "**/*.cy.ts", "**/*.cy.js",
@@ -85,7 +90,7 @@ _TEST_FILE_GLOBS: dict[str, tuple[str, ...]] = {
     "selenium-java": ("**/*Test.java", "**/*Tests.java", "**/Worca*Test.java"),
     "selenium-py": (
         "**/test_*.py", "**/*_test.py",
-        "**/worca_test_*.py", "**/worca_*_test.py",
+        "**/worca_*_test.py", "**/worca_test_*.py",
     ),
     "robot": ("**/*.robot", "**/worca_*.robot"),
     "jest": (
@@ -228,7 +233,19 @@ _VIOLATION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
             r"""(?P<snippet>(?:By\.XPATH|by_xpath|find_element\s*\(\s*By\.XPATH|xpath\s*=\s*['"]|['"]//[a-zA-Z*\[]|locator\s*\(\s*['"]xpath=))"""
         ),
     ),
-    # Hard waits: numeric arg (allow `wait_for_selector` etc.).
+    # Hard waits: only flag the listed callables with a NUMERIC argument.
+    # Intentionally NOT flagged (already-allowed polling primitives — see
+    # `agents/ui-test-automation.agent.md` §4 for positive guidance to the
+    # agent on which to use when):
+    #   - page.wait_for_function("…", timeout=N)
+    #   - page.wait_for_selector("…", timeout=N)
+    #   - page.wait_for_url(...)
+    #   - page.expect_response(...)
+    #   - expect(locator).to_be_visible(timeout=N) / .toBeVisible({timeout:N})
+    #   - expect.poll(callable, timeout=N).to_*(...)
+    #   - cy.wait('@aliasName')  — alias-based, not a numeric arg
+    # The numeric-arg requirement (`\d+`) keeps every legitimate
+    # condition-poll silent and catches only the unconditional sleeps.
     (
         "hard-wait",
         re.compile(

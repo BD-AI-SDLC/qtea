@@ -57,6 +57,7 @@ def install_fake_anthropic(
     monkeypatch,
     *,
     text: str = "ok",
+    texts: list[str] | None = None,
     usage: FakeUsage | None = None,
     raises: Exception | None = None,
     on_call: Callable[[dict[str, Any]], None] | None = None,
@@ -69,7 +70,14 @@ def install_fake_anthropic(
         pytest's ``monkeypatch`` fixture.
     text:
         Text to return as the assistant's response content. Single
-        text block — sufficient for all reasoning-step tests.
+        text block — sufficient for all reasoning-step tests. Ignored
+        when ``texts`` is provided.
+    texts:
+        Sequence of texts to cycle through on successive ``messages.create``
+        calls. Once exhausted, the LAST text is reused for any further
+        calls (so over-calling doesn't crash; tests can assert exact
+        call counts via ``create_mock.call_count``). Use for retry-loop
+        tests that need attempt 1 to fail and attempt 2 to succeed.
     usage:
         Token usage to attach to the response. Defaults to
         :class:`FakeUsage` (100 input, 50 output).
@@ -89,19 +97,28 @@ def install_fake_anthropic(
         ``.call_count`` / ``.call_args_list`` for assertions on call
         count or call ordering.
     """
-    fake_response = FakeResponse(
-        content=[FakeTextBlock(text=text)],
-        usage=usage or FakeUsage(),
-    )
+    text_sequence = list(texts) if texts is not None else [text]
+    if not text_sequence:
+        raise ValueError("install_fake_anthropic: `texts` must be non-empty")
+    responses = [
+        FakeResponse(content=[FakeTextBlock(text=t)], usage=usage or FakeUsage())
+        for t in text_sequence
+    ]
 
     create_mock = AsyncMock()
     if raises is not None:
         create_mock.side_effect = raises
     else:
+        call_index = {"i": 0}
+
         async def _capture_and_return(**kwargs):
             if on_call is not None:
                 on_call(kwargs)
-            return fake_response
+            i = call_index["i"]
+            # Clamp to last response so over-calls don't IndexError.
+            response = responses[min(i, len(responses) - 1)]
+            call_index["i"] = i + 1
+            return response
         create_mock.side_effect = _capture_and_return
 
     class FakeMessages:

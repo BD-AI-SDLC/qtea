@@ -50,6 +50,12 @@ class ResolutionResult:
     """Return shape of :func:`resolve_one`. Serialised to stdout JSON for the
     pytest plugin to consume.
 
+    ``candidates`` carries the LLM's ranked bundle (primary + optional
+    fallback). The top-level ``selector``/``strategy``/``confidence`` mirror
+    ``candidates[0]`` so legacy consumers that don't know about the bundle
+    keep working. For non-agent sources (cached / unresolvable) ``candidates``
+    is ``None``.
+
     Cost-tracking fields (``input_tokens`` / ``output_tokens`` / ``model`` /
     ``duration_ms``) are populated for tier 4 (LLM) results; for ``cached``
     they're zero / null. The runtime plugin reads these and appends one
@@ -72,6 +78,7 @@ class ResolutionResult:
     output_tokens: int | None = None
     model: str | None = None
     duration_ms: int | None = None
+    candidates: tuple[dict[str, Any], ...] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -89,6 +96,7 @@ class ResolutionResult:
             "output_tokens": self.output_tokens,
             "model": self.model,
             "duration_ms": self.duration_ms,
+            "candidates": list(self.candidates) if self.candidates else None,
         }
 
 
@@ -163,23 +171,34 @@ def _build_prompt(intent: str, snapshot_text: str, constant_name: str) -> tuple[
       4. Express confidence honestly (null when uncertain).
     """
     system = (
-        "You resolve a single UI locator from a Playwright accessibility "
-        "snapshot. Read the snapshot, find the element matching the locator's "
-        "intent, and return ONE JSON object describing the selector. "
+        "You resolve a UI locator from a Playwright accessibility snapshot. "
+        "Read the snapshot, find the element matching the locator's intent, "
+        "and return a ranked bundle of up to two selector candidates so the "
+        "runtime can fall back transparently if the primary mutates.\n"
         "Rules:\n"
-        "  1. Output ONLY a JSON object. No prose, no markdown fences.\n"
-        "  2. The selector MUST be findable in the provided snapshot. NEVER "
+        "  1. Output ONLY a JSON object. Your first character MUST be `{` "
+        "and your last character MUST be `}`. No prose before or after, "
+        "no markdown fences, no commentary.\n"
+        "  2. Every selector MUST be findable in the provided snapshot. NEVER "
         "invent attributes or roles not present.\n"
-        "  3. Locator priority (use the highest-applicable): id > data-testid "
-        "> role > label > text > placeholder > scoped css. NEVER XPath.\n"
-        "  4. If no element clearly matches the intent at confidence >= 0.6, "
-        "set selector=null and confidence=null with a `reason` explaining "
-        "what you looked for and why it isn't there.\n"
-        "  5. `strategy` must be one of: id, data-testid, role, label, text, "
+        "  3. Locator priority (use the highest-applicable for the primary): "
+        "id > data-testid > role > label > text > placeholder > scoped css. "
+        "NEVER XPath.\n"
+        "  4. The fallback (if present) MUST use a different `strategy` family "
+        "than the primary (e.g. if primary strategy is `role`, fallback should "
+        "prefer `text`, `label`, or `data-testid`). Omit the fallback when no "
+        "defensible alternate exists in the snapshot.\n"
+        "  5. If no element clearly matches the intent at confidence >= 0.6, "
+        "return an empty `candidates` array and set the top-level `reason` "
+        "explaining what you looked for and why it isn't there.\n"
+        "  6. `strategy` must be one of: id, data-testid, role, label, text, "
         "placeholder, css, or null.\n"
         "Output shape: "
-        "{\"selector\": <string|null>, \"strategy\": <string|null>, "
-        "\"confidence\": <number 0-1 or null>, \"reason\": <string|null>}"
+        "{\"candidates\": ["
+        "{\"selector\": <string>, \"strategy\": <string|null>, "
+        "\"confidence\": <number 0-1 or null>, \"reason\": <string|null>}, "
+        "...up to 2 entries], "
+        "\"reason\": <string|null>}"
     )
     user = (
         f"Locator constant: `{constant_name}`\n"
@@ -216,6 +235,13 @@ def _call_anthropic(system: str, user: str, *, model: str) -> tuple[str, dict[st
         client = anthropic.Anthropic(**anthropic_auth_kwargs())
         # Standard SDK expects the dash-form; convert @ to -.
         send_model = model.replace("@", "-") if "@" in model else model
+    # No assistant-message prefill: Vertex AI (and the Bosch BMF Vertex
+    # relay) rejects requests whose final message is from `assistant` with
+    # `'This model does not support assistant message prefill. The
+    # conversation must end with a user message.'`. The system prompt's
+    # "Output ONLY a JSON object" rule plus temperature=0 produces a
+    # leading `{` reliably; `_parse_response` is tolerant of any leading
+    # whitespace or stray prose by scanning to the first balanced object.
     response = client.messages.create(
         model=send_model,
         max_tokens=512,
@@ -223,11 +249,8 @@ def _call_anthropic(system: str, user: str, *, model: str) -> tuple[str, dict[st
         system=system,
         messages=[
             {"role": "user", "content": user},
-            {"role": "assistant", "content": "{"},  # prefill JSON open-brace
         ],
     )
-    # Anthropic SDK returns a list of content blocks; we take the text of
-    # the first one and prepend the prefilled `{`.
     body_parts: list[str] = []
     for block in response.content:
         if getattr(block, "type", None) == "text":
@@ -238,17 +261,23 @@ def _call_anthropic(system: str, user: str, *, model: str) -> tuple[str, dict[st
         "input_tokens": getattr(usage_obj, "input_tokens", None),
         "output_tokens": getattr(usage_obj, "output_tokens", None),
     }
-    return ("{" + body if body else "{}"), usage
+    return (body if body else "{}"), usage
 
 
 def _parse_response(text: str) -> dict[str, Any]:
-    """Tolerant JSON parser. The prefill guarantees we open with `{`; the
-    model usually closes properly. Strip trailing prose if any."""
+    """Tolerant JSON parser. Locates the first balanced `{...}` object and
+    parses just that. Tolerates leading whitespace, markdown fences, or a
+    stray prose token preceding the JSON — important now that we no longer
+    use assistant-message prefill (Vertex AI rejects that pattern, see
+    `_call_anthropic`)."""
     s = text.strip()
-    # Trim anything after the last balanced brace.
+    start_idx = s.find("{")
+    if start_idx == -1:
+        raise ValueError(f"resolver: no JSON object found in response: {s[:200]!r}")
     depth = 0
     end_idx = -1
-    for i, ch in enumerate(s):
+    for i in range(start_idx, len(s)):
+        ch = s[i]
         if ch == "{":
             depth += 1
         elif ch == "}":
@@ -258,7 +287,62 @@ def _parse_response(text: str) -> dict[str, Any]:
                 break
     if end_idx == -1:
         raise ValueError(f"resolver: unbalanced JSON in response: {s[:200]!r}")
-    return json.loads(s[:end_idx])
+    return json.loads(s[start_idx:end_idx])
+
+
+_MAX_CANDIDATES: int = 2
+
+
+def _normalise_candidates(parsed: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract a ranked candidate list from the LLM response, dropping
+    malformed entries rather than failing the whole call.
+
+    Accepts both the new shape (``{"candidates": [...]}``) and the legacy
+    flat shape (``{"selector": ..., "strategy": ..., "confidence": ...}``)
+    so a model that regresses to the older instruction format doesn't
+    break the runtime. XPath candidates are dropped; the priority-chain
+    rule is enforced per-entry by :func:`is_xpath` further down.
+    """
+    raw = parsed.get("candidates")
+    if not isinstance(raw, list):
+        # Legacy flat shape — wrap into a single-candidate bundle if it
+        # carries a usable, non-XPath selector. XPath selectors fall through
+        # to the empty-list path so resolve_one can surface the priority-gate
+        # rejection reason explicitly.
+        flat_sel = parsed.get("selector")
+        if isinstance(flat_sel, str) and flat_sel.strip() and not is_xpath(flat_sel):
+            return [{
+                "selector": flat_sel.strip(),
+                "strategy": normalise_strategy(parsed.get("strategy")),
+                "confidence": (
+                    float(parsed["confidence"])
+                    if isinstance(parsed.get("confidence"), (int, float))
+                    else None
+                ),
+                "reason": parsed.get("reason") if isinstance(parsed.get("reason"), str) else None,
+            }]
+        return []
+
+    out: list[dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        sel = entry.get("selector")
+        if not isinstance(sel, str) or not sel.strip():
+            continue
+        sel = sel.strip()
+        if is_xpath(sel):
+            continue
+        conf = entry.get("confidence")
+        out.append({
+            "selector": sel,
+            "strategy": normalise_strategy(entry.get("strategy")),
+            "confidence": float(conf) if isinstance(conf, (int, float)) else None,
+            "reason": entry.get("reason") if isinstance(entry.get("reason"), str) else None,
+        })
+        if len(out) >= _MAX_CANDIDATES:
+            break
+    return out
 
 
 def resolve_one(
@@ -287,6 +371,7 @@ def resolve_one(
     cache: dict[str, dict[str, Any]] = read_cache(cache_path) if cache_path else {}
     cached = cache.get(key)
     if cached:
+        cached_candidates = cached.get("candidates")
         return ResolutionResult(
             selector=cached.get("selector"),
             strategy=cached.get("strategy"),
@@ -298,6 +383,11 @@ def resolve_one(
             snapshot_hash=cached.get("snapshot_hash"),
             reason=cached.get("reason"),
             resolved_at=cached.get("resolved_at"),
+            candidates=(
+                tuple(cached_candidates)
+                if isinstance(cached_candidates, list) and cached_candidates
+                else None
+            ),
         )
 
     chosen_model = model or os.environ.get("WORCA_T_RESOLVER_MODEL") or _DEFAULT_MODEL
@@ -329,19 +419,20 @@ def resolve_one(
         raise RuntimeError("unreachable")
     duration_ms = int((time.monotonic() - t_call_start) * 1000)
 
-    selector = parsed.get("selector")
-    strategy = normalise_strategy(parsed.get("strategy"))
-    confidence = parsed.get("confidence")
-    reason = parsed.get("reason")
+    candidates = _normalise_candidates(parsed)
+    top_level_reason = parsed.get("reason") if isinstance(parsed.get("reason"), str) else None
 
-    # Sanitise.
-    if isinstance(selector, str) and is_xpath(selector):
+    # Surface the XPath-rejection reason explicitly when the model regressed
+    # to flat shape with an XPath selector (the candidates list will be empty
+    # because _normalise_candidates drops XPath entries).
+    flat_sel = parsed.get("selector")
+    if not candidates and isinstance(flat_sel, str) and is_xpath(flat_sel):
         return ResolutionResult(
             selector=None, strategy=None, confidence=None,
             source="unresolvable", intent=intent,
             constant_name=constant_name, page_url=page_url,
             snapshot_hash=snap_hash,
-            reason=f"resolver returned XPath ({selector!r}); rejected per locator-priority gate",
+            reason=f"resolver returned XPath ({flat_sel!r}); rejected per locator-priority gate",
             resolved_at=datetime.now(UTC).isoformat(),
             input_tokens=usage.get("input_tokens"),
             output_tokens=usage.get("output_tokens"),
@@ -349,14 +440,13 @@ def resolve_one(
             duration_ms=duration_ms,
         )
 
-    # Confidence-threshold check.
-    if not isinstance(selector, str) or not selector.strip():
+    if not candidates:
         result = ResolutionResult(
             selector=None, strategy=None, confidence=None,
             source="unresolvable", intent=intent,
             constant_name=constant_name, page_url=page_url,
             snapshot_hash=snap_hash,
-            reason=reason or "resolver did not return a selector",
+            reason=top_level_reason or "resolver did not return a selector",
             resolved_at=datetime.now(UTC).isoformat(),
             input_tokens=usage.get("input_tokens"),
             output_tokens=usage.get("output_tokens"),
@@ -364,21 +454,23 @@ def resolve_one(
             duration_ms=duration_ms,
         )
     else:
+        primary = candidates[0]
         result = ResolutionResult(
-            selector=selector.strip(),
-            strategy=strategy,
-            confidence=float(confidence) if isinstance(confidence, (int, float)) else None,
+            selector=primary["selector"],
+            strategy=primary.get("strategy"),
+            confidence=primary.get("confidence"),
             source="agent",
             intent=intent,
             constant_name=constant_name,
             page_url=page_url,
             snapshot_hash=snap_hash,
-            reason=reason,
+            reason=primary.get("reason") or top_level_reason,
             resolved_at=datetime.now(UTC).isoformat(),
             input_tokens=usage.get("input_tokens"),
             output_tokens=usage.get("output_tokens"),
             model=chosen_model,
             duration_ms=duration_ms,
+            candidates=tuple(candidates),
         )
 
     # Persist.
@@ -396,6 +488,8 @@ def resolve_one(
             "snapshot_hash": result.snapshot_hash,
             "resolved_at": result.resolved_at,
         }
+        if result.candidates:
+            entry["candidates"] = list(result.candidates)
         cache[key] = entry
         write_cache(cache_path, cache, run_id=run_id or os.environ.get("WORCA_T_RUN_ID"))
 

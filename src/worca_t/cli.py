@@ -223,7 +223,13 @@ def run(
     parallelism: int = typer.Option(1, "--parallelism", min=1, max=16),
     headless: bool = typer.Option(True, "--headless/--headed"),
     debug: bool = typer.Option(
-        False, "--debug", help="Run with debug agent live from start."
+        False,
+        "--debug",
+        help=(
+            "Invoke the debug agent on EVERY failed step attempt (not just "
+            "the final failure). Diagnosis-only RCA — never edits source. "
+            "Output: <workspace>/debug/step-NN-attemptM-debug-rca.md."
+        ),
     ),
     fix: bool = typer.Option(
         False, "--fix", help="Critical-thinking + principal-eng after RCA."
@@ -283,19 +289,36 @@ def run(
             "the `<sut>/.worca-t/dev-locators.json` convention path."
         ),
     ),
-    cache: bool = typer.Option(
-        False,
-        "--cache",
+    storage_state: Path | None = typer.Option(
+        None,
+        "--storage-state",
         help=(
-            "Enable Claude Code prompt caching for this run. Default is OFF "
-            "because the Bosch Vertex relay does not preserve cache affinity "
-            "across requests — measured net cost ~+$1.30/run on Step 7 Opus "
-            "turns from the 25% cache-creation surcharge with zero read-side "
-            "payback. Pass --cache when running against a backend that does "
-            "serve cross-request cache reads (direct Vertex / direct "
-            "Anthropic API). Sets DISABLE_PROMPT_CACHING=1 in agent env "
-            "when omitted."
+            "Path to a Playwright `storageState.json` file (cookies + "
+            "localStorage). When supplied, Step 9 injects "
+            "`--storage-state=<path>` into Playwright MCP so the heal-agent's "
+            "browser boots already authenticated — skips the auth-replay "
+            "cost (10-30s per heal call). Resolution priority: this flag > "
+            "$WORCA_T_STORAGE_STATE > `<sut>/.worca-t/storage-state.json` "
+            "(produced by `worca-t auth-capture`) > `<workspace>/storage-"
+            "state.json` (auto-captured by the runtime plugin on the first "
+            "passing test of the current run)."
         ),
+    ),
+    cache: bool | None = typer.Option(
+        None,
+        "--cache/--no-cache",
+        help=(
+            "Toggle Claude Code prompt caching for this run. Default is "
+            "auto-detect: enabled when BMF sticky-session routing is active "
+            "(ANTHROPIC_CUSTOM_HEADERS contains x-bmf-sticky-session-instance), "
+            "disabled otherwise. Pass --cache to force on (e.g. direct "
+            "Anthropic API or Vertex AI). Pass --no-cache to force off."
+        ),
+    ),
+    no_cleanup: bool = typer.Option(
+        False,
+        "--no-cleanup",
+        help="Disable automatic cleanup of step artifacts and debug directories when using --from-step. By default, --from-step cleans step-NN/, artifacts/stepNN/, and debug/step-NN-attempt* directories from the target step onward.",
     ),
 ) -> None:
     """Run the full SDLC pipeline."""
@@ -329,10 +352,89 @@ def run(
         yes=yes,
         no_auto_deps=no_auto_deps,
         dev_locators=dev_locators,
+        storage_state=storage_state,
         cache=cache,
+        no_cleanup=no_cleanup,
     )
     rc = asyncio.run(run_pipeline(opts, console=console))
     raise typer.Exit(code=rc)
+
+
+@app.command(name="auth-capture")
+def auth_capture(
+    sut: Path = typer.Option(
+        ...,
+        "--sut",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        help=(
+            "Path to the SUT root. Must contain `.worca-t/sut_inventory.json` "
+            "(produced by a prior `worca-t run` Step 6) and a usable `.venv/` "
+            "with Playwright installed."
+        ),
+    ),
+    output: Path | None = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help=(
+            "Where to write the storageState.json. Defaults to "
+            "`<sut>/.worca-t/storage-state.json` (the convention path that "
+            "Step 9's storage-state resolver picks up automatically)."
+        ),
+    ),
+    headed: bool = typer.Option(
+        True,
+        "--headed/--headless",
+        help=(
+            "Browser visibility. Default --headed so you can complete MFA / "
+            "SSO / captcha interactively. --headless is only useful for SUTs "
+            "whose auth flow is fully automatable (in which case Use case B "
+            "auto-capture during a normal `worca-t run` is simpler)."
+        ),
+    ),
+    timeout: int = typer.Option(
+        600,
+        "--timeout",
+        help=(
+            "Subprocess timeout in seconds. Default 600 (10 min) — generous "
+            "to accommodate interactive MFA. Raise for SUTs with complex "
+            "SSO flows; lower for headless CI capture."
+        ),
+    ),
+) -> None:
+    """One-shot Playwright storageState capture for cross-run reuse (Use case A).
+
+    Runs the SUT's sign-in helper (resolved from `sut_inventory.json`
+    `auth_flow.entry_method`) in a HEADED Chromium so you can complete
+    interactive auth (MFA, SSO, captcha) once. Saves
+    `context.storage_state(path=<output>)` for Step 9's heal agent to
+    reuse via Playwright MCP's `--storage-state` flag.
+
+    For SUTs whose tests already auth successfully (no MFA), you don't
+    need this — Use case B (auto-capture by the runtime plugin during a
+    normal `worca-t run`) handles it automatically. Use this when the
+    SUT's tests cannot fully automate the auth flow.
+    """
+    from worca_t.auth_capture import cmd_auth_capture
+    from worca_t.storage_state import mask_path
+
+    try:
+        out_path = cmd_auth_capture(
+            sut=sut, output=output, headed=headed, timeout_s=timeout,
+        )
+    except (FileNotFoundError, ValueError, NotImplementedError, RuntimeError) as e:
+        console.print(f"[red]auth-capture failed:[/] {e}")
+        raise typer.Exit(code=1) from e
+    console.print(
+        f"[green]auth-capture[/] saved storage state to "
+        f"[bold]{mask_path(out_path)}[/] (absolute: {out_path})"
+    )
+    console.print(
+        "[dim]Subsequent `worca-t run` calls will reuse this file "
+        "automatically (Use case A — SUT convention path).[/]"
+    )
 
 
 @app.command()

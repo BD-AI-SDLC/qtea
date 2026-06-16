@@ -12,6 +12,7 @@ from worca_t.steps.s07_test_architect import (
     TestArchitectStep,
     _active_module_dict,
     _approved_dirs,
+    _inline_reuse_sources,
     _inventory_symbols,
     _path_under_approved,
     _render_plan_markdown,
@@ -97,9 +98,9 @@ def test_approved_dirs_pulls_from_test_and_src_layouts():
 
 def test_path_under_approved_handles_separators_and_dot_prefix():
     approved = {"tests/e2e", "src/pages"}
-    assert _path_under_approved("tests/e2e/worca_test_login.py", approved)
+    assert _path_under_approved("tests/e2e/worca_login_test.py", approved)
     assert _path_under_approved("./src/pages/worca_login_page.py", approved)
-    assert _path_under_approved("tests\\e2e\\worca_test.py", approved)
+    assert _path_under_approved("tests\\e2e\\worca_e2e_test.py", approved)
     assert not _path_under_approved("garden/of_evil.py", approved)
 
 
@@ -119,7 +120,7 @@ def test_validate_plan_rejects_unknown_reuse_reference():
         "active_module": "x",
         "test_cases": [{
             "id": "TC-LOGIN-1",
-            "test_file_target": "tests/worca_test_login.py",
+            "test_file_target": "tests/worca_login_test.py",
             "test_functions": [{"name": "test_login", "markers": ["worca_smoke"]}],
             "fixtures": [{"name": "phantom", "source": "reuse", "from": "tests/conftest.py:phantom"}],
         }],
@@ -195,10 +196,18 @@ def test_validate_plan_passes_on_well_formed_plan():
         "active_module": "x",
         "test_cases": [{
             "id": "TC-LOGIN-1",
-            "test_file_target": "tests/worca_test_login.py",
+            "test_file_target": "tests/worca_login_test.py",
             "test_functions": [{"name": "test_login", "markers": ["worca_smoke"], "uses_fixtures": ["auth"]}],
-            "fixtures": [{"name": "auth", "source": "reuse", "from": "tests/conftest.py:auth"}],
-            "page_objects": [{"name": "LoginPage", "source": "reuse", "from": "src/pages/login.py"}],
+            "fixtures": [{
+                "name": "auth", "source": "reuse",
+                "from": "tests/conftest.py:auth",
+                "reuse_justification": "yields authenticated Page on /dashboard",
+            }],
+            "page_objects": [{
+                "name": "LoginPage", "source": "reuse",
+                "from": "src/pages/login.py",
+                "reuse_justification": "models /login route with submit()",
+            }],
             "locators": [{
                 "name": "LOGIN_BTN", "owning_page": "LoginPage",
                 "source": "create_tbd", "intent": "sign in button",
@@ -206,6 +215,267 @@ def test_validate_plan_passes_on_well_formed_plan():
         }],
     }
     assert _validate_plan_against_inventory(plan, am) == []
+
+
+def test_validate_plan_rejects_missing_reuse_justification():
+    """The phase gate must flag a reuse entry that omits reuse_justification."""
+    am = {
+        "test_directory_layout": {"default_target": "tests"},
+        "existing_fixtures": [{"name": "auth", "file": "tests/conftest.py"}],
+    }
+    plan = {
+        "plan_version": "1.0",
+        "active_module": "x",
+        "test_cases": [{
+            "id": "TC-1",
+            "test_file_target": "tests/x.py",
+            "test_functions": [{"name": "test_x", "markers": ["worca_smoke"]}],
+            "fixtures": [{
+                "name": "auth", "source": "reuse",
+                "from": "tests/conftest.py:auth",
+                # reuse_justification intentionally absent
+            }],
+        }],
+    }
+    violations = _validate_plan_against_inventory(plan, am)
+    assert any("reuse_justification" in v and "auth" in v for v in violations)
+
+
+def test_validate_plan_rejects_whitespace_reuse_justification():
+    """Whitespace-only justification counts as missing — empty rationale is
+    indistinguishable from no rationale for review purposes."""
+    am = {
+        "test_directory_layout": {"default_target": "tests"},
+        "src_directory_layout": {"pages_object_dir": "src/pages"},
+        "existing_page_objects": [{"name": "LoginPage", "file": "src/pages/login.py"}],
+    }
+    plan = {
+        "plan_version": "1.0",
+        "active_module": "x",
+        "test_cases": [{
+            "id": "TC-1",
+            "test_file_target": "tests/x.py",
+            "test_functions": [{"name": "test_x", "markers": ["worca_smoke"]}],
+            "page_objects": [{
+                "name": "LoginPage", "source": "reuse",
+                "from": "src/pages/login.py",
+                "reuse_justification": "   \n  ",
+            }],
+        }],
+    }
+    violations = _validate_plan_against_inventory(plan, am)
+    assert any("reuse_justification" in v and "LoginPage" in v for v in violations)
+
+
+def test_validate_plan_rejects_locator_reuse_missing_justification():
+    am = {
+        "test_directory_layout": {"default_target": "tests"},
+        "src_directory_layout": {"pages_object_dir": "src/pages"},
+        "existing_locators": [{
+            "class_name": "LoginLocators",
+            "file": "src/pages/locators/login.py",
+            "constants": [{"name": "EMAIL_INPUT", "selector": "#email"}],
+        }],
+    }
+    plan = {
+        "plan_version": "1.0",
+        "active_module": "x",
+        "test_cases": [{
+            "id": "TC-1",
+            "test_file_target": "tests/x.py",
+            "test_functions": [{"name": "test_x", "markers": ["worca_smoke"]}],
+            "locators": [{
+                "name": "EMAIL_INPUT", "owning_page": "LoginPage",
+                "source": "reuse",
+                "from": "src/pages/locators/login.py",
+                # reuse_justification absent
+            }],
+        }],
+    }
+    violations = _validate_plan_against_inventory(plan, am)
+    assert any(
+        "reuse_justification" in v and "EMAIL_INPUT" in v
+        for v in violations
+    )
+
+
+def test_inline_reuse_sources_reads_pom_fixture_helper(tmp_path: Path):
+    sut = tmp_path / "sut"
+    (sut / "src" / "pages").mkdir(parents=True)
+    (sut / "tests").mkdir(parents=True)
+    (sut / "src" / "pages" / "login.py").write_text("class LoginPage: pass\n", encoding="utf-8")
+    (sut / "tests" / "conftest.py").write_text("def auth(): pass\n", encoding="utf-8")
+    (sut / "tests" / "helpers.py").write_text("def wait_for(): pass\n", encoding="utf-8")
+
+    am = {
+        "path": ".",
+        "existing_page_objects": [{"name": "LoginPage", "file": "src/pages/login.py"}],
+        "existing_fixtures": [{"name": "auth", "file": "tests/conftest.py"}],
+        "existing_helpers": [{"name": "wait_for", "file": "tests/helpers.py"}],
+    }
+    sources, skipped = _inline_reuse_sources(am, sut, budget=10_000)
+    assert "reuse-source/src/pages/login.py" in sources
+    assert "reuse-source/tests/conftest.py" in sources
+    assert "reuse-source/tests/helpers.py" in sources
+    assert "class LoginPage" in sources["reuse-source/src/pages/login.py"]
+    assert skipped == []
+
+
+def test_inline_reuse_sources_alphabetical_and_budget_capped(tmp_path: Path):
+    """Files are read in alphabetical order; anything past budget is skipped."""
+    sut = tmp_path / "sut"
+    (sut / "src").mkdir(parents=True)
+    # Each file ~600 chars; budget of 1000 should fit ONE (600) and skip the
+    # remaining two. Alphabetical order: a.py, b.py, c.py.
+    (sut / "src" / "a.py").write_text("a" * 600, encoding="utf-8")
+    (sut / "src" / "b.py").write_text("b" * 600, encoding="utf-8")
+    (sut / "src" / "c.py").write_text("c" * 600, encoding="utf-8")
+
+    am = {
+        "path": ".",
+        "existing_page_objects": [
+            {"name": "B", "file": "src/b.py"},
+            {"name": "C", "file": "src/c.py"},
+            {"name": "A", "file": "src/a.py"},
+        ],
+    }
+    sources, skipped = _inline_reuse_sources(am, sut, budget=1000)
+    assert list(sources.keys()) == ["reuse-source/src/a.py"]
+    assert sorted(skipped) == ["src/b.py", "src/c.py"]
+
+
+def test_inline_reuse_sources_handles_module_subpath(tmp_path: Path):
+    """For monorepo modules with path != '.', file paths are joined correctly."""
+    sut = tmp_path / "sut"
+    module_root = sut / "frontend"
+    (module_root / "src" / "pages").mkdir(parents=True)
+    (module_root / "src" / "pages" / "login.py").write_text(
+        "class LoginPage: pass\n", encoding="utf-8",
+    )
+    am = {
+        "path": "frontend",
+        "existing_page_objects": [
+            {"name": "LoginPage", "file": "src/pages/login.py"},
+        ],
+    }
+    sources, skipped = _inline_reuse_sources(am, sut)
+    assert "reuse-source/frontend/src/pages/login.py" in sources
+    assert skipped == []
+
+
+def test_inline_reuse_sources_marks_missing_files_in_skipped(tmp_path: Path):
+    sut = tmp_path / "sut"
+    sut.mkdir()
+    am = {
+        "path": ".",
+        "existing_page_objects": [{"name": "Ghost", "file": "src/ghost.py"}],
+    }
+    sources, skipped = _inline_reuse_sources(am, sut)
+    assert sources == {}
+    assert any("ghost" in s.lower() and "not found" in s for s in skipped)
+
+
+def test_inline_reuse_sources_returns_empty_when_no_active_module():
+    sources, skipped = _inline_reuse_sources(None, Path("/nonexistent"))
+    assert sources == {}
+    assert skipped == []
+
+
+def test_inline_reuse_sources_respects_env_budget(tmp_path: Path, monkeypatch):
+    sut = tmp_path / "sut"
+    (sut / "src").mkdir(parents=True)
+    (sut / "src" / "big.py").write_text("x" * 5000, encoding="utf-8")
+    am = {
+        "path": ".",
+        "existing_page_objects": [{"name": "Big", "file": "src/big.py"}],
+    }
+    monkeypatch.setenv("WORCA_T_REUSE_SOURCE_BUDGET", "100")
+    sources, skipped = _inline_reuse_sources(am, sut)
+    assert sources == {}
+    assert skipped == ["src/big.py"]
+
+
+def test_validate_plan_helper_reuse_requires_justification_and_from():
+    am = {"test_directory_layout": {"default_target": "tests"}}
+    plan = {
+        "plan_version": "1.0",
+        "active_module": "x",
+        "test_cases": [{
+            "id": "TC-1",
+            "test_file_target": "tests/x.py",
+            "test_functions": [{"name": "test_x", "markers": ["worca_smoke"]}],
+            "helpers": [{"name": "wait_for", "source": "reuse"}],
+        }],
+    }
+    violations = _validate_plan_against_inventory(plan, am)
+    msgs = " | ".join(violations)
+    assert "wait_for" in msgs
+    assert "from" in msgs
+    assert "reuse_justification" in msgs
+
+
+# --- auth-chaining depends_on tests ----------------------------------------
+
+def _am_with_auth(fixture_entry="tests/conftest.py:chat_page"):
+    return {
+        "test_directory_layout": {"default_target": "tests"},
+        "auth_flow": {"type": "sso", "fixture_entry": fixture_entry},
+        "existing_fixtures": [{"name": "chat_page", "file": "tests/fixtures/chat_setup.py"}],
+    }
+
+
+def _plan_with_create_fixture(yields="ChatPage", depends_on=None):
+    fix = {
+        "name": "mobile_chat_page", "source": "create",
+        "at": "tests/fixtures/worca_fixtures.py",
+    }
+    if yields is not None:
+        fix["yields"] = yields
+    if depends_on is not None:
+        fix["depends_on"] = depends_on
+    return {
+        "plan_version": "1.0",
+        "active_module": "x",
+        "test_cases": [{
+            "id": "TC-1",
+            "test_file_target": "tests/x.py",
+            "test_functions": [{"name": "test_x", "markers": ["worca_smoke"]}],
+            "fixtures": [fix],
+        }],
+    }
+
+
+def test_validate_plan_rejects_create_fixture_missing_auth_depends_on():
+    violations = _validate_plan_against_inventory(
+        _plan_with_create_fixture(yields="ChatPage"),
+        _am_with_auth(),
+    )
+    assert any("depends_on" in v and "chat_page" in v for v in violations)
+
+
+def test_validate_plan_passes_create_fixture_with_auth_depends_on():
+    violations = _validate_plan_against_inventory(
+        _plan_with_create_fixture(yields="ChatPage", depends_on=["chat_page"]),
+        _am_with_auth(),
+    )
+    assert not any("depends_on" in v for v in violations)
+
+
+def test_validate_plan_skips_auth_check_when_no_auth_flow():
+    am = {"test_directory_layout": {"default_target": "tests"}}
+    violations = _validate_plan_against_inventory(
+        _plan_with_create_fixture(yields="ChatPage"),
+        am,
+    )
+    assert not any("depends_on" in v for v in violations)
+
+
+def test_validate_plan_skips_auth_check_for_primitive_yields():
+    violations = _validate_plan_against_inventory(
+        _plan_with_create_fixture(yields="dict"),
+        _am_with_auth(),
+    )
+    assert not any("depends_on" in v for v in violations)
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +491,7 @@ _GOOD_PLAN = {
     "test_cases": [{
         "id": "TC-LOGIN-1",
         "title": "User can log in",
-        "test_file_target": "tests/worca_test_login.py",
+        "test_file_target": "tests/worca_login_test.py",
         "test_functions": [{
             "name": "test_login_with_valid_credentials",
             "markers": ["worca_smoke"],
@@ -230,10 +500,12 @@ _GOOD_PLAN = {
         "fixtures": [{
             "name": "auth", "source": "reuse",
             "from": "tests/conftest.py:auth",
+            "reuse_justification": "yields authenticated Page on /dashboard",
         }],
         "page_objects": [{
             "name": "LoginPage", "source": "reuse",
             "from": "src/pages/login.py",
+            "reuse_justification": "models /login with submit()",
         }],
         "locators": [{
             "name": "LOGIN_BTN", "owning_page": "LoginPage",
@@ -509,7 +781,7 @@ def test_render_plan_markdown_includes_test_cases_and_sources():
     assert "frontend" in md
     assert "TC-LOGIN-1" in md
     assert "User can log in" in md
-    assert "tests/worca_test_login.py" in md
+    assert "tests/worca_login_test.py" in md
     # Reuse + create_tbd lines render with their source semantics.
     assert "reuse from" in md
     assert "create_tbd" in md

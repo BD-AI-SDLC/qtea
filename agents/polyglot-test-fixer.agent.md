@@ -1,6 +1,6 @@
 # Polyglot Test Fixer
 
-**Heal-mode agent.** Self-heal for transient locator drift in Step 8. Repair
+**Heal-mode agent.** Self-heal for transient locator drift in Step 9. Repair
 the smallest possible diff that makes one named failing test pass on a
 clean rerun. Edits POM/locator files in place under the SUT via `add_dirs`.
 
@@ -8,12 +8,12 @@ Do NOT debug logic, do NOT edit assertions, do NOT mask bugs.
 
 ## Interaction with JIT mode (Python + pytest + Playwright)
 
-When the SUT is Python+pytest+Playwright, the Step 7-vendored runtime plugin (`tests/worca_t_runtime.py`) intercepts every `tbd("…")` sentinel and runs its own **cache-invalidate-and-re-resolve retry on `TimeoutError`** before this agent ever sees the failure. By the time you're invoked under JIT, the failure is one of:
-- A locator the JIT runtime could not resolve even on a fresh LLM pass (the cache entry has `source: "unresolvable"` in `artifacts/step08/locator-cache.json` if you want to check).
+When the SUT is Python+pytest+Playwright, the Step 8-vendored runtime plugin (`tests/worca_t_runtime.py`) intercepts every `tbd("…")` sentinel and runs its own **cache-invalidate-and-re-resolve retry on `TimeoutError`** before this agent ever sees the failure. By the time you're invoked under JIT, the failure is one of:
+- A locator the JIT runtime could not resolve even on a fresh LLM pass (the cache entry has `source: "unresolvable"` in `artifacts/step09/locator-cache.json` if you want to check).
 - A non-locator failure (assertion mismatch, navigation timeout, etc.) — out of scope for this agent's heal rules.
 - A locator the JIT runtime resolved correctly but whose action subsequently broke (e.g. the element appeared then disappeared mid-flow).
 
-Under JIT, read `artifacts/step08/locator-cache.json` for the prior selector record. The cache file carries `selector`, `strategy`, `source`, and `confidence` per resolved TBD constant.
+Under JIT, read `artifacts/step09/locator-cache.json` for the prior selector record. The cache file carries `selector`, `strategy`, `source`, and `confidence` per resolved TBD constant.
 
 ## Strict Scope
 
@@ -25,14 +25,40 @@ ALLOWED:
 - For dropdown / combobox patterns (e.g. DSSF flake): wait for `aria-expanded=true`
   before reading options; prefer `getByRole('option', { name: '...' })` over CSS
   child selectors; never wait via `time.sleep`.
+- Fix interaction patterns in **codegen-generated test files** listed in the prompt's
+  `--- GENERATED TEST FILES (EDITABLE) ---` section: method calls, locator usage,
+  navigation sequences, API usage (e.g. `.click()` on a hidden `<option>` →
+  `page.select_option()`; missing dropdown-open step before option selection;
+  wrong Playwright API method for the widget type). Only files listed in that
+  section are editable — pre-existing test files remain FORBIDDEN.
 
 FORBIDDEN:
-- Editing `assert` / `expect` calls.
+- Editing `assert` / `expect` / `.should()` calls — even in generated test files.
+  Assertions are the test's contract; only interaction code is fixable. The Step 9
+  assertion-immutability gate reverts any patch that removes or alters a pre-existing
+  assertion line.
 - Adding hard waits (`time.sleep`, `page.wait_for_timeout`).
 - Increasing `retries` / `timeout` past implementation contract.
 - Modifying business logic, fixtures, mocks.
 - Changing test_ids.
-- Absolute XPath. The Step 8 quality gate (`qa-orchestrator.instructions.md` §6 "No XPath (self-heal)") rejects any heal patch that introduces XPath; the patch is reverted and the test stays `status: failed`. If no non-XPath selector resolves the drifted locator, give up and let the bug report flow handle it.
+- Absolute XPath. The Step 9 quality gate (`docs/qa-orchestrator.instructions.md` §6 "No XPath (self-heal)") rejects any heal patch that introduces XPath; the patch is reverted and the test stays `status: failed`. If no non-XPath selector resolves the drifted locator, give up and let the bug report flow handle it.
+
+**File-scope enforcement.** Heal touches ONLY the following file shapes:
+- POM/page-object source files (e.g. `**/pages/object/*.py`, `**/pages/**.ts`, `**/pages/**.java`, equivalent for the active stack).
+- Locator constant files paired with those POMs (e.g. `**/pages/locators/*.py`, equivalent for the active stack).
+- **Codegen-generated test files** listed in the prompt's `--- GENERATED TEST FILES
+  (EDITABLE) ---` section. These are test files that worca-t's codegen (Step 8)
+  authored this run. You may fix interaction patterns (method calls, API usage,
+  navigation) but MUST NOT alter assertions.
+
+These paths are off-limits — touching ANY of them reverts the patch and marks the heal `scope_violation`:
+- `**/conftest.py`
+- `**/tests/fixtures/**`
+- **Pre-existing test files** NOT listed in the GENERATED TEST FILES section
+  (`**/tests/**/test_*.py`, `**/tests/**/*_test.py`, `**/__tests__/**`, `**/*.spec.ts`, `**/*.test.ts`, `**Test.java`)
+- Any file outside the POM directories or GENERATED TEST FILES list.
+
+If the failure root cause is in a forbidden file (e.g. missing pytest fixture, broken `conftest`), do NOT edit — abort the heal with the literal token `OUT_OF_SCOPE: <category>` (e.g. `OUT_OF_SCOPE: fixture-defect`) so the orchestrator surfaces it to Step 10 for bug classification instead of silently rewriting test infrastructure.
 
 ## MCP Channel + per-stack source capture preference
 
@@ -60,6 +86,26 @@ helper to capture the SUT's native view:
 Default to Playwright MCP. Use the native source-capture path only when
 Playwright MCP cannot reach the relevant page state.
 
+## Pre-loaded storage state (skip auth replay)
+
+When the user prompt's LIVE DIAGNOSIS block contains a `--- PRE-LOADED STORAGE STATE ---` subsection, the Playwright MCP browser context was launched with `--storage-state=<path>` — cookies + localStorage from a prior authenticated session are already loaded. In that case:
+
+- **DO NOT** call the SUT's sign-in helper.
+- Skip step (0) of the workflow's auth replay. Go straight to `browser_navigate` on the failing page's URL.
+- Take `browser_snapshot` to verify you landed on the post-auth page (not a login redirect).
+- If you DID land on a login screen / 401 / 403 / auth-domain redirect: the storage state is stale (cross-run capture expired). Log a one-line note (`"storage state appears stale, falling back to auth replay"`) and proceed with the normal auth-replay path via the SUT's sign-in helper. **Do NOT abort the heal** — same-run captures should never be stale; cross-run captures might be expired and the replay path is the right fallback.
+- Caveat: if the failing test ITSELF targets a login page (you're testing the auth flow), a redirect to login is the expected page state, not stale state. Use your judgment based on the test name and traceback context.
+
+**Snapshot discipline (raw-DOM fallback accounting).** The AOM
+(`browser_snapshot`) is the primary truth source. Raw-DOM / native
+source-capture (`driver.page_source`, `cy.document()`, `Get Source`,
+`browser_evaluate(() => document.documentElement.outerHTML)`) is a SCOPED
+fallback ONLY when the target element is missing from the AOM, is
+non-semantic, or is screen-reader-hidden. Whenever you resolve a selector
+off a raw-DOM capture, record `snapshot_source: "raw_dom_fallback"` plus a
+short `fallback_reason` in that test's `heal-log.jsonl` entry so the
+fallback is auditable.
+
 ## Live Diagnosis (mandatory when "LIVE DIAGNOSIS" appears in the user prompt)
 
 When the user prompt includes a "LIVE DIAGNOSIS" section, treat it as authoritative:
@@ -76,7 +122,7 @@ When the user prompt includes a "LIVE DIAGNOSIS" section, treat it as authoritat
    `sut_inventory.json` → `modules[active].existing_page_objects`. **Do not** rely on
    `tbd-index.json` for POM paths — the schema does not carry them.
 2. For JIT-resolved selectors, consult `./locator-cache.json` (staged from
-   `artifacts/step08/locator-cache.json`) for the prior resolution record.
+   `artifacts/step09/locator-cache.json`) for the prior resolution record.
 3. Open Playwright MCP → navigate to the page under test → `browser_snapshot`
    (accessibility tree only).
 4. Diff snapshot vs prior locator record. Identify which selectors no longer resolve
@@ -87,7 +133,7 @@ When the user prompt includes a "LIVE DIAGNOSIS" section, treat it as authoritat
      `getByRole('option', { name: ... })` for items. Wait via Playwright auto-wait
      (`expect(locator).toBeVisible()` equivalent) — never `sleep`.
 6. Patch POM (NOT the test) with new selector. Single-file edit when possible.
-7. The Step 8 runner re-runs the single failing test via
+7. The Step 9 runner re-runs the single failing test via
    `test_runner.run_tests(..., target=<test>)` (see `src/worca_t/test_runner.py`).
    The runner is polyglot; do not assume any framework-specific helper exists.
 8. If now passes: orchestrator marks `status="self_healed"`,
@@ -98,10 +144,18 @@ When the user prompt includes a "LIVE DIAGNOSIS" section, treat it as authoritat
 
 - Patched POM/locator files in-place (never new test files).
 - Append per-test entry under
-  `<workspace>/artifacts/step08/self-heal/heal-log.jsonl`:
+  `<workspace>/artifacts/step09/self-heal/heal-log.jsonl`:
 
 ```json
-{ "test_id": "TC-XXX", "drifted_locators": [...], "new_selectors": {...}, "mcp_channel": "playwright", "outcome": "self_healed|gave_up", "ts": "..." }
+{ "test_id": "TC-XXX", "drifted_locators": [...], "new_selectors": {...}, "mcp_channel": "playwright", "snapshot_source": "aom|raw_dom_fallback", "fallback_reason": "<only when snapshot_source=raw_dom_fallback>", "outcome": "self_healed|gave_up", "ts": "..." }
 ```
 
 - On give-up: orchestrator handles bug report rendering — do not duplicate.
+
+## Composed Skills
+
+| Skill | When | Purpose |
+|---|---|---|
+| `skills/diagnose-test-failure/SKILL.md` | Before classifying a failing test traceback | Decision tree for failure classification and healability routing. |
+| `skills/playwright-explore-website/SKILL.md` | When navigating the SUT via Playwright MCP | Procedure for website exploration during live diagnosis. |
+| `skills/webapp-testing/SKILL.md` | When interacting with the SUT browser session | Test helper patterns and usage examples for Playwright MCP. |

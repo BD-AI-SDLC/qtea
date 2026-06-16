@@ -378,7 +378,9 @@ def _render_pipeline_section(steps: list[StepTiming], summary) -> str:
     header = (
         "<tr>"
         "<th>#</th><th>Step</th><th>Status</th><th>Time</th>"
-        "<th>In tok</th><th>Out tok</th><th>Calls</th><th>Cost</th>"
+        "<th>In tok</th><th>Out tok</th>"
+        "<th>Cache Read</th><th>Cache Write</th>"
+        "<th>Calls</th><th>Cost</th>"
         "</tr>"
     )
     rows: list[str] = []
@@ -386,6 +388,8 @@ def _render_pipeline_section(steps: list[StepTiming], summary) -> str:
         color = _STEP_STATUS_COLORS.get(st.status, "#6b7280")
         badge = f'<span class="badge" style="background:{color}">{_escape(st.status)}</span>'
         dur = f"{st.duration_s:.1f}s" if st.duration_s is not None else "-"
+        cache_read = _escape(format_tokens(st.tokens_cache_read)) if st.tokens_cache_read else "-"
+        cache_write = _escape(format_tokens(st.tokens_cache_creation)) if st.tokens_cache_creation else "-"
         rows.append(
             f"<tr>"
             f"<td>{st.step:02d}</td>"
@@ -394,17 +398,23 @@ def _render_pipeline_section(steps: list[StepTiming], summary) -> str:
             f"<td>{dur}</td>"
             f"<td>{_escape(format_tokens(st.tokens_input))}</td>"
             f"<td>{_escape(format_tokens(st.tokens_output))}</td>"
+            f"<td>{cache_read}</td>"
+            f"<td>{cache_write}</td>"
             f"<td>{st.agent_calls}</td>"
             f"<td>{_escape(format_cost(st.cost_usd))}</td>"
             f"</tr>"
         )
 
+    total_cache_read = _escape(format_tokens(summary.total_tokens_cache_read)) if summary.total_tokens_cache_read else "-"
+    total_cache_write = _escape(format_tokens(summary.total_tokens_cache_creation)) if summary.total_tokens_cache_creation else "-"
     totals_row = (
         f"<tr style='font-weight:700;background:#f1f5f9'>"
         f"<td></td><td>TOTAL</td><td></td>"
         f"<td>{summary.pipeline_duration_s:.1f}s</td>"
         f"<td>{_escape(format_tokens(summary.total_tokens_input))}</td>"
         f"<td>{_escape(format_tokens(summary.total_tokens_output))}</td>"
+        f"<td>{total_cache_read}</td>"
+        f"<td>{total_cache_write}</td>"
         f"<td>{summary.total_agent_calls}</td>"
         f"<td>{_escape(format_cost(summary.total_cost_usd))}</td>"
         f"</tr>"
@@ -434,10 +444,23 @@ def render_html(report: RunReport, *, inline_images: bool = False) -> str:
             f'<div class="card"><div class="num">{_escape(format_cost(s.total_cost_usd))}</div>'
             f'<div class="lbl">Total Cost</div></div>'
         )
+    if s.total_tokens_cache_read:
+        duration_card += (
+            f'<div class="card"><div class="num">{_escape(format_tokens(s.total_tokens_cache_read))}</div>'
+            f'<div class="lbl">Cache Read</div></div>'
+        )
 
     results = report.run_results.get("results", [])
     test_section = _render_test_rows(results, inline_images)
     bug_section = _render_bug_cards(report.bug_reports.get("bugs", []))
+    if report.bug_classification_fallback and bug_section:
+        bug_section = (
+            '<div style="background:#fef3c7;border:1px solid #f59e0b;'
+            'border-radius:.5rem;padding:.75rem 1rem;margin-bottom:1rem">'
+            'Bug classification used auto-fallback &mdash; agent output '
+            'was unusable. Severity/category values are defaults, not '
+            'agent-assessed.</div>'
+        ) + bug_section
     plan_section = _render_plan_section(report)
     pipeline_section = _render_pipeline_section(report.steps_summary, s)
 

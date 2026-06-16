@@ -56,6 +56,30 @@ SUT_BASE_URL=http://localhost:3000
 **Minimum for a local run:** only `ANTHROPIC_API_KEY` is required. Jira
 and Xray credentials are optional — steps 1 and 5 auto-adapt.
 
+### Prompt caching (BMF sticky sessions)
+
+If you use the Bosch Model Farm (BMF) relay, set the sticky-session header
+to enable effective prompt caching. Without it, the relay does not honour
+`cache_control` and caching is a net cost loss. With it, worca-t
+auto-detects the header and enables caching — no `--cache` flag needed.
+
+```bash
+# Windows user environment variable (System → Advanced → Environment Variables)
+ANTHROPIC_CUSTOM_HEADERS=x-bmf-sticky-session-instance: 01
+
+# Or via Claude Code user config (~/.claude/settings.json):
+{
+  "env": {
+    "ANTHROPIC_CUSTOM_HEADERS": "x-bmf-sticky-session-instance: 01"
+  }
+}
+```
+
+Pick either instance `01` or `02` — they are two BMF replicas. Each user
+should stick to one instance for cache locality. The header is forwarded
+to both Claude Code CLI subprocesses and direct Anthropic SDK calls
+(reasoning, JIT resolver).
+
 **MCP servers:** `.mcp.json` references `JIRA_BASE_URL`, `JIRA_EMAIL`,
 `JIRA_API_TOKEN`, `HTTP_PROXY`, and `HTTPS_PROXY` via `${VAR}` syntax.
 The Claude CLI resolves these from your environment at launch time, so
@@ -244,8 +268,8 @@ step 1 ok  -> 2 outputs
 >>> step 2 refine
 step 2 ok  -> 2 outputs
 ...
->>> step 10 report
-step 10 ok  -> 2 outputs
+>>> step 11 report
+step 11 ok  -> 2 outputs
 ```
 
 All `run` flags:
@@ -270,6 +294,10 @@ All `run` flags:
 | `--log-level LEVEL` | info | `info \| debug \| trace` |
 | `--env-file PATH` | — | Path to a `.env` file to load (values never appear in logs) |
 | `--no-hitl` | false | Disable interactive prompts (CI mode) |
+| `--cache / --no-cache` | auto | Prompt caching: auto-enabled when BMF sticky-session header is detected, disabled otherwise. `--cache` forces on, `--no-cache` forces off |
+| `--dev-locators PATH` | — | Dev-supplied locator file for JIT resolution (highest-priority Tier 1) |
+| `--storage-state PATH` | — | Playwright `storageState.json` injected into the Step 9 heal-agent's Playwright MCP browser so it skips the 10-30 s auth-replay per heal call. Resolution priority: this flag > `WORCA_T_STORAGE_STATE` > `<sut>/.worca-t/storage-state.json` (from `worca-t auth-capture`) > `<workspace>/storage-state.json` (auto-captured by the runtime on first passing test of the current run). |
+| `--no-cleanup` | false | Keep step artifacts when using `--from-step` (default cleans target step onward) |
 | `-w / --workspace PATH` | `~/.worca-t` | Override the workspace base directory |
 
 ## 6. List and inspect workspaces
@@ -315,10 +343,11 @@ All artifacts are under `.worca-t/<run-id>/artifacts/`:
 │   ├── step04/   test-strategy.md, test-strategy.json
 │   ├── step05/   xray-mapping.json (skipped if no creds)
 │   ├── step06/   research.md, research.json
-│   ├── step07/   generated test files, tbd-index.json
-│   ├── step08/   run-results.json, screenshots/, traces/, locator-cache.json
-│   ├── step09/   bug-reports.md, bug-reports.json
-│   └── step10/   index.html, data/run.json, allure-results/
+│   ├── step07/   code-modification-plan.json
+│   ├── step08/   generated test files, tbd-index.json
+│   ├── step09/   run-results.json, screenshots/, traces/, locator-cache.json
+│   ├── step10/   bug-reports.md, bug-reports.json
+│   └── step11/   index.html, data/run.json, allure-results/
 ├── state.json    checkpoint state
 └── run.log.jsonl structured log
 ```
@@ -327,7 +356,7 @@ All artifacts are under `.worca-t/<run-id>/artifacts/`:
 
 ```bash
 # Built-in HTML (always generated)
-open .worca-t/<run-id>/artifacts/step10/index.html
+open .worca-t/<run-id>/artifacts/step11/index.html
 
 # Or use the --open-report flag to auto-open at end of run
 ```
@@ -337,7 +366,7 @@ open .worca-t/<run-id>/artifacts/step10/index.html
 ### Re-run only the report (after editing bug classifications)
 
 ```bash
-worca-t run --spec ./spec.md --sut ./app --only-step 10
+worca-t run --spec ./spec.md --sut ./app --only-step 11
 ```
 
 ### Resume after a failure
@@ -345,11 +374,11 @@ worca-t run --spec ./spec.md --sut ./app --only-step 10
 The pipeline auto-resumes from the last completed step:
 
 ```bash
-# First run fails at step 7
+# First run fails at step 9
 worca-t run --spec ./spec.md --sut ./app
-# step 7 FAILED: ...
+# step 9 FAILED: ...
 
-# Fix the issue, then just re-run — steps 1-6 are skipped
+# Fix the issue, then just re-run — steps 1-8 are skipped
 worca-t run --spec ./spec.md --sut ./app
 ```
 
@@ -388,6 +417,45 @@ worca-t run --spec ./spec.md --sut ./app
 worca-t run --spec ./spec.md --sut ./app --strict-xray
 ```
 
+### Storage-state reuse (skip auth in Step 9 self-heal)
+
+When Step 9's self-heal agent has to inspect a failing page, its Playwright
+MCP browser runs in a separate process from the test runner — so it inherits
+no cookies and has to replay the SUT's sign-in flow (10-30 s per heal call).
+Two ways to avoid that:
+
+**Use case B — same-run auto-capture (default, fully automatic):** The
+vendored pytest runtime captures `context.storage_state()` on the first
+passing test and writes `<workspace>/storage-state.json`. Step 9
+re-resolves after the test run and injects `--storage-state=<path>` into
+Playwright MCP. Zero user action. Works as long as your tests can
+authenticate on their own (no MFA / captcha).
+
+**Use case A — one-shot capture (for MFA / SSO / captcha):**
+
+```bash
+# Run interactively once; user completes MFA / SSO in the headed browser.
+# Output lands at <sut>/.worca-t/storage-state.json (the convention path).
+worca-t auth-capture --sut ./path-to-your-app
+
+# Subsequent runs reuse the captured state automatically — no flag needed.
+worca-t run --spec ./feature-spec.md --sut ./path-to-your-app
+```
+
+Flags:
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--sut PATH` | required | SUT root with `.worca-t/sut_inventory.json` from a prior `worca-t run` Step 6 |
+| `--output / -o PATH` | `<sut>/.worca-t/storage-state.json` | Where to write the file |
+| `--headed / --headless` | headed | Browser visibility — keep headed for interactive MFA |
+| `--timeout N` | 600 | Subprocess timeout in seconds |
+
+**Explicit override:** pass `--storage-state PATH` to `worca-t run` to
+force a specific file regardless of the convention path. V1 supports
+Python+Playwright SUTs only; Selenium / Cypress / Robot get a clear
+`NotImplementedError` from `auth-capture`.
+
 ## 9. The 11 steps explained
 
 | # | Step | What it does |
@@ -398,9 +466,9 @@ worca-t run --spec ./spec.md --sut ./app --strict-xray
 | 4 | **Strategy** | AI generates test cases (TC-IDs) with steps and priorities |
 | 5 | **Xray** | Uploads test cases to Xray Cloud (auto-skips if no creds) |
 | 6 | **Research** | AI analyzes the SUT codebase, detects stack and patterns |
-| 7 | **Codegen** | AI generates test code (Playwright/Cypress/etc.) |
-| 8 | **Locators** | AI resolves TBD locators using AOM snapshots (never XPath) |
-| 9 | **Execute** | Runs the tests, self-heals failing locators (max 5 tests) |
+| 7 | **Test Architect** | AI emits `code-modification-plan.json` — per-test-case placement decisions (fixtures/POM methods/locators to reuse vs create) |
+| 8 | **Codegen** | AI transpiles the plan into executable test code; emits `tbd(...)` sentinels for unresolved locators |
+| 9 | **Execute** | Runs tests; JIT resolves `tbd(...)` at runtime (Playwright stacks) or self-heals via agent on failure (non-Playwright) |
 | 10 | **Classify** | AI classifies failures into structured bug reports |
 | 11 | **Report** | Generates HTML report + optional Allure report |
 
@@ -449,6 +517,6 @@ worca-t run --spec ... --sut ... --no-hitl
 
 ## Next steps
 
-- See `agents/qa-orchestrator.instructions.md` for the full operator reference
+- See `docs/qa-orchestrator.instructions.md` for the full operator reference
 - See `CHANGELOG.md` for version history
 - Run `worca-t doctor` any time to diagnose environment issues

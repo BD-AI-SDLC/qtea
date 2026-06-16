@@ -28,7 +28,7 @@ from claude_agent_sdk import (
 
 from worca_t.config import CLAUDE_SESSION_KEYS, SECRET_ENV_KEYS, get_model_chain, get_settings, model_for_agent, step_timeout
 from worca_t.logging_setup import get_logger
-from worca_t.mcp_manager import stage_mcp_config
+from worca_t.mcp_manager import stage_empty_mcp_config, stage_mcp_config
 from worca_t.metrics import CURRENT_STEP_METRICS, AgentMetrics, extract_agent_metrics
 from worca_t.proxy import with_proxy_env
 
@@ -56,12 +56,25 @@ class _DriveState:
     # on `playwright`) check this to fail fast rather than burning agent budget
     # on an agent that can't see its primary tools.
     mcp_servers_failed: list[str] = field(default_factory=list)
+    # Names of MCP servers whose status was `pending` at init time. The agent's
+    # tool list is frozen at init, so a `pending` MCP means the agent CANNOT
+    # see that MCP's tools for this run, even if the server connects shortly
+    # after. Steps that strictly need a specific MCP can check this list and
+    # fail-fast rather than burning agent budget on a tool-less invocation;
+    # steps that don't (e.g. step 8 codegen, which doesn't browse) can ignore.
+    mcp_servers_pending: list[str] = field(default_factory=list)
     # Consecutive SDK `api_retry` SystemMessages with no intervening
     # AssistantMessage / ResultMessage / UserMessage. When this hits the
     # active circuit-breaker threshold (`_api_retry_storm_threshold()`,
     # default 5, env-overridable via WORCA_T_API_RETRY_THRESHOLD),
     # `_drive_query` raises `_ApiRetryStorm`.
     api_retry_count: int = 0
+    # Last stop_reason observed from a ResultMessage / AssistantMessage. The
+    # SDK exposes this directly when the underlying Anthropic API populates
+    # it (`"max_tokens"`, `"end_turn"`, `"tool_use"`, `"stop_sequence"`).
+    # Used by Step 8 smart-retry to detect truncation deterministically
+    # rather than inferring from a downstream syntax error.
+    stop_reason: str | None = None
 
 
 @dataclass
@@ -82,10 +95,22 @@ class AgentResult:
     # check this to distinguish "agent produced empty output" from "agent had
     # no tools to do its job".
     mcp_servers_failed: list[str] = field(default_factory=list)
+    # MCP server names whose status was still `pending` when the agent's
+    # tool list was frozen at init. The agent CANNOT see these MCPs' tools
+    # for the duration of this run. Callers that strictly need a specific
+    # MCP (e.g. step 9 heal flow needing `playwright`) should fail-fast.
+    mcp_servers_pending: list[str] = field(default_factory=list)
     # SDK session_id from the init SystemMessage. Pass this back via the
     # `resume=` parameter on a follow-up run_agent call to continue the same
     # conversation and benefit from cache_read on the already-cached prefix.
     session_id: str | None = None
+    # Stop reason from the LLM response. `"max_tokens"` is the strong signal
+    # for truncation (the model wanted to keep generating but hit the budget
+    # cap). Other common values: `"end_turn"`, `"tool_use"`, `"stop_sequence"`.
+    # Optional with default `None` because not every transport / SDK version
+    # populates it; callers checking for truncation should test both this AND
+    # any post-hoc parse-failure signal (e.g. ast.parse).
+    stop_reason: str | None = None
 
 
 # MCP tool allowlist. The SDK's `permission_mode="acceptEdits"` does NOT
@@ -105,26 +130,39 @@ _AGENT_PROMPT_WARN_BYTES = 30_000
 # against the silent-retry-storm failure mode: run 20260603-205851-2d359f
 # burned ~95 s of SDK-internal exponential backoff before colliding with
 # the 1800 s step timeout — diagnostics from that run pinned the cumulative
-# wait at each retry as: 1→0.5 s, 2→1.7 s, 3→4.0 s, 4→8.6 s, 5→17.9 s,
+# backoff at each retry as: 1→0.5 s, 2→1.7 s, 3→4.0 s, 4→8.6 s, 5→17.9 s,
 # 6→35.9 s, 7→67.9 s, 8→100.8 s (Anthropic SDK exp-backoff w/ jitter,
 # default `max_retries=10`).
 #
+# Beware: the backoff above is only the *sleep between retries*. Each
+# actual API call on a hanging upstream can itself burn ~3 minutes before
+# the SDK gives up and bumps the retry counter (observed in run
+# 20260611-075728-0aa560: 5 retries → ~15 min wall-clock waste even
+# though cumulative backoff was only ~18 s). With per-retry hang on the
+# order of minutes, the threshold dominates wall-clock waste — too low
+# and a 30 s Vertex blip kills a 14-turn step that was 90% done.
+#
 # Threshold sizing:
-#   - too low (e.g. 3 → 4 s wait) aborts on routine Anthropic/Vertex
-#     transient 529s that normally recover within 2-4 retries; observed
-#     as false-positive aborts on long-running steps where the agent had
-#     made hundreds of real tool calls (worca-t run 20260603 step-07
-#     attempt 1: 434 events of real progress, then the API stuttered).
-#   - too high (e.g. 10 → 5 min wait) re-creates the original silent-burn
-#     pattern this guard exists to prevent.
-#   - 5 → ~18 s caps wall-clock waste at <20 s while giving the SDK enough
-#     headroom to ride out typical transient bursts.
+#   - too low (e.g. 3 → 4 s backoff, ~9 min wall) aborts on routine
+#     Anthropic/Vertex transient 529s that normally recover within 2-4
+#     retries; observed as false-positive aborts on long-running steps
+#     where the agent had made hundreds of real tool calls (run
+#     20260603 step-07 attempt 1: 434 events of real progress, then API
+#     stuttered; run 20260611 step-08 attempt 1: full plan-reading and
+#     POM-loading done, then API hung).
+#   - too high (e.g. 10 → 5 min backoff, ~30 min wall) re-creates the
+#     original silent-burn pattern this guard exists to prevent and can
+#     collide with the 1800 s step timeout.
+#   - 8 → ~100 s cumulative backoff, ~24 min wall worst-case. Gives the
+#     SDK enough headroom to ride out a ~5-10 min Vertex incident
+#     (observed pattern) without crossing the step timeout, while still
+#     bailing out before a true sustained outage burns the full timeout.
 #
 # Overridable via env: WORCA_T_API_RETRY_THRESHOLD. Useful when:
 #   - ops sees a sustained-flake window in upstream and wants to ride longer;
 #   - a developer is debugging an agent loop and wants to abort sooner.
 # Values are clamped to [1, 10] (above 10 the SDK has already given up).
-_API_RETRY_STORM_THRESHOLD_DEFAULT = 5
+_API_RETRY_STORM_THRESHOLD_DEFAULT = 8
 
 
 def _api_retry_storm_threshold() -> int:
@@ -172,10 +210,31 @@ class _ApiRetryStorm(Exception):
             f"tool-error feedback loop; inspect the transcript's last "
             f"~10 tool calls before the retries began. To tolerate longer "
             f"transient windows, set WORCA_T_API_RETRY_THRESHOLD=<1..10> "
-            f"(default 5)."
+            f"(default 8)."
         )
         self.count = count
         self.threshold = threshold
+
+
+class _ApiFatalError(Exception):
+    """Raised when an api_retry event carries a non-retryable HTTP status.
+
+    4xx errors (auth failures, quota exhaustion, bad requests) are never
+    retryable by HTTP semantics. 5xx errors indicate a sustained API outage
+    that won't recover within the step timeout budget. In both cases,
+    burning the SDK's internal retry loop (up to 10 attempts with
+    exponential backoff, ~24 min wall-clock) wastes time that could be
+    spent surfacing a clear error and letting the user act.
+    """
+
+    def __init__(self, status: int, error: str, data: dict[str, Any]) -> None:
+        super().__init__(
+            f"API fatal error: HTTP {status} — {error or 'unknown'}. "
+            f"Non-retryable; aborting immediately."
+        )
+        self.status = status
+        self.error = error
+        self.data = data
 
 _MODEL_UNAVAILABLE_INDICATORS = (
     "overloaded",
@@ -246,8 +305,22 @@ def _stage_resources(
     extra_paths: list[Path],
     mcp_source: Path | None,
     claude_md: Path | None,
+    enable_mcp: bool,
+    mcp_env: dict[str, str] | None = None,
 ) -> Path:
     """Copy agent file + skills/docs + CLAUDE.md + .mcp.json into workdir.
+
+    When ``enable_mcp`` is False (the `run_agent` default), the staged
+    `.mcp.json` is an explicitly empty `{"mcpServers": {}}` so the SDK
+    spawns no MCP server children for this call. When True, the project's
+    real `.mcp.json` is staged (with env substitution) and the SDK spawns
+    every server it lists.
+
+    ``mcp_env`` is an optional per-call env overlay forwarded to
+    :func:`worca_t.mcp_manager.stage_mcp_config`. Step 9 uses this to
+    inject ``WORCA_T_STORAGE_STATE_ARG`` (the resolved storage-state CLI
+    flag for Playwright MCP) without mutating process env. Ignored when
+    ``enable_mcp`` is False.
 
     Returns the destination path of the agent file inside the workdir.
     """
@@ -274,7 +347,15 @@ def _stage_resources(
         else:
             shutil.copy2(extra, dst)
 
-    stage_mcp_config(workdir, source=mcp_source)
+    if enable_mcp:
+        stage_mcp_config(workdir, source=mcp_source, env=mcp_env)
+    else:
+        # Empty config means the SDK reads no MCP servers and spawns no
+        # subprocesses. Saves the ~3-10 s npx boot cost and silences the
+        # cosmetic `agent.mcp.pending_at_init` warning on every step that
+        # doesn't actually call an `mcp__*` tool — which is all of them
+        # today except step 9's heal flow (Playwright).
+        stage_empty_mcp_config(workdir)
     return agent_dst
 
 
@@ -371,14 +452,29 @@ async def _drive_query(
                     data = getattr(message, "data", {}) or {}
                     servers = data.get("mcp_servers") or []
                     # SDK status enum: connected | failed | needs-auth | pending | disabled.
-                    # `pending` is transient (server still starting at init-message time)
-                    # and `disabled` is intentional, so only flag the genuinely bad states.
+                    # `failed` / `needs-auth` are hard errors; `disabled` is
+                    # intentional. `pending` is the tricky one — the tool list
+                    # is frozen at init, so a server still pending at this
+                    # moment is functionally unavailable to the agent even if
+                    # it connects 200 ms later. We record both bad and pending
+                    # so step-side code can choose to fail-fast.
                     bad = [s for s in servers
                            if isinstance(s, dict) and s.get("status") in ("failed", "needs-auth")]
                     if bad:
                         log.warning("agent.mcp.failed_servers", failed=bad)
                         state.mcp_servers_failed = [
                             s.get("name", "") for s in bad if s.get("name")
+                        ]
+                    pending = [s for s in servers
+                               if isinstance(s, dict) and s.get("status") == "pending"]
+                    if pending:
+                        # Warning (not info) so it's visible in the structured
+                        # log without trawling the transcript. Steps that
+                        # strictly need these MCPs should fail-fast on
+                        # `AgentResult.mcp_servers_pending`.
+                        log.warning("agent.mcp.pending_at_init", pending=pending)
+                        state.mcp_servers_pending = [
+                            s.get("name", "") for s in pending if s.get("name")
                         ]
                 elif subtype == "api_retry":
                     state.api_retry_count += 1
@@ -402,6 +498,18 @@ async def _drive_query(
                         data_keys=sorted(data.keys()) if isinstance(data, dict) else None,
                         data=data,
                     )
+                    error_status = data.get("error_status")
+                    if isinstance(error_status, int) and error_status >= 400:
+                        log.error(
+                            "agent.api_fatal",
+                            http_status=error_status,
+                            error=data.get("error"),
+                        )
+                        raise _ApiFatalError(
+                            error_status,
+                            str(data.get("error", "")),
+                            data,
+                        )
                     if state.api_retry_count >= storm_threshold:
                         log.error(
                             "agent.api_retry_storm",
@@ -419,6 +527,12 @@ async def _drive_query(
                 result = getattr(message, "result", None)
                 if isinstance(result, str) and result:
                     state.final_text = result
+                # Capture stop_reason (best-effort — older SDKs may not
+                # surface it). Last write wins, which is what we want:
+                # the final ResultMessage carries the most relevant value.
+                sr = getattr(message, "stop_reason", None)
+                if isinstance(sr, str) and sr:
+                    state.stop_reason = sr
                 m = extract_agent_metrics(
                     getattr(message, "usage", None),
                     getattr(message, "total_cost_usd", None),
@@ -541,6 +655,8 @@ async def run_agent(
     on_event: Any | None = None,
     debug_live: bool = False,
     resume: str | None = None,
+    enable_mcp: bool = False,
+    mcp_env: dict[str, str] | None = None,
 ) -> AgentResult:
     """Run a single agent via the Claude Agent SDK in an isolated workdir.
 
@@ -579,17 +695,44 @@ async def run_agent(
         letting the cached system-prompt/conversation prefix hit cache_read
         instead of paying the 25% cache_creation premium again. Capture it
         from a prior call's ``AgentResult.session_id``.
+    enable_mcp: opt-in flag for MCP server staging. Default False: stage an
+        empty `{"mcpServers": {}}` so the SDK spawns no MCP server children,
+        saving ~3-10 s of npx boot per call and silencing the cosmetic
+        `agent.mcp.pending_at_init` warning. Pass True only when the agent
+        actually invokes `mcp__*` tools (audit-verified: today only step
+        9's polyglot-test-fixer heal flow needs Playwright MCP). Inverting
+        the historic default reflects the audit: 5+ caller sites never
+        used the MCPs they were paying to spawn.
     """
     del debug_live  # accepted for API compat
     workdir.mkdir(parents=True, exist_ok=True)
-    # Number each call's audit files so multi-call steps (HITL retries,
-    # step 8 self-heal) don't overwrite each other's transcript/metrics/stderr.
-    # `transcript-00.jsonl` is call 0, `transcript-01.jsonl` is call 1, etc.
-    call_idx = len(list(workdir.glob("transcript-*.jsonl")))
+    # Per-call audit files live under <workdir>/logs/ so the workdir root
+    # stays human-scannable — agents, inputs, and outputs at the top level;
+    # transcripts / stderr / metrics tucked away. Each call's files are
+    # numbered (transcript-00.jsonl is call 0, -01 is call 1, ...) so
+    # multi-call steps (HITL retries, the API-storm wait/retry, step 8
+    # self-heal) don't overwrite each other.
+    logs_dir = workdir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    call_idx = len(list(logs_dir.glob("transcript-*.jsonl")))
     suffix = f"-{call_idx:02d}"
-    transcript_path = workdir / f"transcript{suffix}.jsonl"
-    stderr_path = workdir / f"stderr{suffix}.log"
-    metrics_path = workdir / f"metrics{suffix}.json"
+    transcript_path = logs_dir / f"transcript{suffix}.jsonl"
+    stderr_path = logs_dir / f"stderr{suffix}.log"
+    metrics_path = logs_dir / f"metrics{suffix}.json"
+    # Persist the literal user_prompt the SDK receives, so post-mortem
+    # debugging doesn't require re-deriving runtime-substituted values
+    # (stack_hint, env_hint, reuse_hint, JIT runtime hint, ...) from the
+    # source f-string. The transcript only logs what the SDK streams
+    # BACK to us; the input we sent is otherwise opaque. Numbered to
+    # match the transcript for the same call.
+    prompt_path = logs_dir / f"user-prompt{suffix}.md"
+    try:
+        prompt_path.write_text(user_prompt, encoding="utf-8")
+    except OSError as e:
+        # Best-effort: a failure to dump the prompt should never block
+        # the actual agent call. Log + continue.
+        log.warning("agent.user_prompt_dump_failed",
+                    path=str(prompt_path), error=str(e))
 
     settings = get_settings()
     resolved_model = model or model_for_agent(_agent_key(agent_path))
@@ -602,6 +745,8 @@ async def run_agent(
         extra_paths=list(extra_paths or []),
         mcp_source=mcp_source,
         claude_md=claude_md,
+        enable_mcp=enable_mcp,
+        mcp_env=mcp_env,
     )
     _stage_inputs(workdir, inputs)
 
@@ -661,6 +806,29 @@ async def run_agent(
         "DISABLE_PROMPT_CACHING_OPUS",
         "DISABLE_PROMPT_CACHING_SONNET",
         "DISABLE_PROMPT_CACHING_HAIKU",
+    ):
+        if k in full_env:
+            forwarded_env[k] = full_env[k]
+    # Vertex routing / auth signals. These don't match the prefix filter
+    # above (CLAUDE_CODE_*, CLOUD_ML_*) but the claude.exe CLI reads them
+    # directly to decide transport + auth path. They're set at the Windows
+    # user-registry level on Bosch workstations; without explicit forwarding
+    # we'd inherit them by accident via env merging today, but a future SDK
+    # change could break that. Forward explicitly so the subprocess sees a
+    # complete, predictable configuration. (`ANTHROPIC_VERTEX_PROJECT_ID`
+    # already matches the ANTHROPIC_ prefix above — listed here for
+    # documentation completeness; the assignment is idempotent.)
+    #
+    # NOT forwarded on purpose: `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`,
+    # `CLAUDE_CODE_EXECPATH` — those are nesting-detection signals the SDK
+    # uses to refuse to start when it thinks it's inside another Claude Code
+    # session (see CLAUDE_SESSION_KEYS in worca_t.config). Forwarding them
+    # would re-trigger the nesting check we already strip above.
+    for k in (
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+        "CLOUD_ML_REGION",
+        "ANTHROPIC_VERTEX_PROJECT_ID",
     ):
         if k in full_env:
             forwarded_env[k] = full_env[k]
@@ -788,6 +956,16 @@ async def run_agent(
             exit_code = -10
             error = str(e)
             await _force_cleanup(drive_task, state.pre_existing_children, grace_s=2.0)
+        except _ApiFatalError as e:
+            exit_code = -11
+            error = str(e)
+            log.error(
+                "agent.api_fatal",
+                agent=agent_path.name,
+                http_status=e.status,
+                error_detail=e.error,
+            )
+            await _force_cleanup(drive_task, state.pre_existing_children, grace_s=2.0)
         except Exception as e:
             # The SDK's exception text is often opaque (e.g.
             # "Claude Code returned an error result: success"). The real
@@ -827,6 +1005,7 @@ async def run_agent(
     agent_metrics = state.metrics
     session_id = state.session_id
     mcp_servers_failed = list(state.mcp_servers_failed)
+    mcp_servers_pending = list(state.mcp_servers_pending)
     used_model = models_attempted[-1] if models_attempted else resolved_model
 
     duration = time.monotonic() - started
@@ -913,4 +1092,6 @@ async def run_agent(
         metrics=agent_metrics,
         session_id=session_id,
         mcp_servers_failed=mcp_servers_failed,
+        mcp_servers_pending=mcp_servers_pending,
+        stop_reason=state.stop_reason,
     )

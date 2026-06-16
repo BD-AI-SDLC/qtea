@@ -1,9 +1,3 @@
-
----
-
-## 2. `/examples/bug-classification-example.md`
-
-```markdown
 # Example: Bug Classification & Analysis
 
 ## Reported Bug

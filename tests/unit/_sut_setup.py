@@ -12,10 +12,70 @@ Optional `inventory` arg writes a `sut_inventory.json` into
 
 from __future__ import annotations
 
+import atexit
 import json
+import os
+import shutil
+import tempfile
+from pathlib import Path
 from typing import Any
 
+from filelock import FileLock
+
 from worca_t._sut_git import ensure_git_repo_and_branch
+
+# --- Session-scoped git template -------------------------------------------
+#
+# Building a git repo costs four `git` subprocess spawns (init / add / commit
+# / checkout). On scanned corporate Windows boxes each spawn can take seconds
+# (AV intercepts every git.exe launch), which made every step test pay a
+# multi-second SUT-seed tax. Copying a prebuilt `.git` is ~100x cheaper
+# (measured: ~80ms vs seconds), so we pay the real git cost ONCE per test run
+# and filesystem-copy the result per test.
+#
+# Under `pytest-xdist`, every worker is a separate process, so a naive
+# module-level cache would rebuild the template N times (once per worker). We
+# instead build into a run-scoped *shared* directory guarded by a file lock:
+# the first worker to grab the lock builds it, every other worker reuses it.
+#
+# The template lives on branch `worca-t/run-template`; step tests assert on
+# run-results / disk state, never on the exact branch name (the git module's
+# own behaviour is covered separately by test_sut_branch.py, which keeps
+# exercising the real `ensure_git_repo_and_branch`).
+_TEMPLATE_DIR: Path | None = None
+
+
+def _git_template() -> Path:
+    """Return a run-scoped directory containing a baseline git repo.
+
+    Built once across the whole test run (shared across xdist workers via a
+    file lock) and cleaned up at process exit.
+    """
+    global _TEMPLATE_DIR
+    if _TEMPLATE_DIR is not None and (_TEMPLATE_DIR / ".git").exists():
+        return _TEMPLATE_DIR
+
+    # Run-scoped key: shared across xdist workers of the SAME run, distinct
+    # across separate invocations. Falls back to the pid for non-xdist runs.
+    run_uid = os.environ.get("PYTEST_XDIST_TESTRUNUID") or f"pid{os.getpid()}"
+    shared = Path(tempfile.gettempdir()) / f"worca-t-sut-template-{run_uid}"
+    # Marker lives OUTSIDE the template dir so it isn't copied into each SUT.
+    ready = Path(str(shared) + ".ready")
+
+    with FileLock(str(shared) + ".lock"):
+        if not ready.exists():
+            shutil.rmtree(shared, ignore_errors=True)
+            shared.mkdir(parents=True, exist_ok=True)
+            (shared / "README.md").write_text("# fake SUT for tests\n", encoding="utf-8")
+            ensure_git_repo_and_branch(shared, "template")
+            ready.write_text("ok", encoding="utf-8")
+            # Only the builder registers cleanup; ignore_errors covers the
+            # case where a sibling worker already removed it.
+            atexit.register(lambda: shutil.rmtree(shared, ignore_errors=True))
+            atexit.register(lambda: ready.unlink(missing_ok=True))
+
+    _TEMPLATE_DIR = shared
+    return shared
 
 
 def seed_sut(
@@ -25,15 +85,19 @@ def seed_sut(
     inventory: dict[str, Any] | None = None,
     include_default_inventory: bool = True,
 ) -> None:
-    """Make `workspace.sut/` a git repo on the worca-t branch.
+    """Make `workspace.sut/` a git repo (copied from a session template).
+
+    Mirrors the production end-state (`<workspace>/sut/` is a git repo with a
+    baseline commit and a worca-t branch checked out) by filesystem-copying a
+    prebuilt template instead of re-running `git` per test.
 
     Parameters
     ----------
     seed_files:
         Optional `{rel_path: content}` map of files to place into the SUT
-        before the baseline commit. A `README.md` is always added so the
-        baseline commit is non-empty (even on Windows where empty
-        directories can confuse `git add -A`).
+        working tree (overlaid on top of the template's `README.md`). The
+        files are left uncommitted on disk — the step under test stages and
+        commits them via `commit_step`, exactly as in production.
     inventory:
         Optional dict to write as `ws.step_dir(6)/sut_inventory.json`. When
         omitted and `include_default_inventory=True`, a minimal stub with
@@ -44,14 +108,18 @@ def seed_sut(
         (used by tests that exercise the missing-inventory failure path).
     """
     ws_sut = workspace.sut
-    ws_sut.mkdir(parents=True, exist_ok=True)
-    files = dict(seed_files or {})
-    files.setdefault("README.md", "# fake SUT for tests\n")
-    for rel, content in files.items():
+    template = _git_template()
+    if ws_sut.exists():
+        shutil.rmtree(ws_sut)
+    ws_sut.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(template, ws_sut)
+
+    # Overlay per-test seed files on the working tree (uncommitted; the step
+    # under test commits them). README.md is already present from the template.
+    for rel, content in (seed_files or {}).items():
         target = ws_sut / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
-    ensure_git_repo_and_branch(ws_sut, workspace.run_id)
 
     if inventory is not None:
         _write_inventory(workspace, inventory)

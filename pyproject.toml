@@ -101,10 +101,17 @@ dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
     "pytest-mock>=3.12",
+    "pytest-xdist>=3.6",
     "ruff>=0.6",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra --strict-markers"
+# `-n auto` parallelises across CPU cores (pytest-xdist). The suite is
+# heavily I/O-bound (git / subprocess), so this is a large win on multi-core
+# machines. Override with `-n 0` for serial debugging / readable output.
+addopts = "-ra --strict-markers -n auto"
 asyncio_mode = "auto"
+markers = [
+    "integration: spawns real subprocesses / git or does heavy filesystem work (slower). Run the fast inner loop with `-m 'not integration'`; CI runs everything.",
+]

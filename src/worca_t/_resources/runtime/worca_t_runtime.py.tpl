@@ -35,6 +35,32 @@ ENV VARS read by this plugin (set by ``s09_execute.py``):
                                   heuristic only. Unresolvable TBDs fail fast
                                   with a structured diagnostic instead of
                                   silently spending tokens. CI default.
+- ``WORCA_T_PROXY``             — proxy URL to inject into Chromium launches
+                                  (``proxy={'server': URL}``). Overrides
+                                  ``HTTPS_PROXY`` when both are set.
+- ``HTTPS_PROXY`` / ``https_proxy`` — fallback proxy source when
+                                  ``WORCA_T_PROXY`` is unset. Worca-t already
+                                  propagates these into the subprocess via
+                                  ``with_proxy_env`` (which reads
+                                  ``HKCU:\\Environment`` on Windows). Required
+                                  on corporate networks where the SUT's target
+                                  hostname is only resolvable via the corp
+                                  proxy (e.g. ``*.bosch.com`` via px@3128).
+                                  An SUT that explicitly passes ``proxy=`` to
+                                  ``launch()`` wins — the injection is a
+                                  "default-when-absent" only.
+- ``WORCA_T_DISABLE_PROXY_INJECT`` — set to ``1`` to disable the proxy
+                                  injection patch entirely (locator JIT patch
+                                  is unaffected — the two patches are
+                                  orthogonal).
+- ``WORCA_T_WORKSPACE_DIR``     — worca-t run workspace directory. When set,
+                                  the runtime captures Playwright
+                                  ``context.storage_state(path=<dir>/storage-
+                                  state.json)`` on the first passing test
+                                  (Use case B for the Step 9 heal flow —
+                                  same-run storage-state handover). Auto-set
+                                  by Step 9; unset in standalone pytest runs
+                                  (no capture happens).
 
 Resolution tier order (highest precedence first):
   1. Dev-locators file
@@ -292,7 +318,9 @@ def _call_resolver_socket(
         log.warning("worca_t.resolver_socket_server_error %s", payload.get("error"))
         return None
     # Project onto the legacy subprocess response shape so the rest of
-    # the runtime doesn't need to change.
+    # the runtime doesn't need to change. `candidates` is included when
+    # present — newer ResolverServer responses carry a ranked bundle that
+    # the retry proxy uses as zero-cost fallback alternates.
     return {
         "selector": payload.get("selector"),
         "strategy": payload.get("strategy"),
@@ -300,6 +328,11 @@ def _call_resolver_socket(
         "source": payload.get("source"),
         "reason": payload.get("reason"),
         "snapshot_hash": payload.get("snapshot_hash"),
+        "candidates": payload.get("candidates"),
+        "input_tokens": payload.get("input_tokens"),
+        "output_tokens": payload.get("output_tokens"),
+        "model": payload.get("model"),
+        "duration_ms": payload.get("duration_ms"),
     }
 
 
@@ -440,20 +473,149 @@ def _walk_stack_for_constant_name() -> str | None:
     return None
 
 
-def _snapshot_page(page: Any) -> tuple[str, dict[str, Any]]:
-    """Capture the page AOM as ``(json_text, parsed_dict)``.
+def _call_aria_snapshot_sync(body_locator: Any) -> str:
+    """Call ``Locator.aria_snapshot()`` preferring ``mode="ai"`` (added in
+    Playwright 1.59 — returns an LLM-optimized YAML tree). Falls back to
+    the no-mode call when the SUT pins an older Playwright that rejects the
+    kwarg (``TypeError`` from the generated stub signature).
 
-    The parsed dict feeds the in-process heuristic (tier 3) without a
-    re-parse; the JSON text feeds the LLM subprocess (tier 4) without a
-    re-serialize. Falls back to ``("{}", {})`` on failure so the resolver
-    can still receive a well-formed input.
+    Returns the empty string on a falsy / unexpected return.
     """
+    try:
+        return body_locator.aria_snapshot(mode="ai") or ""
+    except TypeError:
+        # Older Playwright (1.40-1.58): no `mode` parameter.
+        return body_locator.aria_snapshot() or ""
+
+
+async def _call_aria_snapshot_async(body_locator: Any) -> str:
+    """Async counterpart of :func:`_call_aria_snapshot_sync`."""
+    try:
+        return await body_locator.aria_snapshot(mode="ai") or ""
+    except TypeError:
+        return await body_locator.aria_snapshot() or ""
+
+
+def _snapshot_page(page: Any) -> tuple[str, dict[str, Any]]:
+    """Capture the page AOM as ``(text, parsed_dict_tree)``.
+
+    Strategy:
+      1. ``page.locator('body').aria_snapshot(mode="ai")`` — Playwright 1.59+,
+         LLM-optimized YAML tree. ``mode="ai"`` was added in v1.59 (verified
+         against the Python docs); the wrapper falls back to a no-mode call
+         on ``TypeError`` so SUTs on 1.40-1.58 still get a snapshot.
+      2. ``page.accessibility.snapshot()`` — pre-1.40 API, returns a dict
+         directly. Removed in Playwright 1.40+; only reached when locator-
+         based capture has already failed.
+
+    Returns ``("", {})`` on total failure so the resolver still receives a
+    well-formed input (the LLM tier then cleanly returns "no candidates"
+    instead of crashing). Errors are logged but never propagate.
+    """
+    # ---- Primary: Locator.aria_snapshot (Playwright 1.40+) ----
+    try:
+        body = page.locator("body")
+        snapshot_text = _call_aria_snapshot_sync(body)
+        snapshot_dict = _parse_aria_snapshot_yaml(snapshot_text)
+        return snapshot_text, snapshot_dict
+    except AttributeError:
+        # `Page.locator` or `Locator.aria_snapshot` not present — fall through.
+        pass
+    except Exception as e:  # noqa: BLE001
+        log.warning("worca_t.snapshot_failed_aria %s", e)
+        # Fall through to legacy API — older Playwright might still work.
+
+    # ---- Legacy: page.accessibility.snapshot() (Playwright <1.40) ----
     try:
         ax = page.accessibility.snapshot() or {}
         return json.dumps(ax, ensure_ascii=False), ax if isinstance(ax, dict) else {}
     except Exception as e:  # noqa: BLE001
         log.warning("worca_t.snapshot_failed %s", e)
-        return "{}", {}
+        return "", {}
+
+
+# YAML-ish ARIA tree parser. Playwright's ``Locator.aria_snapshot()`` emits
+# a structured but non-standard YAML format. We parse it into the same
+# ``{role, name, children}`` shape ``_aom_walk`` expects so the tier-3
+# heuristic works without re-implementing for two formats.
+#
+# Format examples (indentation = 2 spaces per level):
+#   - button "Next"                  → role=button, name="Next"
+#   - heading "Sign in" [level=1]    → role=heading, name="Sign in"
+#   - alert                          → role=alert, name=""
+#   - alert: Error message           → role=alert, name="Error message"
+#   - main:                          → role=main, name="", has children
+#     - paragraph: Welcome           →   child of main
+#   - /url: /help                    → attribute metadata, SKIPPED (not a node)
+
+
+def _parse_aria_snapshot_yaml(yaml_text: str) -> dict[str, Any]:
+    """Parse a ``Locator.aria_snapshot()`` YAML body into a dict tree
+    ``{role, name, children: [...]}`` compatible with :func:`_aom_walk`.
+
+    Returns ``{}`` for empty input so callers can rely on truthy checks.
+
+    Pure-function: no Playwright import, no I/O. Unit-testable standalone.
+    """
+    import re as _re
+
+    if not yaml_text or not yaml_text.strip():
+        return {}
+
+    # Regexes anchored once, not per-line.
+    _RE_QUOTED = _re.compile(r'^([A-Za-z][A-Za-z0-9_-]*)\s+"((?:[^"\\]|\\.)*)"(.*)$')
+    _RE_INLINE = _re.compile(r'^([A-Za-z][A-Za-z0-9_-]*)\s*:\s*(.*)$')
+    _RE_ROLE_ONLY = _re.compile(r'^([A-Za-z][A-Za-z0-9_-]*).*$')
+
+    root_children: list[dict[str, Any]] = []
+    # Stack: list of (indent, child_list_to_append_into).
+    stack: list[tuple[int, list[dict[str, Any]]]] = [(-1, root_children)]
+
+    for raw_line in yaml_text.split("\n"):
+        if not raw_line.strip():
+            continue
+        indent = len(raw_line) - len(raw_line.lstrip())
+        line = raw_line.strip()
+        if not line.startswith("- "):
+            continue
+        body = line[2:].strip()
+        # Skip attribute metadata lines (start with '/' after the dash).
+        if body.startswith("/"):
+            continue
+        # Strip trailing ":" — it just indicates the node has children/attrs;
+        # we infer that from indent-level changes anyway.
+        had_trailing_colon = body.endswith(":")
+        if had_trailing_colon:
+            body = body[:-1].rstrip()
+
+        # Try in order: quoted name, inline text after ":", bare role.
+        name = ""
+        m = _RE_QUOTED.match(body)
+        if m:
+            role = m.group(1)
+            name = m.group(2)
+        else:
+            m2 = _RE_INLINE.match(body)
+            if m2:
+                role = m2.group(1)
+                inline_text = m2.group(2).strip()
+                if inline_text:
+                    name = inline_text
+            else:
+                m3 = _RE_ROLE_ONLY.match(body)
+                if not m3:
+                    continue
+                role = m3.group(1)
+
+        node: dict[str, Any] = {"role": role, "name": name, "children": []}
+        # Find parent: pop until we hit something with a strictly smaller indent.
+        while len(stack) > 1 and stack[-1][0] >= indent:
+            stack.pop()
+        parent_children = stack[-1][1]
+        parent_children.append(node)
+        stack.append((indent, node["children"]))
+
+    return {"role": "document", "name": "", "children": root_children}
 
 
 # ---------------------------------------------------------------------------
@@ -602,13 +764,22 @@ def _heuristic_resolve(intent: str, snapshot: dict[str, Any]) -> str | None:
 class _Resolution:
     """Result of resolving one sentinel. Carries the source so the retry
     proxy knows whether to skip the dev file / cache / heuristic when the
-    selector turns out to be stale at action time."""
+    selector turns out to be stale at action time.
+
+    ``candidates`` carries the LLM's ranked bundle (primary + optional
+    fallback) for tier 4 / cached-tier 4 resolutions. ``selector`` mirrors
+    ``candidates[0]['selector']`` when the bundle is present, but the
+    retry proxy uses ``candidates[1:]`` as zero-cost fallback alternates
+    on ``TimeoutError`` before invalidating the cache and re-calling the
+    resolver. ``None`` for dev / heuristic / failed resolutions.
+    """
 
     selector: str | None
     source: str  # "dev" | "cached" | "heuristic" | "agent" | "none"
     constant_name: str
     intent: str
     test_file: str | None
+    candidates: tuple[dict[str, Any], ...] | None = None
 
 
 def _resolve_tiers_1_2(
@@ -638,10 +809,20 @@ def _resolve_tiers_1_2(
         if cached and cached.get("selector"):
             log.info("worca_t.cache_hit constant=%s selector=%s",
                      constant_name, _sanitize_for_log(cached["selector"]))
+            cached_bundle = cached.get("candidates")
+            bundle_tuple = (
+                tuple(cached_bundle)
+                if isinstance(cached_bundle, list) and cached_bundle
+                else None
+            )
             _append_spend_line({"tier": 2, "source": "cached",
                                 "constant": constant_name,
+                                "candidates_count": len(bundle_tuple) if bundle_tuple else 1,
                                 "input_tokens": 0, "output_tokens": 0, "success": True})
-            return _Resolution(cached["selector"], "cached", constant_name, intent, test_file)
+            return _Resolution(
+                cached["selector"], "cached", constant_name, intent, test_file,
+                candidates=bundle_tuple,
+            )
     return None
 
 
@@ -690,9 +871,16 @@ def _resolve_tiers_3_4(
                             "reason": "resolver_call_failed"})
         return _Resolution(None, "none", constant_name, intent, test_file)
     selector = result.get("selector")
+    raw_candidates = result.get("candidates")
+    bundle_tuple = (
+        tuple(raw_candidates)
+        if isinstance(raw_candidates, list) and raw_candidates
+        else None
+    )
     spend_entry = {
         "tier": 4, "source": result.get("source") or "agent",
         "constant": constant_name,
+        "candidates_count": len(bundle_tuple) if bundle_tuple else (1 if selector else 0),
         "input_tokens": result.get("input_tokens") or 0,
         "output_tokens": result.get("output_tokens") or 0,
         "model": result.get("model"), "duration_ms": result.get("duration_ms"),
@@ -705,24 +893,41 @@ def _resolve_tiers_3_4(
         _append_spend_line(spend_entry)
         return _Resolution(None, "none", constant_name, intent, test_file)
     log.info(
-        "worca_t.resolver_ok constant=%s selector=%s source=%s confidence=%s",
+        "worca_t.resolver_ok constant=%s selector=%s source=%s confidence=%s candidates=%d",
         constant_name, _sanitize_for_log(selector),
         result.get("source"), result.get("confidence"),
+        len(bundle_tuple) if bundle_tuple else 1,
     )
     _append_spend_line(spend_entry)
-    return _Resolution(selector, "agent", constant_name, intent, test_file)
+    return _Resolution(
+        selector, "agent", constant_name, intent, test_file,
+        candidates=bundle_tuple,
+    )
 
 
 async def _snapshot_page_async(page: Any) -> tuple[str, dict[str, Any]]:
-    """Async counterpart of ``_snapshot_page``. Awaits Playwright's
-    ``page.accessibility.snapshot()`` coroutine, returns
-    ``(json_text, parsed_dict)``."""
+    """Async counterpart of :func:`_snapshot_page`. Same fallback chain:
+    aria_snapshot(mode="ai") → aria_snapshot() → legacy
+    page.accessibility.snapshot().
+    """
+    # ---- Primary: Locator.aria_snapshot (Playwright 1.40+) ----
+    try:
+        body = page.locator("body")
+        snapshot_text = await _call_aria_snapshot_async(body)
+        snapshot_dict = _parse_aria_snapshot_yaml(snapshot_text)
+        return snapshot_text, snapshot_dict
+    except AttributeError:
+        pass
+    except Exception as e:  # noqa: BLE001
+        log.warning("worca_t.snapshot_failed_aria_async %s", e)
+
+    # ---- Legacy: page.accessibility.snapshot() (Playwright <1.40) ----
     try:
         ax = await page.accessibility.snapshot() or {}
         return json.dumps(ax, ensure_ascii=False), ax if isinstance(ax, dict) else {}
     except Exception as e:  # noqa: BLE001
         log.warning("worca_t.snapshot_failed_async %s", e)
-        return "{}", {}
+        return "", {}
 
 
 def _safe_page_url(page: Any) -> str | None:
@@ -766,6 +971,7 @@ def _resolve_sentinel(
 
 async def _resolve_sentinel_async(
     page: Any, sentinel: str, *,
+    constant_name: str | None = None,
     skip_dev: bool = False,
     skip_cache: bool = False,
     skip_heuristic: bool = False,
@@ -773,9 +979,18 @@ async def _resolve_sentinel_async(
     """Async sentinel resolver. Same tier ladder as the sync version, but
     awaits the snapshot. Used by the async API (``playwright.async_api``)
     patch.
+
+    ``constant_name`` is captured EAGERLY at ``.locator()`` call time by the
+    async wrapper and threaded through here, because on the async path the
+    actual resolution is deferred to action time — by which point the
+    ``.locator()`` call frame (the only place a ``LOCATOR``-style local points
+    at the sentinel) has already returned and the stack walk would miss it,
+    falling back to ``intent[:64]`` and breaking dev-locator/HITL keying.
     """
     intent = parse_sentinel(sentinel)
-    constant_name = _walk_stack_for_constant_name() or intent[:64]
+    if constant_name is None:
+        constant_name = _walk_stack_for_constant_name()
+    constant_name = constant_name or intent[:64]
     test_file = os.environ.get("PYTEST_CURRENT_TEST", "").split("::", 1)[0] or None
 
     early = _resolve_tiers_1_2(
@@ -807,6 +1022,43 @@ def _invalidate_cache_entry(constant_name: str, intent: str, test_file: str | No
             log.warning("worca_t.cache_invalidate_failed %s", e)
 
 
+def _promote_candidate_in_cache(
+    constant_name: str,
+    intent: str,
+    test_file: str | None,
+    working: dict[str, Any],
+) -> None:
+    """Rewrite the cache entry so the working fallback becomes the primary
+    (and only) candidate. Called after a fallback survives an action that
+    timed out under the original primary — the failed primary is dropped
+    on the theory that it timed out under the inflated 60s timeout and
+    is therefore broken rather than slow. Best-effort; failures don't
+    block the test."""
+    key = _cache_key(test_file, constant_name, intent)
+    cache = _read_cache()
+    entry = cache.get(key)
+    if not entry:
+        return
+    entry["selector"] = working.get("selector")
+    entry["strategy"] = working.get("strategy")
+    entry["confidence"] = working.get("confidence")
+    entry["candidates"] = [working]
+    cache[key] = entry
+    try:
+        _write_cache(cache)
+        _append_spend_line({
+            "tier": 2, "source": "promoted", "constant": constant_name,
+            "input_tokens": 0, "output_tokens": 0, "success": True,
+            "fallback_promoted": True,
+        })
+        log.info(
+            "worca_t.fallback_promoted constant=%s selector=%s",
+            constant_name, _sanitize_for_log(str(working.get("selector"))),
+        )
+    except OSError as e:
+        log.warning("worca_t.fallback_promote_failed %s", e)
+
+
 # Locator action methods that can raise TimeoutError when the selector
 # doesn't resolve to an element. Covers both Playwright's actions
 # (click/fill/etc.) and its query/wait methods that block on an element
@@ -827,15 +1079,23 @@ _RETRIABLE_METHODS = frozenset({
 
 
 class _RetryingLocator:
-    """Thin wrapper around a Playwright Locator that retries once on
-    ``TimeoutError`` by re-resolving the sentinel against the live page
-    (skipping the dev file and the cache that produced the stale selector).
+    """Thin wrapper around a Playwright Locator that, on ``TimeoutError``,
+    first walks any remaining LLM-supplied fallback candidates against the
+    live page (zero token cost) and only falls back to invalidating the
+    cache + re-resolving via the LLM if every candidate in the bundle has
+    been exhausted.
 
     Works against BOTH sync and async Playwright APIs. Detection is
     per-method: when the wrapped Locator's action method is a coroutine
     function (async API), we return an async wrapper that awaits the
-    call and uses :func:`_resolve_sentinel_async` for retry; otherwise
-    we return the sync wrapper. Same class serves both surfaces.
+    call and uses :func:`_resolve_sentinel_async` for the (terminal)
+    re-resolve; otherwise we return the sync wrapper. Same class serves
+    both surfaces.
+
+    Bundle promotion: when a fallback candidate succeeds, the cache entry
+    is rewritten with the working candidate as the sole entry (the failed
+    primary is dropped). Next test reusing the same cache key picks the
+    fallback up directly as the primary — no second-attempt cost.
 
     Non-action attributes pass through transparently — chainable methods
     like ``nth(0)`` / ``filter(has_text=...)`` return new Locators which
@@ -852,7 +1112,7 @@ class _RetryingLocator:
 
     __slots__ = (
         "_real", "_page", "_sentinel", "_resolution",
-        "_rebuild_locator", "_retried",
+        "_rebuild_locator", "_retried", "_remaining_candidates",
     )
 
     def __init__(
@@ -864,34 +1124,135 @@ class _RetryingLocator:
         object.__setattr__(self, "_resolution", resolution)
         object.__setattr__(self, "_rebuild_locator", rebuild_locator)
         object.__setattr__(self, "_retried", False)
+        # candidates[0] is what's already wrapped in `_real`; everything
+        # past it is a fallback the retry path can try without a new
+        # resolver call. None / single-entry bundles → empty list, which
+        # means the proxy falls straight through to the existing LLM
+        # re-resolve path on TimeoutError (no behaviour change).
+        bundle = resolution.candidates
+        remaining: list[dict[str, Any]] = (
+            list(bundle[1:])
+            if bundle is not None and len(bundle) > 1
+            else []
+        )
+        object.__setattr__(self, "_remaining_candidates", remaining)
 
     def __repr__(self):  # pragma: no cover (cosmetic)
         return f"<worca-t RetryingLocator wrapping {self._real!r}>"
 
+    def _try_next_candidate(self):
+        """Pop and apply the next fallback candidate, swapping `_real` to
+        a locator built from its selector. Returns the candidate dict so
+        the caller can promote it in the cache on success, or ``None``
+        when the bundle is exhausted."""
+        if not self._remaining_candidates:
+            return None
+        nxt = self._remaining_candidates.pop(0)
+        sel = nxt.get("selector")
+        if not isinstance(sel, str) or not sel.strip():
+            return None
+        fresh_real = self._rebuild_locator(sel)
+        object.__setattr__(self, "_real", fresh_real)
+        log.info(
+            "worca_t.fallback_candidate_try constant=%s selector=%s strategy=%s",
+            self._resolution.constant_name,
+            _sanitize_for_log(sel),
+            nxt.get("strategy"),
+        )
+        return nxt
+
     def __getattr__(self, name):
         attr = getattr(self._real, name)
-        if not callable(attr) or name not in _RETRIABLE_METHODS or self._retried:
+        if not callable(attr) or name not in _RETRIABLE_METHODS:
+            return attr
+
+        # Once the LLM re-resolve has fired and its replacement also fails,
+        # we propagate — no further retries (matches the historical
+        # "only retries once" invariant; the candidate-walk happens BEFORE
+        # the re-resolve and is bounded by bundle size).
+        if self._retried:
             return attr
 
         import asyncio
 
         if asyncio.iscoroutinefunction(attr):
             async def _async_retry_wrapper(*args, **kwargs):
+                # Walk any in-bundle fallbacks first (zero-cost resilience).
+                while True:
+                    try:
+                        result = await getattr(self._real, name)(*args, **kwargs)
+                    except Exception as exc:  # noqa: BLE001
+                        if not _is_playwright_timeout(exc):
+                            raise
+                        stale = self._resolution
+                        log.info(
+                            "worca_t.retry_on_timeout_async constant=%s source=%s method=%s remaining=%d",
+                            stale.constant_name, stale.source, name,
+                            len(self._remaining_candidates),
+                        )
+                        nxt = self._try_next_candidate()
+                        if nxt is not None:
+                            continue  # retry against the fallback candidate
+                        # Bundle exhausted (or never existed) → LLM re-resolve.
+                        object.__setattr__(self, "_retried", True)
+                        _invalidate_cache_entry(
+                            stale.constant_name, stale.intent, stale.test_file,
+                        )
+                        fresh = await _resolve_sentinel_async(
+                            self._page, self._sentinel,
+                            constant_name=stale.constant_name,
+                            skip_dev=(stale.source == "dev"),
+                            skip_cache=True,
+                            skip_heuristic=(stale.source == "heuristic"),
+                        )
+                        if fresh.selector is None:
+                            log.warning(
+                                "worca_t.retry_unresolvable constant=%s",
+                                stale.constant_name,
+                            )
+                            raise
+                        fresh_real = self._rebuild_locator(fresh.selector)
+                        object.__setattr__(self, "_real", fresh_real)
+                        object.__setattr__(self, "_resolution", fresh)
+                        fresh_method = getattr(fresh_real, name)
+                        return await fresh_method(*args, **kwargs)
+                    # success — if it came from a fallback candidate, promote
+                    # it so subsequent tests skip the failed primary entirely.
+                    stale = self._resolution
+                    if (
+                        stale.candidates
+                        and len(self._remaining_candidates) < len(stale.candidates) - 1
+                    ):
+                        # _remaining_candidates shrank, meaning a fallback was used.
+                        used_idx = len(stale.candidates) - 1 - len(self._remaining_candidates)
+                        _promote_candidate_in_cache(
+                            stale.constant_name, stale.intent, stale.test_file,
+                            stale.candidates[used_idx],
+                        )
+                    return result
+            return _async_retry_wrapper
+
+        def _retry_wrapper(*args, **kwargs):
+            while True:
                 try:
-                    return await attr(*args, **kwargs)
+                    result = getattr(self._real, name)(*args, **kwargs)
                 except Exception as exc:  # noqa: BLE001
                     if not _is_playwright_timeout(exc):
                         raise
-                    object.__setattr__(self, "_retried", True)
                     stale = self._resolution
                     log.info(
-                        "worca_t.retry_on_timeout_async constant=%s source=%s method=%s",
+                        "worca_t.retry_on_timeout constant=%s source=%s method=%s remaining=%d",
                         stale.constant_name, stale.source, name,
+                        len(self._remaining_candidates),
                     )
+                    nxt = self._try_next_candidate()
+                    if nxt is not None:
+                        continue
+                    object.__setattr__(self, "_retried", True)
                     _invalidate_cache_entry(
                         stale.constant_name, stale.intent, stale.test_file,
                     )
-                    fresh = await _resolve_sentinel_async(
+                    fresh = _resolve_sentinel(
                         self._page, self._sentinel,
                         skip_dev=(stale.source == "dev"),
                         skip_cache=True,
@@ -907,41 +1268,18 @@ class _RetryingLocator:
                     object.__setattr__(self, "_real", fresh_real)
                     object.__setattr__(self, "_resolution", fresh)
                     fresh_method = getattr(fresh_real, name)
-                    return await fresh_method(*args, **kwargs)
-            return _async_retry_wrapper
-
-        def _retry_wrapper(*args, **kwargs):
-            try:
-                return attr(*args, **kwargs)
-            except Exception as exc:  # noqa: BLE001
-                if not _is_playwright_timeout(exc):
-                    raise
-                object.__setattr__(self, "_retried", True)
+                    return fresh_method(*args, **kwargs)
                 stale = self._resolution
-                log.info(
-                    "worca_t.retry_on_timeout constant=%s source=%s method=%s",
-                    stale.constant_name, stale.source, name,
-                )
-                _invalidate_cache_entry(
-                    stale.constant_name, stale.intent, stale.test_file,
-                )
-                fresh = _resolve_sentinel(
-                    self._page, self._sentinel,
-                    skip_dev=(stale.source == "dev"),
-                    skip_cache=True,
-                    skip_heuristic=(stale.source == "heuristic"),
-                )
-                if fresh.selector is None:
-                    log.warning(
-                        "worca_t.retry_unresolvable constant=%s",
-                        stale.constant_name,
+                if (
+                    stale.candidates
+                    and len(self._remaining_candidates) < len(stale.candidates) - 1
+                ):
+                    used_idx = len(stale.candidates) - 1 - len(self._remaining_candidates)
+                    _promote_candidate_in_cache(
+                        stale.constant_name, stale.intent, stale.test_file,
+                        stale.candidates[used_idx],
                     )
-                    raise
-                fresh_real = self._rebuild_locator(fresh.selector)
-                object.__setattr__(self, "_real", fresh_real)
-                object.__setattr__(self, "_resolution", fresh)
-                fresh_method = getattr(fresh_real, name)
-                return fresh_method(*args, **kwargs)
+                return result
 
         return _retry_wrapper
 
@@ -983,13 +1321,14 @@ class _AsyncLazyLocator:
     the realized child).
     """
 
-    __slots__ = ("_page", "_sentinel", "_rebuild_locator",
+    __slots__ = ("_page", "_sentinel", "_rebuild_locator", "_constant_name",
                  "_resolved", "_resolved_real", "_resolved_resolution")
 
-    def __init__(self, *, page, sentinel, rebuild_locator):
+    def __init__(self, *, page, sentinel, rebuild_locator, constant_name=None):
         object.__setattr__(self, "_page", page)
         object.__setattr__(self, "_sentinel", sentinel)
         object.__setattr__(self, "_rebuild_locator", rebuild_locator)
+        object.__setattr__(self, "_constant_name", constant_name)
         object.__setattr__(self, "_resolved", False)
         object.__setattr__(self, "_resolved_real", None)
         object.__setattr__(self, "_resolved_resolution", None)
@@ -1000,7 +1339,9 @@ class _AsyncLazyLocator:
     async def _ensure_resolved(self):
         if self._resolved:
             return
-        resolution = await _resolve_sentinel_async(self._page, self._sentinel)
+        resolution = await _resolve_sentinel_async(
+            self._page, self._sentinel, constant_name=self._constant_name,
+        )
         if resolution.selector is None:
             _write_hitl_pending(
                 resolution.intent, resolution.constant_name,
@@ -1045,15 +1386,27 @@ class _AsyncLazyLocator:
 # proxy used to call it directly; we keep the global alias for back-compat.
 _original_locator_methods: dict[str, Any] = {}
 
+# Originals for the BrowserType.launch / launch_persistent_context patches
+# that inject proxy={'server': URL} from env vars. Keys: "sync.launch",
+# "sync.launch_persistent_context", and the async equivalents.
+_original_browsertype_methods: dict[str, Any] = {}
+
 
 def _resolve_page_from_receiver(receiver: Any) -> Any:
     """Find the Page object that owns ``receiver`` (which may be a Page,
-    Frame, or Locator). Playwright's accessibility snapshot lives on
-    ``page.accessibility``; sub-objects expose a ``.page`` property /
-    method that walks to the owning Page.
+    Frame, or Locator). Sub-objects expose a ``.page`` property / method
+    that walks to the owning Page; the Page itself does not have ``.page``.
+
+    Probe: ``main_frame`` is Page-only across all Playwright versions
+    (pre- and post- accessibility-API removal). Prior implementations
+    probed ``accessibility``, which was removed in Playwright 1.40 — that
+    check now silently mis-classifies every Page as "not a Page" and falls
+    through to the ``.page`` walk (which returns ``receiver`` anyway, so
+    the bug was harmless, but the probe was wrong).
     """
-    # Page itself — the accessibility attribute is the cheapest probe.
-    if hasattr(receiver, "accessibility"):
+    # Page itself — `main_frame` is a Page-only attribute that survives
+    # across the 1.40 accessibility API removal.
+    if hasattr(receiver, "main_frame"):
         return receiver
     page_attr = getattr(receiver, "page", None)
     if callable(page_attr):
@@ -1169,9 +1522,15 @@ def _wrap_async_locator_method(original: Any, _kind: str):
             return original(self, selector, *args, **kwargs)
         page = _resolve_page_from_receiver(self)
         _inflate_timeouts_for_page(page)
+        # Capture the constant name NOW, while the `.locator()` call-site frame
+        # is still live on the stack. Resolution itself is deferred to the
+        # first awaited action, by which point this frame is gone — see
+        # `_resolve_sentinel_async` for why eager capture is required.
+        constant_name = _walk_stack_for_constant_name()
         return _AsyncLazyLocator(
             page=page, sentinel=selector,
             rebuild_locator=lambda new_sel: original(self, new_sel, *args, **kwargs),
+            constant_name=constant_name,
         )
     wrapper.__name__ = f"_wrapped_async_{_kind}_locator"
     return wrapper
@@ -1242,6 +1601,131 @@ def _wrapped_page_locator(self, selector, *args, **kwargs):
     )
 
 
+def _proxy_url_to_inject() -> str | None:
+    """Return the proxy URL to inject into ``BrowserType.launch`` calls, or
+    None if injection should be skipped on this call.
+
+    Resolution order:
+      1. ``WORCA_T_PROXY`` — worca-specific override, wins over standard vars.
+      2. ``HTTPS_PROXY`` / ``https_proxy`` — standard env-var path. Worca-t
+         propagates these into the subprocess via ``with_proxy_env`` which
+         reads ``HKCU:\\Environment`` on Windows; users on corporate networks
+         (Bosch px, cntlm, etc.) typically have them set there.
+
+    Returns None when ``WORCA_T_DISABLE_PROXY_INJECT=1`` (explicit opt-out)
+    or when none of the above env vars are set.
+
+    The function is called PER LAUNCH so a test can flip the env mid-session
+    (set in conftest.py before the browser fixture, etc.).
+    """
+    if os.environ.get("WORCA_T_DISABLE_PROXY_INJECT") == "1":
+        return None
+    return (
+        os.environ.get("WORCA_T_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+        or None
+    )
+
+
+def _maybe_inject_proxy_kwarg(kwargs: dict) -> dict:
+    """Mutate-and-return ``kwargs`` to add ``proxy={'server': URL}`` when:
+      - the env says we should inject (``_proxy_url_to_inject()`` returns a URL),
+      - AND the caller did NOT pass ``proxy=`` (SUT's explicit choice wins).
+
+    A SUT-passed ``proxy=None`` is treated as "no proxy" — we respect it.
+    """
+    if "proxy" in kwargs:
+        return kwargs
+    url = _proxy_url_to_inject()
+    if not url:
+        return kwargs
+    kwargs["proxy"] = {"server": url}
+    log.info("worca_t.proxy_injected url=%s", url)
+    return kwargs
+
+
+def _wrap_sync_launch(original):
+    """Wrap a sync ``BrowserType.launch`` / ``launch_persistent_context``.
+
+    Bound to the module-level helper so unit tests can construct a stub
+    BrowserType class, call the wrapped method, and assert on the kwargs
+    forwarded to ``original`` without spawning a real browser.
+    """
+
+    def wrapper(self, *args, **kwargs):
+        kwargs = _maybe_inject_proxy_kwarg(kwargs)
+        return original(self, *args, **kwargs)
+
+    wrapper.__wrapped__ = original  # type: ignore[attr-defined]
+    return wrapper
+
+
+def _wrap_async_launch(original):
+    """Async counterpart of :func:`_wrap_sync_launch`."""
+
+    async def wrapper(self, *args, **kwargs):
+        kwargs = _maybe_inject_proxy_kwarg(kwargs)
+        return await original(self, *args, **kwargs)
+
+    wrapper.__wrapped__ = original  # type: ignore[attr-defined]
+    return wrapper
+
+
+def _install_proxy_patch() -> None:
+    """Monkey-patch ``BrowserType.launch`` and ``launch_persistent_context``
+    on both sync and async APIs so that ``proxy={'server': URL}`` is injected
+    from ``HTTPS_PROXY`` / ``WORCA_T_PROXY`` when the SUT didn't pass its own.
+
+    Why this exists: Playwright's Python ``chromium.launch()`` does NOT
+    auto-pickup ``HTTPS_PROXY`` env var (verified empirically), and the
+    typical SUT's browser fixture builds ``launch(**{"args": [...], "headless"
+    : ...})`` without a ``proxy=`` kwarg. On corporate networks where the
+    target hostname is only resolvable via the corp proxy (e.g. ``*.bosch.com``
+    behind px@localhost:3128), tests then fail with ``net::ERR_NAME_NOT_
+    RESOLVED`` even though the user's other tools (Chrome, VS Code) work fine.
+
+    Idempotent. Skipped entirely when ``WORCA_T_DISABLE_PROXY_INJECT=1``.
+    Tolerates either API surface being absent (sync-only or async-only SUT).
+    """
+    if _original_browsertype_methods:
+        return
+    if os.environ.get("WORCA_T_DISABLE_PROXY_INJECT") == "1":
+        log.info("worca_t.proxy_inject_disabled_via_env")
+        return
+    patched_any = False
+    # ---- Sync API ----
+    try:
+        from playwright.sync_api import BrowserType  # type: ignore[import-untyped]
+    except ImportError:
+        pass
+    else:
+        for method_name in ("launch", "launch_persistent_context"):
+            if not hasattr(BrowserType, method_name):
+                continue
+            original = getattr(BrowserType, method_name)
+            _original_browsertype_methods[f"sync.{method_name}"] = original
+            setattr(BrowserType, method_name, _wrap_sync_launch(original))
+            log.info("worca_t.proxy_patched class=sync.BrowserType.%s", method_name)
+            patched_any = True
+    # ---- Async API ----
+    try:
+        from playwright.async_api import BrowserType as AsyncBrowserType  # type: ignore[import-untyped]
+    except ImportError:
+        pass
+    else:
+        for method_name in ("launch", "launch_persistent_context"):
+            if not hasattr(AsyncBrowserType, method_name):
+                continue
+            original = getattr(AsyncBrowserType, method_name)
+            _original_browsertype_methods[f"async.{method_name}"] = original
+            setattr(AsyncBrowserType, method_name, _wrap_async_launch(original))
+            log.info("worca_t.proxy_patched class=async.BrowserType.%s", method_name)
+            patched_any = True
+    if not patched_any:
+        log.info("worca_t.proxy_inject_no_playwright")
+
+
 def _install_monkey_patch() -> None:
     """Install JIT wrappers on Page.locator, Frame.locator, Locator.locator
     for BOTH sync (``playwright.sync_api``) and async (``playwright.async_api``)
@@ -1256,7 +1740,13 @@ def _install_monkey_patch() -> None:
 
     Either API surface can be absent (depending on what the SUT installs)
     — both ``ImportError`` branches are tolerated independently.
+
+    The proxy-injection patch is installed alongside via
+    :func:`_install_proxy_patch`. Locator and launch patches are
+    orthogonal — disabling one (via its dedicated env var) leaves the
+    other intact.
     """
+    _install_proxy_patch()
     global _original_page_locator
     if _original_locator_methods:
         return
@@ -1323,16 +1813,14 @@ _WORCA_PHASE_MARKERS = ("smoke", "regression", "e2e", "exploratory")
 
 
 def pytest_configure(config):  # noqa: D401 - pytest hook signature
-    """Install the runtime when pytest starts up.
+    """Register ``worca_<phase>`` markers at collection time.
 
-    Also registers ``worca_<phase>`` markers so SUTs running with
-    ``--strict-markers`` don't reject the attribution decorators that
-    Step 7 codegen applies to every generated test. Step 8 uses these
-    markers to scope pytest selection to worca-generated tests only
-    (``-m "worca_smoke or worca_regression or ..."``) without dragging
-    in the SUT's native suite.
+    Marker registration is cheap (no Playwright import) and prevents
+    ``--strict-markers`` rejections. The monkey-patch is deferred to
+    ``pytest_runtest_setup`` so that xdist workers don't all import
+    Playwright and patch classes simultaneously during collection —
+    a race that crashes worker processes on resource-constrained systems.
     """
-    _install_monkey_patch()
     for phase in _WORCA_PHASE_MARKERS:
         config.addinivalue_line(
             "markers",
@@ -1340,34 +1828,161 @@ def pytest_configure(config):  # noqa: D401 - pytest hook signature
         )
 
 
-def pytest_sessionfinish(session, exitstatus):  # noqa: D401, ARG001 - pytest hook signature
-    """Restore the originals on sync + async Page/Frame/Locator.locator
-    (best-effort housekeeping)."""
-    global _original_page_locator
-    if not _original_locator_methods:
+def pytest_runtest_setup(item):  # noqa: D401, ARG001 - pytest hook signature
+    """Lazy-install the monkey-patch on first test setup.
+
+    Deferred from ``pytest_configure`` to avoid concurrent Playwright
+    imports across xdist workers during collection. The idempotent guard
+    inside ``_install_monkey_patch()`` makes this safe to call on every
+    test — the first call installs, all subsequent calls are a no-op.
+    """
+    _install_monkey_patch()
+
+
+# ---------------------------------------------------------------------------
+# Storage-state auto-capture (Use case B — same-run reuse for Step 9 heal)
+# ---------------------------------------------------------------------------
+#
+# When ``WORCA_T_WORKSPACE_DIR`` is set by Step 9, this hook captures
+# ``context.storage_state(path=<workspace>/storage-state.json)`` on the
+# first passing test. Step 9 then injects the file into Playwright MCP via
+# ``--storage-state=<path>`` so the heal-agent boots already authenticated
+# (skips the 10-30 s auth-replay cost per heal invocation).
+#
+# Single capture per session — once the file is written, the flag stays
+# True for the rest of the run. SUTs with separate auth + post-auth tests
+# capture from the first test that authenticated successfully (typically
+# the smoke test); subsequent tests don't re-overwrite even if their state
+# is slightly different.
+#
+# Best-effort: missing context fixture (non-Playwright SUT), missing env
+# var (running outside worca-t), or exception during capture all degrade
+# silently to "no capture this session". Step 9 falls through to manual
+# auth-replay in those cases.
+
+_storage_state_captured: bool = False
+
+
+def pytest_runtest_makereport(item, call):  # noqa: D401, ARG001 - pytest hook signature
+    """Stash per-phase reports on the item so :func:`pytest_runtest_teardown`
+    can tell whether the test passed.
+
+    pytest does not expose a built-in "did this test pass" query at
+    teardown time; the canonical pattern is for plugins to stash reports
+    in ``pytest_runtest_makereport``. The SUT's own conftest may also
+    define this hook — pytest invokes ALL registered hookimpls, not just
+    the first, so our stash is additive (it does not conflict).
+    """
+    setattr(item, f"rep_{call.when}", None)
+    # We need the actual report object; pytest supplies it as the hook's
+    # return value when this impl is a hookwrapper. Without hookwrapper
+    # semantics, the simplest path is to recompute pass-state from
+    # ``call.excinfo`` (None means the phase completed without exception).
+    # That's sufficient for our "did the call phase pass" check.
+    if call.when == "call":
+        passed = call.excinfo is None
+        item.rep_call = type("_RepStub", (), {"passed": passed})()
+
+
+def pytest_runtest_teardown(item, nextitem):  # noqa: D401, ARG001 - pytest hook signature
+    """Capture Playwright storage state on the first passing test.
+
+    Conditions for capture:
+      - ``WORCA_T_WORKSPACE_DIR`` env var is set (Step 9 sets it)
+      - this hook hasn't captured yet in the current session
+      - the test we're tearing down PASSED (i.e. authenticated + ran assertions)
+      - the test has a ``context`` fixture in scope (Playwright SUT)
+
+    All failures degrade silently — capture is a best-effort optimization,
+    not a correctness invariant. The heal flow still works without it.
+    """
+    global _storage_state_captured
+    if _storage_state_captured:
         return
-    # Sync API
+    workspace_dir = os.environ.get("WORCA_T_WORKSPACE_DIR")
+    if not workspace_dir:
+        return
+    # Only capture on a passing test. The pytest report status of the
+    # most-recent call phase lives on the item via stash; older pytest
+    # versions used ``item.rep_call`` (set by user conftest). Be defensive
+    # — when status can't be determined, skip rather than capture from a
+    # potentially-broken context.
+    rep_call = getattr(item, "rep_call", None)
+    if rep_call is not None and getattr(rep_call, "passed", False) is False:
+        return
+    # Get the test's context fixture. Different SUTs may rename the
+    # fixture (e.g. "playwright_context", "browser_context"); we try the
+    # standard name first, then fall back to scanning funcargs for an
+    # object with a ``storage_state`` method.
+    funcargs = getattr(item, "funcargs", None) or {}
+    context = funcargs.get("context")
+    if context is None or not hasattr(context, "storage_state"):
+        for value in funcargs.values():
+            if hasattr(value, "storage_state") and callable(value.storage_state):
+                context = value
+                break
+    if context is None or not hasattr(context, "storage_state"):
+        return
     try:
-        from playwright.sync_api import Page, Frame, Locator  # type: ignore[import-untyped]
-        for cls_name, cls in (("Page", Page), ("Frame", Frame), ("Locator", Locator)):
-            original = _original_locator_methods.get(cls_name)
-            if original is not None and hasattr(cls, "locator"):
-                cls.locator = original  # type: ignore[assignment]
-    except ImportError:
-        pass
-    # Async API
-    try:
-        from playwright.async_api import (  # type: ignore[import-untyped]
-            Page as AsyncPage, Frame as AsyncFrame, Locator as AsyncLocator,
+        out_path = Path(workspace_dir) / "storage-state.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        context.storage_state(path=str(out_path))
+        _storage_state_captured = True
+        log.info(
+            "worca_t.storage_state_captured path=%s test=%s",
+            out_path, item.nodeid,
         )
-        for cls_name, cls in (
-            ("AsyncPage", AsyncPage), ("AsyncFrame", AsyncFrame),
-            ("AsyncLocator", AsyncLocator),
-        ):
-            original = _original_locator_methods.get(cls_name)
-            if original is not None and hasattr(cls, "locator"):
-                cls.locator = original  # type: ignore[assignment]
-    except ImportError:
-        pass
-    _original_locator_methods.clear()
-    _original_page_locator = None
+    except Exception as e:  # noqa: BLE001 - capture is best-effort
+        log.warning("worca_t.storage_state_capture_failed %s", e)
+
+
+def pytest_sessionfinish(session, exitstatus):  # noqa: D401, ARG001 - pytest hook signature
+    """Restore the originals on sync + async Page/Frame/Locator.locator AND
+    BrowserType.launch / launch_persistent_context (best-effort housekeeping)."""
+    global _original_page_locator
+    # Locator patches
+    if _original_locator_methods:
+        # Sync API
+        try:
+            from playwright.sync_api import Page, Frame, Locator  # type: ignore[import-untyped]
+            for cls_name, cls in (("Page", Page), ("Frame", Frame), ("Locator", Locator)):
+                original = _original_locator_methods.get(cls_name)
+                if original is not None and hasattr(cls, "locator"):
+                    cls.locator = original  # type: ignore[assignment]
+        except ImportError:
+            pass
+        # Async API
+        try:
+            from playwright.async_api import (  # type: ignore[import-untyped]
+                Page as AsyncPage, Frame as AsyncFrame, Locator as AsyncLocator,
+            )
+            for cls_name, cls in (
+                ("AsyncPage", AsyncPage), ("AsyncFrame", AsyncFrame),
+                ("AsyncLocator", AsyncLocator),
+            ):
+                original = _original_locator_methods.get(cls_name)
+                if original is not None and hasattr(cls, "locator"):
+                    cls.locator = original  # type: ignore[assignment]
+        except ImportError:
+            pass
+        _original_locator_methods.clear()
+        _original_page_locator = None
+    # BrowserType.launch patches (proxy injection)
+    if _original_browsertype_methods:
+        try:
+            from playwright.sync_api import BrowserType  # type: ignore[import-untyped]
+            for method_name in ("launch", "launch_persistent_context"):
+                original = _original_browsertype_methods.get(f"sync.{method_name}")
+                if original is not None and hasattr(BrowserType, method_name):
+                    setattr(BrowserType, method_name, original)
+        except ImportError:
+            pass
+        try:
+            from playwright.async_api import BrowserType as AsyncBrowserType  # type: ignore[import-untyped]
+            for method_name in ("launch", "launch_persistent_context"):
+                original = _original_browsertype_methods.get(f"async.{method_name}")
+                if original is not None and hasattr(AsyncBrowserType, method_name):
+                    setattr(AsyncBrowserType, method_name, original)
+        except ImportError:
+            pass
+        _original_browsertype_methods.clear()

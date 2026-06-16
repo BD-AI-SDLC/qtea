@@ -34,6 +34,8 @@ purpose of inserting this step.
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 from typing import Any
 
 from worca_t._sut_git import commit_step
@@ -48,6 +50,11 @@ log = get_logger(__name__)
 
 _VALID_MARKERS = {"worca_smoke", "worca_regression", "worca_e2e", "worca_exploratory"}
 
+# Default budget (chars) for inlined POM/fixture/helper source. Sonnet 4.7 has a
+# 200K window; we leave headroom for sut_inventory (30-80K typical), strategy,
+# schema, and response. Override with WORCA_T_REUSE_SOURCE_BUDGET.
+_DEFAULT_REUSE_SOURCE_BUDGET = 120_000
+
 
 def _active_module_dict(sut_inventory_dict: dict) -> dict | None:
     """Pull the active module entry out of a raw `sut_inventory` dict."""
@@ -58,6 +65,82 @@ def _active_module_dict(sut_inventory_dict: dict) -> dict | None:
         if isinstance(mod, dict) and mod.get("name") == active:
             return mod
     return None
+
+
+def _inline_reuse_sources(
+    active_module: dict | None,
+    sut_root: Path,
+    budget: int | None = None,
+) -> tuple[dict[str, str], list[str]]:
+    """Read POM/fixture/helper source files for the active module up to budget.
+
+    The test-architect agent has no file tools; it can only justify reuse
+    decisions against material that is inlined into its prompt. Without source
+    visibility it can verify a symbol *exists* (the inventory tells it that)
+    but not whether the symbol's actual behaviour *fits* the test case.
+
+    Enumerates unique ``file`` paths across ``existing_page_objects``,
+    ``existing_fixtures``, ``existing_helpers`` for the active module, resolves
+    each to ``sut_root / module.path / file``, sorts alphabetically by the
+    SUT-relative key for determinism, then reads files in order. Stops as soon
+    as the NEXT file would push total bytes past ``budget``. Files that don't
+    exist, can't be read, or would exceed the budget are appended to the
+    ``skipped`` list (with reason for missing/unreadable; budget-skip files
+    just appear in the list).
+
+    Returns ``(sources, skipped)`` where ``sources`` is a dict keyed by
+    ``"reuse-source/<sut-relative-posix-path>"`` (the prefix prevents collision
+    with the canonical input keys like ``sut_inventory.json``).
+    """
+    sources: dict[str, str] = {}
+    skipped: list[str] = []
+    if not active_module:
+        return sources, skipped
+
+    if budget is None:
+        try:
+            budget = int(os.environ.get("WORCA_T_REUSE_SOURCE_BUDGET", "")
+                         or _DEFAULT_REUSE_SOURCE_BUDGET)
+        except ValueError:
+            budget = _DEFAULT_REUSE_SOURCE_BUDGET
+
+    module_path = active_module.get("path") or "."
+    module_root = sut_root / module_path
+
+    # Collect unique file paths across all three reuse-candidate categories.
+    rel_paths: set[str] = set()
+    for key in ("existing_page_objects", "existing_fixtures", "existing_helpers"):
+        for entry in active_module.get(key) or []:
+            if isinstance(entry, dict):
+                f = entry.get("file")
+                if isinstance(f, str) and f:
+                    rel_paths.add(f.replace("\\", "/"))
+
+    consumed = 0
+    for rel in sorted(rel_paths):
+        abs_path = module_root / rel
+        if not abs_path.is_file():
+            skipped.append(f"{rel} (not found)")
+            continue
+        try:
+            text = abs_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            skipped.append(f"{rel} (read error: {e})")
+            continue
+        size = len(text)
+        if consumed + size > budget:
+            skipped.append(rel)
+            continue
+        # Key by SUT-root-relative path (module_path + rel) for unambiguous
+        # cross-module audit, even though we only inline the active module.
+        sut_rel = (
+            rel if module_path in (".", "")
+            else f"{module_path.rstrip('/')}/{rel}"
+        )
+        sources[f"reuse-source/{sut_rel}"] = text
+        consumed += size
+
+    return sources, skipped
 
 
 def _inventory_symbols(active_module: dict | None) -> dict[str, set[str]]:
@@ -166,6 +249,15 @@ def _validate_plan_against_inventory(
     symbols = _inventory_symbols(active_module)
     approved = _approved_dirs(active_module)
 
+    # Auth-chaining: extract the auth fixture name once for the
+    # depends_on check below.  "tests/conftest.py:chat_page" → "chat_page"
+    _auth_flow = (active_module or {}).get("auth_flow") or {}
+    _auth_ref = _auth_flow.get("fixture_entry") or ""
+    _auth_fixture_name = _auth_ref.rsplit(":", 1)[-1] if ":" in _auth_ref else _auth_ref
+    _PRIMITIVE_YIELDS = frozenset(
+        {"", "dict", "str", "int", "list", "tuple", "bool", "none", "path"}
+    )
+
     for tc in plan.get("test_cases") or []:
         tc_id = tc.get("id") or "<no-id>"
 
@@ -203,6 +295,11 @@ def _validate_plan_against_inventory(
                             f"{tc_id}: fixture `{f.get('name')}` reuse-from "
                             f"`{ref}` not found in sut_inventory"
                         )
+                if not (f.get("reuse_justification") or "").strip():
+                    violations.append(
+                        f"{tc_id}: fixture `{f.get('name')}` source=reuse "
+                        f"missing `reuse_justification` (one-sentence fit rationale)"
+                    )
             elif src == "create":
                 at = f.get("at")
                 if not at:
@@ -210,6 +307,20 @@ def _validate_plan_against_inventory(
                         f"{tc_id}: fixture `{f.get('name')}` source=create "
                         f"missing `at` field"
                     )
+
+            if src == "create" and _auth_fixture_name:
+                yields_type = (f.get("yields") or "").strip()
+                if yields_type and yields_type.lower() not in _PRIMITIVE_YIELDS:
+                    deps = f.get("depends_on") or []
+                    if _auth_fixture_name not in deps:
+                        violations.append(
+                            f"{tc_id}: fixture `{f.get('name')}` source=create "
+                            f"yields `{yields_type}` but does not declare "
+                            f"`depends_on: [\"{_auth_fixture_name}\"]`. "
+                            f"Fixtures yielding authenticated objects must "
+                            f"chain with the auth fixture from "
+                            f"auth_flow.fixture_entry."
+                        )
 
         for po in tc.get("page_objects") or []:
             src = po.get("source")
@@ -224,6 +335,11 @@ def _validate_plan_against_inventory(
                     violations.append(
                         f"{tc_id}: page_object `{po.get('name')}` reuse-from "
                         f"`{ref}` not found in sut_inventory"
+                    )
+                if not (po.get("reuse_justification") or "").strip():
+                    violations.append(
+                        f"{tc_id}: page_object `{po.get('name')}` source=reuse "
+                        f"missing `reuse_justification` (one-sentence fit rationale)"
                     )
             elif src == "create":
                 at = po.get("at")
@@ -244,6 +360,26 @@ def _validate_plan_against_inventory(
                         f"`{mm.get('name')}` has no signature"
                     )
 
+        for h in tc.get("helpers") or []:
+            src = h.get("source")
+            if src == "reuse":
+                if not h.get("from"):
+                    violations.append(
+                        f"{tc_id}: helper `{h.get('name')}` source=reuse "
+                        f"missing `from` field"
+                    )
+                if not (h.get("reuse_justification") or "").strip():
+                    violations.append(
+                        f"{tc_id}: helper `{h.get('name')}` source=reuse "
+                        f"missing `reuse_justification` (one-sentence fit rationale)"
+                    )
+            elif src == "create":
+                if not h.get("at"):
+                    violations.append(
+                        f"{tc_id}: helper `{h.get('name')}` source=create "
+                        f"missing `at` field"
+                    )
+
         for loc in tc.get("locators") or []:
             src = loc.get("source")
             if src == "create_tbd":
@@ -262,12 +398,23 @@ def _validate_plan_against_inventory(
                 ref = loc.get("from") or loc.get("name")
                 if ref and ref not in symbols["locators"]:
                     # Locator reuse can reference either the constant name or
-                    # the owning file; both should be in symbols. Soft-warn if
-                    # missing (the codegen step will fail loudly if the import
-                    # doesn't resolve, so this is an early-warning gate).
+                    # the owning file. A miss here is genuinely soft: Step 6's
+                    # locator enumeration is often incomplete (it can't always
+                    # parse every constant out of a dynamically-built locator
+                    # module), so a "not found" does NOT mean the reference is
+                    # invalid. Codegen (Step 8) fails loudly if the import
+                    # truly doesn't resolve, so we warn rather than abort the
+                    # whole plan on what is frequently a false positive.
+                    log.warning(
+                        "step07.locator_reuse_not_in_inventory",
+                        tc_id=tc_id,
+                        locator=loc.get("name"),
+                        reference=ref,
+                    )
+                if not (loc.get("reuse_justification") or "").strip():
                     violations.append(
-                        f"{tc_id}: locator `{loc.get('name')}` reuse reference "
-                        f"`{ref}` not found in sut_inventory locator constants"
+                        f"{tc_id}: locator `{loc.get('name')}` source=reuse "
+                        f"missing `reuse_justification` (one-sentence fit rationale)"
                     )
 
     return violations
@@ -417,12 +564,58 @@ class TestArchitectStep(Step):
         if research_md.exists():
             inputs["research.md"] = research_md.read_text(encoding="utf-8")
 
+        skill_path = (
+            package_resource_root() / "skills"
+            / "analyze-sut-structure" / "SKILL.md"
+        )
+        if skill_path.is_file():
+            inputs["analyze-sut-structure.md"] = skill_path.read_text(
+                encoding="utf-8"
+            )
+
+        # Inline the source of every existing POM / fixture / helper for the
+        # active module so the architect can verify reuse FIT (not just
+        # existence) when deciding `source: reuse` and writing the required
+        # `reuse_justification`. Budget-capped; skipped files are surfaced in
+        # the prompt so the architect knows what it can't see.
+        reuse_sources, reuse_skipped = _inline_reuse_sources(
+            active_module, sut_root,
+        )
+        inputs.update(reuse_sources)
+        log.info(
+            "step07.reuse_sources_inlined",
+            count=len(reuse_sources),
+            skipped=len(reuse_skipped),
+            total_chars=sum(len(v) for v in reuse_sources.values()),
+        )
+
         agent = package_resource_root() / "agents" / "test-architect.agent.md"
 
         active_name = active_module.get("name") or sut_inventory.get("active_module") or "?"
         language = active_module.get("language") or "unknown"
 
+        skipped_clause = (
+            f"Files skipped (over reuse-source budget): {', '.join(reuse_skipped)}."
+            if reuse_skipped
+            else "All POM/fixture/helper sources for the active module were inlined."
+        )
+
+        # When the previous attempt failed with a category that has a
+        # prompt clarification hint (schema-type-mismatch, schema-missing-
+        # field, json-unparseable — see failure_classifiers.py), prepend
+        # the clarification verbatim so the architect sees the specific
+        # guidance for the second attempt rather than re-running the
+        # identical prompt that just failed.
+        prompt_clarification = ctx.extras.pop("prompt_clarification", None)
+        clarification_block = (
+            f"**Smart-retry guidance from the previous failed attempt:** "
+            f"{prompt_clarification}\n\n"
+            if isinstance(prompt_clarification, str) and prompt_clarification.strip()
+            else ""
+        )
+
         user_prompt = (
+            f"{clarification_block}"
             f"The inputs below are inlined: `sut_inventory.json` "
             f"(top-level `active_module` = `{active_name}`, language "
             f"`{language}`), `test-strategy.md`, and optionally `research.md`. "
@@ -433,7 +626,20 @@ class TestArchitectStep(Step):
             f"outputs and the pipeline renders the human-readable summary "
             f"locally. Do NOT scan the SUT — trust the inventory. Do NOT "
             f"include method bodies or selector strings — only structural "
-            f"decisions (paths, names, signatures, intents)."
+            f"decisions (paths, names, signatures, intents). "
+            f"The input `analyze-sut-structure.md` provides a procedure for "
+            f"interpreting the inventory — follow its POM ownership tree and "
+            f"reuse-first checklist when making placement decisions. "
+            f"\n\nThe inputs keyed under `reuse-source/<path>` contain the "
+            f"FULL source text of every existing POM, fixture, and helper "
+            f"file the inventory lists for the active module. Read these "
+            f"BEFORE writing any `source: reuse` entry — the inventory tells "
+            f"you what exists, but only the source tells you whether the "
+            f"existing symbol's behaviour FITS this test case. Every "
+            f"`source: reuse` entry MUST include a `reuse_justification` "
+            f"field (one sentence, ≤200 chars) that names the concrete "
+            f"matching dimension you observed in the source. If you cannot "
+            f"name one, emit `source: create` instead. {skipped_clause}"
         )
 
         result = await call_reasoning_llm(
@@ -447,17 +653,40 @@ class TestArchitectStep(Step):
         )
 
         if not result.success or not result.final_text:
+            log.error(
+                "step07.agent_produced_no_output",
+                error=result.error,
+            )
             return StepResult(
                 success=False, status="failed", outputs=[],
                 error=result.error or "agent produced no output",
             )
 
         # --- Validate ----------------------------------------------------
+        # Persist the raw agent output BEFORE attempting to parse/validate.
+        # This guarantees a human can always inspect what the architect
+        # actually returned when something downstream rejects it — the
+        # alternative (which we lived with on run 20260614-190647-ab7dac)
+        # is a silent failure with no artifact and no log entry naming the
+        # reason.
+        raw_dump_path = out_dir / "agent-output-raw.txt"
+        try:
+            raw_dump_path.write_text(result.final_text, encoding="utf-8")
+        except OSError as e:
+            log.warning("step07.raw_dump_failed", error=str(e))
+
         try:
             plan: dict[str, Any] = json.loads(result.final_text)
         except json.JSONDecodeError as e:
+            log.error(
+                "step07.plan_unparseable",
+                error=str(e),
+                raw_dump=str(raw_dump_path),
+                text_len=len(result.final_text),
+            )
             return StepResult(
-                success=False, status="failed", outputs=[],
+                success=False, status="failed",
+                outputs=[raw_dump_path] if raw_dump_path.exists() else [],
                 error=f"plan JSON unparseable: {e}",
             )
 
@@ -467,9 +696,27 @@ class TestArchitectStep(Step):
         # into Step 8.
         ok_schema, schema_err = is_valid(plan, "code-modification-plan")
         if not ok_schema:
+            # Also persist the PARSED plan so the human can diff against
+            # the schema rather than re-parse the raw text.
+            rejected_path = out_dir / "plan-rejected.json"
+            try:
+                rejected_path.write_text(
+                    json.dumps(plan, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            except OSError:
+                rejected_path = raw_dump_path
+            log.error(
+                "step07.plan_schema_invalid",
+                error=schema_err,
+                rejected=str(rejected_path),
+                test_case_count=len(plan.get("test_cases") or []),
+            )
+            outs = [p for p in (raw_dump_path, rejected_path) if p.exists()]
             return StepResult(
-                success=False, status="failed", outputs=[],
+                success=False, status="failed", outputs=outs,
                 error=f"plan failed schema validation: {schema_err}",
+                notes=f"see {rejected_path.name}",
             )
 
         gate_violations = _validate_plan_against_inventory(plan, active_module)

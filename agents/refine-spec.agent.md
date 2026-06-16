@@ -134,11 +134,23 @@ The refined spec retains the original structure and appends/replaces sections:
 |----|-----------|----------|------------|------------|
 | EC-1 | ... | high | [AUTOMATABLE] | ... |
 
+(Every row MUST have an `EC-N` id, a severity ∈ `critical|high|medium|low`,
+and an automation tag. The Step 2 coverage audit fails on any row missing
+these fields.)
+
 ## Non-Functional Requirements
-- **Performance:** ...
-- **Security:** ...
-- **Accessibility:** ...
-- **Compatibility:** ...
+- **NFR-PERF-1 [hard threshold]:** Page load p95 ≤ 2.5s on cold cache. → promoted to AC-PERF-1
+- **NFR-SEC-1:** TLS 1.3 only.
+- **NFR-A11Y-1 [hard threshold]:** WCAG AA. → promoted to AC-A11Y-1
+- **NFR-COMPAT-1 [hard threshold]:** Chrome 120+, Firefox 119+.
+
+(Every NFR carries an `NFR-<CATEGORY>-N` id. NFRs with an objective bound —
+latency, throughput, contrast ratio, supported browser list, WCAG level —
+MUST carry the `[hard threshold]` marker AND be promoted to a numbered AC
+under `## Acceptance Criteria` (cite the AC id inline as
+`→ promoted to AC-...`). Soft NFRs (no numeric/objective bound) need an id
+but no promotion. The Step 2 audit fails on any threshold-bearing NFR that
+is not promoted.)
 
 ## Effort Estimation
 - Complexity: <low | medium | high>
@@ -159,10 +171,15 @@ The refined spec retains the original structure and appends/replaces sections:
 
 ## Rules
 
-- Never delete original content — only enrich. **Exception:** during the
-  Pre-clean Pass above, tracker boilerplate (Jira/Confluence metadata,
-  attachment lists, issue links, sub-tasks, comments, Figma-link tables) may
-  and should be stripped so refinement runs on the substantive requirement.
+- Never delete original content — only enrich. **Exceptions:**
+  1. During the Pre-clean Pass above, tracker boilerplate (Jira/Confluence
+     metadata, attachment lists, issue links, sub-tasks, comments,
+     Figma-link tables) may and should be stripped so refinement runs on
+     the substantive requirement.
+  2. SKIPPED and SCOPE-EXCLUDED items from `user-answers.md` (see "Handling
+     user skips, scope-exclusions, and drops" below) MUST be deleted from
+     the document body and recorded in `## Coverage Notes`. The "never
+     delete" rule does not apply to user-directed drops.
 - Never assume, always ask by involving HITL.
 - **Concrete emit-triggers — if ANY of the following is true for the source spec, emit a Blocker (preferred) or `[CLARIFICATION NEEDED]` tag rather than silently choosing a default:**
   - An identifier referenced in an AC is not defined (URL, env var, route, selector, copy string, error code, translation key).
@@ -176,11 +193,44 @@ The refined spec retains the original structure and appends/replaces sections:
 - All acceptance criteria must use Given/When/Then and be tagged with automation feasibility.
 - Each AC must trace back to a user flow.
 - Requirement ID (`REQ-<slug>`) is mandatory — generate one if the source spec lacks it.
+- **Every AC, EC, and NFR must carry an ID.** Format: ACs `AC-N` or `AC-DOMAIN-N`; ECs `EC-N`; NFRs `NFR-CATEGORY-N` (e.g. `NFR-PERF-1`, `NFR-A11Y-2`, `NFR-SEC-1`). The Step 2 coverage audit hard-fails on any AC/EC/NFR row missing its ID — these are the stable handles Step 3 plans against.
+- **Automation tag on every AC and EC.** One of `[AUTOMATABLE]`, `[MANUAL ONLY]`, `[NEEDS INVESTIGATION]`. The audit fails when the tag is missing. `[NEEDS INVESTIGATION]` is a valid terminal state — it signals a clarification gap to track, not silent acceptance.
+- **Promote threshold-bearing NFRs to ACs.** Any NFR with a numeric or objective bound (perf budget, throughput, contrast ratio, browser matrix) MUST carry a `[hard threshold]` marker AND be promoted to a numbered AC. Cite the promoted AC inline as `→ promoted to AC-...`. The audit fails when a threshold-bearing NFR has no `promoted_to_ac` target.
 - Emit `READY` verdict only when all Definition-of-Ready items pass AND the Blockers table is empty AND the Open Questions section is empty AND no `[CLARIFICATION NEEDED]` tags remain. Otherwise emit `NOT READY` with the blocker list.
 - **Single canonical location per item.** Each unresolved item must appear in exactly ONE of: Blockers table, Open Questions bullets, or inline `[CLARIFICATION NEEDED]` tag. Priority order when classifying a new item: (1) if it blocks at least one specific AC or TC → Blockers; (2) if it is a general product/PO question not tied to a specific AC → Open Questions; (3) inline `[CLARIFICATION NEEDED]` only for ambiguity that is purely local to one sentence and not worth a top-level entry. Do NOT restate the same concern across two locations even with different wording. If you find yourself writing the same gap in two places, delete the lower-priority duplicate.
 - No GitHub/Jira API calls — this agent works on local markdown files only.
 - The refined spec has to be unique and not contain any duplicate content.
 - If there are any Blockers, Open Questions, or `[CLARIFICATION NEEDED]` tags, the agent must ask the user to resolve them before finalizing the refined spec.
+
+## Handling user skips, scope-exclusions, and drops
+
+When `user-answers.md` (or the iteration prompt) marks an item as SKIPPED
+or SCOPE-EXCLUDED, do NOT invent assumptions. Instead:
+
+- **SKIPPED items** (the user pressed Enter or typed "skip"): remove the
+  entire AC, edge case, NFR, or sub-item the question was attached to from
+  the refined spec body. Append an entry to a `## Coverage Notes` section
+  at the end of the document:
+  > **AC-7 (aria-label test):** Dropped — user skipped clarification on
+  > the expected aria-label text. Test coverage omitted.
+- **SCOPE-EXCLUDED items** (user's answer named a scope to exclude, e.g.
+  "mobile isn't in scope"): parse the answer for the excluded scope and
+  remove ACs / edge cases / sub-bullets that depend ONLY on the excluded
+  scope. Keep the in-scope portions intact. Append an entry to
+  `## Coverage Notes`:
+  > **Mobile coverage:** Excluded — user said "mobile isn't in scope".
+
+**`## Coverage Notes` placement.** H2 heading, placed AFTER
+`## Definition of Ready Checklist` (the last existing section in the
+template). Do NOT place it inside any other section.
+
+**Preservation across iterations.** Once `## Coverage Notes` exists in a
+prior iteration's output, preserve all of its entries verbatim and only
+append new ones. Never delete or rewrite existing Coverage Notes entries.
+
+**Never use `[ASSUMPTION: ...]` for SKIPPED or SCOPE-EXCLUDED items.** That
+framing is reserved exclusively for legacy pre-rework ledger entries
+flagged with that directive in `prior-decisions.md`.
 
 ## Non-interactive mode
 

@@ -1,6 +1,6 @@
 # worca-t
 
-> **W**ork**O**rchestrated **R**ealtime **C**laude **A**utonomous **T**esting.
+> **W**orkflow**O**rchestrated **R**ealtime **C**laude **A**utonomous **T**esting.
 > Fully autonomous QA SDLC orchestrator. Python + LLM hybrid.
 
 `worca-t` turns a requirement (Jira ticket or local markdown spec) into a tested
@@ -33,13 +33,14 @@ worca-t run --spec ./feature.md --sut ./my-app
 | 4 | Strategy | `test-manager` | `test-strategy.{md,json}` |
 | 5 | Xray | pure code | `xray-mapping.json` |
 | 6 | Research | `polyglot-test-researcher` | `research.{md,json}` |
-| 7 | TDD codegen | `ui-test-automation` | test files + `tbd-index.json` |
-| 8 | Run + heal | pure code + `polyglot-test-fixer` (on failure) | `run-results.json` (+ `locator-cache.json` when JIT) |
-| 9 | Bug class. | `bug-report-classifier` | `bug-reports.{md,json}` |
-| 10 | Report | pure code | `report/index.html` + Allure (when available) |
+| 7 | Test architect | `test-architect` | `code-modification-plan.json` |
+| 8 | TDD codegen | `ui-test-automation` | test files + `tbd-index.json` |
+| 9 | Run + heal | pure code + `polyglot-test-fixer` (on failure) | `run-results.json` (+ `locator-cache.json` when JIT) |
+| 10 | Bug class. | `bug-report-classifier` | `bug-reports.{md,json}` |
+| 11 | Report | pure code | `report/index.html` + Allure (when available) |
 
 See `GETTING_STARTED.md` for the full end-to-end walkthrough, or
-`agents/qa-orchestrator.instructions.md` for the operator reference manual.
+`docs/qa-orchestrator.instructions.md` for the operator reference manual.
 
 ## Reporting
 
@@ -56,10 +57,13 @@ worca-t list                               # show all workspaces (run-ids, statu
 worca-t run --spec ./spec.md --sut ./app   # resumes from last checkpoint
 worca-t run --run-id <id> --spec ...       # resume a specific workspace by run-id
 worca-t run --from-step 6 --spec ...       # skip steps 1-5
-worca-t run --only-step 10 --spec ...      # regenerate report only
+worca-t run --only-step 11 --spec ...      # regenerate report only
 worca-t run --force --spec ...             # ignore all checkpoints
 worca-t run --debug --spec ...             # verbose debug agent from step 1
 worca-t run --fix --spec ...               # RCA + fix proposal on failure
+worca-t auth-capture --sut ./app           # one-shot Playwright storageState capture
+                                           # (for MFA/SSO SUTs — lets Step 9's
+                                           # heal agent skip auth-replay)
 ```
 
 ## Environment resolution

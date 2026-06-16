@@ -1,6 +1,8 @@
 # QA Orchestrator - Step-by-Step Instructions
 
-> HOW to execute what `agents/qa-orchestrator.agent.md` defines.
+> **Documentation only.** This file describes what `src/worca_t/pipeline.py` does — no Python code loads it at runtime. It is the canonical human/AI-facing specification of the orchestration contract; keep it in sync when the contract changes.
+
+> HOW to execute what `docs/qa-orchestrator.agent.md` defines.
 > Read `CLAUDE.md` first -- it is the source of truth for pipeline structure,
 > agent-model map, MCP servers, and non-negotiable rules.
 >
@@ -19,8 +21,9 @@ Two layers cooperate to run the pipeline:
 
 - **`pipeline.py`** — deterministic orchestrator. Drives steps in order, loads/saves
   checkpoints via `checkpoints.py`, validates schemas via `schemas.py`. No reasoning.
-- **`claude_runner.py`** — agent executor. Spawns `claude` CLI subprocesses, streams
-  output, enforces per-step timeouts. Returns artifacts to `pipeline.py` for validation.
+- **Two LLM transports:**
+  - **`claude_runner.py`** (`run_agent`) — agent executor via Claude Agent SDK. Multi-turn with tool access (Read/Write/Grep/Glob). Used by steps 6, 9, and step 8's violation-fix phase. Context grows with each turn.
+  - **`llm/reasoning.py`** (`call_reasoning_llm`) — direct Anthropic SDK. Single API call, inputs inlined into prompt. Used by steps 2-4, 7, 10, and step 8's codegen phases (A/B). Bounded context, no growth.
 - **This agent (QA Orchestrator)** — semantic reasoning only. Decides what inputs to
   pass, interprets failures, and drives the fix-proposal flow on persistent failure.
 
@@ -278,6 +281,9 @@ JIT resolver respectively).
 - Every `missing_methods` entry has a `signature`.
 - Every `create_tbd` locator has an `intent` of ≤120 chars.
 - Marker names match `worca_<phase>` convention exactly.
+- **Auth chaining:** when `auth_flow.fixture_entry` exists, any `source=create`
+  fixture whose `yields` is a non-primitive type must include the auth fixture
+  name in `depends_on`. Prevents generated fixtures from bypassing authentication.
 
 **Human review gate (post-step-7).** After the phase gate passes,
 `pipeline.py` invokes `review_step_7_plan` (`src/worca_t/review_gate.py`):
@@ -295,26 +301,29 @@ JIT resolver respectively).
 
 ---
 
-#### Step 8 -- TDD codegen
+#### Step 8 -- TDD codegen (phased)
 
 | Field | Value |
 |---|---|
-| Agent | `ui-test-automation` |
-| Input | `artifacts/step07/code-modification-plan.json` (authoritative), `artifacts/step06/sut_inventory.json` (style mimicry + dedup), `--sut` path |
+| Sub-agents | `codegen-pom-extender` (Phase A), `codegen-test-writer` (Phase B), `ui-test-automation` (Phase C violation fix only) |
+| Shared rules | `agents/codegen-rules.md` — canonical quality rules (locator priority, no hard waits, TBD conventions, assertion fidelity, naming). Injected as `inputs["codegen-rules.md"]` into Phase A/B reasoning calls; Phase C agent reads it via tools. |
+| Transport | `call_reasoning_llm` (Phases A/B — single API call per invocation, no multi-turn), `run_agent` (Phase C only) |
+| Input | `artifacts/step07/code-modification-plan.json` (authoritative), `artifacts/step04/test-strategy.md` (assertion values), `artifacts/step06/sut_inventory.json` (style mimicry + dedup), `--sut` path |
 | Output | Test source files in `sut/`, `artifacts/step08/tbd-index.json`, `generated-files.json` |
 | Schema | `schemas/tbd-index.schema.json` |
 
-**Procedure.** Transpile the plan into code: for every `reuse` entry → emit
-an import; for every `create` entry → write a new file at the `at:` path;
-for every `missing_methods` entry → extend the existing POM file in place
-with the given signature; for every `create_tbd` locator → emit the
-language-appropriate sentinel (`tbd("<intent>")` for Python/TS/JS,
-`Tbd.of("<intent>")` for Java, `TBD_LOCATOR` + `TBD_INTENT:` comment for
-other stacks). The plan is authoritative — do not re-derive placement.
+**Procedure (phased).** Python decomposes the plan into three phases using
+`call_reasoning_llm` (bounded context, ~5-10K tokens per call):
+**A** — extend POMs (`codegen-pom-extender`, parallel), declare TBD locators
+(pure Python), create fixtures (with auth-chain context injected when
+`depends_on` is set), create helpers (`source=create` helper entries from the
+plan);
+**B** — generate test files (`codegen-test-writer`, one call per `test_file_target`, strategy filtered to relevant TCs);
+**C** — quality gate: index tests, fix violations via `run_agent`/`ui-test-automation` if found, commit.
 
 Step 8 also vendors the per-language JIT runtime into the SUT (Playwright
-stacks only — Python/TS/JS/Java) so that Step 9 can intercept sentinels at
-test runtime.
+stacks only — Python/TS/JS/Java) BEFORE any reasoning call, so that
+generated imports resolve and Step 9 can intercept sentinels at test runtime.
 
 **Phase gate:**
 - `framework` is a recognized enum value.
@@ -477,6 +486,7 @@ These are non-negotiable. Violations trigger step rejection and the retry/fix cy
 | REQ traceability | Steps 2, 11 | Every requirement links to a `REQ-*` ID. Every bug whose `test_id` resolves to a known TC links to that TC's `requirement_id`; orphan failures (test_id not in strategy) may omit it but must include `rationale: "orphan failure"`. |
 | Self-heal scope | Step 9 | Locators ONLY -- never assertions, never business logic |
 | Plan reuse-vs-create | Step 7 | Every `reuse` reference points to an inventory entry; every `create`/`create_tbd` target is in an inventory-approved directory |
+| Auth-chaining | Step 7 | `source=create` fixtures yielding non-primitive types must declare `depends_on` with the auth fixture from `auth_flow.fixture_entry` |
 | Schema-first | Every step | Every JSON artifact validated via `schemas.py` before hand-off |
 | AOM snapshot only | Steps 9, 10 | Generated test code: AOM only — `page.content()` / raw page-source dumps are forbidden. Step 9 runtime: AOM via `browser_snapshot` is the default; raw-DOM via `browser_evaluate(... outerHTML)` is permitted ONLY when the target element is missing from the AOM, non-semantic, or screen-reader-hidden, AND the fallback is annotated per-item with `snapshot_source="raw_dom_fallback"` + a `fallback_reason`. Unjustified raw captures are logged as advisory violations. |
 
@@ -484,20 +494,7 @@ These are non-negotiable. Violations trigger step rejection and the retry/fix cy
 
 ## 7. Observability
 
-Every log entry in `run.log.jsonl` must include:
-
-| Field | Description |
-|---|---|
-| `run_id` | Current run identifier |
-| `step` | Integer 1-11 |
-| `agent` | Agent name from `CLAUDE.md` section 2 |
-| `attempt` | 1 or 2 |
-| `correlation_id` | Unique per dispatch, for tracing |
-| `timestamp` | ISO-8601 |
-| `level` | `info`, `warn`, or `error` |
-| `message` | What happened |
-
-Secrets are always masked before writing to any log or artifact.
+Every `run.log.jsonl` entry: `run_id`, `step` (1-11), `agent`, `attempt` (1-2), `correlation_id`, `timestamp` (ISO-8601), `level`, `message`. Secrets are always masked.
 
 ---
 

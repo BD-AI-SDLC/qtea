@@ -70,6 +70,7 @@ class RunReport:
     bug_reports: dict[str, Any]
     summary: ReportSummary
     steps_summary: list[StepTiming] = field(default_factory=list)
+    bug_classification_fallback: bool = False
 
 
 def _empty_run_results() -> dict[str, Any]:
@@ -178,6 +179,15 @@ def build_report(ws: Workspace) -> RunReport:
     strategy = _load_json(ws.step_dir(4) / "test-strategy.json")
     steps_summary = _steps_summary_from_state(load_state(ws.state_file))
 
+    # Detect step 10 fallback from checkpoint notes
+    state = load_state(ws.state_file)
+    step10_rec = state.steps.get(10) if state else None
+    fallback = bool(
+        step10_rec
+        and step10_rec.notes
+        and "fallback=True" in step10_rec.notes
+    )
+
     return RunReport(
         run_id=ws.run_id,
         generated_at=datetime.now(UTC).isoformat(),
@@ -187,6 +197,7 @@ def build_report(ws: Workspace) -> RunReport:
         bug_reports=bug_reports,
         summary=_compute_summary(run_results, bug_reports, steps_summary),
         steps_summary=steps_summary,
+        bug_classification_fallback=fallback,
     )
 
 

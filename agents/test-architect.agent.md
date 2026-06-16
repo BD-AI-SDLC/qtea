@@ -21,18 +21,41 @@ These arrive **inlined** in the user prompt as fenced markdown sections (no work
   - `existing_locators[]` — class_name, file, constants[] with selectors. Reuse target for locators.
   - `auth_flow` — type, entry_method, credentials_env_vars, fixture_entry. Most tests need this.
 - **`research.md`** (Step 6 narrative, optional) — for human-readable context only. The structured JSON is authoritative.
+- **`reuse-source/<sut-relative-path>`** (zero or more) — the FULL source text of every existing POM, fixture, and helper file the inventory lists for the active module. These are the materials you use to verify reuse FIT (not just existence). The inventory tells you a symbol exists; only the source tells you whether that symbol's actual behaviour matches what your test case needs. The orchestrator caps the total inlined bytes; any files skipped due to budget are listed at the end of the user prompt — treat skipped files as "presumed unfit" and prefer `create` over `reuse` for symbols defined in them.
 
 ## Output
 
 **Respond with the `code-modification-plan` JSON object only — no prose, no markdown fences.** The schema (`schemas/code-modification-plan.schema.json`) is validated locally by the pipeline on every call, and is additionally enforced server-side via structured outputs when the active backend permits it (the standard Anthropic API does; some Vertex-routed proxies disallow the feature via org policy and fall back to prompt-only JSON mode). Either way, schema violations are rejected before reaching Step 8. The pipeline renders the human-readable summary for the post-step-7 review gate locally from your JSON — you do NOT emit a markdown file.
 
+## Scope filter — skip non-automatable test cases
+
+**Before any reasoning, walk the strategy and DROP every test case that cannot be automated as a browser/UI test.** These belong in the strategy as a record for humans to execute, but they must NOT appear in `code-modification-plan.json` — there is no code to write for them, and a placeholder entry would either violate the schema (missing `test_file_target` / `test_functions`) or generate an empty test file that does nothing useful.
+
+A test case is non-automatable when ANY of the following holds:
+
+- Its title or section header contains `(manual)`, `manual`, `manual only`, `[MANUAL]`, or `[MANUAL ONLY]`.
+- Its `Type:` / `Test Type:` field is or contains `Visual`, `Manual`, `Visual (manual)`, `Exploratory (manual)`, or any `(manual)` parenthetical.
+- It carries an explicit `Automation Type: manual` / `Automatable: no` / `Manual: yes` field.
+- The body describes a check that requires human perception with no machine equivalent — e.g. "styling matches the design-system spec" without a measurable assertion, "feels responsive", "looks consistent with brand guidelines", subjective UX judgement, screenshot-against-design comparison without a pixel-diff tooling reference, etc.
+
+**Visual fidelity / design-system styling test cases are presumed manual unless the strategy explicitly names an automated tool to use** (axe-core for contrast, a visual-regression library like Percy/Applitools with a baseline, etc.). When in doubt about a "visual" or "looks correct" check, skip it — the user prefers a clean plan with fewer TCs over a plan that wastes codegen turns on entries no real test framework can verify.
+
+When you skip test cases, append a string to the top-level `notes` ARRAY (the schema defines `notes` as `array of strings` — NOT a bare string). Correct shape: `"notes": ["Skipped non-automatable TCs: TC-X (manual visual), TC-Y (manual exploratory)"]`. The array can hold multiple entries — one per category of skip is fine. **Never emit `notes` as a bare string** — the pipeline rejects the plan and aborts the step. The schema requires at least one automatable test case in the plan — if every TC in the strategy is non-automatable, return your best single-entry plan covering the most-automatable candidate and explain in the `notes` array why everything else was skipped. The pipeline will surface this to the reviewer.
+
 ## Reasoning contract
 
-For each test case in `test-strategy.md`:
+For each AUTOMATABLE test case in `test-strategy.md`:
 
-1. **Determine `test_file_target`.** Use `test_directory_layout.default_target` + convention (`by_type` → e.g. `tests/e2e/worca_test_<slug>.<ext>`; `by_page` → `tests/<page>/worca_test_<slug>.<ext>`; `flat` → `tests/worca_test_<slug>.<ext>`). File name pattern is strict: `worca_test_<feature>.py` for Python (matches pytest's `*_test.py` discovery), `worca_<feature>.spec.ts` for TS/JS, `Worca<Feature>Test.java` for Java.
+1. **Determine `test_file_target`.** Use `test_directory_layout.default_target` + convention (`by_type` → e.g. `tests/e2e/worca_<slug>_test.py`; `by_page` → `tests/<page>/worca_<slug>_test.py`; `flat` → `tests/worca_<slug>_test.py`). File name pattern is strict: `worca_<feature>_test.py` for Python (starts with the `worca_` collision-avoidance prefix and ends with `_test.py` so it matches pytest's default `*_test.py` discovery — note `worca_test_<feature>.py` matches NEITHER `test_*.py` nor `*_test.py` and would be silently uncollected), `worca_<feature>.spec.ts` for TS/JS, `Worca<Feature>Test.java` for Java.
 
-2. **Map preconditions to fixtures.** For each precondition (e.g. "user is authenticated"), look in `existing_fixtures` for a fixture that covers it. If found → emit `{"source": "reuse", "from": "<file>:<fixture_name>"}`. If not → emit `{"source": "create", "at": "<target_file>", "yields": "<type>", "scope": "function|class|session"}`. Default new fixtures to `tests/conftest.py` unless the inventory shows a different fixture file convention.
+2. **Map preconditions to fixtures.** For each precondition (e.g. "user is authenticated"), look in `existing_fixtures` for a fixture that covers it. If found → emit `{"source": "reuse", "from": "<file>:<fixture_name>"}`. If not → apply the **compose-over-create check** below before emitting `source: create`. Default new fixtures to `tests/conftest.py` unless the inventory shows a different fixture file convention.
+
+   **Compose-over-create check** (mandatory before emitting `source: create`):
+   - **Can the precondition be met by calling an existing POM method in the test body?** Check `existing_page_objects[].methods` and `existing_locators[].constants` for a method or locator that already handles this concern (e.g. `LANGUAGE_DROP_DOWN` + `SELECT_EN` locator constants mean the test can switch language via an existing POM method — no fixture needed). If yes, omit the fixture; the precondition is met inline in the test function body.
+   - **Can the precondition be met by a standard Playwright/framework API call in the test body?** Route-blocking (`page.route(...)`), cookie injection, header overrides — these are test-body one-liners, not fixture-worthy. If yes, omit the fixture.
+   - **Only create a fixture when the precondition requires a different browser context or authentication state** (e.g. a mobile viewport needing its own `browser.new_context(viewport=...)`, or a different user role). Even then, the new fixture MUST chain with the auth fixture — see the `depends_on` rule below.
+
+   **`depends_on` rule for auth chaining** (non-negotiable — phase gate enforces). When `auth_flow.fixture_entry` names a fixture (e.g. `"tests/conftest.py:chat_page"`), ANY `source: create` fixture whose `yields` type matches or extends the auth fixture's yield type MUST declare `depends_on: ["<auth_fixture_name>"]`. A fixture that yields an authenticated page object WITHOUT chaining the auth fixture will bypass authentication at runtime. Emit `{"source": "create", "at": "...", "yields": "...", "depends_on": ["<auth_fixture_name>"]}`.
 
 3. **Map steps to POM methods.**
    - **Identify the owning POM by physical page-context, NOT by testid-prefix match.** The owning POM is the one that models the URL/screen on which the element renders — established by what existing locators on that same screen are already grouped under. Example: if a test for a NEW "Gemini Enterprise" link in the side navigation already reuses `OPEN_CLOSE_SIDE_NAVIGATION` (owned by `ChatPage`) or `SETTINGS` (also `ChatPage`), then the new Gemini link is ALSO on `ChatPage` — extend `ChatPage`, do NOT create a `GeminiNavPage`. The absence of a `gemini-*` testid in the inventory means the feature is new (TDD), not that it lives on its own page.
@@ -50,11 +73,12 @@ For each test case in `test-strategy.md`:
 
 1. **Never propose duplicates.** Every `create` decision must be justified by absence in the inventory. If a fixture / POM / helper / locator already exists with the right shape, you MUST emit `reuse` referencing it. The codegen agent enforces byte-match deduplication as a backstop, but planning duplicates wastes its turns.
 2. **Never hallucinate reuse references.** This is the inverse of rule 1 and is the most common cause of phase-gate rejection. A `source: "reuse"` entry's `from:` value MUST be a string that you can find verbatim by searching `sut_inventory.json` — either as a `file` + `name` pair in `existing_fixtures` / `existing_page_objects` / `existing_helpers`, or as a `class_name` / constant in `existing_locators`. If the symbol is plausible-sounding but not actually listed (e.g. a spy/instrumentation fixture the strategy *implies* needs to exist but the SUT does not actually provide), you MUST emit `source: "create"` with an `at:` path under the inventory's `pages_object_dir` / fixtures dir / `tests/conftest.py`. The phase gate hard-aborts on orphan reuse references — no retry, no autofix. When uncertain, prefer `create` over `reuse`.
-3. **Reuse first.** Default to extending existing classes; only propose new files when the inventory shows a missing category (e.g. no POM exists for the feature's UI region). Rule 2 takes precedence: only reuse what you can verify, never what the strategy assumes.
+3. **Reuse first, compose second, create last.** Default to extending existing classes; only propose new files when the inventory shows a missing category (e.g. no POM exists for the feature's UI region). Before creating a fixture, verify the precondition cannot be met by an existing POM method or framework API call in the test body (see the compose-over-create check in step 2). Rule 2 takes precedence: only reuse what you can verify, never what the strategy assumes.
 4. **Plan is structural, not behavioral.** You specify file paths, class/method names, signatures, fixture wiring — NOT method bodies, NOT assertion text, NOT selector strings. Method bodies + selectors are the codegen agent's + the JIT resolver's jobs.
 5. **Marker names are strict.** Only `worca_smoke|worca_regression|worca_e2e|worca_exploratory`. The executor's `-m` filter only matches these.
 6. **Plan version is `"1.0"`.** Set `plan_version: "1.0"` exactly. The codegen step rejects other values.
 7. **Schema-first.** Your output is validated against `schemas/code-modification-plan.schema.json` before handoff. Any schema violation is a hard rejection.
+8. **Justify every reuse against the source you read.** Every `source: "reuse"` entry MUST include a `reuse_justification` field — one sentence (≤200 chars) that names the concrete matching dimension you observed when reading the inlined `reuse-source/*` file. Reference the matching dimension explicitly: yielded type and pre-state for fixtures (e.g. `"yields Page already authenticated as admin and dismisses welcome modal"`), owning-page coherence for POMs (e.g. `"ChatPage already models the /chat route and its side-nav region this TC exercises"`), selector-intent overlap for locators (e.g. `"existing SIGN_IN_BUTTON constant targets the same primary CTA on the login form"`). Empty / generic / shape-less justifications ("matches", "fits", "reuse from inventory") are rejected by the phase gate. If after reading the source you cannot name a concrete matching dimension, emit `source: "create"` (or `create_tbd` for locators) instead.
 
 ## Workflow
 
@@ -78,10 +102,10 @@ Every entry below MUST have its required fields present, with the right discrimi
 | top-level plan | `plan_version`, `active_module`, `test_cases` | — | — |
 | `test_case` | `id` (TC-…), `test_file_target`, `test_functions` | — | — |
 | `test_function` | `name` | — | — |
-| `fixture_entry` | `name`, `source` | `from` | `at` |
-| `page_object_entry` | `name`, `source` | `from` | `at`; each `missing_methods[]` needs `name` + `signature` |
-| `helper_entry` | `name`, `source` | `from` | `at` |
-| `locator_entry` | `name`, **`owning_page`**, `source` | `from` | `intent` (≤120 chars) |
+| `fixture_entry` | `name`, `source` | `from`, **`reuse_justification`** | `at` |
+| `page_object_entry` | `name`, `source` | `from`, **`reuse_justification`** | `at`; each `missing_methods[]` needs `name` + `signature` |
+| `helper_entry` | `name`, `source` | `from`, **`reuse_justification`** | `at` |
+| `locator_entry` | `name`, **`owning_page`**, `source` | `from`, **`reuse_justification`** | `intent` (≤120 chars) |
 
 ## Minimal valid plan (shape reference — copy field names exactly)
 
@@ -91,11 +115,12 @@ Every entry below MUST have its required fields present, with the right discrimi
   "active_module": "frontend",
   "language": "python",
   "framework": "pytest",
+  "notes": ["12 of 13 strategy TCs planned; TC-GEMNAV-013 skipped (manual visual — no automated tool referenced)"],
   "test_cases": [
     {
       "id": "TC-LOGIN-1",
       "title": "User can log in with valid credentials",
-      "test_file_target": "tests/e2e/worca_test_login.py",
+      "test_file_target": "tests/e2e/worca_login_test.py",
       "test_functions": [
         {
           "name": "test_login_with_valid_credentials",
@@ -104,14 +129,17 @@ Every entry below MUST have its required fields present, with the right discrimi
         }
       ],
       "fixtures": [
-        {"name": "authenticated_session", "source": "reuse", "from": "tests/conftest.py:authenticated_session"}
+        {"name": "authenticated_session", "source": "reuse", "from": "tests/conftest.py:authenticated_session",
+         "reuse_justification": "yields an authenticated Page on the /dashboard route — exactly the pre-state this TC needs before login-success assertion"}
       ],
       "page_objects": [
         {"name": "LoginPage", "source": "reuse", "from": "src/pages/login.py",
+         "reuse_justification": "models /login route; already exposes fill_email + fill_password; only submit() is missing",
          "missing_methods": [{"name": "submit", "signature": "submit(self) -> None"}]}
       ],
       "locators": [
-        {"name": "EMAIL_INPUT", "owning_page": "LoginPage", "source": "reuse", "from": "src/pages/locators/login.py"},
+        {"name": "EMAIL_INPUT", "owning_page": "LoginPage", "source": "reuse", "from": "src/pages/locators/login.py",
+         "reuse_justification": "existing constant targets the same email field this TC fills"},
         {"name": "SIGN_IN_BUTTON", "owning_page": "LoginPage", "source": "create_tbd", "intent": "sign in button"}
       ]
     }
@@ -124,6 +152,7 @@ Every entry below MUST have its required fields present, with the right discrimi
 The step's phase gate validates:
 
 - Every `reuse` reference's `from` field points to a file:symbol that exists in `sut_inventory.json`.
+- Every `source: reuse` entry has a non-empty `reuse_justification` (≤200 chars) that names a concrete matching dimension. Generic justifications like "matches" or "from inventory" still pass the schema but should be avoided — they signal you didn't actually read the source.
 - Every `create` / `create_tbd` `at` target lands in an inventory-approved directory (matches `test_directory_layout` / `src_directory_layout`).
 - Every `missing_methods` entry has a signature (no shape-less stubs).
 - Every `create_tbd` locator has an `intent` string of ≤120 chars.

@@ -17,7 +17,24 @@
     },
     "acceptance_criteria": {
       "type": "array",
+      "minItems": 1,
       "items": { "type": "string", "minLength": 1 }
+    },
+    "acceptance_criteria_structured": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/acceptanceCriterion" }
+    },
+    "edge_cases_structured": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/edgeCase" }
+    },
+    "nfrs_structured": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/nfr" }
+    },
+    "coverage_notes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/coverageNote" }
     },
     "user_flows": { "type": ["object", "null"] },
     "test_boundaries": { "type": ["object", "null"] },
@@ -46,6 +63,57 @@
           }
         },
         "children": { "type": "array", "items": { "$ref": "#/$defs/section" } }
+      }
+    },
+    "acceptanceCriterion": {
+      "type": "object",
+      "required": ["id", "text"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "pattern": "^AC-[A-Za-z0-9][A-Za-z0-9\\-_]*$" },
+        "text": { "type": "string", "minLength": 1 },
+        "given": { "type": ["string", "null"] },
+        "when": { "type": ["string", "null"] },
+        "then": { "type": ["string", "null"] },
+        "priority": { "type": "string", "enum": ["P0", "P1", "P2", "P3", "UNKNOWN"] },
+        "automation": { "type": "string", "enum": ["AUTOMATABLE", "MANUAL_ONLY", "NEEDS_INVESTIGATION", "UNKNOWN"] },
+        "user_flow": { "type": ["string", "null"] },
+        "requires_tc": { "type": "boolean" },
+        "promoted_from_nfr": { "type": "boolean" }
+      }
+    },
+    "edgeCase": {
+      "type": "object",
+      "required": ["id", "text", "severity"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "pattern": "^EC-[A-Za-z0-9][A-Za-z0-9\\-_]*$" },
+        "text": { "type": "string", "minLength": 1 },
+        "severity": { "type": "string", "enum": ["critical", "high", "medium", "low", "UNKNOWN"] },
+        "automation": { "type": "string", "enum": ["AUTOMATABLE", "MANUAL_ONLY", "NEEDS_INVESTIGATION", "UNKNOWN"] },
+        "mitigation": { "type": ["string", "null"] }
+      }
+    },
+    "nfr": {
+      "type": "object",
+      "required": ["id", "text", "category"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "pattern": "^NFR-[A-Za-z0-9][A-Za-z0-9\\-_]*$" },
+        "text": { "type": "string", "minLength": 1 },
+        "category": { "type": "string", "enum": ["performance", "security", "accessibility", "compatibility", "other"] },
+        "has_threshold": { "type": "boolean" },
+        "promoted_to_ac": { "type": ["string", "null"] }
+      }
+    },
+    "coverageNote": {
+      "type": "object",
+      "required": ["item_id", "reason", "resolution"],
+      "additionalProperties": true,
+      "properties": {
+        "item_id": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string" },
+        "resolution": { "type": "string", "enum": ["dropped", "scope_excluded", "accepted_risk", "legacy_assumption"] }
       }
     }
   }

@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worca-t/schemas/traceability-matrix.schema.json",
+  "title": "TraceabilityMatrix",
+  "type": "object",
+  "required": ["requirement_id", "entries", "summary"],
+  "additionalProperties": true,
+  "properties": {
+    "requirement_id": { "type": "string", "pattern": "^REQ-[A-Za-z0-9][A-Za-z0-9\\-_]*$" },
+    "generated_at": { "type": "string" },
+    "run_id": { "type": "string" },
+    "entries": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/entry" }
+    },
+    "summary": {
+      "type": "object",
+      "required": ["plan_tc_count", "strategy_tc_count", "consolidated_count", "orphan_plan_tcs", "orphan_acs", "accepted_risk_drops"],
+      "additionalProperties": true,
+      "properties": {
+        "plan_tc_count": { "type": "integer", "minimum": 0 },
+        "strategy_tc_count": { "type": "integer", "minimum": 0 },
+        "consolidated_count": { "type": "integer", "minimum": 0 },
+        "orphan_plan_tcs": { "type": "array", "items": { "type": "string" } },
+        "orphan_acs": { "type": "array", "items": { "type": "string" } },
+        "accepted_risk_drops": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  },
+  "$defs": {
+    "entry": {
+      "type": "object",
+      "required": ["plan_tc_id", "strategy_tc_id", "ac_ids", "ec_ids", "resolution"],
+      "additionalProperties": true,
+      "properties": {
+        "plan_tc_id": { "type": "string", "pattern": "^TC-[A-Za-z0-9][A-Za-z0-9\\-_]*$" },
+        "strategy_tc_id": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "string", "pattern": "^TC-[A-Za-z0-9][A-Za-z0-9\\-_]*$" }
+          ]
+        },
+        "ac_ids": { "type": "array", "items": { "type": "string" } },
+        "ec_ids": { "type": "array", "items": { "type": "string" } },
+        "nfr_ids": { "type": "array", "items": { "type": "string" } },
+        "priority": { "type": "string", "enum": ["P0", "P1", "P2", "P3", "UNKNOWN"] },
+        "automation_type": { "type": ["string", "null"] },
+        "resolution": { "type": "string", "enum": ["mapped", "split", "merged", "dropped_accepted_risk", "dropped"] }
+      }
+    }
+  }
+}

@@ -12,7 +12,7 @@ Use the value of `language` from `./sut_inventory.json` at `modules[active_modul
 
 | `language` value | Test file naming | Common framework |
 |---|---|---|
-| `python` | `test_*.py` (worca prefix: `worca_test_*.py`) | pytest + pytest-playwright OR selenium |
+| `python` | `test_*.py` (worca prefix: `worca_*_test.py`) | pytest + pytest-playwright OR selenium |
 | `typescript` | `*.spec.ts` (worca: `worca_*.spec.ts`) | Playwright OR Cypress OR WebdriverIO |
 | `javascript` | `*.spec.js` (worca: `worca_*.spec.js`) | same as TS |
 | `java` | `*Test.java` (worca: `Worca*Test.java`) | TestNG / JUnit + Selenium OR Playwright-Java |
@@ -105,7 +105,7 @@ Use the catalog in `agents/polyglot-test-researcher.prompt.md` §2 as the canoni
 
 ## §4 — Locator Strategy (Strict Priority)
 
-Authoritative order — must match `ui-test-automation.agent.md` rule 1, `qa-orchestrator.instructions.md` §6, and `CLAUDE.md`. Keep these in sync; any change here must be mirrored in all three.
+Authoritative order — must match `ui-test-automation.agent.md` rule 1, `docs/qa-orchestrator.instructions.md` §6, and `CLAUDE.md`. Keep these in sync; any change here must be mirrored in all three.
 
 When defining elements, use the **first available** option from this list:
 
@@ -264,7 +264,7 @@ export default defineConfig({
 All scenarios assume the normal worca-t pipeline path: `./sut_inventory.json` is staged in your workdir by Step 7's orchestration code, and `modules[active_module]` holds the active module record.
 
 **Scenario A (Python + Playwright):** `sut_inventory.json["modules"][active]` shows `language: "python"`, `package_manager: "poetry"`, and lists existing page objects under `pages/object/`.
-→ Generate `worca_test_<feature>.py` placed in `sut_inventory.modules[active].test_directory_layout.default_target` (e.g., `tests/regression/`). Import existing `SignInPage` / `<Feature>Page` from the SUT instead of redefining them. Use `pytest-playwright` synchronous fixtures. **Before creating a new `*Page` / `*Locators` class, run the §2 Owning-Page check** — if the SUT's existing locator constants share a `data-testid` prefix family with the selectors you'd write, extend the owning page object instead of forking.
+→ Generate `worca_<feature>_test.py` placed in `sut_inventory.modules[active].test_directory_layout.default_target` (e.g., `tests/regression/`). Import existing `SignInPage` / `<Feature>Page` from the SUT instead of redefining them. Use `pytest-playwright` synchronous fixtures. **Before creating a new `*Page` / `*Locators` class, run the §2 Owning-Page check** — if the SUT's existing locator constants share a `data-testid` prefix family with the selectors you'd write, extend the owning page object instead of forking.
 
 **Scenario B (Java + Selenium):** `sut_inventory.json["modules"][active]` shows `language: "java"`, `package_manager: "maven"`.
 → Generate `Worca<Feature>Test.java` under `src/test/java/`. Use TestNG `@Test` annotations and `@FindBy` page-object pattern. Reuse any existing `*Page.java` from `sut_inventory.existing_page_objects`.

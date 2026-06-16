@@ -8,17 +8,24 @@ polyglot-test-planner: claude-sonnet-4-6
 test-manager: claude-sonnet-4-6
 
 # -- Phase B: Research & Implementation --
-polyglot-test-researcher: claude-haiku-4-5@20251001
-test-architect: claude-sonnet-4-6
-ui-test-automation: claude-sonnet-4-6
+polyglot-test-researcher: claude-sonnet-4-6
+test-architect: claude-opus-4-6
+ui-test-automation: claude-opus-4-6
+codegen-pom-extender: claude-opus-4-6
+codegen-test-writer: claude-opus-4-6
 
 # -- Phase C: Execution & Reporting --
-polyglot-test-fixer: claude-sonnet-4-6
+polyglot-test-fixer: claude-opus-4-6
 bug-report-classifier: claude-sonnet-4-6
+
+# -- HITL --
+plan-editor: claude-sonnet-4-6
+tbd-intent-editor: claude-sonnet-4-6
+
+# -- Step 8 Phase D (TBD intent quality gate) --
+tbd-intent-scorer: claude-haiku-4-5@20251001
 
 # -- Infrastructure / Support --
 debug: claude-sonnet-4-6
-qa-sdlc-orchestrator: claude-opus-4-6
 critical-thinking: claude-opus-4-6
 principal-software-engineer: claude-opus-4-6
-plan: claude-sonnet-4-6

@@ -32,11 +32,20 @@ TC templates, severity decision trees, design principles, and configuration defa
 - User workflows or acceptance criteria are unclear
 
 **CAN PROCEED when:**
-- Standard patterns apply (e.g., login flow)
-- Industry best practices fill minor gaps
-- You clearly state assumptions in output
+- The fact is unambiguously stated in the input spec or plan.
+- Standard, well-defined patterns apply with NO open variables (e.g. a login flow whose endpoint, credentials format, and error states are all spelled out in the input).
 
-**Non-interactive mode (`--no-hitl` / `--yes` / non-TTY).** In headless runs you cannot ask the operator. For each ALWAYS-ASK trigger that fires, record the question as an `[ASSUMPTION]` line in the test strategy's Assumptions section and proceed with the most conservative interpretation the matrix implies (treat security as high-risk, criticality as high, contradictions resolved in favor of the stricter requirement). Do not block.
+**Never write tests based on assumptions.** If the input is missing a fact a TC depends on, you have two choices: (1) involve the user via the HITL flow (steps 2/3 already collect clarifications, and any unresolved item shows up in `## Coverage Notes`), or (2) drop the TC and record the drop in `## Coverage Notes`. Do NOT proceed with a guess — a test that asserts an invented value either passes meaninglessly or fails mysteriously. We test facts, not guesses.
+
+**Non-interactive mode (`--no-hitl` / `--yes` / non-TTY).** In headless runs you cannot ask the operator. For each ALWAYS-ASK trigger that fires AND for any input gap that would otherwise be filled by a guess, DROP the affected TC and record it in `## Coverage Notes` with the reason (`TC-X: dropped — non-interactive mode, missing <fact>`). Do not emit `[ASSUMPTION]` lines. Do not block.
+
+### Respect upstream drops
+
+The input `plan.md` (and optionally `refined-spec.md`) may have a `## Coverage Notes` section listing AC/TC IDs that the user explicitly dropped or excluded earlier in the run (steps 2/3 HITL). Treat that section as authoritative:
+
+- Do NOT generate test cases for any TC ID listed as dropped.
+- Do NOT re-derive the dropped behavior under a different TC ID — that defeats the user's explicit opt-out.
+- Propagate the `## Coverage Notes` section into `test-strategy.md` (H2 at root, AFTER the `## Test Cases` section) so the human reviewer sees what was excluded and why. Append any new drops you make in this step. Preserve entries verbatim if a prior iteration already wrote them.
 
 ### Prioritization
 
@@ -66,7 +75,7 @@ Classify input using the detection table in `test-manager.prompt.md` §1. If unc
 1. Define scope (in scope / out of scope) — keep it brief (5-10 lines)
 2. Generate test cases with the TC template structure from `test-manager.prompt.md` §2.
 3. Edge cases are test cases — give each an ID and priority, don't list them in a separate summary section. Use `templates/edge-case-checklist.md` to inform TC design.
-4. Add an Assumptions section only if something non-obvious would affect test design or codegen.
+4. If any TC required a fact you don't have, DROP it and record the drop in `## Coverage Notes`. Do NOT add an Assumptions section — assumptions cause hallucinations, and we test facts only.
 
 **Output**: `test-strategy.md`
 
@@ -102,26 +111,52 @@ Use these patterns to ensure consistent format and thoroughness.
 - Location: Same directory as input or specified output path
 - Naming: `test-strategy.md`
 
-**Structure**: Follow `templates/test-strategy-template.md` — Scope, Test Cases, optional Assumptions. No additional sections.
+**Structure**: Follow `templates/test-strategy-template.md` — Scope, Test Cases, and (when items were dropped/excluded) Coverage Notes. **Never include an Assumptions section** — drop instead of assume.
 
 ---
 
 ## Output
 
-Write `test-strategy.md` to the output directory with three sections:
+Write `test-strategy.md` to the output directory with these sections:
 
 1. **Scope** — what is in/out of scope (5-10 lines max).
 2. **Test Cases** — every test case has an id `TC-<slug>` and a priority (`P0`-`P3`). Edge cases are test cases with appropriate priority, not a separate summary list. See `templates/test-strategy-template.md` for structure.
-3. **Assumptions** — only if something non-obvious would affect test design or codegen. Omit if none.
+3. **Coverage Notes** — required when any TC was dropped (by upstream HITL or by you for missing facts in non-interactive mode). Lists each dropped TC ID and the reason. Omit ONLY if no drops have ever been recorded for this run.
+
+**Never** include an `## Assumptions` section — assumptions cause hallucinations. If a TC depended on a fact you don't have, drop it and record the drop here. We work with facts; missing facts mean missing tests, not invented tests. The Step 4 audit hard-fails on any `## Assumptions` heading in the strategy markdown.
+
+**Preconditions and steps are specification-level, not implementation-level.** Describe the required state ("Signed-in user with EN locale active", "GA analytics endpoint unreachable"), NOT the mechanism ("Load the EN-locale fixture", "Use `page.route(...)` to block GA"). The test-architect (Step 7) decides the mechanism based on the SUT's actual infrastructure. Naming a fixture, API call, or framework method in the strategy biases the architect toward creating new infrastructure when the SUT already has the capability.
+
+**Required per-TC fields (machine-extracted by Step 4 parser).** In addition to `Type / Priority / Preconditions / Steps / Expected`, every `#### TC-<slug>:` body MUST include:
+
+- `**Req ID:** REQ-<slug>` — the refined-spec requirement id this TC traces back to.
+- `**ACs:** AC-1, AC-2` (or `**ACs:** -` when none) — the AC ids this TC covers.
+- `**ECs:** EC-3` (optional, omit when none) — the EC ids this TC covers.
+- `**Derived from:** TC-PLAN-001` — the plan TC ids this strategy TC is derived from (comma-separated when consolidating ≥ 2 plan TCs into one strategy TC; defaults to the strategy TC's own id when omitted, but ALWAYS list it explicitly so the matrix is unambiguous).
+- `**Automation Type:** ui|api|integration|unit|performance|accessibility|contract|visual|manual` — used by the Step 4 audit to validate consolidation legitimacy.
+
+**Consolidation rules.** A single strategy TC may be `Derived from` two or more plan TCs ONLY when those plan TCs share BOTH the same priority AND the same automation type. Mixed priorities → split into two strategy TCs (you cannot demote a P0 into a P2 bundle). Mixed automation types → split (a `ui` test and an `api` test cannot share one strategy TC body). The Step 4 audit hard-fails on cross-priority or cross-type consolidation.
+
+**Traceability matrix.** The Python pipeline emits `traceability-matrix.json` automatically after your strategy is parsed (you do NOT write it). The matrix is built from the `Derived from`, `ACs`, and `ECs` fields above and is consumed by Step 10 (bug classification) to attach AC-level context to each bug. Ensure those fields are present and correct.
+
+**Heading hierarchy (parser requirement).** The Step 4 parser walks markdown headings and decides what is a test case vs a section organiser. Follow this exact convention so it doesn't misclassify a header:
+
+- `# Test Strategy` (H1, document title — one per file).
+- `## Scope`, `## Test Cases`, `## Coverage Notes` (H2, organisational headers — NEVER treated as test cases as long as the literal title matches).
+- `#### TC-<slug>: <Title>` (H4, one per test case). The `TC-<slug>:` prefix is mandatory; without it the parser falls back to a permissive name match. The body MUST contain at least one of `**Type:**`, `**Priority:**`, `**Steps:**`, or `**Expected:**` for the parser to accept a generic-titled heading. Section headers (Scope, Test Cases, Coverage Notes) are organisational only — never give them TC-style bodies.
 
 Make sure the test strategy is unique, doesn't contain duplicates, and not even similar test cases.
 If the test case is simple, keep it simple and short. Don't overcomplicate it by adding unnecessary details. If the test case is complex, break it down into smaller, more manageable test cases to ensure clarity and maintainability.
 
 **TC count budget — be ruthless.** Step 3's planner roster is your input ceiling, not a floor. For a single-feature spec (one user-facing element / flow / endpoint) the final strategy should land at **5–8 TCs**. Hard ceiling: **≤ 1.5 × the number of automatable ACs in the refined spec** (rounded up). If the planner's roster exceeds this, drop the lowest-signal entries — don't propagate the bloat to Step 7 codegen (which pays the most expensive Opus tokens).
 
-**One TC per behavior, not per variation — use `parametrize`.** Variations of the same behavior across viewport sizes, locales, browser/device tiers, breakpoint thresholds, or themes are ONE TC with a `parametrized_over` field naming the axis. Step 7 codegen will emit a single `@pytest.mark.parametrize` test function. Examples that MUST be collapsed: per-viewport visibility (e.g. desktop/mobile/320px) → one TC parametrized over viewport; per-locale label text (EN/DE/FR) → one TC parametrized over locale; per-locale tooltip text → one TC parametrized over locale; per-locale aria-label → one TC parametrized over locale. Never emit "X-EN" + "X-DE" as separate TCs.
+**One TC per behavior, not per variation — use `parametrize` (EXCEPT for localization).** Variations of the same behavior across viewport sizes, browser/device tiers, breakpoint thresholds, or themes are ONE TC with a `parametrized_over` field naming the axis. Step 7 codegen will emit a single `@pytest.mark.parametrize` test function.
 
-**Collapse near-duplicates aggressively.** "X exists" and "X renders correctly" are the same TC. "DE translation key exists" and "DE label renders 'foo'" are the same TC — if the label renders, the key necessarily exists. When in doubt, keep the higher-signal end-to-end variant and drop the lower-signal isolated check.
+**Localization is the exception.** Emit ONE TC per supported language, with TC IDs suffixed by locale code (e.g. `TC-NAV-009-EN`, `TC-NAV-009-DE`). Each TC is fully standalone with its own steps and expected results substituted for the locale. Reason: localization bugs are per-key per-locale (a translation missing for one locale while present for others) — separate TCs make failures attributable per language and let triage / reports filter per locale.
+
+Examples that MUST stay collapsed: per-viewport visibility (e.g. desktop/mobile/320px) → one TC parametrized over viewport; per-theme contrast → one TC parametrized over theme. Examples that MUST split per locale: per-locale label text → one TC per locale (e.g. `TC-NAV-LABEL-EN`, `TC-NAV-LABEL-DE`); per-locale tooltip text → one TC per locale; per-locale aria-label → one TC per locale.
+
+**Collapse near-duplicates aggressively (within a locale).** "X exists" and "X renders correctly" are the same TC. Within a single locale, "DE label renders 'foo'" and "DE label renders correctly" are the same TC — if the label renders correctly, the key necessarily exists. When in doubt, keep the higher-signal end-to-end variant and drop the lower-signal isolated check. **Cross-locale duplicates are intentional under Rule 11** — do NOT collapse `TC-NAV-009-EN` + `TC-NAV-009-DE` into a single parametrized TC.
 
 ---
 
@@ -130,10 +165,9 @@ If the test case is simple, keep it simple and short. Don't overcomplicate it by
 | Error Scenario | Handling |
 |----------------|----------|
 | Template not found | Use inline template structure |
-| Input unclear | Generate test strategy with assumptions documented |
-| Missing context | Add "Assumptions" section in output |
+| Input unclear / missing context | Drop the affected TCs and record each in `## Coverage Notes` with the reason. Do NOT invent assumptions. |
 | Edge case checklist unavailable | Manually apply common edge cases |
-| Template fields incomplete | Mark as "[TBD]" and note in summary |
+| Template fields incomplete | Drop the TC and record in `## Coverage Notes` — never substitute "[TBD]" in the test body. |
 | Can't determine input type | Default to Feature Spec |
 
 ---

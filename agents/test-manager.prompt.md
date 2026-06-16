@@ -24,7 +24,7 @@ If input doesn't match cleanly, default to Feature Spec but note uncertainty.
 TC-XXX: [Title]
 - Type: [UI/API/Integration/Performance/Security]
 - Priority: [P0/P1/P2/P3]
-- Preconditions: [Required setup]
+- Preconditions: [Required state — describe WHAT, not HOW]
 - Steps: [Numbered list]
 - Expected Result: [Outcome]
 ```

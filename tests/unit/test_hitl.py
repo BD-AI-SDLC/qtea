@@ -5,6 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from worca_t.hitl import (
+    RESOLUTION_ANSWERED,
+    RESOLUTION_SCOPE_EXCLUSION,
+    RESOLUTION_SKIPPED_DROP,
+    RESOLUTION_SKIPPED_LEGACY,
     HitlDecision,
     Question,
     append_ledger,
@@ -15,6 +19,7 @@ from worca_t.hitl import (
     has_not_ready_verdict,
     ledger_path,
     load_ledger,
+    looks_like_negative_drop_intent,
     looks_like_skip_intent,
     question_key,
     render_prior_decisions_md,
@@ -131,7 +136,7 @@ def test_format_answers_md_includes_each_qa_pair():
 def test_format_answers_md_handles_skipped_answers():
     qs = [Question(id="CLAR-01", kind="clarification", prompt_text="q?")]
     md = format_answers_md(qs, {})
-    assert "No items were answered or skipped" in md
+    assert "No items were answered, skipped, or excluded" in md
 
 
 def test_write_answers_file_writes_to_workdir(tmp_path: Path):
@@ -155,7 +160,11 @@ def test_question_key_same_across_kinds():
     assert question_key(a) == question_key(b)
 
 
-def test_format_answers_md_renders_skipped_section_with_assumption_directive():
+def test_format_answers_md_renders_skipped_section_with_drop_directive():
+    """Skipped items must instruct the agent to DROP the AC/TC and record
+    in Coverage Notes. The directive prose may NEGATIVELY reference
+    `[ASSUMPTION]` ("Do NOT write..."), but the active instruction must
+    be DROP, not the old "make a reasonable assumption" framing."""
     qs = [
         Question(id="CLAR-01", kind="clarification", prompt_text="ans me"),
         Question(id="CLAR-02", kind="clarification", prompt_text="skip me"),
@@ -163,19 +172,62 @@ def test_format_answers_md_renders_skipped_section_with_assumption_directive():
     answers = {"CLAR-01": "yes"}
     skipped = [qs[1]]
     md = format_answers_md(qs, answers, skipped=skipped)
+    lowered = md.lower()
     assert "## Answered" in md
-    assert "## Skipped" in md
-    assert "ASSUMPTION" in md
-    assert "Do NOT re-emit" in md
+    assert "## Skipped — Drop From Output" in md
+    assert "Coverage Notes" in md
+    assert "remove" in lowered
     assert "skip me" in md
+    # Old instructional phrasing must be gone.
+    assert "make a reasonable assumption" not in lowered
+    assert "mark it inline with" not in lowered
 
 
 def test_write_answers_file_passes_skipped_through(tmp_path: Path):
     qs = [Question(id="CLAR-01", kind="clarification", prompt_text="q?")]
     path = write_answers_file(tmp_path, qs, {}, skipped=qs)
     content = path.read_text(encoding="utf-8")
-    assert "Skipped" in content
-    assert "ASSUMPTION" in content
+    lowered = content.lower()
+    assert "Drop From Output" in content
+    assert "Coverage Notes" in content
+    # Old instructional phrasing must be gone.
+    assert "make a reasonable assumption" not in lowered
+    assert "mark it inline with" not in lowered
+
+
+def test_format_answers_md_accepts_legacy_dict_str_str_answers():
+    """Legacy callers may still pass `dict[str, str]` (answer-only). The
+    function treats those values as RESOLUTION_ANSWERED."""
+    qs = [Question(id="CLAR-01", kind="clarification", prompt_text="q?")]
+    md = format_answers_md(qs, {"CLAR-01": "an answer"})
+    assert "## Answered" in md
+    assert "an answer" in md
+
+
+def test_format_answers_md_accepts_tuple_valued_answers():
+    """New prompt_user return shape: `dict[str, tuple[resolution, text]]`."""
+    qs = [Question(id="CLAR-01", kind="clarification", prompt_text="q?")]
+    md = format_answers_md(qs, {"CLAR-01": (RESOLUTION_ANSWERED, "an answer")})
+    assert "## Answered" in md
+    assert "an answer" in md
+
+
+def test_format_answers_md_renders_scope_exclusion_section():
+    """Scope-exclusion items get their own section with clear "interpret
+    as scope-exclusion, NOT as a literal value" framing."""
+    qs = [
+        Question(
+            id="CLAR-01", kind="clarification", prompt_text="aria-label for mobile?"
+        ),
+    ]
+    answers = {"CLAR-01": (RESOLUTION_SCOPE_EXCLUSION, "mobile isn't in scope")}
+    md = format_answers_md(qs, answers)
+    assert "## Scope Exclusions — Drop Excluded Items" in md
+    assert "mobile isn't in scope" in md
+    assert "scope-exclusion, NOT a literal value" in md
+    assert "Coverage Notes" in md
+    # Must not slot the exclusion text into the Answered section.
+    assert "## Answered" not in md
 
 
 def test_question_key_strips_blocker_prefix():
@@ -482,6 +534,133 @@ def test_looks_like_skip_intent_rejects_real_answers():
 
 
 # ---------------------------------------------------------------------------
+# Negative-drop / scope-exclusion intent detection
+# ---------------------------------------------------------------------------
+
+
+def test_negative_drop_regex_matches_no_aria_label():
+    """The original failing example from the user: 'there is no aria-label'
+    must be detected so the confirmation prompt fires."""
+    matched, phrase = looks_like_negative_drop_intent("there is no aria-label")
+    assert matched
+    assert phrase == "there is no aria-label"
+
+
+def test_negative_drop_regex_matches_mobile_out_of_scope():
+    """Scope-exclusion phrasing must trigger detection. The user-supplied
+    example: 'mobile isn't in scope'."""
+    cases = [
+        "mobile isn't in scope",
+        "mobile is not in scope",
+        "out of scope",
+        "not in scope",
+        "out of scope: mobile",
+        "skip mobile",
+        "exclude mobile",
+        "not testing mobile",
+    ]
+    for s in cases:
+        matched, _ = looks_like_negative_drop_intent(s)
+        assert matched, f"should detect negative-drop intent: {s!r}"
+
+
+def test_negative_drop_regex_matches_doesnt_exist():
+    cases = [
+        "there are no events",
+        "the app doesn't use redux",
+        "we don't have an analytics SDK",
+        "no such header",
+        "the feature doesn't exist",
+    ]
+    for s in cases:
+        matched, _ = looks_like_negative_drop_intent(s)
+        assert matched, f"should detect negative-drop intent: {s!r}"
+
+
+def test_negative_drop_regex_rejects_bare_no_and_none():
+    """Bare 'no' / 'none' must NOT trigger drop-intent — those are real
+    short answers (and 'none' is already handled by _SKIP_INTENT_RE)."""
+    rejects = [
+        "no",
+        "none",
+        "no special characters allowed",  # legitimate negative answer
+        "no special characters",
+    ]
+    for s in rejects:
+        matched, _ = looks_like_negative_drop_intent(s)
+        assert not matched, f"must NOT detect drop-intent in: {s!r}"
+
+
+def test_negative_drop_regex_rejects_legitimate_quoted_negatives():
+    """Answers that happen to contain 'no' inside quoted technical
+    identifiers must not trigger."""
+    rejects = [
+        "use the 'no-cache' header",
+        "the value is 'no-store'",
+        "set it to 'no'",
+    ]
+    for s in rejects:
+        matched, _ = looks_like_negative_drop_intent(s)
+        assert not matched, f"must NOT detect drop-intent in: {s!r}"
+
+
+def test_negative_drop_regex_rejects_verbose_phrasing():
+    """The regex is anchored end-to-end — trailing prose breaks the match
+    so the agent gets the typed text as a literal answer with more
+    context to interpret."""
+    rejects = [
+        "mobile isn't in scope yet but will be next quarter",
+        "exclude mobile for now until we have time",
+        "there is no aria-label but we should add one",
+    ]
+    for s in rejects:
+        matched, _ = looks_like_negative_drop_intent(s)
+        assert not matched, f"verbose phrasing should fall through: {s!r}"
+
+
+# ---------------------------------------------------------------------------
+# Resolution constants & ledger legacy back-compat
+# ---------------------------------------------------------------------------
+
+
+def test_resolution_constants_have_expected_string_values():
+    """The ledger JSONL relies on these exact string values for back-compat
+    with pre-rework runs. RESOLUTION_SKIPPED_LEGACY must be 'skipped' so
+    older ledger entries get classified as legacy on resume."""
+    assert RESOLUTION_ANSWERED == "answered"
+    assert RESOLUTION_SKIPPED_DROP == "skipped_drop"
+    assert RESOLUTION_SCOPE_EXCLUSION == "scope_exclusion"
+    assert RESOLUTION_SKIPPED_LEGACY == "skipped"
+
+
+def test_ledger_legacy_skipped_jsonl_maps_to_legacy_resolution(tmp_path: Path):
+    """A pre-rework ledger file on disk has entries with
+    'resolution': 'skipped'. Load it and confirm those map to
+    RESOLUTION_SKIPPED_LEGACY (preserving the old [ASSUMPTION] contract
+    the user originally agreed to)."""
+    import json
+    path = ledger_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({
+            "step": 2,
+            "agent_label": "refine-spec",
+            "question_id": "BLOCK-01",
+            "question_text": "legacy skipped item?",
+            "question_kind": "blocker",
+            "resolution": "skipped",
+            "answer": "",
+            "context": "",
+            "tokens": [],
+        }) + "\n",
+        encoding="utf-8",
+    )
+    loaded = load_ledger(tmp_path)
+    assert len(loaded) == 1
+    assert loaded[0].resolution == RESOLUTION_SKIPPED_LEGACY
+
+
+# ---------------------------------------------------------------------------
 # Distinctive-token paraphrase matching
 # ---------------------------------------------------------------------------
 
@@ -665,23 +844,66 @@ def test_load_ledger_missing_file_returns_empty(tmp_path: Path):
     assert load_ledger(tmp_path) == []
 
 
-def test_render_prior_decisions_md_contains_answer_and_skip_directives():
+def test_render_prior_decisions_md_contains_answer_and_drop_directives():
+    """New semantics: skipped_drop renders a DROP directive (Coverage Notes,
+    no instructional [ASSUMPTION] framing)."""
     decisions = [
         HitlDecision.from_question(
             Question(id="BLOCK-01", kind="blocker", prompt_text="Which GA SDK?"),
-            step=2, agent_label="refine-spec", resolution="answered",
+            step=2, agent_label="refine-spec", resolution=RESOLUTION_ANSWERED,
             answer="gtag.js",
         ),
         HitlDecision.from_question(
             Question(id="BLOCK-02", kind="blocker", prompt_text="Tracking call args?"),
-            step=2, agent_label="refine-spec", resolution="skipped",
+            step=2, agent_label="refine-spec", resolution=RESOLUTION_SKIPPED_DROP,
         ),
     ]
     md = render_prior_decisions_md(decisions)
+    lowered = md.lower()
     assert "gtag.js" in md
     assert "User answer" in md
-    assert "skip" in md.lower()
-    assert "do NOT" in md or "do not" in md.lower()
+    assert "DROP" in md
+    assert "Coverage Notes" in md
+    # Old instructional framing must be gone for the new skipped_drop branch.
+    # (Legacy entries are tested separately; they ARE allowed to render
+    # [ASSUMPTION] framing.)
+    assert "reasonable assumption" not in lowered
+
+
+def test_render_prior_decisions_md_preserves_legacy_assumption_framing():
+    """A pre-rework ledger entry with resolution='skipped' (legacy) must
+    still render with [ASSUMPTION] framing — preserves user intent at the
+    time the decision was made under the old contract."""
+    decisions = [
+        HitlDecision.from_question(
+            Question(id="BLOCK-01", kind="blocker", prompt_text="Legacy skip?"),
+            step=2, agent_label="refine-spec",
+            resolution=RESOLUTION_SKIPPED_LEGACY,
+        ),
+    ]
+    md = render_prior_decisions_md(decisions)
+    assert "ASSUMPTION" in md
+    assert "legacy" in md.lower()
+
+
+def test_render_prior_decisions_md_renders_scope_exclusion():
+    decisions = [
+        HitlDecision.from_question(
+            Question(
+                id="BLOCK-01",
+                kind="blocker",
+                prompt_text="aria-label for mobile and desktop?",
+            ),
+            step=2, agent_label="refine-spec",
+            resolution=RESOLUTION_SCOPE_EXCLUSION,
+            answer="mobile isn't in scope",
+        ),
+    ]
+    md = render_prior_decisions_md(decisions)
+    assert "scope" in md.lower()
+    assert "mobile isn't in scope" in md
+    assert "Coverage Notes" in md
+    assert "ASSUMPTION" not in md
 
 
 def test_format_answers_md_renders_ledger_resolved_section():

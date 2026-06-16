@@ -141,9 +141,13 @@ async def test_one_round_resolution_prompts_user_and_reruns(tmp_path, monkeypatc
     scripted.install(monkeypatch)
 
     # Stub the user prompt: answer every question with "use okta".
+    # Note: prompt_user now returns dict[str, tuple[resolution, text]].
+    from worca_t.hitl import RESOLUTION_ANSWERED
     monkeypatch.setattr(
         "worca_t.hitl.prompt_user",
-        lambda qs, *, agent_label: {q.id: "use okta" for q in qs},
+        lambda qs, *, agent_label: {
+            q.id: (RESOLUTION_ANSWERED, "use okta") for q in qs
+        },
     )
 
     result = await call_reasoning_llm_with_hitl(
@@ -264,9 +268,12 @@ async def test_max_iterations_cap_terminates_loop(tmp_path, monkeypatch):
     scripted = _ScriptedAnthropic(responses=responses)
     scripted.install(monkeypatch)
 
+    from worca_t.hitl import RESOLUTION_ANSWERED
     monkeypatch.setattr(
         "worca_t.hitl.prompt_user",
-        lambda qs, *, agent_label: {q.id: f"answer-{q.id}" for q in qs},
+        lambda qs, *, agent_label: {
+            q.id: (RESOLUTION_ANSWERED, f"answer-{q.id}") for q in qs
+        },
     )
 
     result = await call_reasoning_llm_with_hitl(
@@ -320,3 +327,92 @@ async def test_failed_llm_call_returns_immediately(tmp_path, monkeypatch):
     # to validate" and returns early without prompting.
     assert len(scripted.calls) == 1
     assert result.final_text == ""
+
+
+# ---------------------------------------------------------------------------
+# Skip-as-drop semantics (replaces skip-as-assumption)
+# ---------------------------------------------------------------------------
+
+
+async def test_skip_produces_drop_directive_in_iteration_2_prompt(
+    tmp_path, monkeypatch
+):
+    """When the user skips, the iteration-2 prompt the agent sees must
+    instruct DROP semantics — not "make a reasonable assumption" framing.
+
+    Note: the prompt explicitly mentions `[ASSUMPTION]` in a prohibition
+    ("Do NOT write [ASSUMPTION]"), so the literal substring IS in the
+    prompt — we assert on the old INSTRUCTIONAL wording instead.
+    """
+    scripted = _ScriptedAnthropic(responses=[_MD_WITH_QUESTION, _MD_RESOLVED])
+    scripted.install(monkeypatch)
+
+    # User skips everything (returns empty dict).
+    monkeypatch.setattr(
+        "worca_t.hitl.prompt_user", lambda qs, *, agent_label: {}
+    )
+
+    await call_reasoning_llm_with_hitl(
+        agent_path=_write_agent_file(tmp_path),
+        ctx=_fake_ctx(workspace_root=tmp_path),
+        workdir=tmp_path / "wd",
+        user_prompt="Refine this:",
+        inputs={"spec.md": "# Login (raw)"},
+        output_filename="refined-spec.md",
+        step=2,
+        agent_label="refine-spec",
+        model="claude-sonnet-4-6",
+    )
+
+    assert len(scripted.calls) == 2
+    iter2_user_msg = scripted.calls[1]["messages"][-1]["content"]
+    lowered = iter2_user_msg.lower()
+    assert "drop" in lowered
+    assert "remove" in lowered
+    assert "Coverage Notes" in iter2_user_msg
+    # The old INSTRUCTIONAL phrasing must be gone — these were the
+    # active directives that made the agent invent assumptions.
+    assert "make a reasonable assumption" not in lowered
+    assert "mark it inline with" not in lowered
+
+
+async def test_scope_exclusion_passes_answer_through_with_exclusion_framing(
+    tmp_path, monkeypatch
+):
+    """A scope-exclusion answer ("mobile isn't in scope") must appear in
+    the iteration-2 prompt with explicit "interpret as scope-exclusion"
+    framing so the agent removes the named scope rather than including
+    the typed text as a literal value."""
+    scripted = _ScriptedAnthropic(responses=[_MD_WITH_QUESTION, _MD_RESOLVED])
+    scripted.install(monkeypatch)
+
+    from worca_t.hitl import RESOLUTION_SCOPE_EXCLUSION
+    monkeypatch.setattr(
+        "worca_t.hitl.prompt_user",
+        lambda qs, *, agent_label: {
+            q.id: (RESOLUTION_SCOPE_EXCLUSION, "mobile isn't in scope") for q in qs
+        },
+    )
+
+    await call_reasoning_llm_with_hitl(
+        agent_path=_write_agent_file(tmp_path),
+        ctx=_fake_ctx(workspace_root=tmp_path),
+        workdir=tmp_path / "wd",
+        user_prompt="Refine this:",
+        inputs={"spec.md": "# Login (raw)"},
+        output_filename="refined-spec.md",
+        step=2,
+        agent_label="refine-spec",
+        model="claude-sonnet-4-6",
+    )
+
+    iter2_user_msg = scripted.calls[1]["messages"][-1]["content"]
+    lowered = iter2_user_msg.lower()
+    assert "Scope Exclusions" in iter2_user_msg
+    assert "mobile isn't in scope" in iter2_user_msg
+    assert "scope-exclusion" in lowered
+    assert "Coverage Notes" in iter2_user_msg
+    # The old INSTRUCTIONAL phrasing for the skip→assumption fallback must be
+    # gone (the prompt mentions [ASSUMPTION] only in a prohibition).
+    assert "make a reasonable assumption" not in lowered
+    assert "mark it inline with" not in lowered

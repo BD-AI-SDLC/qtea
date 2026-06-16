@@ -83,7 +83,8 @@ def _empty_report(run_id: str) -> dict:
             "by_priority": {"P0": 0, "P1": 0, "P2": 0, "P3": 0},
             "by_category": {
                 "functional": 0, "ui": 0, "performance": 0, "security": 0,
-                "accessibility": 0, "integration": 0, "flaky": 0, "environment": 0,
+                "accessibility": 0, "integration": 0, "flaky": 0,
+                "environment": 0, "test-code-defect": 0,
             },
         },
         "bugs": [],
@@ -285,6 +286,24 @@ class BugClassifierStep(Step):
         if strategy_src.exists():
             inputs["test-strategy.json"] = strategy_src.read_text(encoding="utf-8")
 
+        # The traceability matrix (emitted by Step 4 when WORCA_T_COVERAGE_AUDIT=1)
+        # lets the classifier attach AC-level context to each bug — useful
+        # for severity inference and for routing bugs to the team that owns
+        # the underlying AC. Best-effort: legacy runs without the matrix
+        # remain functional.
+        matrix_src = ctx.workspace.step_dir(4) / "traceability-matrix.json"
+        if matrix_src.exists():
+            inputs["traceability-matrix.json"] = matrix_src.read_text(encoding="utf-8")
+
+        # `generated-files.json` lets the classifier distinguish
+        # `test-code-defect` (failure in a worca-t-authored file this run)
+        # from `environment` (SUT/infra issue). Without this input the
+        # classifier mislabels worca-t's own ImportErrors as environment
+        # bugs — see run 20260611-184450 BUG-001.
+        gen_files_src = ctx.workspace.step_dir(8) / "generated-files.json"
+        if gen_files_src.exists():
+            inputs["generated-files.json"] = gen_files_src.read_text(encoding="utf-8")
+
         # Reference docs the agent uses for classification heuristics
         # (best-effort — missing docs don't fail the step).
         docs_root = package_resource_root()
@@ -301,10 +320,11 @@ class BugClassifierStep(Step):
         user_prompt = (
             f"Classify the {len(candidates)} failing test(s) provided in "
             f"`bug-candidates.json` into structured bug reports. Use "
-            f"`run-results.json`, `heal-log.jsonl` (if present), and "
-            f"`test-strategy.json` for additional context. The required output "
-            f"shape is enforced by JSON schema — respond with the JSON object "
-            f"only. Use run id `{run_id}` in the output."
+            f"`run-results.json`, `heal-log.jsonl` (if present), "
+            f"`test-strategy.json`, and `traceability-matrix.json` (if present, "
+            f"for AC-level context per failing TC) for additional context. "
+            f"The required output shape is enforced by JSON schema — respond "
+            f"with the JSON object only. Use run id `{run_id}` in the output."
         )
 
         agent_res = await call_reasoning_llm(

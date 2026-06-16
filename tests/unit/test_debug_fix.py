@@ -147,6 +147,77 @@ async def test_failed_attempt1_sets_debug_live_for_retry(tmp_path: Path):
     assert ctx.extras.get("debug_live") is True
 
 
+# ---------------------------------------------------------------------------
+# Retry classification — content-failure CLEARS resume; transient KEEPS it
+# ---------------------------------------------------------------------------
+
+
+class _ContentFailStep(Step):
+    """Always fails with a content-validation-style error (NOT a storm)."""
+    number = 95
+    name = "content-fail"
+    timeout_s = 60
+
+    async def run(self, ctx: StepContext) -> StepResult:
+        return StepResult(
+            success=False, status="failed", outputs=[],
+            error="5 violation(s): [hard-wait] tests/foo.py:42 wait_for_timeout(500)",
+        )
+
+
+class _StormFailStep(Step):
+    """Always fails with the api_retry_storm sentinel error."""
+    number = 94
+    name = "storm-fail"
+    timeout_s = 60
+
+    async def run(self, ctx: StepContext) -> StepResult:
+        return StepResult(
+            success=False, status="failed", outputs=[],
+            error=(
+                "SDK api_retry storm (8 consecutive retries with no "
+                "intervening progress; threshold=8). The upstream "
+                "Anthropic/Vertex API is returning transient errors..."
+            ),
+        )
+
+
+async def test_content_failure_clears_resume_session_before_retry(tmp_path: Path):
+    """Content / validation failures must clear `step{N}_resume_session`
+    so attempt 2 starts FRESH instead of replaying the same flawed
+    reasoning path.
+
+    Regression guard for run 20260611-075728-0aa560 step 8 attempt 2:
+    Haiku resumed the same session as attempt 1 and re-emitted the
+    same 5 `wait_for_timeout` violations rather than re-deriving an
+    assertion-based test from scratch.
+    """
+    ctx = _ctx(tmp_path, no_hitl=True)  # skip the storm-decision prompt
+    step = _ContentFailStep()
+    # Simulate a step.run() having stashed a session id during attempt 1.
+    ctx.extras["step95_resume_session"] = "sess-attempt1-xyz"
+
+    await step.execute(ctx)
+
+    # Must be cleared so attempt 2's step.run() reads None → fresh session.
+    assert "step95_resume_session" not in ctx.extras
+
+
+async def test_transient_failure_preserves_resume_session(tmp_path: Path):
+    """api_retry_storm failures must KEEP `step{N}_resume_session` so
+    attempt 2 resumes and skips the work the relay-dropped turn lost.
+    """
+    ctx = _ctx(tmp_path, no_hitl=True, yes=True)  # skip storm prompt
+    step = _StormFailStep()
+    ctx.extras["step94_resume_session"] = "sess-attempt1-abc"
+
+    await step.execute(ctx)
+
+    # Must STILL be present so attempt 2's step.run() resumes the
+    # session and reclaims the prior turn's Reads.
+    assert ctx.extras.get("step94_resume_session") == "sess-attempt1-abc"
+
+
 def test_debug_artifacts_snapshotted_on_failure(tmp_path: Path):
     ctx = _ctx(tmp_path)
     wd = ctx.workspace.step_workdir(98)

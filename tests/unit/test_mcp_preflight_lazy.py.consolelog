@@ -1,0 +1,5 @@
+mcp: warming playwright for step 02…
+mcp preflight (step 02): one or more required servers failed to start:
+  playwright: spawn error
+Non-interactive mode: fix MCP setup and re-run (or omit --no-hitl / --yes to 
+enable the retry prompt).

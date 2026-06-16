@@ -322,6 +322,11 @@ class ResolverServer:
             "snapshot_hash": result.snapshot_hash,
             "reason": result.reason,
             "resolved_at": result.resolved_at,
+            # Ranked candidate bundle (primary + optional fallback). Absent /
+            # None for non-agent sources; populated for tier 4 LLM resolutions
+            # so the runtime can try the fallback on TimeoutError before
+            # paying another resolver round-trip.
+            "candidates": list(result.candidates) if result.candidates else None,
             # Telemetry — per-call cost data for Phase 6 aggregation.
             "input_tokens": result.input_tokens,
             "output_tokens": result.output_tokens,

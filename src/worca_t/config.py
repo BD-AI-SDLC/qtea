@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib import resources
 from pathlib import Path
+from typing import Any
 
 import yaml
 from dotenv import load_dotenv
@@ -15,17 +16,27 @@ from dotenv import load_dotenv
 MAX_STEP_TIMEOUT_S = 1800
 
 DEFAULT_STEP_TIMEOUTS: dict[int, int] = {
-    1: 600,
-    2: 600,
-    3: 900,
-    4: 1500,
-    5: 500,
-    6: 900,
-    7: 1800,
-    8: 1800,  # execute + self-heal
-    9: 600,   # bug-classifier
-    10: 600,  # report
+    1: 600,   # intake
+    2: 600,   # refine
+    3: 900,   # plan
+    4: 1500,  # strategy
+    5: 500,   # xray-upload
+    6: 900,   # research
+    7: 1800,  # test-architect
+    8: 1800,  # codegen (multi-phase, multiple LLM calls)
+    9: 1500,  # execute + self-heal (heal alone gets HEAL_AGENT_TIMEOUT_S)
+    10: 600,  # bug-classifier
+    11: 600,  # report
 }
+
+# Per-heal-attempt timeout used by Step 9's polyglot-test-fixer invocation.
+# A single heal pass typically does: read test source → read POM source →
+# read snapshot (MCP or live page) → diagnose → write patch. That's 3–6 min
+# of model + tool time on a non-trivial failure. The previous derivation
+# (`step_timeout(9) // 4`) yielded 150 s which truncated every heal in
+# run 20260611-184450-1fbf3d. Decoupled here so a Step 9 budget bump and a
+# heal budget bump are independent knobs.
+HEAL_AGENT_TIMEOUT_S = 600
 
 # Markdown size enforcement.
 MD_SOFT_LIMIT_LINES = 200
@@ -111,8 +122,26 @@ def get_settings() -> Settings:
     )
 
 
+def _parse_custom_headers() -> dict[str, str]:
+    """Parse ``ANTHROPIC_CUSTOM_HEADERS`` into a header dict.
+
+    Format: ``"key1: value1, key2: value2"`` (comma-separated).
+    Returns an empty dict when the env var is unset or empty.
+    """
+    raw = os.environ.get("ANTHROPIC_CUSTOM_HEADERS", "").strip()
+    if not raw:
+        return {}
+    headers: dict[str, str] = {}
+    for part in raw.split(","):
+        if ":" not in part:
+            continue
+        k, v = part.split(":", 1)
+        headers[k.strip()] = v.strip()
+    return headers
+
+
 def anthropic_auth_kwargs() -> dict[str, str]:
-    """Return the auth kwargs to pass to ``anthropic.AsyncAnthropic`` / ``anthropic.Anthropic``.
+    """Return the auth + header kwargs for ``anthropic.AsyncAnthropic`` / ``anthropic.Anthropic``.
 
     The Anthropic Python SDK has TWO mutually exclusive auth parameters and
     they produce different HTTP headers:
@@ -127,6 +156,11 @@ def anthropic_auth_kwargs() -> dict[str, str]:
     against either the raw Anthropic API OR a model-farm proxy that
     expects Bearer auth.
 
+    When ``ANTHROPIC_CUSTOM_HEADERS`` is set (e.g. BMF sticky-session
+    routing), those headers are injected via ``default_headers`` so
+    direct-SDK callers benefit from the same routing as the Claude Code
+    CLI subprocess.
+
     Returns an empty dict when neither env var is set — let the SDK raise
     its standard "no API key" error rather than masking it here.
 
@@ -134,13 +168,18 @@ def anthropic_auth_kwargs() -> dict[str, str]:
     mimic the Vertex API like Bosch's model farm), use
     :func:`use_vertex_backend` + :func:`anthropic_vertex_kwargs` instead.
     """
+    kwargs: dict[str, Any] = {}
     auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
     if auth_token:
-        return {"auth_token": auth_token}
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if api_key:
-        return {"api_key": api_key}
-    return {}
+        kwargs["auth_token"] = auth_token
+    else:
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if api_key:
+            kwargs["api_key"] = api_key
+    custom = _parse_custom_headers()
+    if custom:
+        kwargs["default_headers"] = custom
+    return kwargs
 
 
 def use_vertex_backend() -> bool:
@@ -164,7 +203,7 @@ def use_vertex_backend() -> bool:
     return False
 
 
-def anthropic_vertex_kwargs() -> dict[str, str]:
+def anthropic_vertex_kwargs() -> dict[str, Any]:
     """Return constructor kwargs for ``anthropic.AsyncAnthropicVertex``.
 
     Reads the standard Vertex env vars (``ANTHROPIC_VERTEX_BASE_URL``,
@@ -173,12 +212,15 @@ def anthropic_vertex_kwargs() -> dict[str, str]:
     (Bosch model farm) ``project_id`` is often a placeholder like ``"_"``
     and ``region`` is unused because the proxy ignores it.
 
+    When ``ANTHROPIC_CUSTOM_HEADERS`` is set (e.g. BMF sticky-session
+    routing), those headers are injected via ``default_headers``.
+
     Returns only the kwargs that have values in env — the SDK fills in
     sensible defaults for omitted ones (and raises a clear error if a
     truly required one is missing, like project_id when ``CLOUD_ML_REGION``
     isn't set).
     """
-    kwargs: dict[str, str] = {}
+    kwargs: dict[str, Any] = {}
     base_url = os.environ.get("ANTHROPIC_VERTEX_BASE_URL")
     if base_url:
         kwargs["base_url"] = base_url
@@ -196,6 +238,9 @@ def anthropic_vertex_kwargs() -> dict[str, str]:
         # SDK requires a non-empty value to construct the (then-discarded)
         # URL template. Provide a safe placeholder.
         kwargs["region"] = "us-east5"
+    custom = _parse_custom_headers()
+    if custom:
+        kwargs["default_headers"] = custom
     return kwargs
 
 

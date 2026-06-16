@@ -22,6 +22,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 
 /**
@@ -43,22 +44,57 @@ import java.util.regex.Pattern;
  */
 final class WorcaTResolver {
 
+    static final class Candidate {
+        final String selector;
+        final String strategy;     // nullable
+        final Double confidence;   // nullable
+        final String reason;       // nullable
+
+        Candidate(String selector, String strategy, Double confidence, String reason) {
+            this.selector = selector;
+            this.strategy = strategy;
+            this.confidence = confidence;
+            this.reason = reason;
+        }
+    }
+
     static final class Resolution {
         final String selector;
         final String source;          // "dev" | "cached" | "heuristic" | "agent" | "none"
         final String constantName;
         final String intent;
         final String testFile;
+        /** Ranked candidate bundle (primary + optional fallback). null for
+         *  non-LLM sources or when the bundle is unknown (e.g. disk cache
+         *  hit across JVM restarts — see {@link #bundleCache}). */
+        final List<Candidate> candidates;
 
         Resolution(String selector, String source, String constantName,
-                   String intent, String testFile) {
+                   String intent, String testFile, List<Candidate> candidates) {
             this.selector = selector;
             this.source = source;
             this.constantName = constantName;
             this.intent = intent;
             this.testFile = testFile;
+            this.candidates = candidates;
+        }
+
+        Resolution(String selector, String source, String constantName,
+                   String intent, String testFile) {
+            this(selector, source, constantName, intent, testFile, null);
         }
     }
+
+    /**
+     * In-memory cross-test bundle store keyed by cache key. The disk cache
+     * format (regex-based, single-selector-per-entry) intentionally does
+     * NOT persist the candidates array — adding full JSON-bundle round-trip
+     * to the regex parser would be unsafe. Instead, the JVM-scoped map
+     * carries bundles across tests within a single Maven/Gradle invocation
+     * (the common case); cross-JVM-restart, bundles are absent and the
+     * cache hit degrades to single-candidate behaviour (= pre-bundle world).
+     */
+    private static final Map<String, List<Candidate>> bundleCache = new ConcurrentHashMap<>();
 
     private WorcaTResolver() {}
 
@@ -90,7 +126,12 @@ final class WorcaTResolver {
             String cached = cacheLookup(key);
             if (cached != null) {
                 log("cache_hit", "constant", constantName, "selector", cached);
-                return new Resolution(cached, "cached", constantName, intent, testFile);
+                // Pair the disk-cached selector with any in-memory bundle for
+                // this key (populated by an earlier LLM resolve in the same
+                // JVM run). Absent across cold JVM starts — fine, the retry
+                // proxy degrades to single-candidate behaviour.
+                List<Candidate> cachedBundle = bundleCache.get(key);
+                return new Resolution(cached, "cached", constantName, intent, testFile, cachedBundle);
             }
         }
 
@@ -111,13 +152,42 @@ final class WorcaTResolver {
             log("no_llm_resolve_active", "constant", constantName, "intent", intent);
             return new Resolution(null, "none", constantName, intent, testFile);
         }
-        String llmSelector = callResolverServer(intent, constantName, snapshotText, testFile, safePageUrl(page));
-        if (llmSelector == null) {
+        ResolverResponse rr = callResolverServer(intent, constantName, snapshotText, testFile, safePageUrl(page));
+        if (rr == null || rr.selector == null) {
             log("resolver_failed", "constant", constantName, "intent", intent);
             return new Resolution(null, "none", constantName, intent, testFile);
         }
-        log("resolver_ok", "constant", constantName, "selector", llmSelector);
-        return new Resolution(llmSelector, "agent", constantName, intent, testFile);
+        log("resolver_ok", "constant", constantName, "selector", rr.selector);
+        // Cache the bundle in-memory so subsequent tests in the same JVM hit
+        // it via tier 2 and can also walk the fallback candidate.
+        if (rr.candidates != null && !rr.candidates.isEmpty()) {
+            bundleCache.put(key, rr.candidates);
+        }
+        return new Resolution(rr.selector, "agent", constantName, intent, testFile, rr.candidates);
+    }
+
+    /**
+     * Rewrite the disk cache entry's primary selector to the working fallback
+     * AND update the in-memory bundle cache so the working candidate is the
+     * sole entry. Called after a fallback candidate survives an action that
+     * timed out under the original primary.
+     */
+    static void promoteCandidateInCache(String testFile, String constantName, String intent, Candidate working) {
+        String key = cacheKey(testFile, constantName, intent);
+        Path p = cachePath();
+        if (p != null) {
+            try {
+                Map<String, String> entries = readCacheEntries(p);
+                if (entries.containsKey(key)) {
+                    entries.put(key, working.selector);
+                    writeCacheEntries(p, entries);
+                }
+            } catch (Exception e) {
+                log("fallback_promote_failed", "error", e.toString());
+            }
+        }
+        bundleCache.put(key, Collections.singletonList(working));
+        log("fallback_promoted", "key", key, "selector", working.selector);
     }
 
     static void invalidateCacheEntry(String testFile, String constantName, String intent) {
@@ -434,7 +504,19 @@ final class WorcaTResolver {
     // Tier-4 LLM via ResolverServer (TCP loopback)
     // ----------------------------------------------------------------------
 
-    private static String callResolverServer(
+    /** Compact response carrier so we can hand back both the primary selector
+     *  AND its candidates bundle without two parsing passes. */
+    private static final class ResolverResponse {
+        final String selector;            // nullable
+        final List<Candidate> candidates; // nullable / possibly empty
+
+        ResolverResponse(String selector, List<Candidate> candidates) {
+            this.selector = selector;
+            this.candidates = candidates;
+        }
+    }
+
+    private static ResolverResponse callResolverServer(
         String intent, String constantName, String snapshotText,
         String testFile, String pageUrl
     ) {
@@ -468,22 +550,127 @@ final class WorcaTResolver {
             );
             String line = br.readLine();
             if (line == null) return null;
-            return extractSelectorFromJson(line);
+            return parseResolverResponse(line);
         } catch (IOException e) {
             log("resolver_socket_error", "error", e.toString());
             return null;
         }
     }
 
-    private static String extractSelectorFromJson(String responseLine) {
+    private static ResolverResponse parseResolverResponse(String responseLine) {
         if (responseLine.contains("\"ok\":false")) return null;
-        Pattern p = Pattern.compile("\"selector\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"");
-        java.util.regex.Matcher m = p.matcher(responseLine);
+        // Top-level selector first (the "winner" the server already mirrored
+        // from candidates[0]). Then walk the candidates array, if present.
+        String topSelector = extractTopLevelString(responseLine, "selector");
+        if (topSelector != null && topSelector.isEmpty()) topSelector = null;
+        List<Candidate> bundle = parseCandidatesArray(responseLine);
+        return new ResolverResponse(topSelector, bundle);
+    }
+
+    /** Match a top-level (not nested) ``"key":"value"`` in a JSON response.
+     *  The {@code candidates} array is shallow (each entry is a flat object)
+     *  so the first ``"selector":...`` match outside the bracketed array is
+     *  the top-level field. We use a simple heuristic: prefer the match that
+     *  occurs BEFORE the candidates bracket; fall back to the first match. */
+    private static String extractTopLevelString(String json, String key) {
+        int candIdx = json.indexOf("\"candidates\"");
+        String scope = candIdx > 0 ? json.substring(0, candIdx) : json;
+        Pattern p = Pattern.compile("\"" + Pattern.quote(key) + "\"\\s*:\\s*(null|\"((?:\\\\.|[^\"\\\\])*)\")");
+        java.util.regex.Matcher m = p.matcher(scope);
         if (m.find()) {
-            String sel = unescapeJson(m.group(1));
-            return sel.isEmpty() ? null : sel;
+            if ("null".equals(m.group(1))) return null;
+            return unescapeJson(m.group(2));
+        }
+        // Fall back to whole-doc scan (server may have re-ordered fields).
+        m = p.matcher(json);
+        if (m.find()) {
+            if ("null".equals(m.group(1))) return null;
+            return unescapeJson(m.group(2));
         }
         return null;
+    }
+
+    /** Extract the {@code candidates} array from a resolver response. Each
+     *  candidate object is parsed flat (no nested objects). Returns an empty
+     *  list when the field is missing or empty; never returns null. */
+    private static List<Candidate> parseCandidatesArray(String json) {
+        int idx = json.indexOf("\"candidates\"");
+        if (idx < 0) return Collections.emptyList();
+        int colon = json.indexOf(':', idx);
+        if (colon < 0) return Collections.emptyList();
+        int arrStart = -1;
+        for (int i = colon + 1; i < json.length(); i++) {
+            char c = json.charAt(i);
+            if (Character.isWhitespace(c)) continue;
+            if (c == '[') { arrStart = i; break; }
+            if (c == 'n') return Collections.emptyList();  // null
+            break;
+        }
+        if (arrStart < 0) return Collections.emptyList();
+        int arrEnd = findBalancedJson(json, arrStart, '[', ']');
+        if (arrEnd < 0) return Collections.emptyList();
+        String body = json.substring(arrStart + 1, arrEnd);
+        List<Candidate> out = new ArrayList<>();
+        int p = 0;
+        while (p < body.length()) {
+            int objStart = body.indexOf('{', p);
+            if (objStart < 0) break;
+            int objEnd = findBalancedJson(body, objStart, '{', '}');
+            if (objEnd < 0) break;
+            Candidate c = parseCandidateObject(body.substring(objStart, objEnd + 1));
+            if (c != null) out.add(c);
+            p = objEnd + 1;
+        }
+        return out;
+    }
+
+    private static Candidate parseCandidateObject(String obj) {
+        String selector = extractTopLevelString(obj, "selector");
+        if (selector == null || selector.isEmpty()) return null;
+        if (selector.startsWith("//") || selector.startsWith("xpath=") || selector.contains("By.XPATH")) {
+            return null;  // priority-chain gate
+        }
+        String strategy = extractTopLevelString(obj, "strategy");
+        Double confidence = extractNumberField(obj, "confidence");
+        String reason = extractTopLevelString(obj, "reason");
+        return new Candidate(selector, strategy, confidence, reason);
+    }
+
+    private static Double extractNumberField(String obj, String key) {
+        Pattern p = Pattern.compile(
+            "\"" + Pattern.quote(key) + "\"\\s*:\\s*(null|(-?\\d+(?:\\.\\d+)?))"
+        );
+        java.util.regex.Matcher m = p.matcher(obj);
+        if (m.find()) {
+            if ("null".equals(m.group(1))) return null;
+            try { return Double.parseDouble(m.group(2)); }
+            catch (NumberFormatException e) { return null; }
+        }
+        return null;
+    }
+
+    /** Find the matching close bracket/brace, honouring JSON string escapes
+     *  so nested {@code "} characters don't confuse depth tracking. */
+    private static int findBalancedJson(String src, int start, char open, char close) {
+        int depth = 0;
+        boolean inString = false;
+        boolean escape = false;
+        for (int i = start; i < src.length(); i++) {
+            char c = src.charAt(i);
+            if (escape) { escape = false; continue; }
+            if (inString) {
+                if (c == '\\') escape = true;
+                else if (c == '"') inString = false;
+                continue;
+            }
+            if (c == '"') { inString = true; continue; }
+            if (c == open) depth++;
+            else if (c == close) {
+                depth--;
+                if (depth == 0) return i;
+            }
+        }
+        return -1;
     }
 
     // ----------------------------------------------------------------------

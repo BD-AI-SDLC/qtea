@@ -248,9 +248,13 @@ async def test_plan_step_hitl_loop_prompts_user_and_reruns(
 ):
     calls = _install_scripted_anthropic(monkeypatch, [PLAN_MD_WITH_BLOCKERS, PLAN_MD])
 
+    # prompt_user returns dict[str, tuple[resolution, text]].
+    from worca_t.hitl import RESOLUTION_ANSWERED
     monkeypatch.setattr(
         "worca_t.hitl.prompt_user",
-        lambda questions, *, agent_label: {q.id: "use mock IdP" for q in questions},
+        lambda questions, *, agent_label: {
+            q.id: (RESOLUTION_ANSWERED, "use mock IdP") for q in questions
+        },
     )
 
     ctx = _ctx(tmp_path)

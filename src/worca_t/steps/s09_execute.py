@@ -20,8 +20,10 @@ Self-heal budget is capped (default 5 tests) to bound runtime.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -30,12 +32,12 @@ from pathlib import Path
 
 from worca_t._sut_git import commit_step
 from worca_t.claude_runner import run_agent
-from worca_t.config import package_resource_root, step_timeout
+from worca_t.config import HEAL_AGENT_TIMEOUT_S, package_resource_root, step_timeout
 from worca_t.logging_setup import get_logger
 from worca_t.proxy import safe_subprocess_env
 from worca_t.resolver_server import ResolverServer
 from worca_t.schemas import is_valid
-from worca_t.stack_profile import PYTHON_VENV_MANAGERS, StackProfile
+from worca_t.stack_profile import PYTHON_VENV_MANAGERS, StackProfile, wrap_command
 from worca_t.steps.base import Step, StepContext, StepResult
 from worca_t.auth_helpers import (
     auth_relevant_sut_files as _auth_relevant_sut_files,
@@ -45,8 +47,10 @@ from worca_t.test_runner import (
     _PYTEST_PLUGIN_PROVIDERS,
     RunResult,
     TestRunEntry,
+    execute_command,
     install_command_for,
     prepare_sut,
+    resolve_command,
     run_tests,
 )
 
@@ -70,7 +74,7 @@ _WORCA_PYTEST_MARKER_FILTER = os.environ.get(
 
 # Patterns that mark an XPath selector. Used by `_patch_introduces_xpath` to
 # reject heal patches that quietly downgrade to XPath in violation of the
-# Step 9 quality gate (see qa-orchestrator.instructions.md §6).
+# Step 9 quality gate (see docs/qa-orchestrator.instructions.md §6).
 _XPATH_PATTERNS: tuple[str, ...] = (
     "By.XPATH",
     "xpath=",
@@ -116,6 +120,256 @@ def _patch_introduces_xpath(pre: bytes | None, post: bytes | None) -> bool:
     except Exception:
         return False
     return post_count > _count_xpath_markers(pre_src)
+
+
+# ---------------------------------------------------------------------------
+# Assertion-immutability gate (mirrors XPath gate above)
+# ---------------------------------------------------------------------------
+
+import re as _re_module
+
+_ASSERTION_LINE_PATTERNS: tuple[_re_module.Pattern, ...] = (
+    _re_module.compile(r"^\s*assert\b"),
+    _re_module.compile(r"^\s*expect\s*\("),
+    _re_module.compile(r"^\s*with\s+pytest\.raises\b"),
+    _re_module.compile(r"\.should\s*\("),
+    _re_module.compile(
+        r"^\s*assert(?:Equals|True|False|Null|NotNull|That|Same|Throws)\s*\(",
+        _re_module.IGNORECASE,
+    ),
+    _re_module.compile(r"^\s*Should\s+(?:Be|Contain|Match|Not)", _re_module.IGNORECASE),
+)
+
+
+def _extract_assertion_lines(source: str) -> list[str]:
+    """Extract normalised assertion lines from source (stripped + lowered)."""
+    out: list[str] = []
+    for line in source.splitlines():
+        stripped = line.strip()
+        if any(p.search(stripped) for p in _ASSERTION_LINE_PATTERNS):
+            out.append(stripped.lower())
+    return out
+
+
+def _patch_modifies_assertions(pre: bytes | None, post: bytes | None) -> bool:
+    """True iff the post-heal source REMOVED or ALTERED any assertion line
+    that existed in the pre-heal source.
+
+    Adding new assertions is allowed. When *pre* is ``None`` the file was
+    created by the heal, so there were no prior assertions to protect."""
+    if pre is None or post is None:
+        return False
+    try:
+        pre_src = pre.decode("utf-8", errors="replace")
+        post_src = post.decode("utf-8", errors="replace")
+    except Exception:
+        return False
+    pre_assertions = _extract_assertion_lines(pre_src)
+    if not pre_assertions:
+        return False
+    post_assertions = _extract_assertion_lines(post_src)
+    from collections import Counter
+
+    pre_counts = Counter(pre_assertions)
+    post_counts = Counter(post_assertions)
+    for assertion, count in pre_counts.items():
+        if post_counts.get(assertion, 0) < count:
+            return True
+    return False
+
+
+# File-shape predicates that heal is forbidden to touch. Mirrors the
+# FORBIDDEN block in `agents/polyglot-test-fixer.agent.md`. A heal that
+# modifies any file matching one of these (and not also matching the
+# POM allowlist) is reverted and reported as scope_violation. Catches
+# the run 20260611-184450 incident where the heal agent edited
+# `tests/fixtures/worca_gemini_nav_*` instead of staying inside POM/
+# locator source. Implemented as predicates rather than glob patterns
+# because `fnmatch` does not handle `**`-recursive semantics portably.
+
+
+def _heal_path_is_forbidden(rel_posix: str) -> bool:
+    """True iff the path matches a FORBIDDEN file shape (basename + segments)."""
+    p = rel_posix
+    basename = p.rsplit("/", 1)[-1] if "/" in p else p
+    segments = p.split("/")
+    if basename == "conftest.py":
+        return True
+    if "__tests__" in segments:
+        return True
+    if "tests" in segments and "fixtures" in segments:
+        # Forbidden when 'fixtures' sits directly under any 'tests/' segment.
+        for i, seg in enumerate(segments[:-1]):
+            if seg == "tests" and i + 1 < len(segments) and segments[i + 1] == "fixtures":
+                return True
+    if "tests" in segments:
+        if basename.startswith("test_") and basename.endswith(".py"):
+            return True
+        if basename.endswith("_test.py"):
+            return True
+    if basename.endswith((".spec.ts", ".spec.js", ".test.ts", ".test.js")):
+        return True
+    if basename.endswith("Test.java"):
+        return True
+    return False
+
+
+def _heal_allowlist_dirs(active_module: dict | None) -> set[str]:
+    """POM/locator directories (SUT-relative, posix-style) heal may touch.
+
+    Derived from `sut_inventory.json` → `modules[active].existing_page_objects`
+    + `existing_locators`. Empty set means "no allowlist information" — in
+    that case we fall back to permissive behaviour (only the FORBIDDEN globs
+    are enforced).
+    """
+    if not isinstance(active_module, dict):
+        return set()
+    dirs: set[str] = set()
+    for key in ("existing_page_objects", "existing_locators"):
+        for entry in active_module.get(key) or []:
+            file_rel = (entry.get("file") if isinstance(entry, dict) else "") or ""
+            file_rel = file_rel.replace("\\", "/")
+            if not file_rel:
+                continue
+            parent = file_rel.rsplit("/", 1)[0] if "/" in file_rel else ""
+            if parent:
+                dirs.add(parent)
+    return dirs
+
+
+def _heal_path_in_scope(
+    rel_path: str,
+    allowlist_dirs: set[str],
+    generated_files: set[str] | None = None,
+) -> bool:
+    """True iff a heal-modified path is in-scope.
+
+    Logic:
+      0. If the path is a codegen-generated file → always in-scope
+         (the heal agent is fixing codegen's own mistakes).
+      1. If the path is FORBIDDEN (fixture / test / conftest shape) → out.
+      2. If ``allowlist_dirs`` is non-empty, the path's parent must START WITH
+         one of those dirs. Empty allowlist → only rule (1) applies.
+    """
+    p = rel_path.replace("\\", "/")
+    if generated_files and p in generated_files:
+        return True
+    if _heal_path_is_forbidden(p):
+        return False
+    if not allowlist_dirs:
+        return True
+    return any(p == d or p.startswith(d + "/") for d in allowlist_dirs)
+
+
+def _git_revert_path(sut_root: Path, rel_path: str, status_code: str) -> bool:
+    """Revert a single uncommitted change. Returns True on success."""
+    import subprocess
+    try:
+        if status_code.strip() == "??":
+            (sut_root / rel_path).unlink(missing_ok=True)
+        else:
+            subprocess.run(
+                ["git", "checkout", "HEAD", "--", rel_path],
+                cwd=sut_root, capture_output=True, text=True,
+                check=False, timeout=10,
+            )
+        return True
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.error("step09.git_revert_failed", path=rel_path, error=str(e))
+        return False
+
+
+def _git_status_porcelain(sut_root: Path) -> list[tuple[str, str]]:
+    """Return [(status_code, path), …] from `git status --porcelain`.
+
+    Uses `--untracked-files=all` so new files inside a previously-untracked
+    directory are listed individually (default porcelain collapses them to
+    the directory path, which breaks per-file revert). Empty list on
+    git-missing / error. Handles rename entries by taking the destination
+    path.
+    """
+    import subprocess
+    if not (sut_root / ".git").exists():
+        return []
+    try:
+        res = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=sut_root, capture_output=True, text=True, check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.warning("step09.git_status_failed", error=str(e))
+        return []
+    out: list[tuple[str, str]] = []
+    for line in (res.stdout or "").splitlines():
+        if len(line) < 4:
+            continue
+        status_code = line[:2]
+        path_part = line[3:].strip().strip('"')
+        if " -> " in path_part:
+            path_part = path_part.split(" -> ", 1)[1].strip().strip('"')
+        if path_part:
+            out.append((status_code, path_part))
+    return out
+
+
+def _heal_scope_check_and_revert(
+    sut_root: Path,
+    base_sha: str | None,
+    allowlist_dirs: set[str],
+    generated_files: set[str] | None = None,
+    pre_heal_dirty: set[str] | None = None,
+) -> list[str]:
+    """Inspect ``git status --porcelain`` for files the heal touched.
+
+    Reverts any out-of-scope modifications (``git checkout HEAD -- <file>``
+    for modified/deleted, ``rm`` for newly added). Returns the list of paths
+    that were reverted — empty when every touched file was in-scope.
+    Caller maps a non-empty return to ``applied=false, reason=scope_violation``.
+
+    *pre_heal_dirty*: files already dirty before the heal agent ran (e.g.
+    ``worca-junit.xml`` from pytest). These are skipped — the heal agent
+    did not create them.
+    """
+    reverted: list[str] = []
+    for status_code, path_part in _git_status_porcelain(sut_root):
+        if pre_heal_dirty and path_part in pre_heal_dirty:
+            continue
+        if _heal_path_in_scope(path_part, allowlist_dirs, generated_files=generated_files):
+            continue
+        if _git_revert_path(sut_root, path_part, status_code):
+            reverted.append(path_part)
+            log.warning(
+                "step09.heal_out_of_scope_reverted",
+                path=path_part,
+                base_sha=base_sha,
+            )
+    return reverted
+
+
+def _heal_revert_all_uncommitted(
+    sut_root: Path,
+    base_sha: str | None,
+) -> list[str]:
+    """Revert EVERY uncommitted change in the SUT working tree.
+
+    Called when the heal agent failed outright (timeout, transport error)
+    to ensure no in-flight edits — even ones inside the POM allowlist —
+    survive on disk. Without this, run 20260611-184450 left 5 in-progress
+    fixture edits on the worca-t branch after the 150s timeout, and the
+    `applied=false` log conflicted with the on-disk reality.
+    """
+    reverted: list[str] = []
+    for status_code, path_part in _git_status_porcelain(sut_root):
+        if _git_revert_path(sut_root, path_part, status_code):
+            reverted.append(path_part)
+    if reverted:
+        log.warning(
+            "step09.heal_full_revert",
+            base_sha=base_sha,
+            paths=reverted,
+        )
+    return reverted
 # Fallback tests subdirectory used when:
 #   - --isolated-tests is set (explicit user opt-in to today's behavior), OR
 #   - sut_inventory has no test_directory_layout for the active module.
@@ -281,6 +535,25 @@ def _load_index(ctx: StepContext) -> dict:
         return {}
 
 
+def _load_generated_files(ctx: StepContext) -> set[str]:
+    """Load Step 8's ``generated-files.json`` and return SUT-relative posix paths.
+
+    These are the files codegen produced this run.  The heal agent is allowed
+    to edit them even when they match a test-file FORBIDDEN pattern, because
+    the heal agent is fixing codegen's own mistakes (interaction patterns,
+    locator usage) — NOT pre-existing SUT test code.
+    """
+    p = ctx.workspace.step_dir(8) / "generated-files.json"
+    if not p.exists():
+        return set()
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    files = data.get("files") or []
+    return {f.replace("\\", "/") for f in files if isinstance(f, str)}
+
+
 def _sut_tests_dir(
     sut_root: Path,
     *,
@@ -340,6 +613,8 @@ def _build_fixer_prompt(
     sut_base_url: str | None = None,
     active_module: dict | None = None,
     staged_files: list[str] | None = None,
+    storage_state_path: Path | None = None,
+    generated_files: set[str] | None = None,
 ) -> str:
     snippet = (entry.traceback or entry.message or "(no traceback)")[-3000:]
 
@@ -353,17 +628,49 @@ def _build_fixer_prompt(
             files_str = "\n".join(f"  - `{sut_root / p}`" for p in (staged_files or [])) \
                 or "  (none discovered)"
         language = (active_module or {}).get("language") or "unknown"
+        # Storage-state pre-load directive (empty string when no state
+        # was resolved by Step 9). When set, instructs the agent to skip
+        # the auth-replay step entirely; when unset, the auth-replay
+        # workflow remains.
+        from worca_t import storage_state as _storage_state_mod
+        storage_state_block = _storage_state_mod.summary_for_prompt(storage_state_path)
+        # Step (1) of the workflow varies based on storage-state availability.
+        # When pre-loaded, the agent skips the sign-in helper outright.
+        # When absent, the agent follows the SUT's auth flow as before.
+        if storage_state_path is not None:
+            step_one = (
+                f"(1) The browser is already authenticated via the pre-loaded "
+                f"storage state described above. Use `browser_navigate` to go "
+                f"directly to the failing page URL — do NOT call the SUT's "
+                f"sign-in helper. (If the page redirects to login, the state "
+                f"is stale: log a note and fall back to the auth-replay path "
+                f"via the helpers below.) "
+            )
+        else:
+            step_one = (
+                f"(1) Use the Playwright MCP `browser_navigate` to open "
+                f"`{sut_base_url}` and follow the SUT's auth flow via the "
+                f"existing sign-in helper above. "
+            )
         live_block = (
             f"\n--- LIVE DIAGNOSIS ---\n"
             f"SUT base URL: `{sut_base_url}`. Active module language: `{language}`.\n"
             f"{auth_summary}\n"
+            f"{storage_state_block}\n"
             + (f"\nSUT clone root (you have add_dirs access — read + edit "
                f"these files directly): `{sut_root}`\n" if sut_root else "\n")
             + (f"\nKey SUT files for this active module — call these instead "
                f"of reimplementing auth or navigation:\n{files_str}\n\n"
-               f"Workflow: (1) use the Playwright MCP `browser_navigate` to open "
-               f"`{sut_base_url}` and follow the SUT's auth flow via the existing "
-               f"sign-in helper above. (2) Take a `browser_snapshot` of the page "
+               f"Workflow: (0) **MCP boot gate.** If your tool list contains "
+               f"`WaitForMcpServers`, call it once with no arguments and wait "
+               f"for it to return before any other tool use. The SDK only "
+               f"includes that tool when the Playwright MCP server hasn't "
+               f"finished connecting yet — if it's absent, MCPs are already "
+               f"connected and you can skip directly to (1). This single call "
+               f"eliminates the race where `browser_navigate` fires before "
+               f"Playwright MCP finishes booting. "
+               f"{step_one}"
+               f"(2) Take a `browser_snapshot` of the page "
                f"the failing test targets and compare it to what the traceback "
                f"says the test expected. (3) Patch the test based on what you "
                f"observe live, NOT just from the traceback text. Match the "
@@ -378,6 +685,30 @@ def _build_fixer_prompt(
         if entry.file else "(unknown — see `entry.file`)"
     )
 
+    gen_block = ""
+    if generated_files:
+        _test_suffixes = (
+            "_test.py", ".spec.ts", ".spec.js", ".test.ts", ".test.js",
+            "Test.java",
+        )
+        gen_test_files = sorted(
+            f for f in generated_files
+            if f.endswith(_test_suffixes)
+            or (f.split("/")[-1].startswith("test_") and f.endswith(".py"))
+        )
+        if gen_test_files:
+            files_list = "\n".join(f"  - `{f}`" for f in gen_test_files)
+            gen_block = (
+                f"\n--- GENERATED TEST FILES (EDITABLE) ---\n"
+                f"The following test files were generated by codegen (Step 8) "
+                f"this run. You MAY edit interaction patterns in these files "
+                f"(method calls, locator usage, navigation sequences, API "
+                f"usage like switching from `.click()` to `page.select_option()`). "
+                f"You MUST NOT modify assertions (`assert`, `expect`, `.should()`). "
+                f"Pre-existing test files NOT listed here remain FORBIDDEN.\n"
+                f"{files_list}\n"
+            )
+
     return (
         "A single test failed. Apply the smallest possible patch to make it "
         "pass without modifying assertions, business logic, or test_ids, and "
@@ -390,6 +721,7 @@ def _build_fixer_prompt(
         f"Status: {entry.status}\n"
         f"Message: {entry.message or '(none)'}\n\n"
         f"Traceback:\n{snippet}\n"
+        f"{gen_block}"
         f"{live_block}\n"
         f"Edit the failing test file at its absolute path above using the "
         f"Edit tool. The pipeline does NOT copy your changes anywhere — the "
@@ -436,23 +768,39 @@ def _apply_fixer_outputs(
     return True
 
 
-def _filter_command_for_tests(command: str, test_ids: list[str]) -> str:
-    """Best-effort narrowing of the run command to a subset of failing tests.
+def _filter_command_for_tests(command: str, failing: list[TestRunEntry]) -> str:
+    """Best-effort narrowing of a pytest re-run command to only the tests we
+    just healed, via ``-k "<name> or <name>"``.
 
-    For pytest we append `-k <expr>` constructed from the test ids' tail.
-    For other frameworks we just return the command unchanged - re-running
-    everything is safe (idempotent) and avoids brittle CLI assumptions.
+    Uses the real test-function names (which ``-k`` matches as substrings of
+    the node id) rather than reconstructing them from slugified ids, so the
+    expression reliably re-selects exactly the healed tests. Parametrization
+    suffixes (``test_x[case]``) are stripped to the base name so every
+    parametrization of a healed test is re-run.
+
+    No-op (returns the command unchanged) when:
+      - there are no failing tests,
+      - the command is not pytest-family (re-running everything is safe and
+        avoids brittle CLI assumptions for Cypress/Jest/Playwright-TS/Robot),
+      - a ``-k`` selector is already present (don't clobber an explicit one),
+      - or no usable test names could be extracted.
     """
-    if not test_ids:
+    if not failing:
         return command
     tokens = command.lower().split()
-    if "pytest" in tokens:
-        names = [tid.split("-", 1)[-1].replace("_", " ") for tid in test_ids]
-        # quote whole thing
-        expr = " or ".join(t.split(" ")[-1] for t in names if t)
-        if expr:
-            return f"{command} -k \"{expr}\""
-    return command
+    if "pytest" not in tokens:
+        return command
+    if re.search(r"(?:^|\s)-k(?:\s|=)", command):
+        return command
+    names: list[str] = []
+    for e in failing:
+        name = (e.name or "").split("[", 1)[0].strip()
+        if name and name not in names:
+            names.append(name)
+    if not names:
+        return command
+    expr = " or ".join(names)
+    return f'{command} -k "{expr}"'
 
 
 def _build_bug_candidates(failing: list[TestRunEntry]) -> dict:
@@ -489,6 +837,7 @@ def _summarize_resolver_spend(jit_cache_dir: Path) -> dict | None:
     total_input = 0
     total_output = 0
     unresolvable = 0
+    fallback_promoted_count = 0
     durations_ms: list[int] = []
     models: set[str] = set()
     count = 0
@@ -514,6 +863,8 @@ def _summarize_resolver_spend(jit_cache_dir: Path) -> dict | None:
                     durations_ms.append(int(entry["duration_ms"]))
                 if entry.get("success") is False:
                     unresolvable += 1
+                if entry.get("fallback_promoted"):
+                    fallback_promoted_count += 1
     except OSError:
         return None
     if count == 0:
@@ -538,6 +889,7 @@ def _summarize_resolver_spend(jit_cache_dir: Path) -> dict | None:
         "tier_3_hits": tier_hits[3],
         "tier_4_hits": tier_hits[4],
         "unresolvable_count": unresolvable,
+        "fallback_promoted_count": fallback_promoted_count,
         "models": sorted(models) or None,
         "median_duration_ms": (
             sorted(durations_ms)[len(durations_ms) // 2] if durations_ms else None
@@ -704,10 +1056,59 @@ def _bug_candidates_for_unresolvable_tbds(remaining: list[dict]) -> list[dict]:
     return out
 
 
+def _lazy_probe_heal_mcp(
+    server_name: str,
+    env: dict[str, str] | None = None,
+) -> tuple[bool, str]:
+    """Probe one MCP server just before the first heal-agent invocation.
+
+    ``env`` is an optional per-call MCP env overlay (e.g.
+    ``{"WORCA_T_STORAGE_STATE_ARG": "--storage-state=/abs/path"}``).
+    Threaded through to ``load_mcp_config`` so the rendered MCP server
+    args reflect per-run substitutions (e.g. the storage-state file path
+    Step 9 just resolved) without mutating ``os.environ``.
+
+    Returns ``(ok, detail)``. On failure the caller logs + skips the heal
+    loop (heal is best-effort — a missing Playwright MCP shouldn't fail
+    the whole Step 9 run; the failing tests still flow to Step 10 as bug
+    candidates).
+
+    Centralised in a module-level helper so unit tests can monkey-patch
+    ``s09_execute._lazy_probe_heal_mcp`` without touching the MCP plumbing.
+    """
+    from worca_t.mcp_manager import load_mcp_config, probe_server
+
+    try:
+        all_servers = load_mcp_config(env=env)
+    except (FileNotFoundError, OSError, ValueError) as e:
+        return False, f"could not load .mcp.json: {e}"
+
+    server = all_servers.get(server_name)
+    if server is None:
+        return False, f"{server_name!r} not declared in .mcp.json"
+
+    ok, detail = probe_server(server)
+    return ok, detail or ""
+
+
 class ExecuteStep(Step):
     number = 9
     name = "execute"
     timeout_s = step_timeout(9)
+    # Playwright MCP is only consumed by the `polyglot-test-fixer` heal
+    # agent (`enable_mcp=True` call site below). Heal only runs when the
+    # first test pass produces failing tests AND those failures aren't
+    # synthetic runner-failure entries. On green runs (all tests pass,
+    # or runner_only_failure short-circuits) the agent is never spawned,
+    # so we'd be paying the 5-15s MCP probe + npx-cache warmup for no
+    # benefit. Probing lazily inside :meth:`run` (just before the first
+    # heal call) keeps the warmup contiguous with the SDK spawn (the
+    # `pending` race the eager probe was meant to avoid) without taxing
+    # green runs.
+    mcp_servers_required: frozenset[str] = frozenset()
+    # Server name probed lazily. Kept as a class constant so tests can
+    # override without monkey-patching string literals.
+    _LAZY_MCP_SERVER: str = "playwright"
 
     def pre_attempt_cleanup(self, ctx: StepContext, attempt: int) -> None:
         """Rotate ``heal-log.jsonl`` so attempt 2 doesn't append on top of
@@ -826,7 +1227,11 @@ class ExecuteStep(Step):
         # binds a port). Tier order at runtime: dev-locators → cache →
         # in-process heuristic → ResolverServer (LLM) → HITL/fail-fast.
         jit_cache_dir = ctx.workspace.root / "locator-cache"
-        jit_cache_dir.mkdir(parents=True, exist_ok=True)
+        # Dir creation deferred to the `if jit_runtime_vendored:` branch below —
+        # non-Playwright stacks never load the vendored runtime, so they don't
+        # need the dir and shouldn't pollute the workspace with an empty one.
+        # All write sites (runtime template's _write_cache / _append_spend_line /
+        # _write_hitl_pending and jit_resolver.write_cache) mkdir on demand.
         runtime_env["WORCA_T_CACHE_DIR"] = str(jit_cache_dir)
         runtime_env["WORCA_T_RUN_ID"] = ctx.workspace.run_id
         resolver_model = os.environ.get("WORCA_T_RESOLVER_MODEL")
@@ -842,6 +1247,32 @@ class ExecuteStep(Step):
         elif os.environ.get("WORCA_T_DEV_LOCATORS"):
             runtime_env["WORCA_T_DEV_LOCATORS"] = os.environ["WORCA_T_DEV_LOCATORS"]
 
+        # Workspace dir for the runtime plugin's same-run storage-state auto-
+        # capture (Use case B in storage_state.py). The plugin reads this on
+        # first passing test to know where to write storage-state.json.
+        runtime_env["WORCA_T_WORKSPACE_DIR"] = str(ctx.workspace.root)
+
+        # Storage state for Playwright MCP injection. Resolved against the
+        # 4-tier precedence (CLI flag > env > SUT convention path > workspace
+        # auto-capture). When set, _heal_mcp_env carries the
+        # ``--storage-state=<path>`` flag for `.mcp.json` token substitution;
+        # when unset, the empty arg is filtered by mcp_manager.
+        from worca_t import storage_state as _storage_state_mod
+        _storage_state_path = _storage_state_mod.resolve(
+            sut_root=ctx.workspace.sut,
+            workspace_root=ctx.workspace.root,
+            cli_opt=getattr(ctx.options, "storage_state", None),
+        )
+        _heal_mcp_env = {
+            "WORCA_T_STORAGE_STATE_ARG": _storage_state_mod.to_mcp_arg(_storage_state_path),
+        }
+        if _storage_state_path is not None:
+            runtime_env["WORCA_T_STORAGE_STATE"] = str(_storage_state_path)
+            log.info(
+                "step09.storage_state_resolved",
+                path=_storage_state_mod.mask_path(_storage_state_path),
+            )
+
         # Prepare SUT: run the deterministically-detected install command
         # (poetry install / npm ci / mvn install / ...). Idempotent at the
         # package-manager level; the cost on warm runs is a few seconds and
@@ -852,6 +1283,15 @@ class ExecuteStep(Step):
         # paths below can append to it regardless of whether prepare_sut ran.
         install_log_path = out_dir / "install.log"
         stack_profile = _load_stack_profile(ctx)
+        log.info(
+            "step09.stack_profile",
+            package_manager=stack_profile.package_manager if stack_profile else None,
+            pre_install=stack_profile.pre_install_command if stack_profile else None,
+            install=stack_profile.install_command if stack_profile else None,
+            wrapper=stack_profile.wrapper_prefix if stack_profile else None,
+            venv_path=stack_profile.venv_path if stack_profile else None,
+            detection_signal=stack_profile.detection_signal if stack_profile else None,
+        )
         if stack_profile and stack_profile.install_command:
             prep = prepare_sut(
                 stack_profile,
@@ -877,7 +1317,54 @@ class ExecuteStep(Step):
                 command=prep.command,
                 duration_s=prep.duration_s,
             )
-        elif stack_profile is None:
+            if stack_profile.venv_path:
+                venv_abs = ctx.workspace.sut / stack_profile.venv_path
+                log.info(
+                    "step09.venv_check",
+                    venv_path=str(venv_abs),
+                    exists=venv_abs.exists(),
+                    is_dir=venv_abs.is_dir() if venv_abs.exists() else False,
+                )
+                if venv_abs.exists():
+                    # Bypass poetry's venv resolution for all subsequent
+                    # commands (playwright install, pytest). After
+                    # prepare_sut created .venv, invoke directly via its
+                    # bin dir — equivalent to activating the venv.
+                    bin_dir = str(
+                        venv_abs / ("Scripts" if os.name == "nt" else "bin")
+                    )
+                    stack_profile = dataclasses.replace(
+                        stack_profile,
+                        wrapper_prefix=bin_dir,
+                        package_manager="pip",
+                    )
+                    log.info("step09.venv_activated", bin_dir=bin_dir)
+
+        # Playwright stacks need browser binaries installed after the
+        # package install. Idempotent — skips if already present.
+        _PW_FRAMEWORKS = {"playwright-py", "playwright-ts", "playwright-js", "playwright-java"}
+        if stack_profile and framework in _PW_FRAMEWORKS:
+            pw_cmd = wrap_command(stack_profile, "playwright install chromium")
+            log.info("step09.playwright_install", command=pw_cmd)
+            rc, out, err, dur = execute_command(
+                pw_cmd, cwd=ctx.workspace.sut, timeout_s=300,
+                isolate_venv=bool(
+                    (stack_profile.package_manager or "").lower()
+                    in PYTHON_VENV_MANAGERS
+                ),
+            )
+            with open(install_log_path, "a", encoding="utf-8") as f:
+                f.write(
+                    f"\n$ {pw_cmd}\n# exit_code: {rc}\n"
+                    f"# STDOUT\n{out}\n\n# STDERR\n{err}\n"
+                )
+            if rc != 0:
+                log.warning(
+                    "step09.playwright_install_failed",
+                    exit_code=rc, stderr=err[:300],
+                )
+
+        if stack_profile is None:
             log.warning(
                 "step09.no_stack_profile",
                 hint="step06 stack_profile.json missing; running tests with "
@@ -956,6 +1443,7 @@ class ExecuteStep(Step):
         ).is_file()
         _resolver_server = None
         if jit_runtime_vendored:
+            jit_cache_dir.mkdir(parents=True, exist_ok=True)
             _resolver_server = ResolverServer(
                 cache_dir=jit_cache_dir,
                 run_id=ctx.workspace.run_id,
@@ -970,6 +1458,15 @@ class ExecuteStep(Step):
             )
 
         try:
+            log.info(
+                "step09.test_run_start",
+                framework=framework,
+                cwd=str(ctx.workspace.sut),
+                detected_cmd=detected_cmd or "(none — will use framework default)",
+                marker_filter=_WORCA_PYTEST_MARKER_FILTER,
+                parallelism=getattr(ctx.options, "parallelism", 0),
+                headless=getattr(ctx.options, "headless", True),
+            )
             first = run_tests(
                 framework,
                 cwd=ctx.workspace.sut,
@@ -979,7 +1476,32 @@ class ExecuteStep(Step):
                 profile=stack_profile,
                 headless=getattr(ctx.options, "headless", True),
                 marker_filter=_WORCA_PYTEST_MARKER_FILTER,
+                parallelism=getattr(ctx.options, "parallelism", 0),
             )
+            log.info(
+                "step09.test_run_done",
+                command=first.command,
+                cwd=first.cwd,
+                exit_code=first.exit_code,
+                duration_s=round(first.duration_s, 1),
+                totals=first.totals,
+            )
+
+            # Persist raw test-runner stdout/stderr as a standalone artifact
+            # so humans can diagnose without parsing run-results.json.
+            test_output_path = out_dir / "test-output.log"
+            try:
+                test_output_path.write_text(
+                    f"# framework: {framework}\n"
+                    f"$ {first.command}\n"
+                    f"# exit_code: {first.exit_code}\n"
+                    f"# duration: {first.duration_s:.1f}s\n\n"
+                    f"--- STDOUT ---\n{first.stdout or '(empty)'}\n\n"
+                    f"--- STDERR ---\n{first.stderr or '(empty)'}\n",
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
 
             attempts = 1
             patches_applied = 0
@@ -1000,6 +1522,16 @@ class ExecuteStep(Step):
                 len(failing) > 0
                 and all(r.id == "T-runner-failure" for r in failing)
             )
+            # Also skip heal on exit code 3 (pytest internal error) when all
+            # failing entries are infrastructure errors — no real test ran, so
+            # there is no POM/locator to patch.
+            if not runner_only and first.exit_code == 3:
+                all_infra = (
+                    len(failing) > 0
+                    and all(r.runner_failure is not None for r in failing)
+                )
+                if all_infra:
+                    runner_only = True
 
             # Runtime dep-recovery: on a missing_module runner failure, attempt
             # one install + re-run before declaring defeat. This catches gaps
@@ -1075,6 +1607,7 @@ class ExecuteStep(Step):
                                 profile=stack_profile,
                                 headless=getattr(ctx.options, "headless", True),
                                 marker_filter=_WORCA_PYTEST_MARKER_FILTER,
+                                parallelism=getattr(ctx.options, "parallelism", 0),
                             )
                             attempts = 2
                             failing = _failing_tests(first)
@@ -1082,6 +1615,9 @@ class ExecuteStep(Step):
                                 len(failing) > 0
                                 and all(r.id == "T-runner-failure" for r in failing)
                             )
+                            if not runner_only and first.exit_code == 3:
+                                if all(r.runner_failure is not None for r in failing):
+                                    runner_only = True
                             log.info(
                                 "step09.dep_recover_retry",
                                 runner_only_after=runner_only,
@@ -1134,10 +1670,81 @@ class ExecuteStep(Step):
                     failing_count=len(failing),
                 )
                 failing = []
+
+            # Re-resolve storage state AFTER run_tests() so Use case B (the
+            # runtime plugin's same-run auto-capture) is visible to the heal
+            # loop on the FIRST run, not only on `--from-step 9` resumes.
+            # The early resolve at step start happens BEFORE tests execute,
+            # so the workspace file does not exist yet on a cold run. Re-
+            # resolving here, after tests have finished writing it, closes
+            # that gap. _heal_mcp_env is mutated in place so the lazy MCP
+            # probe + every run_agent call below pick up the fresh path
+            # without further plumbing.
+            _storage_state_path = _storage_state_mod.resolve(
+                sut_root=ctx.workspace.sut,
+                workspace_root=ctx.workspace.root,
+                cli_opt=getattr(ctx.options, "storage_state", None),
+            )
+            _heal_mcp_env["WORCA_T_STORAGE_STATE_ARG"] = (
+                _storage_state_mod.to_mcp_arg(_storage_state_path)
+            )
+            if _storage_state_path is not None:
+                runtime_env["WORCA_T_STORAGE_STATE"] = str(_storage_state_path)
+                log.info(
+                    "step09.storage_state_resolved_post_run",
+                    path=_storage_state_mod.mask_path(_storage_state_path),
+                )
+
+            if failing and len(failing) <= _MAX_HEAL_TESTS:
+                # Lazy Playwright MCP probe — replaces the eager preflight
+                # so green runs skip the 5-15s warmup. We probe ONCE before
+                # the first heal-agent invocation; the warmup is contiguous
+                # with the SDK spawn (same cache-warm semantics the eager
+                # preflight provided, just deferred until actually needed).
+                # On probe failure: log + skip the heal loop entirely. Heal
+                # is best-effort — the failing tests still flow to Step 10
+                # as bug candidates without an MCP-driven patch.
+                mcp_ok, mcp_detail = _lazy_probe_heal_mcp(
+                    self._LAZY_MCP_SERVER,
+                    env=_heal_mcp_env,
+                )
+                if not mcp_ok:
+                    log.warning(
+                        "step09.heal_mcp_probe_failed",
+                        server=self._LAZY_MCP_SERVER,
+                        detail=mcp_detail,
+                        failing_count=len(failing),
+                    )
+                    # Record per-test skip in heal-log so the audit trail
+                    # explains the absent heal without going silent.
+                    for entry in failing:
+                        with heal_log_path.open("a", encoding="utf-8") as fh:
+                            fh.write(json.dumps({
+                                "test_id": entry.id,
+                                "file": entry.file,
+                                "applied": False,
+                                "agent_success": False,
+                                "agent_error": (
+                                    f"skipped: Playwright MCP probe failed "
+                                    f"({mcp_detail or 'unknown'})"
+                                ),
+                                "ts": datetime.now(UTC).isoformat(),
+                            }, ensure_ascii=False) + "\n")
+                    # Short-circuit the heal loop; downstream emission of
+                    # run-results.json / bug-candidates.json continues so
+                    # Step 10 still sees the failures.
+                    failing = []
+                else:
+                    log.info(
+                        "step09.heal_mcp_probe_ok",
+                        server=self._LAZY_MCP_SERVER,
+                    )
             if failing and len(failing) <= _MAX_HEAL_TESTS:
                 fixer_agent = package_resource_root() / "agents" / "polyglot-test-fixer.agent.md"
                 sut_base_url = os.environ.get("SUT_BASE_URL")
                 heal_relevant_sut_files = _auth_relevant_sut_files(active_module)
+                heal_allowlist = _heal_allowlist_dirs(active_module)
+                generated_files = _load_generated_files(ctx)
                 for entry in failing:
                     heal_wd = ctx.workspace.step_workdir(9) / f"heal-{entry.id}"
                     heal_wd.mkdir(parents=True, exist_ok=True)
@@ -1153,6 +1760,38 @@ class ExecuteStep(Step):
                         except OSError:
                             pre_bytes = None
 
+                    # Capture HEAD before the heal so the scope guard below
+                    # can revert any out-of-scope edits the agent made (or
+                    # left dangling on timeout) back to the Step 8 commit
+                    # state. Best-effort — git not available means we skip
+                    # the scope check rather than failing the heal.
+                    import subprocess as _sp
+                    base_sha: str | None = None
+                    try:
+                        _res = _sp.run(
+                            ["git", "rev-parse", "HEAD"],
+                            cwd=ctx.workspace.sut,
+                            capture_output=True, text=True, check=False,
+                            timeout=5,
+                        )
+                        if _res.returncode == 0:
+                            base_sha = (_res.stdout or "").strip() or None
+                    except (OSError, _sp.TimeoutExpired):
+                        base_sha = None
+
+                    # Snapshot git-dirty state BEFORE the heal agent runs.
+                    # Files already dirty at this point (e.g. worca-junit.xml
+                    # from pytest) are excluded from the scope check to avoid
+                    # false scope violations.
+                    pre_heal_dirty: set[str] = {
+                        p for _, p in _git_status_porcelain(ctx.workspace.sut)
+                    }
+
+                    # Step 9's heal flow is the only `run_agent` call site in
+                    # the pipeline that actually uses Playwright MCP tools
+                    # (`browser_navigate`, `browser_snapshot`). After the
+                    # audit that flipped `run_agent`'s `enable_mcp` default
+                    # to False, this call must opt back in.
                     agent_res = await run_agent(
                         fixer_agent,
                         workdir=heal_wd,
@@ -1163,13 +1802,63 @@ class ExecuteStep(Step):
                             sut_base_url=sut_base_url,
                             active_module=active_module,
                             staged_files=heal_relevant_sut_files,
+                            storage_state_path=_storage_state_path,
+                            generated_files=generated_files,
                         ),
-                        extra_paths=[],
+                        extra_paths=[
+                            package_resource_root() / "skills" / "diagnose-test-failure",
+                            package_resource_root() / "skills" / "playwright-explore-website",
+                            package_resource_root() / "skills" / "webapp-testing",
+                        ],
                         add_dirs=[ctx.workspace.sut],
-                        timeout_s=min((self.timeout_s or 1800) // 4, 600),
+                        timeout_s=HEAL_AGENT_TIMEOUT_S,
                         step=9,
                         max_turns=30,
+                        enable_mcp=True,
+                        mcp_env=_heal_mcp_env,
                     )
+
+                    # Scope guard: revert any heal edits to files outside the
+                    # POM/locator allowlist (or matching the FORBIDDEN globs).
+                    # Runs unconditionally — even on agent_res.success=False
+                    # (timeout, error) — because the agent may have written
+                    # files to disk before the timeout fired and left them
+                    # uncommitted on the worca-t branch. The run 20260611
+                    # incident left 5 in-flight fixture edits on disk after
+                    # the 150s timeout — this revert prevents that recurrence.
+                    scope_reverted = _heal_scope_check_and_revert(
+                        ctx.workspace.sut, base_sha, heal_allowlist,
+                        generated_files=generated_files,
+                        pre_heal_dirty=pre_heal_dirty,
+                    )
+                    scope_violation = bool(scope_reverted)
+                    if scope_violation:
+                        log.warning(
+                            "step09.heal_scope_violation",
+                            test_id=entry.id,
+                            reverted=scope_reverted,
+                            allowlist=sorted(heal_allowlist),
+                        )
+
+                    # Additional cleanup: when the heal agent FAILED outright
+                    # (timeout, transport error) any in-scope edits it left
+                    # uncommitted on disk must also be reverted. An in-flight
+                    # patch that the agent never finished reviewing is no
+                    # safer than an out-of-scope one — keeping it commits the
+                    # orchestrator to half-thought-through code and confuses
+                    # the next heal attempt.
+                    failed_partial_revert: list[str] = []
+                    if not agent_res.success:
+                        failed_partial_revert = _heal_revert_all_uncommitted(
+                            ctx.workspace.sut, base_sha,
+                        )
+                        if failed_partial_revert:
+                            log.warning(
+                                "step09.heal_failed_partial_edits_reverted",
+                                test_id=entry.id,
+                                reverted=failed_partial_revert,
+                                agent_error=agent_res.error,
+                            )
 
                     # The fixer now edits the failing test file IN PLACE inside
                     # the SUT (via add_dirs). Detect a real change by comparing
@@ -1179,7 +1868,7 @@ class ExecuteStep(Step):
                     # instead of editing in place — _apply_fixer_outputs copies
                     # that file into the SUT.
                     applied = False
-                    if agent_res.success:
+                    if agent_res.success and not scope_violation:
                         post_bytes: bytes | None = None
                         if target_in_sut.exists():
                             try:
@@ -1200,7 +1889,7 @@ class ExecuteStep(Step):
                         # selector is rejected. Revert the SUT file to its
                         # pre-heal state (restore bytes if it existed, delete
                         # if the heal created it from scratch) and mark the
-                        # patch unapplied. See `qa-orchestrator.instructions.md`
+                        # patch unapplied. See `docs/qa-orchestrator.instructions.md`
                         # §6 "No XPath (self-heal)".
                         post_bytes_check = target_in_sut.read_bytes() if target_in_sut.exists() else None
                         if _patch_introduces_xpath(pre_bytes, post_bytes_check):
@@ -1224,6 +1913,30 @@ class ExecuteStep(Step):
                             )
                             applied = False
 
+                    assertion_rejected = False
+                    if applied and generated_files:
+                        post_bytes_assert = target_in_sut.read_bytes() if target_in_sut.exists() else None
+                        if _patch_modifies_assertions(pre_bytes, post_bytes_assert):
+                            assertion_rejected = True
+                            try:
+                                if pre_bytes is not None:
+                                    target_in_sut.write_bytes(pre_bytes)
+                                elif target_in_sut.exists():
+                                    target_in_sut.unlink()
+                            except OSError as e:
+                                log.warning(
+                                    "step09.assertion_revert_failed",
+                                    test_id=entry.id,
+                                    file=entry.file,
+                                    error=str(e),
+                                )
+                            log.warning(
+                                "step09.heal_rejected_assertion_modified",
+                                test_id=entry.id,
+                                file=entry.file,
+                            )
+                            applied = False
+
                     if applied:
                         patches_applied += 1
                         # Per-test commit so the human reviewer sees exactly which
@@ -1238,19 +1951,30 @@ class ExecuteStep(Step):
                     else:
                         patches_rejected += 1
 
-                    summary_text = (
-                        agent_res.error
-                        if not agent_res.success
-                        else (
-                            "patch applied"
-                            if applied
-                            else (
-                                "rejected: heal introduced XPath selector (Step 9 quality gate)"
-                                if xpath_rejected
-                                else "no usable patch produced"
-                            )
+                    if scope_violation:
+                        summary_text = (
+                            f"rejected: heal touched out-of-scope file(s) "
+                            f"{','.join(scope_reverted[:3])}; "
+                            f"reverted to pre-heal state. Heal scope is "
+                            f"POM/locator only — see "
+                            f"agents/polyglot-test-fixer.agent.md FORBIDDEN."
                         )
-                    )
+                    elif not agent_res.success:
+                        summary_text = agent_res.error
+                    elif applied:
+                        summary_text = "patch applied"
+                    elif xpath_rejected:
+                        summary_text = (
+                            "rejected: heal introduced XPath selector "
+                            "(Step 9 quality gate)"
+                        )
+                    elif assertion_rejected:
+                        summary_text = (
+                            "rejected: heal modified assertions in generated "
+                            "test (Step 9 assertion-immutability gate)"
+                        )
+                    else:
+                        summary_text = "no usable patch produced"
                     self_heal_meta[entry.id] = {
                         "attempted": True,
                         "applied": applied,
@@ -1268,26 +1992,50 @@ class ExecuteStep(Step):
                     }
                     if xpath_rejected:
                         heal_entry["rejected"] = "xpath"
+                    if assertion_rejected:
+                        heal_entry["rejected"] = "assertion_modified"
+                    if scope_violation:
+                        heal_entry["rejected"] = "scope_violation"
+                        heal_entry["reverted_files"] = scope_reverted
                     with heal_log_path.open("a", encoding="utf-8") as fh:
                         fh.write(json.dumps(heal_entry, ensure_ascii=False) + "\n")
 
                 if patches_applied > 0:
-                    # Re-run the full suite once. Cheaper than per-test filtering
-                    # for our typical small surface, and avoids brittle CLI assumptions.
+                    # Re-run ONLY the healed tests via `-k`, not the whole
+                    # suite. We resolve the command the same way `run_tests`
+                    # would, narrow it to the tests we just patched, then feed
+                    # it back as `detected_command`. Non-pytest stacks fall
+                    # back to the full command (see `_filter_command_for_tests`).
+                    base_cmd, _parser = resolve_command(
+                        framework,
+                        detected=detected_cmd,
+                        cwd=ctx.workspace.sut,
+                        profile=stack_profile,
+                        marker_filter=_WORCA_PYTEST_MARKER_FILTER,
+                    )
+                    narrowed_cmd = _filter_command_for_tests(base_cmd, failing)
                     second = run_tests(
                         framework,
                         cwd=ctx.workspace.sut,
-                        detected_command=detected_cmd,
+                        detected_command=narrowed_cmd,
                         timeout_s=min((self.timeout_s or 1800) // 2, 900),
                         env_extra=runtime_env,
                         profile=stack_profile,
                         headless=getattr(ctx.options, "headless", True),
                         marker_filter=_WORCA_PYTEST_MARKER_FILTER,
+                        parallelism=getattr(ctx.options, "parallelism", 0),
                     )
                     attempts = 2
-                    # Second run is authoritative when it produced parseable results.
+                    # The narrowed re-run only reports the healed subset, so
+                    # MERGE its outcomes into the full first-run result set
+                    # (override the healed entries by id, keep everyone else).
+                    # Replacing wholesale would drop every non-healed test from
+                    # totals / bug-candidates / the runner-failure check.
                     if second.results:
-                        first.results = second.results
+                        by_id = {r.id: r for r in second.results}
+                        first.results = [
+                            by_id.get(r.id, r) for r in first.results
+                        ]
                         first.exit_code = second.exit_code
             elif failing:
                 log.warning(
@@ -1381,11 +2129,17 @@ class ExecuteStep(Step):
                 except OSError as e:
                     log.warning("step09.jit_cache_publish_failed", error=str(e))
 
+            # Counts come from `totals` (Fix 7): `tests` excludes synthetic
+            # T-runner-failure entries; `infrastructure_errors` is reported
+            # separately so a green-looking `tests=N` cannot conceal a run
+            # that never executed a single real test.
+            totals = payload["totals"]
             notes_parts = [
                 f"framework={framework}",
-                f"tests={len(first.results)}",
-                f"failed={payload['totals']['failed']}",
-                f"errors={payload['totals']['errors']}",
+                f"tests={totals['tests']}",
+                f"failed={totals['failed']}",
+                f"errors={totals['errors']}",
+                f"infra_errors={totals.get('infrastructure_errors', 0)}",
                 f"attempts={attempts}",
                 f"healed={patches_applied}",
             ]
@@ -1399,12 +2153,25 @@ class ExecuteStep(Step):
             #     prior "warned" status hid this and Step 9/11 ran on garbage;
             #     Step 10 then crashed rendering an environment-bug card.
             #     This is an environment failure, not a real test failure.
-            #   - `warned` when real failures or errors remain alongside passing
-            #     tests — Step 9 will classify them as bug candidates.
+            #   - `failed` when ALL tests errored/failed and NONE passed — no
+            #     assertion was ever evaluated, so there is nothing to classify.
+            #   - `warned` when some tests passed and some failed/errored —
+            #     Step 10 will classify the failures as bug candidates.
             runner_only_failure = (
                 len(first.results) > 0
                 and all(r.id == "T-runner-failure" for r in first.results)
             )
+            # Defensive: exit code 3 (pytest internal error) with no
+            # passed/failed tests is also an environment failure, even
+            # if the JUnit entries don't all carry T-runner-failure IDs.
+            if not runner_only_failure and first.exit_code == 3:
+                real_passed_or_failed = any(
+                    r.status in ("passed", "failed")
+                    and r.id != "T-runner-failure"
+                    for r in first.results
+                )
+                if not real_passed_or_failed:
+                    runner_only_failure = True
             if runner_only_failure:
                 first_entry = first.results[0]
                 first_msg = (first_entry.message or "").strip() or "test runner failed"
@@ -1426,11 +2193,41 @@ class ExecuteStep(Step):
                         f"(exit_code={first.exit_code}). This is an environment "
                         f"failure, not a real test failure. {first_msg[:300]}"
                     )
+                # Surface stderr/stdout so the user can diagnose without
+                # opening run-results.json.
+                runner_stderr = (first_entry.stderr or "").strip()
+                runner_stdout = (first_entry.stdout or "").strip()
+                if runner_stderr:
+                    error += f"\n\n--- stderr (last 1500 chars) ---\n{runner_stderr[-1500:]}"
+                elif runner_stdout:
+                    error += f"\n\n--- stdout (last 1500 chars) ---\n{runner_stdout[-1500:]}"
                 return StepResult(
                     success=False,
                     status="failed",
                     outputs=[run_results_path, bug_path],
                     error=error,
+                    notes=notes,
+                )
+
+            # All-tests-errored gate: when every test errored/failed and
+            # none passed, no assertion was evaluated. This is functionally
+            # equivalent to a runner failure (e.g. DNS unreachable, auth
+            # fixture crash, SUT down) and should not be masked as "warned".
+            any_passed = any(
+                r.status == "passed" for r in first.results
+            )
+            if final_failing and not any_passed:
+                first_entry = final_failing[0]
+                msg_snippet = (first_entry.message or "").strip()[:300]
+                return StepResult(
+                    success=False,
+                    status="failed",
+                    outputs=[run_results_path, bug_path],
+                    error=(
+                        f"all {len(first.results)} test(s) errored with zero "
+                        f"passing — no assertion was evaluated. First error: "
+                        f"{msg_snippet}"
+                    ),
                     notes=notes,
                 )
 

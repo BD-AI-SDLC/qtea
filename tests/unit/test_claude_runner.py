@@ -127,6 +127,59 @@ async def test_run_agent_happy_path(tmp_path: Path, monkeypatch):
     assert (workdir / ".mcp.json").exists()
 
 
+async def test_run_agent_defaults_to_empty_mcp(tmp_path: Path, monkeypatch):
+    """Default `enable_mcp=False` writes an empty `{"mcpServers": {}}` into
+    the workdir regardless of what `mcp_source` references. This is the
+    no-spawn default — most steps audit-confirmed they don't need MCP, so
+    paying the spawn cost everywhere was waste.
+    """
+    install_fake_query(monkeypatch)
+    agent = tmp_path / "demo.agent.md"; agent.write_text("x", encoding="utf-8")
+    # A non-empty source — proves we IGNORE it when enable_mcp is off.
+    mcp = tmp_path / ".mcp.json"
+    mcp.write_text(json.dumps({"mcpServers": {"playwright": {"command": "npx"}}}),
+                   encoding="utf-8")
+    workdir = tmp_path / "wd-default"
+
+    result = await run_agent(
+        agent,
+        workdir=workdir,
+        inputs={},
+        user_prompt="hi",
+        timeout_s=10,
+        mcp_source=mcp,
+    )
+    assert result.success
+    staged = json.loads((workdir / ".mcp.json").read_text(encoding="utf-8"))
+    assert staged == {"mcpServers": {}}
+
+
+async def test_run_agent_enable_mcp_stages_project_config(tmp_path: Path, monkeypatch):
+    """Explicit `enable_mcp=True` stages the project's real `.mcp.json` so
+    the SDK spawns the declared servers. Step 9 is the only caller that
+    uses this path today.
+    """
+    install_fake_query(monkeypatch)
+    agent = tmp_path / "heal.agent.md"; agent.write_text("x", encoding="utf-8")
+    mcp = tmp_path / ".mcp.json"
+    mcp.write_text(json.dumps({"mcpServers": {"playwright": {"command": "npx"}}}),
+                   encoding="utf-8")
+    workdir = tmp_path / "wd-enabled"
+
+    result = await run_agent(
+        agent,
+        workdir=workdir,
+        inputs={},
+        user_prompt="hi",
+        timeout_s=10,
+        mcp_source=mcp,
+        enable_mcp=True,
+    )
+    assert result.success
+    staged = json.loads((workdir / ".mcp.json").read_text(encoding="utf-8"))
+    assert "playwright" in staged["mcpServers"]
+
+
 async def test_run_agent_stages_inputs(tmp_path: Path, monkeypatch):
     install_fake_query(monkeypatch)
     agent = tmp_path / "a.agent.md"; agent.write_text("x", encoding="utf-8")
@@ -399,6 +452,72 @@ async def test_run_agent_does_not_overwrite_audit_files(tmp_path: Path, monkeypa
     assert r2.transcript_path.name == "transcript-01.jsonl"
     assert r1.metrics_path.name == "metrics-00.json"
     assert r2.metrics_path.name == "metrics-01.json"
+
+
+async def test_run_agent_dumps_user_prompt_to_logs(tmp_path: Path, monkeypatch):
+    """run_agent must write the literal user_prompt to
+    <workdir>/logs/user-prompt-XX.md alongside the transcript.
+
+    Transcripts only log SDK→client events (init / thinking / assistant /
+    result); they never echo the client→SDK user_prompt. Without this
+    dump, post-mortem debugging requires re-deriving the runtime-
+    substituted f-string (stack_hint, env_hint, reuse_hint, JIT hint,
+    sut_root path, ...) from the source — a nuisance and easy to get
+    wrong. Numbered to match the transcript so HITL / storm-wait / heal
+    re-invocations stay side-by-side.
+    """
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
+    )
+    agent = tmp_path / "a.agent.md"; agent.write_text("x", encoding="utf-8")
+    mcp = tmp_path / ".mcp.json"; mcp.write_text("{}", encoding="utf-8")
+    wd = tmp_path / "wd-prompt"
+
+    sentinel = "## Step contract\n\nFollow the plan in `./plan.json` literally."
+    r = await run_agent(agent, workdir=wd, inputs={},
+                        user_prompt=sentinel, timeout_s=5, mcp_source=mcp)
+
+    dumped = wd / "logs" / "user-prompt-00.md"
+    assert dumped.exists(), (
+        f"expected user_prompt dump at {dumped}; "
+        f"logs/ contents: {list((wd / 'logs').iterdir())}"
+    )
+    assert dumped.read_text(encoding="utf-8") == sentinel
+    # Numbered to align with transcript-00.jsonl for the same call.
+    assert r.transcript_path.name == "transcript-00.jsonl"
+    assert dumped.name == "user-prompt-00.md"
+
+
+async def test_run_agent_audit_files_land_in_logs_subdir(tmp_path: Path, monkeypatch):
+    """Audit files (transcript / stderr / metrics) MUST live under
+    ``<workdir>/logs/``, not the workdir root.
+
+    Regression guard for the workdir-cleanup refactor: dropping these
+    files at the workdir root cluttered the human-scannable view of
+    staged inputs / agent / claude_md / .mcp.json. The logs subdir
+    keeps the root tidy and groups per-call audit data together.
+    """
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
+    )
+    agent = tmp_path / "a.agent.md"; agent.write_text("x", encoding="utf-8")
+    mcp = tmp_path / ".mcp.json"; mcp.write_text("{}", encoding="utf-8")
+    wd = tmp_path / "wd-logs"
+
+    r = await run_agent(agent, workdir=wd, inputs={}, user_prompt="hi",
+                        timeout_s=5, mcp_source=mcp)
+
+    logs_dir = wd / "logs"
+    assert logs_dir.is_dir()
+    assert r.transcript_path.parent == logs_dir
+    assert r.stderr_path.parent == logs_dir
+    assert r.metrics_path.parent == logs_dir
+    # No audit files should have leaked to the workdir root.
+    assert not (wd / "transcript-00.jsonl").exists()
+    assert not (wd / "stderr-00.log").exists()
+    assert not (wd / "metrics-00.json").exists()
 
 
 async def test_run_agent_timeout_preserves_partial_metrics(tmp_path: Path, monkeypatch):
