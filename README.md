@@ -1,14 +1,15 @@
 # worca-t
 
-> **W**orkflow**O**rchestrated **R**ealtime **C**laude **A**utonomous **T**esting.
-> Fully autonomous QA SDLC orchestrator. Python + LLM hybrid.
+> **W**orkflow **O**rchestrated **R**ealtime **C**laude **A**utonomous **T**esting.  
+> Fully autonomous QA SDLC orchestrator. Hybrid workflow consists of Python + LLM calls.  
+> It uses Python to run the pipeline deterministically, and spins up agents via direct SDK invocation (solely LLM prompt) or Claude Agent SDK (file management, MCP).
 
 `worca-t` turns a requirement (Jira ticket or local markdown spec) into a tested
-feature, executed tests, classified bugs, and a polished report - in 11
+feature, executed tests, self-heal, classified bugs, and a polished report - in 11
 deterministic, checkpointed steps.
 
 ## Install
-
+clone the repo locally. then, to install it:
 ```bash
 uv tool install <path-to-worca-t>
 worca-t --help
@@ -65,23 +66,6 @@ worca-t auth-capture --sut ./app           # one-shot Playwright storageState ca
                                            # (for MFA/SSO SUTs — lets Step 9's
                                            # heal agent skip auth-replay)
 ```
-
-## Environment resolution
-
-Step 6 auto-discovers which environment variables the SUT needs (by
-scanning `.env.example`, source code, etc.) and resolves their values
-through a cascade of strategies:
-
-1. **Host environment** — variables already set in `os.environ`
-2. **Dotenv file** — loaded via `--env-file` or from `.env.example` / `.env.template` in the SUT
-3. **Azure DevOps Variable Groups** — pulled via REST API when `AZDO_ORG`, `AZDO_PROJECT`, `AZDO_VARIABLE_GROUP`, and `AZDO_PAT` are set
-4. **Interactive prompt** — asks for missing required values one by one (skipped with `--no-hitl`)
-
-Resolved values are injected into the process environment for Steps 8–9.
-Values are never logged or persisted to disk.
-
-See `GETTING_STARTED.md` §2 for setup details and Azure DevOps pipeline
-examples.
 
 ## Status
 
