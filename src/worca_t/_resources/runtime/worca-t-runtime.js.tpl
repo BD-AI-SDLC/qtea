@@ -150,6 +150,32 @@ function invalidateCacheEntry(/** @type {string} */ key) {
   }
 }
 
+/**
+ * Rewrite the cache entry so the working fallback becomes the sole entry.
+ * Called after a fallback candidate survives an action that timed out under
+ * the original primary — the failed primary is dropped on the theory that
+ * it timed out under the inflated 60s timeout and is therefore broken
+ * rather than slow. Mirrors Python `_promote_candidate_in_cache`.
+ * @param {string} key  cache key
+ * @param {{selector: string, strategy?: string | null, confidence?: number | null}} working
+ */
+function promoteCandidateInCache(key, working) {
+  const cache = readCache();
+  const entry = cache[key];
+  if (!entry) return;
+  entry.selector = working.selector;
+  entry.strategy = working.strategy ?? null;
+  entry.confidence = working.confidence ?? null;
+  entry.candidates = [working];
+  cache[key] = entry;
+  try {
+    writeCache(cache);
+    log("fallback_promoted", { key, selector: working.selector });
+  } catch (e) {
+    log("fallback_promote_failed", { error: String(e) });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Dev-locators (vendored mini-loader)
 // ---------------------------------------------------------------------------
@@ -380,6 +406,9 @@ function callResolverSocket(req) {
             log("resolver_socket_server_error", { error: payload.error });
             finish(null);
           } else {
+            // candidates: ranked bundle (primary + optional fallback) for
+            // the runtime's TimeoutError retry path. Absent in legacy
+            // server responses — the proxy degrades gracefully when None.
             finish({
               selector: payload.selector ?? null,
               strategy: payload.strategy ?? null,
@@ -387,6 +416,9 @@ function callResolverSocket(req) {
               source: payload.source ?? "agent",
               snapshotHash: payload.snapshot_hash ?? null,
               reason: payload.reason ?? null,
+              candidates: Array.isArray(payload.candidates) && payload.candidates.length
+                ? payload.candidates
+                : null,
             });
           }
         } catch (e) {
@@ -421,7 +453,8 @@ function callResolverSocket(req) {
  *    source: "dev" | "cached" | "heuristic" | "agent" | "none",
  *    constantName: string,
  *    intent: string,
- *    testFile: string | null
+ *    testFile: string | null,
+ *    candidates?: Array<{selector: string, strategy?: string | null, confidence?: number | null, reason?: string | null}> | null
  * }} Resolution
  */
 
@@ -479,7 +512,14 @@ async function resolveSentinel(page, sentinel, opts) {
     const cached = cache[key];
     if (cached && cached.selector) {
       log("cache_hit", { constant: constantName, selector: cached.selector });
-      return { selector: cached.selector, source: "cached", constantName, intent, testFile };
+      const cachedCandidates = Array.isArray(cached.candidates) && cached.candidates.length
+        ? cached.candidates
+        : null;
+      return {
+        selector: cached.selector, source: "cached",
+        constantName, intent, testFile,
+        candidates: cachedCandidates,
+      };
     }
   }
 
@@ -512,11 +552,19 @@ async function resolveSentinel(page, sentinel, opts) {
     log("resolver_failed", { constant: constantName, intent });
     return { selector: null, source: "none", constantName, intent, testFile };
   }
+  const bundle = Array.isArray(result.candidates) && result.candidates.length
+    ? result.candidates
+    : null;
   log("resolver_ok", {
     constant: constantName, selector: result.selector,
     source: result.source, confidence: result.confidence,
+    candidates: bundle ? bundle.length : 1,
   });
-  return { selector: result.selector, source: "agent", constantName, intent, testFile };
+  return {
+    selector: result.selector, source: "agent",
+    constantName, intent, testFile,
+    candidates: bundle,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -545,48 +593,86 @@ function isPlaywrightTimeout(/** @type {any} */ err) {
 }
 
 /**
- * Build a Proxy around a real Locator that retries an action once on TimeoutError.
+ * Build a Proxy around a real Locator that, on TimeoutError, first walks
+ * any remaining LLM-supplied fallback candidates from the resolution
+ * bundle (zero LLM cost) and only invalidates + re-resolves when every
+ * candidate in the bundle has been exhausted. On a fallback success, the
+ * cache entry is rewritten with the working candidate as the sole entry
+ * so the next test skips the failed primary entirely.
+ *
  * @param {{real: any, page: any, sentinel: string, resolution: Resolution,
  *          originalLocator: (selector: string) => any}} ctx
  */
 function makeRetryingLocator(ctx) {
   let real = ctx.real;
   let resolution = ctx.resolution;
-  let retried = false;
+  let retried = false;  // guards the LLM re-resolve to one attempt
+  // candidates[0] is what's already wrapped in `real`; everything past it
+  // is a fallback the retry path can try without a new resolver call.
+  /** @type {Array<any>} */
+  const remaining = (Array.isArray(resolution.candidates) && resolution.candidates.length > 1)
+    ? resolution.candidates.slice(1)
+    : [];
+  const totalFallbacks = remaining.length;
 
   return new Proxy({}, {
     get(_target, prop) {
-      const value = real[prop];
-      if (typeof value !== "function" || !RETRIABLE_METHODS.has(String(prop)) || retried) {
-        return typeof value === "function" ? value.bind(real) : value;
+      const initialValue = real[prop];
+      if (typeof initialValue !== "function" || !RETRIABLE_METHODS.has(String(prop)) || retried) {
+        return typeof initialValue === "function" ? initialValue.bind(real) : initialValue;
       }
       return async (/** @type {any[]} */ ...args) => {
-        try {
-          return await value.apply(real, args);
-        } catch (err) {
-          if (!isPlaywrightTimeout(err)) throw err;
-          retried = true;
-          log("retry_on_timeout", {
-            constant: resolution.constantName,
-            source: resolution.source, method: String(prop),
-          });
-          // Invalidate cache entry for the failing source.
-          if (resolution.source === "cached" || resolution.source === "agent") {
-            const k = cacheKey(resolution.testFile, resolution.constantName, resolution.intent);
-            invalidateCacheEntry(k);
+        // Walk any in-bundle fallbacks first (zero-cost resilience).
+        while (true) {
+          try {
+            // Always read `real[prop]` afresh — `real` is swapped after
+            // each candidate attempt and the new method must be picked up.
+            const result = await real[prop].apply(real, args);
+            // Success — if a fallback was used, promote it.
+            if (remaining.length < totalFallbacks) {
+              const usedIdx = totalFallbacks - remaining.length;  // 1..N
+              const working = /** @type {any} */ (resolution.candidates)[usedIdx];
+              const k = cacheKey(resolution.testFile, resolution.constantName, resolution.intent);
+              promoteCandidateInCache(k, working);
+            }
+            return result;
+          } catch (err) {
+            if (!isPlaywrightTimeout(err)) throw err;
+            log("retry_on_timeout", {
+              constant: resolution.constantName,
+              source: resolution.source, method: String(prop),
+              remaining: remaining.length,
+            });
+            if (remaining.length > 0) {
+              const nxt = remaining.shift();
+              if (nxt && typeof nxt.selector === "string" && nxt.selector.trim()) {
+                real = ctx.originalLocator(nxt.selector);
+                log("fallback_candidate_try", {
+                  constant: resolution.constantName,
+                  selector: nxt.selector, strategy: nxt.strategy ?? null,
+                });
+                continue;
+              }
+            }
+            // Bundle exhausted (or never existed) → LLM re-resolve.
+            retried = true;
+            if (resolution.source === "cached" || resolution.source === "agent") {
+              const k = cacheKey(resolution.testFile, resolution.constantName, resolution.intent);
+              invalidateCacheEntry(k);
+            }
+            const fresh = await resolveSentinel(ctx.page, ctx.sentinel, {
+              skipDev: resolution.source === "dev",
+              skipCache: true,
+              skipHeuristic: resolution.source === "heuristic",
+            });
+            if (!fresh.selector) {
+              log("retry_unresolvable", { constant: resolution.constantName });
+              throw err;
+            }
+            real = ctx.originalLocator(fresh.selector);
+            resolution = fresh;
+            return await real[prop].apply(real, args);
           }
-          const fresh = await resolveSentinel(ctx.page, ctx.sentinel, {
-            skipDev: resolution.source === "dev",
-            skipCache: true,
-            skipHeuristic: resolution.source === "heuristic",
-          });
-          if (!fresh.selector) {
-            log("retry_unresolvable", { constant: resolution.constantName });
-            throw err;
-          }
-          real = ctx.originalLocator(fresh.selector);
-          resolution = fresh;
-          return await real[prop].apply(real, args);
         }
       };
     },

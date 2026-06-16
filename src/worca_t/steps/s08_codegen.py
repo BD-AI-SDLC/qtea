@@ -30,19 +30,43 @@ review via `git diff worca-t/run-<id>` rather than reading a duplicate copy.
 
 from __future__ import annotations
 
+import asyncio
 import json
-from dataclasses import replace
+import os
+import re as _re
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
-from worca_t._sut_git import commit_step
+from worca_t._sut_git import commit_step, files_in_commit
 from worca_t.claude_runner import run_agent
+from worca_t.codegen_reconcile import (
+    fixture_mismatches_to_fixture_tasks,
+    mismatches_to_pom_tasks,
+    reconcile_codegen,
+    reconcile_fixtures,
+)
 from worca_t.config import package_resource_root, step_timeout
+from worca_t.llm.reasoning import call_reasoning_llm
 from worca_t.logging_setup import get_logger
 from worca_t.schemas import is_valid
 from worca_t.steps.base import Step, StepContext, StepResult
 from worca_t.test_indexer import IndexResult, index_tests, resolve_framework, violations_summary
 
 log = get_logger(__name__)
+
+# Phase B.5 auto-patch is intentionally a SINGLE retry. Do NOT convert the
+# if-block at the call site into a `while recon.mismatches` loop — a second
+# failure must hard-fail to Step 9 so a human sees the real bug instead of
+# the orchestrator silently re-extending forever. See plan Phase B.5.
+B5_MAX_AUTOPATCH_RETRIES = 1
+
+# Languages B.5 currently understands. Other languages (Java today) skip
+# reconciliation entirely; the StepResult records `b5_skipped=<lang>` so a
+# green B.5 line cannot be misread as "Java was covered."
+_B5_SUPPORTED_LANGUAGES: frozenset[str] = frozenset({
+    "python", "typescript", "javascript",
+})
 
 
 def _vendor_jit_runtime(sut_root: Path) -> Path | None:
@@ -452,14 +476,6 @@ def _read_detected_stack(ctx: StepContext) -> str | None:
     return _read_research(ctx).get("detected_stack")
 
 
-def _select_skills(detected_stack: str | None) -> list[str]:
-    if not detected_stack:
-        return ["webapp-testing"]
-    if "playwright" in detected_stack:
-        return ["playwright-generate-test", "webapp-testing"]
-    return ["webapp-testing"]
-
-
 def _active_module_dict(sut_inventory_dict: dict) -> dict | None:
     """Pull the active module entry out of a raw `sut_inventory` dict.
 
@@ -512,10 +528,89 @@ def _inventory_files(active_module: dict | None) -> list[str]:
     return out
 
 
+_FENCE_OPEN_RE = _re.compile(r"^```[A-Za-z0-9_+\-]*\s*$", _re.MULTILINE)
+_FENCE_CLOSE_RE = _re.compile(r"^```\s*$", _re.MULTILINE)
+
+
+def _strip_code_fences(text: str) -> str:
+    """Extract source code from an LLM response that may wrap it in fences.
+
+    ``call_reasoning_llm`` without ``output_schema`` returns freeform text.
+    Models frequently wrap code output in ```python / ```py / ``` fences,
+    AND sometimes write a prose preamble before the fence ("Looking at
+    the plan, I need to…") and/or postamble after it ("Hope that helps!").
+    Writing any of that into a .py / .ts / .java file causes SyntaxError
+    at import time — observed twice:
+
+    1. Run 20260611-075728 step 8 — two test files began with the LLM's
+       reasoning paragraph; Phase B.5 reported `parse_error` at line 1.
+    2. Earlier: chat_page.py written starting with literal ``\\`\\`\\`py``.
+
+    Algorithm:
+      - If the text contains a `\\`\\`\\`<lang>` opening fence on its own
+        line, return the contents up to the matching closing `\\`\\`\\``
+        (or end of text if the closing fence is missing).
+      - Otherwise return the stripped text unchanged — models that obey
+        the "code only, no fences" instruction send raw code.
+    """
+    s = text.strip()
+    if not s:
+        return s
+    open_m = _FENCE_OPEN_RE.search(s)
+    if open_m is None:
+        return s
+    body_start = open_m.end()
+    # Skip the newline immediately after the opening fence line.
+    if body_start < len(s) and s[body_start] == "\n":
+        body_start += 1
+    rest = s[body_start:]
+    close_m = _FENCE_CLOSE_RE.search(rest)
+    if close_m is None:
+        # Unclosed fence — everything after the opener is the body.
+        return rest.rstrip()
+    return rest[: close_m.start()].rstrip()
+
+
 def _is_worca_file(rel: str) -> bool:
     """True for paths whose basename matches the agent's `worca_`/`Worca` convention."""
     name = Path(rel).name.lower()
     return name.startswith("worca")
+
+
+_B5_NON_TEST_SUFFIXES: tuple[str, ...] = (
+    "_page", "_locators", "_fixture", "_data", "_helper", "_runtime",
+)
+
+
+def _b5_filter_test_files(produced: list[Path], language: str) -> list[Path]:
+    """Filter agent_produced down to test files only.
+
+    POMs, fixtures, locators, helpers, data, and runtime files are excluded
+    — B.5 only verifies tests' calls against POMs. Conventions:
+
+    * Python / TS / JS: `worca_<feature>_test.<ext>` — snake_case, ends in
+      ``_test``. Files named ``worca_<feature>_<role>.<ext>`` (role ∈ the
+      non-test suffix table above) are explicitly skipped.
+    * Java: ``Worca<Feature>Test.java`` — CamelCase. Lowercased, the stem
+      ends in ``test`` with no underscore separator. Only ``.java`` files
+      get this looser match; without the extension gate, a Python POM
+      named ``worca_dashboardtest`` (unusual but legal) would false-match.
+    """
+    out: list[Path] = []
+    for p in produced:
+        stem = p.stem.lower()
+        ext = p.suffix.lower()
+        if any(stem.endswith(suf) for suf in _B5_NON_TEST_SUFFIXES):
+            continue
+        is_test = (
+            stem.endswith("_test")
+            or stem.startswith("test_")
+            or "_test_" in stem
+            or (ext == ".java" and stem.endswith("test"))
+        )
+        if is_test:
+            out.append(p)
+    return out
 
 
 def _filter_index_to_worca(
@@ -561,6 +656,1418 @@ def _filter_index_to_worca(
         support_files=support_files,
         violations=violations,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase A/B: plan decomposition + reasoning-call orchestration
+# ---------------------------------------------------------------------------
+
+_MAX_CONCURRENT_LLM_CALLS = int(os.environ.get("WORCA_T_CODEGEN_CONCURRENCY", "3"))
+
+
+@dataclass
+class _PomTask:
+    pom_name: str
+    pom_file: str  # SUT-relative path
+    source: str  # "reuse" or "create"
+    from_path: str | None = None
+    at_path: str | None = None
+    missing_methods: list[dict[str, Any]] = field(default_factory=list)
+    locator_file: str | None = None
+    locator_class: str | None = None
+
+
+@dataclass
+class _LocatorTask:
+    constant_name: str
+    intent: str
+    owning_page: str
+    locator_file: str | None = None
+
+
+@dataclass
+class _FixtureTask:
+    name: str
+    at: str
+    yields: str | None = None
+    scope: str = "function"
+    depends_on: list[str] = field(default_factory=list)
+
+
+@dataclass
+class _HelperTask:
+    name: str
+    at: str
+    signature: str | None = None
+
+
+def _build_pom_tasks(
+    plan: dict[str, Any],
+    sut_root: Path,
+    inventory: dict[str, Any] | None,
+) -> dict[str, _PomTask]:
+    """Group and deduplicate page_objects with missing_methods across all TCs."""
+    tasks: dict[str, _PomTask] = {}  # keyed by POM file path
+    inv_locators = {}
+    if inventory:
+        am = _active_module_dict(inventory) or {}
+        for lc in am.get("existing_locators") or []:
+            if isinstance(lc, dict) and lc.get("class_name"):
+                inv_locators[lc["class_name"]] = lc
+
+    for tc in plan.get("test_cases") or []:
+        for po in tc.get("page_objects") or []:
+            src = po.get("source", "reuse")
+            file_path = po.get("from") or po.get("at") or ""
+            if not file_path:
+                continue
+            pom_name = po.get("name", "")
+
+            if file_path not in tasks:
+                loc_info = inv_locators.get(f"{pom_name}Locators") or {}
+                tasks[file_path] = _PomTask(
+                    pom_name=pom_name,
+                    pom_file=file_path,
+                    source=src,
+                    from_path=po.get("from"),
+                    at_path=po.get("at"),
+                    locator_file=loc_info.get("file"),
+                    locator_class=loc_info.get("class_name"),
+                )
+
+            task = tasks[file_path]
+            existing_names = {m["name"] for m in task.missing_methods}
+            for method in po.get("missing_methods") or []:
+                name = method.get("name", "")
+                if name and name not in existing_names:
+                    task.missing_methods.append(method)
+                    existing_names.add(name)
+                elif name in existing_names:
+                    log.debug(
+                        "step08.pom_method_dedup",
+                        method=name, pom=file_path,
+                    )
+    return tasks
+
+
+def _build_locator_tasks(
+    plan: dict[str, Any],
+    inventory: dict[str, Any] | None,
+) -> list[_LocatorTask]:
+    """Collect create_tbd locators across all TCs."""
+    inv_locators: dict[str, str] = {}
+    if inventory:
+        am = _active_module_dict(inventory) or {}
+        for lc in am.get("existing_locators") or []:
+            if isinstance(lc, dict):
+                inv_locators[lc.get("class_name", "")] = lc.get("file", "")
+
+    tasks: list[_LocatorTask] = []
+    seen: set[str] = set()
+    for tc in plan.get("test_cases") or []:
+        for loc in tc.get("locators") or []:
+            if loc.get("source") != "create_tbd":
+                continue
+            name = loc.get("name", "")
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            owning = loc.get("owning_page", "")
+            locator_cls = f"{owning}Locators" if owning else ""
+            tasks.append(_LocatorTask(
+                constant_name=name,
+                intent=loc.get("intent", ""),
+                owning_page=owning,
+                locator_file=inv_locators.get(locator_cls),
+            ))
+    return tasks
+
+
+def _build_fixture_tasks(plan: dict[str, Any]) -> list[_FixtureTask]:
+    """Collect source=create fixtures across all TCs."""
+    tasks: list[_FixtureTask] = []
+    seen: set[str] = set()
+    for tc in plan.get("test_cases") or []:
+        for fix in tc.get("fixtures") or []:
+            if fix.get("source") != "create":
+                continue
+            name = fix.get("name", "")
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            tasks.append(_FixtureTask(
+                name=name,
+                at=fix.get("at", ""),
+                yields=fix.get("yields"),
+                scope=fix.get("scope", "function"),
+                depends_on=fix.get("depends_on") or [],
+            ))
+    return tasks
+
+
+def _build_helper_tasks(plan: dict[str, Any]) -> list[_HelperTask]:
+    """Collect source=create helpers across all TCs."""
+    tasks: list[_HelperTask] = []
+    seen: set[str] = set()
+    for tc in plan.get("test_cases") or []:
+        for h in tc.get("helpers") or []:
+            if h.get("source") != "create":
+                continue
+            name = h.get("name", "")
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            tasks.append(_HelperTask(
+                name=name,
+                at=h.get("at", ""),
+                signature=h.get("signature"),
+            ))
+    return tasks
+
+
+def _group_helper_tasks_by_file(
+    helper_tasks: list[_HelperTask],
+) -> dict[str, list[_HelperTask]]:
+    by_file: dict[str, list[_HelperTask]] = {}
+    for task in helper_tasks:
+        if not task.at:
+            continue
+        by_file.setdefault(task.at, []).append(task)
+    return by_file
+
+
+async def _create_helpers(
+    helper_tasks: list[_HelperTask],
+    sut_root: Path,
+    workdir: Path,
+    agents_root: Path,
+    active_module: dict[str, Any] | None,
+    step: int,
+    rules_content: str = "",
+) -> list[tuple[str, bool]]:
+    """Phase A5: create new helper functions via call_reasoning_llm.
+
+    One LLM call per target file (all helpers sharing a target file
+    are created in a single pass).
+    """
+    if not helper_tasks:
+        return []
+
+    agent_path = agents_root / "codegen-pom-extender.agent.md"
+    sem = asyncio.Semaphore(_MAX_CONCURRENT_LLM_CALLS)
+
+    existing_helpers = (active_module or {}).get("existing_helpers") or []
+    style_ref = ""
+    if existing_helpers and existing_helpers[0].get("file"):
+        ref_path = sut_root / existing_helpers[0]["file"]
+        if ref_path.is_file():
+            try:
+                raw_ref = ref_path.read_text(encoding="utf-8")
+                head = raw_ref[:3000]
+                last_nl = head.rfind("\n")
+                style_ref = head[:last_nl] if last_nl > 0 else head
+            except OSError:
+                pass
+
+    by_file = _group_helper_tasks_by_file(helper_tasks)
+
+    async def _create_file(
+        file_path: str, tasks: list[_HelperTask],
+    ) -> tuple[str, bool]:
+        specs = [
+            {"name": t.name, "signature": t.signature}
+            for t in tasks
+        ]
+        existing = ""
+        target = sut_root / file_path
+        if target.is_file():
+            try:
+                existing = target.read_text(encoding="utf-8")
+            except OSError:
+                pass
+
+        inputs: dict[str, str] = {
+            "helper_specs.json": json.dumps(specs, indent=2),
+        }
+        if existing:
+            inputs["existing_file.py"] = existing
+        if style_ref:
+            inputs["style_reference.py"] = style_ref
+        if rules_content:
+            inputs["codegen-rules.md"] = rules_content
+
+        names = ", ".join(t.name for t in tasks)
+        async with sem:
+            log.info(
+                "step08.helper_create.start",
+                file=file_path,
+                helpers=len(tasks),
+                names=names,
+            )
+            result = await call_reasoning_llm(
+                agent_path,
+                workdir=workdir,
+                user_prompt=(
+                    f"Create {len(tasks)} helper function(s) — {names} — "
+                    f"matching the specs in `helper_specs.json`. "
+                    f"If `existing_file.py` is provided, append the new "
+                    f"helpers to it and return the complete updated file. "
+                    f"Otherwise return a complete new file. "
+                    f"`style_reference.py` shows coding conventions only. "
+                    f"The output must be syntactically valid Python."
+                ),
+                inputs=inputs,
+                step=step,
+                timeout_s=120,
+                max_tokens=4000 + 800 * len(tasks),
+            )
+
+        if result.success and result.final_text.strip():
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                clean = _strip_code_fences(result.final_text)
+                target.write_text(clean, encoding="utf-8")
+                if target.suffix == ".py":
+                    import ast as _ast
+                    try:
+                        _ast.parse(clean)
+                    except SyntaxError as e:
+                        try:
+                            if existing:
+                                target.write_text(existing, encoding="utf-8")
+                            else:
+                                target.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        log.error(
+                            "step08.helper_syntax_invalid",
+                            file=file_path, error=str(e),
+                        )
+                        return file_path, False
+                missing = [
+                    t.name for t in tasks
+                    if _re.search(
+                        rf"^\s*def\s+{_re.escape(t.name)}\s*\(",
+                        clean, _re.M,
+                    ) is None
+                ]
+                if missing:
+                    log.error(
+                        "step08.helper_create.symbols_missing",
+                        file=file_path, missing=missing,
+                    )
+                    return file_path, False
+                log.info(
+                    "step08.helper_create.done",
+                    file=file_path, helpers=len(tasks),
+                )
+                return file_path, True
+            except OSError as e:
+                log.error(
+                    "step08.helper_write_failed",
+                    file=file_path, error=str(e),
+                )
+                return file_path, False
+        else:
+            log.warning(
+                "step08.helper_create.failed",
+                file=file_path, error=result.error,
+            )
+            return file_path, False
+
+    results = list(await asyncio.gather(
+        *[_create_file(fp, tasks) for fp, tasks in by_file.items()]
+    ))
+    return results
+
+
+_POM_EXTENDER_MAX_TOKENS_OVERRIDE_KEY = "s08_pom_extender_max_tokens_override"
+_POM_EXTENDER_MAX_TOKENS_HARD_CAP = 32000
+
+
+async def _extend_poms(
+    pom_tasks: dict[str, _PomTask],
+    sut_root: Path,
+    workdir: Path,
+    agents_root: Path,
+    step: int,
+    rules_content: str = "",
+    ctx: StepContext | None = None,
+) -> list[tuple[str, bool]]:
+    """Phase A2: extend each POM with missing_methods via call_reasoning_llm.
+
+    When ``ctx`` is provided, the per-call max_tokens budget can be overridden
+    by setting ``ctx.extras[_POM_EXTENDER_MAX_TOKENS_OVERRIDE_KEY]`` to an int
+    BEFORE this call. The override is consumed (popped) so a successful
+    attempt 2 doesn't leak the override into unrelated POMs or subsequent
+    Step 8 phases. The override is armed by ``_extend_one`` itself on
+    syntax-validation failure (truncation signal) — see the rollback block.
+    """
+    agent_path = agents_root / "codegen-pom-extender.agent.md"
+    sem = asyncio.Semaphore(_MAX_CONCURRENT_LLM_CALLS)
+    results: list[tuple[str, bool]] = []
+
+    # Smart-retry override is per-_extend_poms-call. Consume once at the top:
+    # all POMs in this call share the same budget multiplier (when armed),
+    # and we don't want to re-apply it across nested calls.
+    # TODO: migrate to classifier-driven override key in Phase 3.
+    budget_override: int | None = None
+    if ctx is not None:
+        raw = ctx.extras.pop(_POM_EXTENDER_MAX_TOKENS_OVERRIDE_KEY, None)
+        if isinstance(raw, int) and raw > 0:
+            budget_override = min(raw, _POM_EXTENDER_MAX_TOKENS_HARD_CAP)
+
+    async def _extend_one(file_path: str, task: _PomTask) -> tuple[str, bool]:
+        if not task.missing_methods:
+            return file_path, True
+
+        abs_path = sut_root / file_path
+        if not abs_path.is_file():
+            log.warning("step08.pom_not_found", path=file_path)
+            return file_path, False
+
+        existing_source = abs_path.read_text(encoding="utf-8")
+        locator_source = ""
+        if task.locator_file:
+            loc_path = sut_root / task.locator_file
+            if loc_path.is_file():
+                locator_source = loc_path.read_text(encoding="utf-8")
+
+        methods_json = json.dumps(task.missing_methods, indent=2)
+
+        inputs = {"existing_pom.py": existing_source}
+        if locator_source:
+            inputs["locators.py"] = locator_source
+        inputs["missing_methods.json"] = methods_json
+        if rules_content:
+            inputs["codegen-rules.md"] = rules_content
+
+        # Scale max_tokens with the workload: the agent must return the FULL
+        # updated file (existing source + new method bodies). Hard-coding 8000
+        # truncated ChatPage on run 20260614-190647-ab7dac (22K-char file + 19
+        # methods → response cut mid-`def`, file became unparseable, Phase B.5
+        # reconciler then reported every test method as `method_not_found`
+        # with `existing_methods=[]` because ast.parse choked on the broken
+        # file). Heuristic: existing-source tokens (~chars/3) + ~600 tokens
+        # per new method body + 1000 buffer. Floor 8000, cap 32000 to stay
+        # within model output limits and avoid runaway.
+        method_count = len(task.missing_methods)
+        estimated = (len(existing_source) // 3) + method_count * 600 + 1000
+        dynamic_max_tokens = max(8000, min(estimated, _POM_EXTENDER_MAX_TOKENS_HARD_CAP))
+        # Smart-retry override (consumed at _extend_poms entry above) wins
+        # over the heuristic — it carries the previous attempt's budget × 2.
+        if budget_override is not None:
+            dynamic_max_tokens = budget_override
+
+        async with sem:
+            log.info(
+                "step08.pom_extend.start",
+                pom=task.pom_name,
+                methods=method_count,
+                existing_chars=len(existing_source),
+                max_tokens=dynamic_max_tokens,
+            )
+            result = await call_reasoning_llm(
+                agent_path,
+                workdir=workdir,
+                user_prompt=(
+                    f"Add {len(task.missing_methods)} missing method(s) to the "
+                    f"`{task.pom_name}` class in `existing_pom.py`. The companion "
+                    f"locator class is in `locators.py` (if provided). The method "
+                    f"specifications are in `missing_methods.json` — each has `name`, "
+                    f"`signature`, and optionally `purpose`. Return the complete "
+                    f"updated file content.\n\n"
+                    f"LOCATOR RULE: The locator class already contains TBD sentinel "
+                    f"constants (e.g. `NAME = tbd(\"...\")`) for every unresolved "
+                    f"element. Reference them via `self.locators.<CONSTANT>` — "
+                    f"do NOT use inline `tbd(...)` calls in method bodies. "
+                    f"Do NOT import `tbd` into this file."
+                ),
+                inputs=inputs,
+                step=step,
+                timeout_s=120,
+                max_tokens=dynamic_max_tokens,
+            )
+
+        if not (result.success and result.final_text.strip()):
+            log.warning(
+                "step08.pom_extend.failed",
+                pom=task.pom_name,
+                error=result.error,
+            )
+            return file_path, False
+
+        new_content = _strip_code_fences(result.final_text)
+        try:
+            abs_path.write_text(new_content, encoding="utf-8")
+        except OSError as e:
+            log.error("step08.pom_write_failed", pom=task.pom_name, error=str(e))
+            return file_path, False
+
+        # Validate Python syntax post-write. Catches mid-`def` truncation
+        # (max_tokens overrun) and other broken output BEFORE Phase B.5
+        # reconciliation chokes on it. Without this check, the reconciler
+        # would AST-parse a SyntaxError file, conclude the POM has zero
+        # methods, and report 30+ misleading "method_not_found" mismatches
+        # — masking the real failure (file corrupted by truncation).
+        if abs_path.suffix == ".py":
+            import ast as _ast
+            try:
+                _ast.parse(new_content)
+            except SyntaxError as e:
+                # Roll back the corrupted write so Phase B.5 sees the
+                # untouched original file (still missing the methods, but
+                # parseable — gives a meaningful mismatch list).
+                try:
+                    abs_path.write_text(existing_source, encoding="utf-8")
+                except OSError:
+                    pass
+                # Arm smart-retry: stash a 2× budget on ctx.extras so the
+                # step's retry (MAX_ATTEMPTS=2 in base.py) picks it up at
+                # the top of the next _extend_poms call. Capped at the
+                # hard limit; only armed when ctx is available.
+                # Two truncation signals are checked, strongest first:
+                #   (a) result.stop_reason == "max_tokens" — definitive
+                #       signal from the LLM that it wanted to keep going
+                #       but hit the budget. Always arms when present.
+                #   (b) syntax error position — when stop_reason is missing
+                #       or "end_turn", fall back to the heuristic: if the
+                #       broken line lies in the back third of the file, it
+                #       looks like truncation. Otherwise it's likely a real
+                #       logic bug the agent emitted mid-file, and bumping
+                #       the budget won't help.
+                stop_reason = getattr(result, "stop_reason", None)
+                truncation_likely = False
+                if ctx is not None:
+                    line_no = getattr(e, "lineno", 0) or 0
+                    written_lines = max(new_content.count("\n"), 1)
+                    if stop_reason == "max_tokens":
+                        truncation_likely = True
+                    elif stop_reason in (None, "end_turn"):
+                        truncation_likely = line_no >= int(written_lines * 0.66)
+                    if truncation_likely:
+                        new_budget = min(
+                            dynamic_max_tokens * 2,
+                            _POM_EXTENDER_MAX_TOKENS_HARD_CAP,
+                        )
+                        if new_budget > dynamic_max_tokens:
+                            ctx.extras[
+                                _POM_EXTENDER_MAX_TOKENS_OVERRIDE_KEY
+                            ] = new_budget
+                            log.info(
+                                "step08.pom_extender.smart_retry_armed",
+                                pom=task.pom_name,
+                                prev_max_tokens=dynamic_max_tokens,
+                                next_max_tokens=new_budget,
+                                error_line=line_no,
+                                written_lines=written_lines,
+                                signal=(
+                                    "stop_reason=max_tokens"
+                                    if stop_reason == "max_tokens"
+                                    else "syntax_error_at_eof"
+                                ),
+                            )
+                log.error(
+                    "step08.pom_syntax_invalid",
+                    pom=task.pom_name,
+                    file=file_path,
+                    line=getattr(e, "lineno", None),
+                    error=str(e),
+                    chars_written=len(new_content),
+                    max_tokens=dynamic_max_tokens,
+                    truncation_likely=truncation_likely,
+                    hint=(
+                        "smart-retry armed: next attempt will use doubled max_tokens"
+                        if truncation_likely else
+                        "syntax error not at file end — likely a real logic bug, not truncation"
+                    ),
+                )
+                return file_path, False
+
+        log.info("step08.pom_extend.done", pom=task.pom_name)
+        return file_path, True
+
+    tasks_to_run = [
+        _extend_one(fp, task)
+        for fp, task in pom_tasks.items()
+        if task.missing_methods
+    ]
+    if tasks_to_run:
+        results = list(await asyncio.gather(*tasks_to_run))
+    return results
+
+
+def _detect_const_indent(lines: list[str], is_java: bool) -> str:
+    """Best-effort detection of the indentation new TBD constants should use.
+
+    Scans for an existing constant declaration and reuses its leading
+    whitespace. This adapts to both module-level locator files (column 0)
+    and class-body page objects (indented) instead of assuming a fixed
+    4-space class-body placement.
+    """
+    for ln in lines:
+        s = ln.strip()
+        if not s or s.startswith("#") or s.startswith("//"):
+            continue
+        if is_java:
+            if "static final" in s and "=" in s:
+                return ln[: len(ln) - len(ln.lstrip())]
+        else:
+            if "=" in s:
+                head = s.split("=", 1)[0].strip()
+                if head and head.replace("_", "").isalnum() and head.isupper():
+                    return ln[: len(ln) - len(ln.lstrip())]
+    # No existing constant to mirror. Java constants always live in a class
+    # body; Python constants live at class-body indent only when a class wraps
+    # the file, otherwise at module level.
+    if is_java:
+        return "    "
+    for ln in lines:
+        st = ln.lstrip()
+        if st.startswith("class ") and st.rstrip().endswith(":"):
+            return "    "
+    return ""
+
+
+def _write_tbd_locators(
+    locator_tasks: list[_LocatorTask],
+    sut_root: Path,
+    language: str | None,
+) -> int:
+    """Phase A3: mechanical append of TBD locator constants (pure Python)."""
+    if not locator_tasks:
+        return 0
+
+    by_file: dict[str, list[_LocatorTask]] = {}
+    for task in locator_tasks:
+        if task.locator_file:
+            by_file.setdefault(task.locator_file, []).append(task)
+        else:
+            log.warning(
+                "step08.tbd_locator_no_file",
+                constant=task.constant_name,
+                owning_page=task.owning_page,
+            )
+
+    written = 0
+    is_java = (language or "").lower() == "java"
+
+    for file_path, tasks in by_file.items():
+        abs_path = sut_root / file_path
+        if not abs_path.is_file():
+            log.warning("step08.tbd_locator_file_missing", path=file_path)
+            continue
+
+        content = abs_path.read_text(encoding="utf-8")
+        lines = content.rstrip().split("\n")
+
+        tbd_import = "from tests.worca_t_runtime import tbd"
+        if is_java:
+            tbd_import = "import com.worca.runtime.Tbd;"
+        needs_import = tbd_import not in content and "import tbd" not in content.lower()
+
+        if needs_import:
+            if is_java:
+                # Java imports must follow the `package …;` declaration and
+                # precede the type declaration. Insert right after the package
+                # line when present, otherwise at the top of the file.
+                for i, line in enumerate(lines):
+                    if line.strip().startswith("package ") and line.rstrip().endswith(";"):
+                        lines.insert(i + 1, "")
+                        lines.insert(i + 2, tbd_import)
+                        break
+                else:
+                    lines.insert(0, tbd_import)
+            else:
+                for i, line in enumerate(lines):
+                    if line.startswith("import ") or line.startswith("from "):
+                        lines.insert(i, tbd_import)
+                        break
+                else:
+                    lines.insert(0, tbd_import)
+
+        # Determine the indentation new constants should carry. Prefer the
+        # leading whitespace of an existing constant in the same file (handles
+        # both module-level locator modules and class-body POMs). Fall back to
+        # 4-space class-body indent for Java (constants are always class
+        # members) and for Python only when a wrapping `class` is present;
+        # otherwise module-level (no indent).
+        const_indent = _detect_const_indent(lines, is_java)
+
+        new_lines: list[str] = []
+        for task in tasks:
+            if task.constant_name in content:
+                log.debug(
+                    "step08.tbd_locator_exists",
+                    constant=task.constant_name,
+                )
+                continue
+            if is_java:
+                new_lines.append(
+                    f'{const_indent}public static final String {task.constant_name} = '
+                    f'Tbd.of("{task.intent}");'
+                )
+            else:
+                new_lines.append(
+                    f'{const_indent}{task.constant_name} = tbd("{task.intent}")'
+                )
+            written += 1
+
+        if new_lines:
+            indent_idx = len(lines)
+            for i in range(len(lines) - 1, -1, -1):
+                stripped = lines[i].strip()
+                if stripped and not stripped.startswith("#") and stripped != "":
+                    indent_idx = i + 1
+                    break
+            for nl in new_lines:
+                lines.insert(indent_idx, nl)
+                indent_idx += 1
+
+            abs_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            log.info(
+                "step08.tbd_locators_written",
+                file=file_path,
+                count=len(new_lines),
+            )
+
+    return written
+
+
+def _group_fixture_tasks_by_file(
+    fixture_tasks: list[_FixtureTask],
+) -> dict[str, list[_FixtureTask]]:
+    """Collate fixtures by target file so each file gets one LLM call.
+
+    Without this, parallel `asyncio.gather` calls all read the same starting
+    `existing` content and overwrite each other (last writer wins) — silently
+    dropping every fixture except one. See run 20260611-184450-1fbf3d for the
+    incident where 5 of 6 fixtures vanished.
+    """
+    by_file: dict[str, list[_FixtureTask]] = {}
+    for task in fixture_tasks:
+        if not task.at:
+            continue
+        by_file.setdefault(task.at, []).append(task)
+    return by_file
+
+
+async def _create_fixtures(
+    fixture_tasks: list[_FixtureTask],
+    sut_root: Path,
+    workdir: Path,
+    agents_root: Path,
+    active_module: dict[str, Any] | None,
+    step: int,
+    rules_content: str = "",
+) -> list[tuple[str, bool]]:
+    """Phase A4: create new fixtures via call_reasoning_llm.
+
+    One LLM call per target file (not per fixture) — all fixtures destined
+    for the same file are created in a single pass to avoid the read/write
+    race that drops co-located fixtures.
+    """
+    if not fixture_tasks:
+        return []
+
+    agent_path = agents_root / "codegen-pom-extender.agent.md"
+    sem = asyncio.Semaphore(_MAX_CONCURRENT_LLM_CALLS)
+
+    existing_fixtures = (active_module or {}).get("existing_fixtures") or []
+    style_ref = ""
+    if existing_fixtures and existing_fixtures[0].get("file"):
+        ref_path = sut_root / existing_fixtures[0]["file"]
+        if ref_path.is_file():
+            try:
+                raw_ref = ref_path.read_text(encoding="utf-8")
+                # Truncate at a clean line boundary so the LLM never sees a
+                # mid-statement cut (e.g. `parser.addoption(` with no closer).
+                # A truncated style reference once caused the LLM to copy the
+                # broken fragment verbatim into the generated fixture file,
+                # producing unparseable Python that the reconciler reported
+                # as `fixture_file_missing` for every declared fixture.
+                head = raw_ref[:3000]
+                last_nl = head.rfind("\n")
+                style_ref = head[:last_nl] if last_nl > 0 else head
+            except OSError:
+                pass
+
+    by_file = _group_fixture_tasks_by_file(fixture_tasks)
+
+    async def _create_file(file_path: str, tasks: list[_FixtureTask]) -> tuple[str, bool]:
+        specs = [
+            {
+                "name": t.name,
+                "yields": t.yields,
+                "scope": t.scope,
+                "depends_on": t.depends_on,
+            }
+            for t in tasks
+        ]
+        existing = ""
+        target = sut_root / file_path
+        if target.is_file():
+            try:
+                existing = target.read_text(encoding="utf-8")
+            except OSError:
+                pass
+
+        inputs: dict[str, str] = {
+            "fixture_specs.json": json.dumps(specs, indent=2),
+        }
+        if existing:
+            inputs["existing_file.py"] = existing
+        if style_ref:
+            inputs["style_reference.py"] = style_ref
+        if rules_content:
+            inputs["codegen-rules.md"] = rules_content
+
+        # Inject auth/dependency context when fixtures declare depends_on
+        dep_fixture_names: set[str] = set()
+        for t in tasks:
+            dep_fixture_names.update(t.depends_on)
+
+        dep_clause = ""
+        if dep_fixture_names and active_module:
+            for inv_fix in (active_module.get("existing_fixtures") or []):
+                if inv_fix.get("name") in dep_fixture_names:
+                    dep_file = inv_fix.get("file")
+                    if dep_file:
+                        dep_path = sut_root / dep_file
+                        if dep_path.is_file():
+                            try:
+                                dep_source = dep_path.read_text(
+                                    encoding="utf-8",
+                                )
+                                inputs[
+                                    f"dep_fixture_{inv_fix['name']}.py"
+                                ] = dep_source
+                            except OSError:
+                                pass
+            auth_flow = active_module.get("auth_flow")
+            if auth_flow:
+                inputs["auth_flow.json"] = json.dumps(auth_flow, indent=2)
+            dep_names = ", ".join(sorted(dep_fixture_names))
+            dep_clause = (
+                f" The new fixture(s) depend on existing fixture(s): "
+                f"{dep_names}. The source of each depended-on fixture is "
+                f"provided as `dep_fixture_<name>.py`. The new fixture(s) "
+                f"MUST request the depended-on fixture as a pytest "
+                f"parameter and build on top of its yielded object — do "
+                f"NOT re-implement authentication or session setup. If "
+                f"`auth_flow.json` is provided, it describes the SUT's "
+                f"authentication mechanism."
+            )
+
+        names = ", ".join(t.name for t in tasks)
+        async with sem:
+            log.info(
+                "step08.fixture_create.start",
+                file=file_path,
+                fixtures=len(tasks),
+                names=names,
+            )
+            result = await call_reasoning_llm(
+                agent_path,
+                workdir=workdir,
+                user_prompt=(
+                    f"Create {len(tasks)} pytest fixture(s) — {names} — "
+                    f"matching the specs in `fixture_specs.json`. ALL "
+                    f"specified fixtures must appear in the output. "
+                    f"If `existing_file.py` is provided, append the new "
+                    f"fixtures to it and return the complete updated file "
+                    f"(existing content + new fixtures). Otherwise return "
+                    f"a complete new file containing ONLY the requested "
+                    f"fixtures plus the imports they need. "
+                    f"`style_reference.py` shows coding conventions only "
+                    f"(import grouping, fixture scope, naming) — do NOT "
+                    f"copy its content into your output. The output must "
+                    f"be syntactically valid Python.{dep_clause}"
+                ),
+                inputs=inputs,
+                step=step,
+                timeout_s=120,
+                max_tokens=4000 + 1000 * len(tasks),
+            )
+
+        if result.success and result.final_text.strip():
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                clean = _strip_code_fences(result.final_text)
+                # When `existing` was supplied, the agent is instructed to
+                # return the COMPLETE file. Log a noticeable shrink so an
+                # agent that wrongly returns only the new fixtures
+                # (clobbering the existing file) is diagnosable from the
+                # run log rather than failing silently.
+                if existing and len(clean) < len(existing) // 2:
+                    log.warning(
+                        "step08.fixture_overwrite_shrink",
+                        file=file_path,
+                        prev_bytes=len(existing),
+                        new_bytes=len(clean),
+                        hint="agent may have dropped existing content",
+                    )
+                target.write_text(clean, encoding="utf-8")
+                # Validate Python syntax post-write. Mirrors the POM
+                # extender's gate (see `_extend_one`): catches truncated /
+                # malformed output BEFORE the reconciler chokes on it and
+                # reports misleading `fixture_file_missing` for every
+                # declared fixture. Roll back so the next attempt starts
+                # from the prior file state (or no file, if newly created).
+                if target.suffix == ".py":
+                    import ast as _ast
+                    try:
+                        _ast.parse(clean)
+                    except SyntaxError as e:
+                        try:
+                            if existing:
+                                target.write_text(existing, encoding="utf-8")
+                            else:
+                                target.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        log.error(
+                            "step08.fixture_syntax_invalid",
+                            file=file_path,
+                            line=getattr(e, "lineno", None),
+                            error=str(e),
+                            chars_written=len(clean),
+                            hint="rolled back; next attempt will regenerate",
+                        )
+                        return file_path, False
+                # Verify each requested fixture name actually appears as a
+                # `def <name>` in the written file. A missing name surfaces
+                # immediately in the log AND fails the file so reconcile
+                # (Fix 2) catches it.
+                missing = [
+                    t.name for t in tasks
+                    if _re.search(rf"^\s*def\s+{_re.escape(t.name)}\s*\(", clean, _re.M) is None
+                ]
+                if missing:
+                    log.error(
+                        "step08.fixture_create.symbols_missing",
+                        file=file_path,
+                        missing=missing,
+                    )
+                    return file_path, False
+                log.info(
+                    "step08.fixture_create.done",
+                    file=file_path,
+                    fixtures=len(tasks),
+                )
+                return file_path, True
+            except OSError as e:
+                log.error(
+                    "step08.fixture_write_failed",
+                    file=file_path,
+                    error=str(e),
+                )
+                return file_path, False
+        else:
+            log.warning(
+                "step08.fixture_create.failed",
+                file=file_path,
+                error=result.error,
+            )
+            return file_path, False
+
+    results = list(await asyncio.gather(
+        *[_create_file(fp, tasks) for fp, tasks in by_file.items()]
+    ))
+    return results
+
+
+def _build_imports_manifest(
+    plan: dict[str, Any],
+    pom_tasks: dict[str, _PomTask],
+    locator_tasks: list[_LocatorTask],
+    fixture_tasks: list[_FixtureTask],
+    helper_tasks: list[_HelperTask],
+    sut_root: Path,
+) -> dict[str, Any]:
+    """Phase B1: build the imports manifest for the test writer."""
+    pom_files = []
+    for fp, task in pom_tasks.items():
+        pom_files.append({
+            "class_name": task.pom_name,
+            "file": fp,
+            "import_path": fp.replace("/", ".").replace("\\", ".").removesuffix(".py"),
+            "methods_added": [m["name"] for m in task.missing_methods],
+            "locator_class": task.locator_class,
+            "locator_file": task.locator_file,
+        })
+
+    tbd_locators = [
+        {
+            "constant_name": t.constant_name,
+            "file": t.locator_file or "",
+            "intent": t.intent,
+            "owning_page": t.owning_page,
+        }
+        for t in locator_tasks
+    ]
+
+    fixtures_created = [
+        {"name": t.name, "file": t.at, "yields": t.yields, "scope": t.scope}
+        for t in fixture_tasks
+    ]
+
+    helpers_created = [
+        {"name": t.name, "file": t.at, "signature": t.signature}
+        for t in helper_tasks
+    ]
+
+    existing_fixtures: dict[str, str] = {}
+    for tc in plan.get("test_cases") or []:
+        for fix in tc.get("fixtures") or []:
+            if fix.get("source") == "reuse" and fix.get("from"):
+                existing_fixtures[fix["name"]] = fix["from"]
+
+    return {
+        "language": plan.get("language"),
+        "framework": plan.get("framework"),
+        "sut_root": str(sut_root),
+        "pom_files": pom_files,
+        "tbd_locators_added": tbd_locators,
+        "fixtures_created": fixtures_created,
+        "helpers_created": helpers_created,
+        "existing_fixtures": existing_fixtures,
+    }
+
+
+def _filter_strategy_for_tcs(strategy_text: str, tc_ids: list[str]) -> str:
+    """Extract only the relevant #### TC-<id>: sections from the strategy."""
+    if not tc_ids:
+        return strategy_text
+
+    sections: list[str] = []
+    current: list[str] = []
+    current_id: str | None = None
+    tc_set = set(tc_ids)
+
+    for line in strategy_text.split("\n"):
+        m = _re.match(r"^####\s+(TC-[^:\s]+)", line)
+        if m:
+            if current_id and current_id in tc_set:
+                sections.append("\n".join(current))
+            current = [line]
+            current_id = m.group(1)
+        elif current_id is not None:
+            current.append(line)
+
+    if current_id and current_id in tc_set:
+        sections.append("\n".join(current))
+
+    return "\n\n".join(sections) if sections else strategy_text
+
+
+async def _generate_test_files(
+    plan: dict[str, Any],
+    strategy_text: str,
+    manifest: dict[str, Any],
+    sut_root: Path,
+    workdir: Path,
+    agents_root: Path,
+    reuse_hint: str,
+    runtime_hint: str,
+    env_hint: str,
+    step: int,
+    rules_content: str = "",
+) -> list[tuple[str, bool]]:
+    """Phase B2: generate test files via call_reasoning_llm (one per target)."""
+    agent_path = agents_root / "codegen-test-writer.agent.md"
+    sem = asyncio.Semaphore(_MAX_CONCURRENT_LLM_CALLS)
+
+    by_target: dict[str, list[dict[str, Any]]] = {}
+    for tc in plan.get("test_cases") or []:
+        target = tc.get("test_file_target", "tests/worca_test.py")
+        by_target.setdefault(target, []).append(tc)
+
+    if not by_target:
+        return []
+
+    async def _generate_one(
+        target: str, tcs: list[dict[str, Any]],
+    ) -> tuple[str, bool]:
+        tc_ids = [tc.get("id", "") for tc in tcs]
+        filtered_strategy = _filter_strategy_for_tcs(strategy_text, tc_ids)
+
+        sub_plan = {
+            "plan_version": plan.get("plan_version"),
+            "active_module": plan.get("active_module"),
+            "language": plan.get("language"),
+            "framework": plan.get("framework"),
+            "test_cases": tcs,
+        }
+
+        abs_target = sut_root / target
+        inputs = {
+            "plan.json": json.dumps(sub_plan, indent=2),
+            "strategy.md": filtered_strategy,
+            "imports.json": json.dumps(manifest, indent=2),
+        }
+        if rules_content:
+            inputs["codegen-rules.md"] = rules_content
+
+        prompt = (
+            f"Generate a complete test file to be written at "
+            f"`{abs_target}`. The plan contains {len(tcs)} test case(s): "
+            f"{', '.join(tc_ids)}. "
+            f"Use `plan.json` for structure (test functions, fixtures, markers) "
+            f"and `strategy.md` for assertion values (expected strings, URLs, "
+            f"counts — lift them VERBATIM into equality assertions). "
+            f"Use `imports.json` to know what POM classes, locators, and "
+            f"fixtures are available to import."
+            f"{env_hint}{runtime_hint}{reuse_hint}"
+        )
+
+        async with sem:
+            log.info(
+                "step08.test_gen.start",
+                target=target,
+                test_cases=len(tcs),
+            )
+            result = await call_reasoning_llm(
+                agent_path,
+                workdir=workdir,
+                user_prompt=prompt,
+                inputs=inputs,
+                step=step,
+                timeout_s=180,
+                max_tokens=16000,
+            )
+
+        if result.success and result.final_text.strip():
+            try:
+                abs_target.parent.mkdir(parents=True, exist_ok=True)
+                abs_target.write_text(_strip_code_fences(result.final_text), encoding="utf-8")
+                log.info("step08.test_gen.done", target=target)
+                return target, True
+            except OSError as e:
+                log.error(
+                    "step08.test_gen.write_failed",
+                    target=target, error=str(e),
+                )
+                return target, False
+        else:
+            log.warning(
+                "step08.test_gen.failed",
+                target=target, error=result.error,
+            )
+            return target, False
+
+    results = list(await asyncio.gather(
+        *[_generate_one(t, tcs) for t, tcs in by_target.items()]
+    ))
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Phase D: TBD intent quality gate
+# ---------------------------------------------------------------------------
+#
+# After Phases A-C have written code and the indexer's quality gate has
+# passed, score every `tbd("intent")` / `Tbd.of("intent")` call-site for
+# resolver-quality. Low-quality intents (vague, literal CSS, empty) waste
+# runtime tokens and cause unrecoverable resolution failures — better to
+# block here than at Step 9.
+#
+# - FAIL → step fails (overridable via WORCA_T_INTENT_FAIL_AS_WARN=1).
+# - WARN → step succeeds but warnings are stashed on `ctx.extras` for the
+#   post-Step-8 review gate to surface on TTY.
+# - WORCA_T_SKIP_INTENT_SCORE=1 skips Phase D entirely (no scoring, no gate).
+
+
+_INTENT_QUALITY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["results"],
+    "additionalProperties": False,
+    "properties": {
+        "results": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["intent", "score", "rationale"],
+                "additionalProperties": False,
+                "properties": {
+                    "intent": {"type": "string"},
+                    "score": {"enum": ["PASS", "WARN", "FAIL"]},
+                    "rationale": {"type": "string", "maxLength": 200},
+                },
+            },
+        },
+    },
+}
+
+
+async def _phase_d_score_intents(
+    produced_in_sut: list[Path],
+    jit_files_added: list[Path],
+    sut_root: Path,
+    out_dir: Path,
+    workdir: Path,
+    agents_root: Path,
+) -> tuple[bool, dict[str, Any], list[dict[str, Any]], str | None]:
+    """Score every TBD sentinel in produced sources. Returns
+    ``(success, summary_dict, warnings_list, error_message)``.
+
+    - ``success`` is False only when at least one FAIL surfaces AND
+      ``WORCA_T_INTENT_FAIL_AS_WARN`` is not set to 1.
+    - ``summary_dict`` is the persisted artifact payload.
+    - ``warnings_list`` carries every WARN entry (and every FAIL when
+      FAIL_AS_WARN is in effect) for the post-step review gate.
+    - ``error_message`` is a short user-facing string on failure.
+    """
+    # Local import keeps the worca-t boot path light when callers don't
+    # exercise codegen (tests, CLI subcommands).
+    from worca_t.tbd_scanner import scan_tbd_intents
+
+    if os.environ.get("WORCA_T_SKIP_INTENT_SCORE") == "1":
+        log.info("step08.phase_d.skipped", reason="WORCA_T_SKIP_INTENT_SCORE=1")
+        return True, {"skipped": True, "reason": "env_skip"}, [], None
+
+    jit_resolved = {p.resolve() for p in jit_files_added if p.exists()}
+    scan_paths: list[Path] = []
+    seen: set[Path] = set()
+    for p in produced_in_sut:
+        resolved = p.resolve() if p.exists() else p
+        if resolved in seen or resolved in jit_resolved:
+            continue
+        seen.add(resolved)
+        scan_paths.append(p)
+
+    intents = scan_tbd_intents(scan_paths, sut_root)
+    if not intents:
+        log.info("step08.phase_d.no_intents")
+        empty = {
+            "results": [],
+            "summary": {"pass": 0, "warn": 0, "fail": 0, "total": 0},
+        }
+        return True, empty, [], None
+
+    # Build a deterministic input payload — anchors needed by the post-step
+    # editor live alongside the intent string so the model has the file:line
+    # context without having to invent it.
+    payload_intents = [
+        {
+            "intent": t.intent,
+            "context": f"{str(t.file).replace(chr(92), '/')}:{t.line}",
+        }
+        for t in intents
+    ]
+
+    agent_path = agents_root / "tbd-intent-scorer.agent.md"
+    result = await call_reasoning_llm(
+        agent_path,
+        workdir=workdir,
+        user_prompt=(
+            f"Score {len(payload_intents)} TBD locator intent(s) emitted by "
+            f"Step 8 codegen. The intents will be passed to the Step 9 JIT "
+            f"resolver against a live page's AOM. Be conservative on FAIL — "
+            f"WARN is the right call when in doubt. Return exactly one entry "
+            f"per input intent, in the same order."
+        ),
+        inputs={"intents.json": json.dumps({"intents": payload_intents}, indent=2)},
+        output_schema=_INTENT_QUALITY_SCHEMA,
+        timeout_s=120,
+        max_tokens=4000,
+        step=8,
+    )
+
+    if not result.success or not result.final_text.strip():
+        log.warning(
+            "step08.phase_d.scorer_failed",
+            error=result.error,
+            count=len(payload_intents),
+        )
+        # Scorer failure is a Phase-D infrastructure problem, not an intent
+        # quality problem. Surface as a warning, don't block the step.
+        partial = {
+            "scorer_error": result.error or "no output",
+            "results": [],
+            "summary": {"pass": 0, "warn": 0, "fail": 0,
+                        "total": len(payload_intents)},
+        }
+        return True, partial, [], None
+
+    try:
+        scored: dict[str, Any] = json.loads(result.final_text)
+    except json.JSONDecodeError as e:
+        log.warning("step08.phase_d.unparseable", error=str(e))
+        return True, {"scorer_error": f"unparseable JSON: {e}",
+                      "results": []}, [], None
+
+    raw_results = scored.get("results") or []
+    if len(raw_results) != len(intents):
+        log.warning(
+            "step08.phase_d.result_count_mismatch",
+            expected=len(intents),
+            got=len(raw_results),
+        )
+
+    # Splice scanner anchors into the scorer output so downstream consumers
+    # (review gate, editor agent) can find each call-site without re-scanning.
+    enriched: list[dict[str, Any]] = []
+    for idx, intent_obj in enumerate(intents):
+        scored_entry = raw_results[idx] if idx < len(raw_results) else {
+            "intent": intent_obj.intent, "score": "WARN",
+            "rationale": "scorer omitted this intent — defaulted to WARN",
+        }
+        enriched.append({
+            "file": str(intent_obj.file).replace("\\", "/"),
+            "line": intent_obj.line,
+            "constant_name": intent_obj.constant_name,
+            "intent": intent_obj.intent,
+            "language": intent_obj.language,
+            "score": scored_entry.get("score", "WARN"),
+            "rationale": scored_entry.get("rationale", ""),
+        })
+
+    pass_n = sum(1 for e in enriched if e["score"] == "PASS")
+    warn_n = sum(1 for e in enriched if e["score"] == "WARN")
+    fail_n = sum(1 for e in enriched if e["score"] == "FAIL")
+    summary = {
+        "results": enriched,
+        "summary": {"pass": pass_n, "warn": warn_n, "fail": fail_n,
+                    "total": len(enriched)},
+    }
+
+    log.info(
+        "step08.phase_d.scored",
+        pass_n=pass_n, warn_n=warn_n, fail_n=fail_n, total=len(enriched),
+    )
+
+    fail_as_warn = os.environ.get("WORCA_T_INTENT_FAIL_AS_WARN") == "1"
+    if fail_n > 0 and not fail_as_warn:
+        # Step fails. Surface WARN+FAIL entries so a manual --from-step 8
+        # restart with the env var set can still show them in the review gate.
+        warnings_list = [e for e in enriched if e["score"] in ("WARN", "FAIL")]
+        return (
+            False, summary, warnings_list,
+            f"intent quality gate: {fail_n} FAIL intent(s)",
+        )
+
+    if fail_as_warn and fail_n > 0:
+        log.warning(
+            "step08.phase_d.fail_downgraded",
+            fail_n=fail_n,
+            reason="WORCA_T_INTENT_FAIL_AS_WARN=1",
+        )
+
+    warnings_list = [e for e in enriched if e["score"] in ("WARN", "FAIL")]
+    return True, summary, warnings_list, None
+
+
+async def _auto_fix_intents(
+    flagged: list[dict],
+    sut_root: Path,
+    workdir: Path,
+    agents_root: Path,
+) -> tuple[int, list[str]]:
+    """Attempt to rewrite WARN/FAIL intents via the tbd-intent-editor agent.
+
+    Returns ``(rewritten_count, errors)``.  Single attempt — no retry loop.
+    """
+    from worca_t.review_gate import _replace_intent_at_line
+
+    agent_path = agents_root / "tbd-intent-editor.agent.md"
+    result = await call_reasoning_llm(
+        agent_path,
+        workdir=workdir,
+        user_prompt=(
+            "Improve each flagged intent based on its rationale. For FAIL "
+            "intents: replace literal selectors (CSS, XPath, IDs) with "
+            "role + visible label descriptions. For WARN intents: add "
+            "specificity — include the UI region or disambiguating context "
+            "(e.g. 'submit' → 'submit order button in checkout form'). Use "
+            "the constant_name as a hint for the element's purpose when the "
+            "intent is too vague."
+        ),
+        inputs={
+            "flagged-intents.json": json.dumps(
+                {"intents": flagged}, indent=2, ensure_ascii=False,
+            ),
+        },
+        output_schema={
+            "type": "object",
+            "required": ["intents"],
+            "additionalProperties": False,
+            "properties": {
+                "intents": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["intent"],
+                        "additionalProperties": True,
+                        "properties": {
+                            "intent": {"type": "string", "maxLength": 120},
+                        },
+                    },
+                },
+            },
+        },
+        step=8,
+        timeout_s=60,
+        max_tokens=2000 + 200 * len(flagged),
+    )
+
+    if not result.success or not result.final_text.strip():
+        log.warning(
+            "step08.phase_d.autofix_agent_failed", error=result.error,
+        )
+        return 0, [result.error or "agent produced no output"]
+
+    try:
+        updated = json.loads(result.final_text)
+    except json.JSONDecodeError as e:
+        log.warning("step08.phase_d.autofix_unparseable", error=str(e))
+        return 0, [f"unparseable response: {e}"]
+
+    new_intents = updated.get("intents") or []
+    if len(new_intents) != len(flagged):
+        log.warning(
+            "step08.phase_d.autofix_count_mismatch",
+            expected=len(flagged), got=len(new_intents),
+        )
+        return 0, [f"count mismatch: expected {len(flagged)}, got {len(new_intents)}"]
+
+    rewritten = 0
+    errors: list[str] = []
+    for old, new in zip(flagged, new_intents):
+        old_intent = old.get("intent", "")
+        new_intent = (new.get("intent") or "").strip()
+        if not new_intent or new_intent == old_intent:
+            continue
+        rel = old.get("file", "")
+        line_no = old.get("line", 0)
+        abs_path = sut_root / rel
+        if not abs_path.is_file():
+            errors.append(f"{rel} (not found)")
+            continue
+        try:
+            text = abs_path.read_text(encoding="utf-8")
+        except OSError as e:
+            errors.append(f"{rel} (read: {e})")
+            continue
+        new_text, ok = _replace_intent_at_line(
+            text, line_no, old_intent, new_intent,
+        )
+        if not ok:
+            errors.append(f"{rel}:{line_no} (intent not found at line)")
+            continue
+        try:
+            abs_path.write_text(new_text, encoding="utf-8")
+        except OSError as e:
+            errors.append(f"{rel} (write: {e})")
+            continue
+        rewritten += 1
+        log.info(
+            "step08.phase_d.autofix_rewritten",
+            file=rel, line=line_no,
+            old=old_intent[:60], new=new_intent[:60],
+        )
+
+    return rewritten, errors
 
 
 class CodegenStep(Step):
@@ -710,41 +2217,23 @@ class CodegenStep(Step):
                     ),
                 )
 
-        # --- Stage planning artifacts (no SUT bytes) ------------------------
-        #
-        # Minimum-sufficient input set, ranked by authority:
-        #   - test-strategy.md (step 4): the curated, authoritative test
-        #     specification. Includes the test cases the agent must implement.
-        #   - sut_inventory.json (step 6): the SUT's own layout (existing page
-        #     objects, fixtures, locators, helpers). The active module record
-        #     lives at modules[active_module] — the agent extracts it on read.
-        #
-        # Deliberately NOT staged:
-        #   - plan.md (step 3) + refined-spec.md (step 2): redundant with
-        #     test-strategy.md, which is derived from them.
-        #   - research.md (step 6): every datum the agent needed (env var
-        #     names via env_hint; frameworks + layout via sut_inventory;
-        #     build/test commands consumed by step 8 via research.json) is
-        #     already supplied by other inputs. Saves ~25 KB / turn.
-        #   - active_module.json: byte-identical duplicate of
-        #     sut_inventory.json["modules"][active_module]. Saves ~22 KB / turn.
-        inputs = {
-            "code-modification-plan.json": plan_json,
-            "test-strategy.md": strategy_md,
-        }
-        if sut_inv_json.exists():
-            inputs["sut_inventory.json"] = sut_inv_json
+        # --- Parse plan + load inputs for phased codegen --------------------
+        try:
+            plan_data = json.loads(plan_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            return StepResult(
+                success=False, status="failed", outputs=[],
+                error=f"failed to parse code-modification-plan.json: {e}",
+            )
+        strategy_text = strategy_md.read_text(encoding="utf-8")
 
         agents_root = package_resource_root() / "agents"
-        skills_root = package_resource_root() / "skills"
-        agent = agents_root / "ui-test-automation.agent.md"
-        claude_md = package_resource_root() / "CLAUDE.md"
 
-        extras: list[Path] = []
-        for skill in _select_skills(detected_stack):
-            p = skills_root / skill
-            if p.exists():
-                extras.append(p)
+        rules_path = agents_root / "codegen-rules.md"
+        rules_content = ""
+        if rules_path.is_file():
+            rules_content = rules_path.read_text(encoding="utf-8")
+            log.info("step08.codegen_rules_loaded", path=str(rules_path))
 
         stack_hint = f"Detected stack: `{detected_stack}`. " if detected_stack else ""
 
@@ -888,7 +2377,14 @@ class CodegenStep(Step):
             # detected (greenfield TS/JS, or unknown lang).
             pages_object_dir = src_layout.get("pages_object_dir") or f"{base_dir}/pages/object"
             pages_locators_dir = src_layout.get("pages_locators_dir") or f"{base_dir}/pages/locators"
-            helpers_dir = src_layout.get("helpers_dir") or f"{base_dir}/helpers"
+            raw_helpers_dir = src_layout.get("helpers_dir")
+            pkg_root = src_layout.get("package_root")
+            if raw_helpers_dir and pkg_root and raw_helpers_dir.startswith(base_dir):
+                helpers_dir = f"{pkg_root}/utils"
+            elif raw_helpers_dir:
+                helpers_dir = raw_helpers_dir
+            else:
+                helpers_dir = f"{base_dir}/helpers"
             fixtures_dir = f"{base_dir}/fixtures"  # fixtures always under tests/
             data_dir = f"{base_dir}/data"
 
@@ -951,7 +2447,7 @@ class CodegenStep(Step):
                 f"file at its ABSOLUTE path under the SUT clone. The pipeline "
                 f"does NOT copy your output anywhere afterwards — the SUT IS "
                 f"the deliverable, on a worca-t-owned git branch. Specifically:\n"
-                f"   - Test files → `{abs_tests}/worca_test_<feature>.<ext>`\n"
+                f"   - Test files → `{abs_tests}/worca_<feature>_test.<ext>`\n"
                 f"   - Test data → `{abs_data}/worca_<feature>_data.<ext>`\n"
                 f"   - Fixtures → `{abs_fixtures}/worca_<feature>_fixture.<ext>`\n"
                 f"   - Page objects → `{abs_pages_object}/worca_<feature>_page.<ext>`\n"
@@ -966,94 +2462,100 @@ class CodegenStep(Step):
                 f"emit Python tests for a TypeScript module or vice versa.\n"
             )
 
-        result = await run_agent(
-            agent,
-            workdir=wd,
-            inputs=inputs,
-            user_prompt=(
-                f"{stack_hint}**Placement is decided by Step 7 — read the plan first.** "
-                f"`./code-modification-plan.json` is the authoritative placement "
-                f"contract. For each test case it specifies the test_file_target, "
-                f"test_functions (with markers + uses_fixtures), fixtures (reuse "
-                f"vs create with `from`/`at` pointers), page_objects (reuse vs "
-                f"create with missing_methods + signatures), and locators (reuse "
-                f"with `from`, or create_tbd with an `intent` string). Do NOT "
-                f"re-derive any of these — your job is to transpile the plan "
-                f"into executable code. **For every `reuse` entry: import from "
-                f"the `from` reference. For every `create` entry: write at the "
-                f"`at` path. For every `missing_methods` entry: add the method "
-                f"to the existing POM file with the specified signature. For "
-                f"every `create_tbd` locator: emit `tbd(\"<intent>\")` (Python/"
-                f"TS/JS) or `Tbd.of(\"<intent>\")` (Java) or `TBD_LOCATOR` + "
-                f"`TBD_INTENT:` comment (other stacks) using the plan's intent.**\n\n"
-                f"`./sut_inventory.json` is the secondary input — use it only "
-                f"for byte-match locator dedup (Rule 7 below) and style mimicry "
-                f"(naming conventions, import patterns).\n\n"
-                f"**`./test-strategy.md` is AUTHORITATIVE for assertion content.** "
-                f"The plan tells you WHERE code goes and which POM methods to "
-                f"call; the strategy tells you WHAT each test must assert. For "
-                f"every test case in the plan, locate the matching `#### "
-                f"TC-<id>:` section in the strategy and lift its `Steps:` and "
-                f"`Expected Result:` clauses VERBATIM into your assertions. "
-                f"When the strategy says `Assert href equals \"https://...\"`, "
-                f"emit `assert actual == \"https://...\"` — NOT `assert actual` "
-                f"(truthy), NOT `assert \"http\" in actual` (substring), NOT "
-                f"`assert len(actual) > 0` (non-empty). Same for locale "
-                f"strings, ARIA labels, counts, attribute values: copy the "
-                f"exact literal from the strategy into an equality assertion. "
-                f"Weak/loose assertions (truthy, substring, length-only) are a "
-                f"defect — they pass when the SUT regresses and defeat the "
-                f"purpose of the test. The plan does NOT carry these values; "
-                f"the strategy does. Skipping the strategy means skipping the "
-                f"assertions.\n\n"
-                f"The SUT clone you are testing is at the absolute path "
-                f"`{sut_root}` (read it directly via Read/Grep/Glob — no copy "
-                f"is staged in your working directory). Generate executable "
-                f"test code by writing files at their ABSOLUTE paths under "
-                f"`{sut_root}/` (see the per-category placement table below). "
-                f"The pipeline does NOT copy your output anywhere — your "
-                f"writes ARE the deliverable. Hard rules: locator priority "
-                f"`id > data-testid > role > label > text > placeholder > "
-                f"scoped css`; NO XPath; NO hard waits (no `time.sleep`, no "
-                f"`cy.wait(<number>)`, no `waitForTimeout`); NO "
-                f"`page.content()` - use AOM snapshots; no inline credentials. "
-                f"Unresolved selectors: follow the four-branch TBD-marker rule "
-                f"in your agent.md §3 (Python+PW -> `tbd(...)`, TS/JS+PW -> "
-                f"`tbd(...)` from `./worca-t-runtime`, Java+PW -> "
-                f"`Tbd.of(...)`, all other stacks -> `TBD_LOCATOR` + "
-                f"`TBD_INTENT:` comment). Pick the branch that matches "
-                f"`sut_inventory.json[\"modules\"][active_module].language` + "
-                f"framework — never mix."
-                f"\n\n--- DISCOVERY DISCIPLINE (non-negotiable) ---\n"
-                f"1. **Do NOT use Bash for filesystem discovery.** No `find`, "
-                f"no `grep -r`, no `ls`. Use `Read` for known paths and "
-                f"`Glob`/`Grep` tools for pattern search — they are faster, "
-                f"cheaper, and don't pay shell-spawn overhead per call.\n"
-                f"2. **Trust `sut_inventory.json`.** Every existing page "
-                f"object, fixture, helper, and locator class is listed there "
-                f"with its absolute file path. Read those paths directly — "
-                f"do NOT Glob/Grep for files the inventory already names.\n"
-                f"3. **Discovery budget: ≤5 reads, ≤2 Glob/Grep calls before "
-                f"your first `Write`.** Reading `sut_inventory.json` + "
-                f"`test-strategy.md` + the 1–3 existing files you'll extend "
-                f"is enough context to start writing. If you find yourself "
-                f"reading a 4th SUT file before any Write, stop and write.\n"
-                f"4. **Batch independent `Write` calls in a single response.** "
-                f"When you have content ready for N files, emit N `Write` "
-                f"tool calls in the same assistant turn — do not serialize "
-                f"them one-per-turn.\n"
-                f"5. **Per-file size discipline.** A locator class, page "
-                f"object, or test file should be ≤200 lines. If you find "
-                f"yourself generating more, split by feature.{env_hint}"
-                f"{runtime_hint}{reuse_hint}"
-            ),
-            extra_paths=extras,
-            add_dirs=[sut_root],
-            timeout_s=self.timeout_s,
-            step=8,
-            max_turns=40,
-            claude_md=claude_md if claude_md.exists() else None,
+        # --- Phased codegen orchestration -----------------------------------
+        #
+        # Instead of one monolithic run_agent call (which grew context to
+        # 60-80K+ tokens across 9+ turns), split into focused phases:
+        #   A: Infrastructure scaffold (POM extension, TBD locators, fixtures)
+        #   B: Test file generation (one reasoning call per test_file_target)
+        #   C: Quality gate (unchanged — indexer + violation fix)
+        #
+        # Each call_reasoning_llm call is a single API round-trip with ~5-10K
+        # tokens of bounded context. No multi-turn growth.
+        language = (active_module_dict or {}).get("language")
+
+        # Phase A1: deduplicate infrastructure tasks across TCs
+        pom_tasks = _build_pom_tasks(plan_data, sut_root, sut_inventory_dict)
+        locator_tasks = _build_locator_tasks(plan_data, sut_inventory_dict)
+        fixture_tasks = _build_fixture_tasks(plan_data)
+        helper_tasks = _build_helper_tasks(plan_data)
+
+        total_methods = sum(len(t.missing_methods) for t in pom_tasks.values())
+        log.info(
+            "step08.phased.plan_parsed",
+            pom_count=len(pom_tasks),
+            missing_methods=total_methods,
+            tbd_locators=len(locator_tasks),
+            fixture_creates=len(fixture_tasks),
+            helper_creates=len(helper_tasks),
+            test_cases=len(plan_data.get("test_cases") or []),
         )
+
+        # Phase A2: TBD locators (pure Python — no LLM call).
+        # Runs BEFORE POM extension so the locator file already contains
+        # TBD constants when the POM extender reads it — methods then
+        # reference self.locators.<CONSTANT> instead of inline tbd() calls.
+        tbd_written = _write_tbd_locators(locator_tasks, sut_root, language)
+        if tbd_written:
+            log.info("step08.tbd_locators.total", count=tbd_written)
+
+        # Phase A3: extend POMs with missing methods
+        if total_methods > 0:
+            pom_results = await _extend_poms(
+                pom_tasks, sut_root, wd, agents_root, step=8,
+                rules_content=rules_content,
+                ctx=ctx,
+            )
+            pom_failures = [fp for fp, ok in pom_results if not ok]
+            if pom_failures:
+                log.warning(
+                    "step08.pom_extend.partial_failure",
+                    failed=pom_failures,
+                )
+
+        # Phase A4: create fixtures
+        if fixture_tasks:
+            await _create_fixtures(
+                fixture_tasks, sut_root, wd, agents_root,
+                active_module=active_module_dict, step=8,
+                rules_content=rules_content,
+            )
+
+        # Phase A5: create helpers
+        if helper_tasks:
+            await _create_helpers(
+                helper_tasks, sut_root, wd, agents_root,
+                active_module=active_module_dict, step=8,
+                rules_content=rules_content,
+            )
+
+        # Phase B1: build imports manifest
+        manifest = _build_imports_manifest(
+            plan_data, pom_tasks, locator_tasks, fixture_tasks,
+            helper_tasks, sut_root,
+        )
+
+        # Phase B2: generate test files
+        test_results = await _generate_test_files(
+            plan_data, strategy_text, manifest, sut_root, wd, agents_root,
+            reuse_hint=reuse_hint,
+            runtime_hint=runtime_hint,
+            env_hint=env_hint,
+            step=8,
+            rules_content=rules_content,
+        )
+
+        if not test_results or not any(ok for _, ok in test_results):
+            failed_targets = [t for t, ok in test_results if not ok] if test_results else []
+            return StepResult(
+                success=False,
+                status="failed",
+                outputs=[],
+                error=(
+                    f"all test file generation calls failed "
+                    f"(targets: {failed_targets or 'none'})"
+                ),
+            )
 
         # The agent now writes ABSOLUTE paths under `<workspace>/sut/` via
         # `add_dirs=[sut_root]`. Detect what it produced by walking the SUT
@@ -1077,16 +2579,219 @@ class CodegenStep(Step):
         # "did the agent write anything?" gate.
         jit_resolved = {p.resolve() for p in jit_files_added}
         agent_produced = [p for p in produced_in_sut if p.resolve() not in jit_resolved]
-        if not result.success or not agent_produced:
+        if not agent_produced:
             return StepResult(
                 success=False,
                 status="failed",
                 outputs=[],
+                error=f"codegen did not produce any worca_*-prefixed files under {sut_root}",
+            )
+
+        # --- Phase B.5: static reconciliation + auto-patch ---------------
+        #
+        # Walk every generated test file, extract POM method call sites,
+        # verify the called methods exist on the post-extension POMs with
+        # compatible arity. On mismatch, auto-patch by re-invoking the POM
+        # extender once (B5_MAX_AUTOPATCH_RETRIES); if mismatches persist
+        # after the retry, hard-fail before Step 9 burns time on
+        # AttributeErrors. See plan: Phase B.5.
+        language = (
+            (active_module_dict or {}).get("language")
+            or plan_data.get("language")
+            or "python"
+        ).lower()
+        b5_skipped_reason: str | None = None
+        if language not in _B5_SUPPORTED_LANGUAGES:
+            b5_skipped_reason = language
+            log.info(
+                "step08.b5.skipped",
+                language=language,
+                hint="B.5 v1 supports python/typescript/javascript only.",
+            )
+        b5_test_files = (
+            _b5_filter_test_files(agent_produced, language)
+            if b5_skipped_reason is None else []
+        )
+        recon = reconcile_codegen(
+            test_files=b5_test_files,
+            pom_files=manifest["pom_files"],
+            sut_root=sut_root,
+            language=language,
+        )
+        # Fixture reconciliation runs alongside POM reconciliation: it walks
+        # the plan and asserts every `source==create` fixture exists on disk
+        # as a `@pytest.fixture`-decorated function. Catches the Phase A4
+        # race that silently dropped 5 of 6 fixtures in run 20260611-184450.
+        fx_files_scanned, fx_mismatches = reconcile_fixtures(
+            plan_data, sut_root,
+        )
+        recon.fixture_files_scanned = fx_files_scanned
+        recon.fixture_mismatches = fx_mismatches
+        b5_autopatched = False
+        b5_autopatch_error: str | None = None
+        if recon.mismatches and b5_skipped_reason is None:
+            log.info(
+                "step08.b5.mismatches_found",
+                count=len(recon.mismatches),
+                kinds=sorted({m.kind for m in recon.mismatches}),
+            )
+            patch_tasks = mismatches_to_pom_tasks(
+                recon.mismatches, pom_tasks,
+                manifest_pom_files=manifest.get("pom_files"),
+            )
+            if patch_tasks:
+                b5_autopatched = True
+                # Robustness: _extend_poms makes LLM calls + disk reads;
+                # transport / API / OSError must not crash the step. On
+                # exception we hard-fail with the original mismatches in
+                # the audit artifact.
+                try:
+                    await _extend_poms(
+                        patch_tasks, sut_root, wd, agents_root, step=8,
+                        rules_content=rules_content,
+                        ctx=ctx,
+                    )
+                except Exception as e:  # noqa: BLE001 - we surface as StepResult
+                    b5_autopatch_error = f"{type(e).__name__}: {e}"
+                    log.error(
+                        "step08.b5.autopatch_crashed",
+                        error=b5_autopatch_error,
+                    )
+                else:
+                    recon = reconcile_codegen(
+                        test_files=b5_test_files,
+                        pom_files=manifest["pom_files"],
+                        sut_root=sut_root,
+                        language=language,
+                    )
+                    recon.fixture_files_scanned = fx_files_scanned
+                    recon.fixture_mismatches = fx_mismatches
+
+        # Phase B.5 fixture auto-patch: re-run _create_fixtures for any
+        # `source==create` fixture the plan declared but reconciliation
+        # didn't find. Single retry (same MAX_AUTOPATCH semantics as POM
+        # repair). `source==reuse` misses are NOT auto-patched.
+        if recon.fixture_mismatches and b5_skipped_reason is None:
+            fx_patch = fixture_mismatches_to_fixture_tasks(
+                recon.fixture_mismatches, plan_data,
+            )
+            if fx_patch:
+                log.info(
+                    "step08.b5.fixture_autopatch.start",
+                    count=len(fx_patch),
+                    names=[t.name for t in fx_patch],
+                )
+                try:
+                    await _create_fixtures(
+                        fx_patch, sut_root, wd, agents_root,
+                        active_module=active_module_dict, step=8,
+                        rules_content=rules_content,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    log.error(
+                        "step08.b5.fixture_autopatch_crashed",
+                        error=f"{type(e).__name__}: {e}",
+                    )
+                else:
+                    fx_files_scanned, fx_mismatches = reconcile_fixtures(
+                        plan_data, sut_root,
+                    )
+                    recon.fixture_files_scanned = fx_files_scanned
+                    recon.fixture_mismatches = fx_mismatches
+                    b5_autopatched = True
+
+        reconcile_path = out_dir / "reconcile-result.json"
+        reconcile_path.write_text(
+            json.dumps(recon.as_dict(), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        ok_recon_schema, recon_schema_err = is_valid(
+            recon.as_dict(), "reconcile-result",
+        )
+        if not ok_recon_schema:
+            log.warning("step08.b5.schema_invalid", error=recon_schema_err)
+
+        if b5_autopatch_error is not None:
+            return StepResult(
+                success=False,
+                status="failed",
+                outputs=[reconcile_path],
                 error=(
-                    result.error or
-                    f"agent did not produce any worca_*-prefixed files under {sut_root}"
+                    f"Phase B.5 auto-patch crashed before re-verify: "
+                    f"{b5_autopatch_error}"
+                ),
+                notes=(
+                    f"{len(recon.mismatches)} mismatch(es) before crash; "
+                    f"b5_autopatched=True"
                 ),
             )
+
+        if recon.mismatches:
+            def _anchor(m: Any) -> str:
+                base = (
+                    f"{m.call_site.test_file}:{m.call_site.line} "
+                    f"calls {m.resolved_pom}.{m.call_site.method_name}() "
+                    f"({m.kind}"
+                )
+                if m.suggested_method:
+                    base += f" — did you mean `{m.suggested_method}`?"
+                return base + ")"
+
+            anchors = "; ".join(_anchor(m) for m in recon.mismatches[:5])
+            log.error(
+                "step08.b5.reconciliation_failed",
+                unresolved=len(recon.mismatches),
+                autopatched=b5_autopatched,
+            )
+            return StepResult(
+                success=False,
+                status="failed",
+                outputs=[reconcile_path],
+                error=(
+                    f"Phase B.5 reconciliation failed "
+                    f"({'after auto-patch' if b5_autopatched else 'no autopatch tried'}): "
+                    f"{anchors}"
+                ),
+                notes=f"{len(recon.mismatches)} unresolved mismatch(es)",
+            )
+
+        if recon.fixture_mismatches:
+            def _fx_anchor(fm: Any) -> str:
+                refs = (
+                    f" used by {','.join(fm.referenced_by[:3])}"
+                    if fm.referenced_by else ""
+                )
+                return (
+                    f"{fm.expected_file} missing `{fm.name}` "
+                    f"({fm.kind}, source={fm.source}{refs})"
+                )
+
+            fx_anchors = "; ".join(
+                _fx_anchor(fm) for fm in recon.fixture_mismatches[:5]
+            )
+            log.error(
+                "step08.b5.fixture_reconciliation_failed",
+                unresolved=len(recon.fixture_mismatches),
+            )
+            return StepResult(
+                success=False,
+                status="failed",
+                outputs=[reconcile_path],
+                error=(
+                    f"Phase B.5 fixture reconciliation failed: {fx_anchors}"
+                ),
+                notes=(
+                    f"{len(recon.fixture_mismatches)} unresolved fixture "
+                    f"mismatch(es)"
+                ),
+            )
+        log.info(
+            "step08.b5.reconciled",
+            test_files=recon.test_files_scanned,
+            call_sites=recon.call_sites_checked,
+            autopatched=b5_autopatched,
+            skipped=b5_skipped_reason,
+        )
 
         # Index the SUT clone, then filter to ONLY worca-prefixed entries so
         # the SUT's own pre-existing tests don't pollute our tbd-index or
@@ -1098,7 +2803,7 @@ class CodegenStep(Step):
         # Resolve framework AFTER the agent ran when `detected_stack` was
         # None: the SUT now has the agent's files, so the extension fallback
         # in `resolve_framework` can pick the right framework (e.g. "pytest"
-        # when the agent wrote `worca_test_*.py`).
+        # when the agent wrote `worca_*_test.py`).
         framework = resolve_framework(detected_stack, sut_root)
         # Lazy-vendor for the no-detected-stack edge case (matches original
         # post-agent behavior). When `detected_stack` was set, vendoring
@@ -1141,6 +2846,54 @@ class CodegenStep(Step):
 
         if index.violations:
             summary = violations_summary(index)
+            log.info(
+                "step08.violation_self_fix",
+                count=len(index.violations),
+                framework=framework,
+            )
+            fix_agent = agents_root / "ui-test-automation.agent.md"
+            fix_result = await run_agent(
+                fix_agent,
+                workdir=wd,
+                inputs={},
+                user_prompt=(
+                    f"Your generated code has {len(index.violations)} "
+                    f"non-negotiable rule violation(s):\n\n"
+                    f"```\n{summary}\n```\n\n"
+                    f"Fix each violation IN-PLACE by rewriting the "
+                    f"offending file(s). Hard waits (`wait_for_timeout`, "
+                    f"`time.sleep`, `cy.wait(<ms>)`) must be replaced "
+                    f"with Playwright's built-in auto-waiting (e.g. "
+                    f"`expect(locator).to_be_visible()`, "
+                    f"`locator.click()` which auto-waits, "
+                    f"`page.wait_for_selector()`). XPath selectors must "
+                    f"be replaced with CSS / data-testid / role "
+                    f"selectors. Write the corrected files using the "
+                    f"same absolute paths.\n\n"
+                    f"The full codegen rules are in "
+                    f"`{agents_root / 'codegen-rules.md'}` — read it "
+                    f"if you need to understand why a rule exists or "
+                    f"what the correct replacement pattern is."
+                ),
+                extra_paths=[package_resource_root() / "skills" / "webapp-testing"],
+                add_dirs=[sut_root],
+                timeout_s=min(self.timeout_s or 1800, 300),
+                step=8,
+                max_turns=10,
+            )
+
+            full_index = index_tests(sut_root, framework=framework)
+            index = _filter_index_to_worca(
+                full_index, sut_root, exclude=jit_resolved,
+            )
+            payload = index.as_dict()
+            index_path.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+        if index.violations:
+            summary = violations_summary(index)
             (out_dir / "violations.log").write_text(summary, encoding="utf-8")
             log.error(
                 "step08.violations",
@@ -1172,6 +2925,77 @@ class CodegenStep(Step):
                 ),
             )
 
+        # --- Phase D: TBD intent quality gate -------------------------------
+        # Score every `tbd("intent")` / `Tbd.of("intent")` sentinel before
+        # the JIT resolver consumes them at runtime. Cheap one-shot Haiku
+        # call; results persist alongside the other Step 8 artifacts.
+        (
+            phase_d_ok, phase_d_summary, phase_d_warnings, phase_d_error,
+        ) = await _phase_d_score_intents(
+            produced_in_sut=produced_in_sut,
+            jit_files_added=jit_files_added,
+            sut_root=sut_root,
+            out_dir=out_dir,
+            workdir=wd,
+            agents_root=agents_root,
+        )
+        intent_quality_path = out_dir / "tbd-intent-quality.json"
+        intent_quality_path.write_text(
+            json.dumps(phase_d_summary, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        # Phase D auto-fix: when WARN/FAIL intents exist, attempt one
+        # automated rewrite via the tbd-intent-editor agent, then re-score.
+        # Single attempt — mirrors B5_MAX_AUTOPATCH_RETRIES philosophy.
+        fixable = [
+            e for e in (phase_d_warnings or [])
+            if e.get("score") in ("WARN", "FAIL")
+        ]
+        if fixable:
+            rewritten, fix_errors = await _auto_fix_intents(
+                fixable, sut_root, wd, agents_root,
+            )
+            if fix_errors:
+                log.warning(
+                    "step08.phase_d.autofix_errors",
+                    errors=fix_errors[:5],
+                )
+            if rewritten > 0:
+                log.info(
+                    "step08.phase_d.autofix_rescoring",
+                    rewritten=rewritten,
+                )
+                (
+                    phase_d_ok, phase_d_summary,
+                    phase_d_warnings, phase_d_error,
+                ) = await _phase_d_score_intents(
+                    produced_in_sut=produced_in_sut,
+                    jit_files_added=jit_files_added,
+                    sut_root=sut_root,
+                    out_dir=out_dir,
+                    workdir=wd,
+                    agents_root=agents_root,
+                )
+                intent_quality_path.write_text(
+                    json.dumps(phase_d_summary, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+
+        if not phase_d_ok:
+            return StepResult(
+                success=False,
+                status="failed",
+                outputs=[index_path, manifest_path, intent_quality_path],
+                error=phase_d_error or "intent quality gate failed",
+                notes=f"fail={phase_d_summary.get('summary', {}).get('fail', 0)}",
+            )
+        # Stash WARN entries for the post-step review gate. Use ctx.extras
+        # (already used by Step 9 etc.) — the gate is only rendered on TTY.
+        if phase_d_warnings:
+            ctx.extras["step8_intent_warnings"] = phase_d_warnings
+            ctx.extras["step8_intent_quality_path"] = str(intent_quality_path)
+
         # JIT runtime files were already vendored before the agent ran
         # (see the pre-vendoring block at the top of `run`). Make sure they
         # are present in `produced_in_sut` so the commit manifest below
@@ -1192,6 +3016,38 @@ class CodegenStep(Step):
             message_detail=f"{len(produced_in_sut)} files, {len(index.tests)} tests",
         )
 
+        # Rewrite generated-files.json with the ACTUAL commit changeset.
+        # The pre-commit write above (line ~2091) was glob-based and misses
+        # in-place modifications to existing files (POM extensions, locator
+        # appends, conftest patches). Run 20260611-184450 surfaced this:
+        # the manifest listed 3 files while the commit modified 6. Falls
+        # back to the glob result when the diff query fails or returns empty.
+        if sha:
+            committed_files = files_in_commit(sut_root, sha)
+            if committed_files:
+                glob_paths = {
+                    str(p.relative_to(sut_root).as_posix())
+                    for p in produced_in_sut
+                }
+                merged = sorted(set(committed_files) | glob_paths)
+                manifest_path.write_text(
+                    json.dumps(
+                        {
+                            "sut_root": str(sut_root),
+                            "branch": f"worca-t/run-{ctx.workspace.run_id}",
+                            "commit": sha,
+                            "files": merged,
+                        },
+                        indent=2, ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                log.info(
+                    "step08.generated_manifest.rewritten",
+                    commit=sha,
+                    file_count=len(merged),
+                )
+
         total_tbd = (
             sum(len(t.tbd_markers) for t in index.tests)
             + sum(len(s.tbd_markers) for s in index.support_files)
@@ -1199,15 +3055,20 @@ class CodegenStep(Step):
         notes = (
             f"framework={framework} files={len(index.files)} "
             f"tests={len(index.tests)} "
-            f"support_files={len(index.support_files)} tbd={total_tbd}"
+            f"support_files={len(index.support_files)} tbd={total_tbd} "
+            f"b5_autopatched={b5_autopatched}"
         )
+        if b5_skipped_reason is not None:
+            notes += f" b5_skipped={b5_skipped_reason}"
         if sha:
             notes += f" commit={sha}"
         if not ok_schema:
             notes += f"; schema_warning={schema_err}"
+        if not ok_recon_schema:
+            notes += f"; b5_schema_warning={recon_schema_err}"
         return StepResult(
             success=True,
             status="completed" if ok_schema else "warned",
-            outputs=[index_path, manifest_path],
+            outputs=[index_path, manifest_path, reconcile_path],
             notes=notes,
         )

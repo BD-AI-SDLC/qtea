@@ -784,3 +784,80 @@ def test_merge_llm_inventory_merges_existing_locators():
     assert "ExtraLocators" in by_class
     chat_consts = {c.name for c in by_class["ChatPageLocators"].constants}
     assert chat_consts == {"EXISTING", "NEW_FROM_LLM"}  # de-duped + grafted
+
+
+# ---------------------------------------------------------------------------
+# Serialization: LocatorConstant.line is stripped from JSON output
+# ---------------------------------------------------------------------------
+
+
+def test_asdict_strips_locator_constant_line_from_module():
+    """ModuleInventory.as_dict must NOT include `line` on locator constants.
+
+    The field stays on the in-memory dataclass for any future debugging
+    consumer, but the JSON written to disk and forwarded to the codegen
+    agent must omit it: the codegen step uses constants only for
+    byte-match dedup (name + selector), `line` is never consulted
+    programmatically, and dropping it trims ~10% off the inventory wire
+    payload — a meaningful win on the Bosch relay where each codegen
+    turn re-sends the full prefix uncached.
+    """
+    mod = ModuleInventory(
+        name="m", path=".", language="python", package_manager="poetry",
+        existing_locators=[LocatorClass(
+            name="ChatPageLocators",
+            file="x.py",
+            class_name="ChatPageLocators",
+            constants=[
+                LocatorConstant(name="A", selector="#a", line=10),
+                LocatorConstant(name="B", selector="#b", line=42),
+            ],
+        )],
+        source="deterministic",
+    )
+    # In-memory dataclass still carries `line` (preserve traceability):
+    assert mod.existing_locators[0].constants[0].line == 10
+
+    # Serialized dict must NOT carry `line`:
+    d = mod.as_dict()
+    consts = d["existing_locators"][0]["constants"]
+    assert {c["name"] for c in consts} == {"A", "B"}
+    for c in consts:
+        assert "line" not in c, f"`line` leaked into serialized constant: {c}"
+        # Functional fields must still be present.
+        assert "name" in c and "selector" in c
+
+
+def test_asdict_strips_locator_constant_line_through_full_inventory():
+    """The strip also walks SutInventory.modules[].existing_locators[]
+    so multi-module SUTs get the same treatment as single-module ones.
+    """
+    inv = SutInventory(
+        is_monorepo=True,
+        modules=[
+            ModuleInventory(
+                name="frontend", path="apps/web", language="typescript",
+                existing_locators=[LocatorClass(
+                    name="LoginLocators", file="login.ts",
+                    class_name="LoginLocators",
+                    constants=[LocatorConstant(name="EMAIL", selector="#e", line=7)],
+                )],
+            ),
+            ModuleInventory(
+                name="backend", path="apps/api", language="python",
+                existing_locators=[LocatorClass(
+                    name="ApiLocators", file="api.py",
+                    class_name="ApiLocators",
+                    constants=[LocatorConstant(name="HEALTH", selector="#h", line=22)],
+                )],
+            ),
+        ],
+        active_module="frontend",
+    )
+    d = inv.as_dict()
+    for mod_d in d["modules"]:
+        for lc in mod_d["existing_locators"]:
+            for c in lc["constants"]:
+                assert "line" not in c, (
+                    f"`line` leaked into {mod_d['name']}.{lc['class_name']}.{c['name']}"
+                )

@@ -47,9 +47,11 @@ Use this template when creating test strategies for new features.
 
 ---
 
-### Assumptions
+### Coverage Notes
 
-> Only include this section if something non-obvious would affect test design or code generation. Omit entirely if there are no noteworthy assumptions.
+> Required when any TC was dropped or excluded — by upstream HITL (`plan.md` / `refined-spec.md` Coverage Notes), or by the test-manager in non-interactive mode when a fact required by a TC was missing. List each dropped TC ID and the reason. Omit ONLY if no drops have been recorded for this run.
+>
+> **Never** add an Assumptions section. Assumptions cause hallucinations; we test facts only. Missing facts mean missing tests, recorded here — not invented tests.
 
-- [Assumption 1]
-- [Assumption 2]
+- **TC-XXX:** Dropped — [reason, e.g. "user skipped clarification on expected aria-label text"]
+- **<Topic>:** Excluded — user said "<exact answer>"

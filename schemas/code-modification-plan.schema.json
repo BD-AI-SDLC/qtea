@@ -95,6 +95,12 @@
         "depends_on": {
           "type": "array",
           "items": { "type": "string" }
+        },
+        "reuse_justification": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "Required by the s07 phase gate when source=reuse. One sentence naming the matching dimension that justifies reusing this fixture (e.g. 'yields Page already authenticated as admin')."
         }
       }
     },
@@ -126,6 +132,12 @@
               "purpose": { "type": ["string", "null"] }
             }
           }
+        },
+        "reuse_justification": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "Required by the s07 phase gate when source=reuse. One sentence naming the matching dimension (e.g. 'ChatPage already models the side-nav route this TC exercises')."
         }
       }
     },
@@ -138,7 +150,13 @@
         "source": { "enum": ["reuse", "create"] },
         "from": { "type": "string" },
         "at": { "type": "string" },
-        "signature": { "type": ["string", "null"] }
+        "signature": { "type": ["string", "null"] },
+        "reuse_justification": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "Required by the s07 phase gate when source=reuse. One sentence naming why this helper fits (matching signature, side-effect-free, etc)."
+        }
       }
     },
     "locator_entry": {
@@ -166,6 +184,12 @@
           "minLength": 1,
           "maxLength": 120,
           "description": "Required when source=create_tbd. Semantic intent string used by the JIT resolver at runtime. Prefer visible role+label (e.g. 'sign in button')."
+        },
+        "reuse_justification": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "Required by the s07 phase gate when source=reuse. One sentence naming why this locator constant fits (matching selector intent, owning-page coherence)."
         }
       }
     }

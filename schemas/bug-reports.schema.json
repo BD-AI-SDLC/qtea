@@ -40,8 +40,10 @@
           "category": {
             "enum": [
               "functional", "ui", "performance", "security",
-              "accessibility", "integration", "flaky", "environment"
-            ]
+              "accessibility", "integration", "flaky", "environment",
+              "test-code-defect"
+            ],
+            "description": "Dominant failure axis. `test-code-defect` MUST be used when the failure is in test code that worca-t generated this run (collection ImportError, syntax error, undefined-symbol in fixtures/conftest, etc.) — distinct from `environment` which is for SUT infrastructure issues. Cross-reference `artifacts/step08/generated-files.json` to tell the two apart."
           },
           "component": { "type": "string" },
           "requirement_id": { "type": "string" },

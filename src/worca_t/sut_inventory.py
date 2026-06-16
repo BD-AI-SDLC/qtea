@@ -208,8 +208,44 @@ class SutInventory:
 
 
 def _asdict(obj: Any) -> dict[str, Any]:
-    """`dataclasses.asdict` with stable key order and no-None pruning at top level."""
-    return asdict(obj)
+    """`dataclasses.asdict` with stable key order and no-None pruning at top level.
+
+    Post-processes the result to strip purely-informational fields whose
+    bytes are dead weight on the wire to LLM agents:
+
+    - ``LocatorConstant.line``: source line of the constant assignment.
+      Kept on the in-memory dataclass for any future debugging consumer,
+      but excluded from the serialized JSON. The codegen agent uses
+      ``constants`` only for byte-match dedup (name + selector); the
+      ``line`` field is never consulted programmatically anywhere in the
+      codebase (verified via grep) and the deserializer at the LLM-merge
+      site (`merge_llm_inventory`) already defaults missing `line` to 0.
+      On the 20260611-075728-0aa560 SUT this trims ~7-10% off the
+      `existing_locators` block (~10% of the whole inventory).
+    """
+    d = asdict(obj)
+    _strip_locator_constant_lines(d)
+    return d
+
+
+def _strip_locator_constant_lines(d: Any) -> None:
+    """In-place: drop ``line`` from every ``LocatorConstant`` in *d*.
+
+    Walks the inventory shape (single module OR full ``SutInventory`` with
+    a ``modules`` list). Mutating in-place is cheap and avoids a full
+    deep-copy of the (already large) dict.
+    """
+    if isinstance(d, dict):
+        # Locator constants live two levels down: existing_locators[].constants[]
+        for lc in d.get("existing_locators") or ():
+            if not isinstance(lc, dict):
+                continue
+            for c in lc.get("constants") or ():
+                if isinstance(c, dict):
+                    c.pop("line", None)
+        # Top-level SutInventory wraps modules; recurse into each.
+        for mod in d.get("modules") or ():
+            _strip_locator_constant_lines(mod)
 
 
 # ---------------------------------------------------------------------------

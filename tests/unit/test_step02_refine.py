@@ -202,9 +202,13 @@ async def test_refine_step_hitl_loop_prompts_user_and_reruns(
     )
 
     # Stub the user prompt so the test doesn't try to read stdin.
+    # prompt_user returns dict[str, tuple[resolution, text]].
+    from worca_t.hitl import RESOLUTION_ANSWERED
     monkeypatch.setattr(
         "worca_t.hitl.prompt_user",
-        lambda questions, *, agent_label: {q.id: "use okta" for q in questions},
+        lambda questions, *, agent_label: {
+            q.id: (RESOLUTION_ANSWERED, "use okta") for q in questions
+        },
     )
 
     ctx = _ctx(tmp_path)

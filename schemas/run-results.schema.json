@@ -16,11 +16,20 @@
     "totals": {
       "type": "object",
       "properties": {
-        "tests": { "type": "integer", "minimum": 0 },
+        "tests": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Count of REAL test entries (excludes synthetic infrastructure-failure entries like collection-time ImportError or xdist worker crash)."
+        },
         "passed": { "type": "integer", "minimum": 0 },
         "failed": { "type": "integer", "minimum": 0 },
         "skipped": { "type": "integer", "minimum": 0 },
-        "errors": { "type": "integer", "minimum": 0 }
+        "errors": { "type": "integer", "minimum": 0 },
+        "infrastructure_errors": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Synthetic entries created when the runner aborted before producing per-test results (collection failures, missing modules, xdist worker crashes, etc.). These are NOT counted in `tests`; they indicate the entire run was blocked."
+        }
       }
     },
     "self_heal": {

@@ -129,6 +129,37 @@ def commit_step(
         return None
 
 
+def files_in_commit(sut_root: Path, sha: str) -> list[str]:
+    """Return SUT-relative paths of every file changed in `sha`.
+
+    Used by Step 8 to build `generated-files.json` from ground truth
+    (the actual commit) rather than a `worca_*` glob — the glob missed
+    in-place modifications to existing files (POM extensions, locator
+    appends, conftest.py edits), causing the manifest to under-report.
+
+    Empty list on git error / empty sha.
+    """
+    if not sha or not (sut_root / ".git").exists():
+        return []
+    try:
+        result = _git(
+            sut_root, "diff-tree", "--no-commit-id", "--name-only", "-r", sha,
+        )
+    except subprocess.CalledProcessError as e:
+        log.warning(
+            "sut.diff_tree_failed",
+            sha=sha,
+            stderr=(e.stderr or "").strip()[:500],
+        )
+        return []
+    files = [
+        line.strip().replace("\\", "/")
+        for line in (result.stdout or "").splitlines()
+        if line.strip()
+    ]
+    return files
+
+
 def current_branch(sut_root: Path) -> str | None:
     """Return the currently-checked-out branch name, or None on detached HEAD / error."""
     try:

@@ -8,6 +8,8 @@ import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -210,7 +212,13 @@ public final class WorcaT {
         protected final Object[] originalLocatorArgs;
         protected Locator real;
         protected WorcaTResolver.Resolution resolution;
-        protected boolean retried = false;
+        protected boolean retried = false;  // guards the LLM re-resolve to one attempt
+        /** Fallback candidates from the bundle (everything past candidates[0],
+         *  which is already wrapped in {@code real}). Walked on TimeoutError
+         *  BEFORE invalidate + re-resolve, so a one-mutation fallback costs
+         *  zero LLM tokens. Empty when resolution carries no bundle. */
+        protected List<WorcaTResolver.Candidate> remainingCandidates;
+        protected int totalFallbacks;
 
         LazyResolvingLocator(Page page, String sentinel, Object[] originalArgs) {
             this.page = page;
@@ -235,6 +243,15 @@ public final class WorcaT {
                 );
             }
             real = buildReal(resolution.selector);
+            if (resolution.candidates != null && resolution.candidates.size() > 1) {
+                remainingCandidates = new ArrayList<>(
+                    resolution.candidates.subList(1, resolution.candidates.size())
+                );
+                totalFallbacks = remainingCandidates.size();
+            } else {
+                remainingCandidates = new ArrayList<>();
+                totalFallbacks = 0;
+            }
         }
 
         @Override
@@ -248,34 +265,54 @@ public final class WorcaT {
                     throw e.getCause();
                 }
             }
-            // Retriable action: try once, on timeout invalidate + re-resolve + retry once.
-            try {
-                return method.invoke(real, args);
-            } catch (InvocationTargetException invocation) {
-                Throwable cause = invocation.getCause();
-                if (!WorcaTResolver.isPlaywrightTimeout(cause)) throw cause;
-                retried = true;
-                // Invalidate the cache entry for stale dev/cache/agent sources.
-                if ("cached".equals(resolution.source) || "agent".equals(resolution.source)) {
-                    WorcaTResolver.invalidateCacheEntry(
-                        resolution.testFile, resolution.constantName, resolution.intent
-                    );
-                }
-                WorcaTResolver.Resolution fresh = WorcaTResolver.resolveSentinel(
-                    page, sentinel,
-                    "dev".equals(resolution.source),
-                    true,                                  // skip cache (we just invalidated)
-                    "heuristic".equals(resolution.source) // skip heuristic if it just failed
-                );
-                if (fresh.selector == null) {
-                    throw cause;  // propagate original timeout
-                }
-                real = buildReal(fresh.selector);
-                resolution = fresh;
+            // Retriable action: walk in-bundle fallbacks first, then fall
+            // back to invalidate + LLM re-resolve.
+            while (true) {
                 try {
-                    return method.invoke(real, args);
-                } catch (InvocationTargetException e) {
-                    throw e.getCause();
+                    Object result = method.invoke(real, args);
+                    // Success — promote the working fallback (if one was used).
+                    if (remainingCandidates.size() < totalFallbacks) {
+                        int usedIdx = totalFallbacks - remainingCandidates.size();  // 1..N
+                        WorcaTResolver.Candidate working = resolution.candidates.get(usedIdx);
+                        WorcaTResolver.promoteCandidateInCache(
+                            resolution.testFile, resolution.constantName,
+                            resolution.intent, working
+                        );
+                    }
+                    return result;
+                } catch (InvocationTargetException invocation) {
+                    Throwable cause = invocation.getCause();
+                    if (!WorcaTResolver.isPlaywrightTimeout(cause)) throw cause;
+                    if (!remainingCandidates.isEmpty()) {
+                        WorcaTResolver.Candidate nxt = remainingCandidates.remove(0);
+                        if (nxt != null && nxt.selector != null && !nxt.selector.isEmpty()) {
+                            real = buildReal(nxt.selector);
+                            continue;  // retry against the fallback candidate
+                        }
+                    }
+                    // Bundle exhausted (or never existed) → LLM re-resolve.
+                    retried = true;
+                    if ("cached".equals(resolution.source) || "agent".equals(resolution.source)) {
+                        WorcaTResolver.invalidateCacheEntry(
+                            resolution.testFile, resolution.constantName, resolution.intent
+                        );
+                    }
+                    WorcaTResolver.Resolution fresh = WorcaTResolver.resolveSentinel(
+                        page, sentinel,
+                        "dev".equals(resolution.source),
+                        true,
+                        "heuristic".equals(resolution.source)
+                    );
+                    if (fresh.selector == null) {
+                        throw cause;
+                    }
+                    real = buildReal(fresh.selector);
+                    resolution = fresh;
+                    try {
+                        return method.invoke(real, args);
+                    } catch (InvocationTargetException e) {
+                        throw e.getCause();
+                    }
                 }
             }
         }

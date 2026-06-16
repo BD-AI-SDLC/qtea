@@ -37,7 +37,7 @@ _BLOCKER_PREFIX = "How should we resolve this blocker: "
 _TC_ID_RE = re.compile(r"TC-[A-Z]+-\d+", re.IGNORECASE)
 _AC_ID_RE = re.compile(r"\bAC-\d+\b", re.IGNORECASE)
 
-# Text the user can type to mean "skip this — make an assumption". Without
+# Text the user can type to mean "skip this — drop from output". Without
 # this, "i'm not sure" / "skip" / "n/a" are treated as literal answers and
 # the agent dutifully threads them into the spec, which then causes the next
 # step's agent to re-raise the same gap as a fresh blocker.
@@ -63,6 +63,40 @@ _SKIP_INTENT_RE = re.compile(
 )
 
 
+# Negative / scope-exclusion phrases that LOOK like answers but mean "don't
+# test this aspect". The user types "there is no aria-label" or "mobile
+# isn't in scope" expecting the agent to drop the corresponding coverage,
+# but without this detection the agent receives the raw text as a literal
+# answer and threads it into the plan. Conservative on purpose: requires a
+# noun token after "no" / "don't have" so bare "no" / "none" / "no special
+# characters allowed" don't trigger. Matches always go through a
+# confirmation prompt in `prompt_user` — never auto-applied.
+# The trailing ``(?:\s+\S+){0,3}`` after each noun anchor allows multi-word
+# topic phrases ("analytics SDK", "aria-label text") without losing the
+# end-anchor guard — the input must still wrap up cleanly after at most a
+# handful of additional tokens, so verbose prose ("mobile isn't in scope
+# yet but will be next quarter") still falls through.
+_NEGATIVE_DROP_RE = re.compile(
+    r"""^(?:
+        there\s+is\s+no\s+\S+(?:\s+\S+){0,3}
+      | there\s+are\s+no\s+\S+(?:\s+\S+){0,3}
+      | (?:we|i)\s+(?:don[''']?t|do\s+not)\s+have\s+
+          (?:an?\s+|any\s+)?\S+(?:\s+\S+){0,3}
+      | no\s+such\s+\S+(?:\s+\S+){0,3}
+      | (?:\S+\s+){1,3}(?:does\s+not|doesn[''']?t)\s+exist
+      | (?:we|the\s+app|the\s+page|the\s+product)\s+
+          (?:do(?:n[''']?t|esn[''']?t)|do\s+not)\s+
+          (?:use|have|support)\s+\S+(?:\s+\S+){0,3}
+      | (?:\S+\s+){1,3}(?:isn[''']?t|is\s+not|aren[''']?t|are\s+not)\s+
+          (?:in\s+scope|applicable|relevant|tested|supported)
+      | (?:not|out\s+of)\s+(?:in\s+)?scope(?:\s*[:\-,]\s*\S+(?:\s+\S+){0,3})?
+      | (?:skip(?:ping)?|drop|exclude|omit)\s+\S+(?:\s+\S+){0,3}
+      | not\s+testing\s+\S+(?:\s+\S+){0,3}
+    )[.!\s]*$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
 def looks_like_skip_intent(text: str) -> bool:
     """True when the user's typed text is a polite stand-in for skip-empty-Enter.
 
@@ -72,6 +106,44 @@ def looks_like_skip_intent(text: str) -> bool:
     agents then re-raise as fresh blockers.
     """
     return bool(_SKIP_INTENT_RE.match(text.strip()))
+
+
+def looks_like_negative_drop_intent(text: str) -> tuple[bool, str | None]:
+    """Detect negative / scope-exclusion phrases like "there is no aria-label"
+    or "mobile isn't in scope".
+
+    Returns ``(matched, phrase)`` — *phrase* is the trimmed input on a match,
+    used to populate the confirmation prompt in ``prompt_user`` so the user
+    sees exactly what we interpreted as an exclusion. ``(False, None)`` on
+    no match. Bare ``"no"`` / ``"none"`` / ``"no special characters allowed"``
+    do NOT match — the pattern requires a noun token after the negation.
+    """
+    stripped = text.strip()
+    if _NEGATIVE_DROP_RE.match(stripped):
+        return True, stripped
+    return False, None
+
+
+# Resolution values stored on ``HitlDecision.resolution`` and persisted to
+# the on-disk ledger. Strings (not Enum) so the JSONL format stays flat and
+# resumable across versions.
+#
+# - ``answered``        — user typed a literal answer to incorporate.
+# - ``skipped_drop``    — user pressed Enter / typed "skip" — agent drops
+#                         the corresponding AC/TC and records it in
+#                         ``## Coverage Notes``.
+# - ``scope_exclusion`` — user's answer was a scope-exclusion ("mobile
+#                         isn't in scope"); agent removes the named scope
+#                         from coverage and keeps the rest.
+# - ``skipped``         — LEGACY pre-rework value. Ledger entries written
+#                         before the skip-as-drop change carried this; we
+#                         continue to render them with the old
+#                         ``[ASSUMPTION]`` framing so a resumed run honors
+#                         the contract the user answered under.
+RESOLUTION_ANSWERED = "answered"
+RESOLUTION_SKIPPED_DROP = "skipped_drop"
+RESOLUTION_SCOPE_EXCLUSION = "scope_exclusion"
+RESOLUTION_SKIPPED_LEGACY = "skipped"
 
 
 @dataclass
@@ -308,8 +380,11 @@ def render_prior_decisions_md(ledger: list[HitlDecision]) -> str:
     """Render the ledger as a markdown block the next agent reads as context.
 
     The agent is instructed to treat each entry as final — do not re-raise.
-    For skipped items, the agent should propagate the same ``[ASSUMPTION]``
-    framing the prior agent used.
+    Per-entry directive depends on the resolution: answered items apply
+    verbatim; ``skipped_drop`` and ``scope_exclusion`` propagate the
+    drop / exclusion (no ``[ASSUMPTION]``); legacy ``skipped`` entries
+    (pre-rework runs) preserve the old assumption framing the user
+    originally agreed to.
     """
     if not ledger:
         return ""
@@ -319,9 +394,10 @@ def render_prior_decisions_md(ledger: list[HitlDecision]) -> str:
         "The user has already addressed the following items earlier in this",
         "run. Treat each one as final. **Do NOT re-emit any of these as new",
         "blockers, clarifications, or open questions** — even when the test",
-        "case you are designing would benefit from more detail. For items",
-        "marked _Skipped_, apply the same conservative assumption the prior",
-        "agent used and proceed.",
+        "case you are designing would benefit from more detail. Each entry",
+        "below carries a per-item directive on how to honor the prior",
+        "decision (incorporate, drop, exclude scope, or apply legacy",
+        "assumption).",
         "",
     ]
     for entry in ledger:
@@ -332,12 +408,31 @@ def render_prior_decisions_md(ledger: list[HitlDecision]) -> str:
             lines.append("")
             lines.append(f"**Original context:** {entry.context}")
         lines.append("")
-        if entry.resolution == "answered":
+        if entry.resolution == RESOLUTION_ANSWERED:
             lines.append(f"**User answer:** {entry.answer}")
+        elif entry.resolution == RESOLUTION_SKIPPED_DROP:
+            lines.append(
+                "**User chose to skip.** DROP the corresponding AC / TC "
+                "from your output and record the drop in a "
+                "`## Coverage Notes` section. Do NOT write `[ASSUMPTION]`. "
+                "Do not re-ask."
+            )
+        elif entry.resolution == RESOLUTION_SCOPE_EXCLUSION:
+            lines.append(
+                f"**User excluded a scope.** Their answer: `{entry.answer}`. "
+                f"Remove ACs / TCs / sub-bullets that depend on the "
+                f"excluded scope. Record the exclusion in "
+                f"`## Coverage Notes`. Do not re-ask."
+            )
+        elif entry.resolution == RESOLUTION_SKIPPED_LEGACY:
+            lines.append(
+                "**User skipped (legacy pre-rework contract).** Apply the "
+                "same conservative assumption framing (`[ASSUMPTION: ...]`) "
+                "the earlier agent used. Do not re-ask."
+            )
         else:
             lines.append(
-                "**User chose to skip.** Apply a reasonable default and "
-                "document it inline with `[ASSUMPTION: ...]`. Do not re-ask."
+                "**Unknown resolution.** Do not re-ask this item."
             )
         lines.append("")
     return "\n".join(lines) + "\n"
@@ -594,11 +689,30 @@ def has_not_ready_verdict(md_text: str) -> bool:
     return bool(_NOT_READY_RE.search(md_text))
 
 
-def prompt_user(questions: list[Question], *, agent_label: str) -> dict[str, str]:
-    """Ask each question on stdin and return ``{question_id: answer}``.
+def prompt_user(
+    questions: list[Question], *, agent_label: str
+) -> dict[str, tuple[str, str]]:
+    """Ask each question on stdin and return ``{question_id: (resolution, answer)}``.
 
-    Uses ``rich`` for formatting. If stdin is not a TTY (CI), returns an empty
-    dict so callers can skip the re-invocation loop cleanly.
+    *resolution* is one of :data:`RESOLUTION_ANSWERED` /
+    :data:`RESOLUTION_SCOPE_EXCLUSION`. ``RESOLUTION_SKIPPED_DROP`` items are
+    NOT included in the return dict — callers detect them by their absence
+    from the answer set (matching the historical ``id not in answers``
+    pattern). *answer* is the user's typed text (for ANSWERED items) or the
+    typed text we interpreted as an exclusion (for SCOPE_EXCLUSION items).
+
+    Two-step UX per question:
+
+    1. Ask the question. Empty input / :func:`looks_like_skip_intent` →
+       skipped (omitted from return dict).
+    2. If :func:`looks_like_negative_drop_intent` flags the typed answer
+       (e.g. "there is no aria-label", "mobile isn't in scope"), show a
+       one-line confirmation — default Y interprets as a scope-exclusion;
+       N keeps the typed text as a literal answer; E re-prompts so the user
+       can retype.
+
+    Returns an empty dict when stdin is not a TTY (CI) so callers can skip
+    the re-invocation loop cleanly.
     """
     if not sys.stdin.isatty():
         log.info("hitl.skip_non_tty", agent=agent_label, count=len(questions))
@@ -610,58 +724,105 @@ def prompt_user(questions: list[Question], *, agent_label: str) -> dict[str, str
         Panel(
             f"[bold yellow]{agent_label}[/bold yellow] needs input on "
             f"[bold]{len(questions)}[/bold] open item(s).\n"
-            f"Press [bold]Enter[/bold] with no text to skip an item — the agent "
-            f"will document it as a `[ASSUMPTION]` and not ask again.",
+            f"Type your answer, or press [bold]Enter[/bold] to skip — "
+            f"skipped items are [bold]dropped from the output[/bold] "
+            f"(no assumption made).",
             title="Human input required",
             border_style="yellow",
         )
     )
 
-    answers: dict[str, str] = {}
+    answers: dict[str, tuple[str, str]] = {}
     for q in questions:
         console.print()
         console.rule(f"[bold]{q.id}[/bold] · {q.kind}", style="cyan")
         if q.context and q.context != q.prompt_text:
             console.print(f"[dim]context:[/dim] {q.context}")
-        ans = Prompt.ask(f"[green]{q.prompt_text}[/green]", default="").strip()
-        if not ans:
-            continue
-        if looks_like_skip_intent(ans):
-            # Treat as a skip — same effect as pressing Enter — and tell the
-            # user so they know the typed phrase did NOT enter the spec.
-            console.print(
-                f"[dim]→ recognized as skip intent ({ans!r}); "
-                f"deferring like an empty answer.[/dim]"
-            )
-            log.info("hitl.skip_intent_text", q_id=q.id, raw=ans)
-            continue
-        answers[q.id] = ans
+
+        while True:
+            ans = Prompt.ask(f"[green]{q.prompt_text}[/green]", default="").strip()
+            if not ans:
+                break
+            if looks_like_skip_intent(ans):
+                console.print(
+                    f"[dim]→ recognized as skip intent ({ans!r}); "
+                    f"dropping like an empty answer.[/dim]"
+                )
+                log.info("hitl.skip_intent_text", q_id=q.id, raw=ans)
+                break
+
+            matched, phrase = looks_like_negative_drop_intent(ans)
+            if matched:
+                console.print(
+                    f"[yellow]Looks like you want to exclude "
+                    f"'{phrase}' from coverage.[/]"
+                )
+                choice = Prompt.ask(
+                    r"[bold]Proceed?[/] [dim](\[y\]es-drop / "
+                    r"\[n\]o-keep-as-answer / \[e\]dit-retype)[/]",
+                    choices=["y", "n", "e"],
+                    default="y",
+                    show_choices=False,
+                )
+                if choice == "y":
+                    answers[q.id] = (RESOLUTION_SCOPE_EXCLUSION, ans)
+                    log.info(
+                        "hitl.scope_exclusion_confirmed",
+                        q_id=q.id,
+                        phrase=phrase,
+                    )
+                    break
+                if choice == "n":
+                    answers[q.id] = (RESOLUTION_ANSWERED, ans)
+                    break
+                # 'e' falls through to re-prompt
+                console.print("[dim]→ retype your answer[/]")
+                continue
+
+            answers[q.id] = (RESOLUTION_ANSWERED, ans)
+            break
     return answers
 
 
 def format_answers_md(
     questions: list[Question],
-    answers: dict[str, str],
+    answers: dict[str, tuple[str, str]] | dict[str, str],
     *,
     skipped: list[Question] | None = None,
     ledger_resolved: list[tuple[Question, HitlDecision]] | None = None,
 ) -> str:
     """Render the user's answers (and skips) as a markdown file the agent reads on rerun.
 
-    Answered questions get an explicit answer to incorporate. Skipped questions
-    instruct the agent to make a reasonable assumption, mark it with
-    ``[ASSUMPTION: ...]``, and remove the original `[CLARIFICATION NEEDED]`
-    tag / blocker row / open-question entry — DO NOT re-emit clarification
-    requests for the same items.
+    The ``answers`` dict maps ``question_id`` to either ``(resolution, answer)``
+    (the new :func:`prompt_user` shape) or a bare ``answer`` string (legacy
+    callers — treated as ``RESOLUTION_ANSWERED``). Skipped items are passed
+    through the ``skipped`` list and rendered as drop directives (no
+    ``[ASSUMPTION]``). Scope-exclusion items live in the ``answers`` dict
+    with resolution ``scope_exclusion`` and get their own section.
 
     ``ledger_resolved`` carries questions the agent emitted in this round that
-    matched a prior-step decision in the run's HITL ledger. They get rendered
-    with the prior answer / skip directive so the agent silently applies the
-    same resolution and drops the duplicate item.
+    matched a prior-step decision in the run's HITL ledger. Each entry's
+    directive depends on the prior decision's resolution — answered items
+    apply verbatim; ``skipped_drop`` and ``scope_exclusion`` propagate the
+    drop / exclusion; legacy ``skipped`` entries (pre-rework runs) preserve
+    the old ``[ASSUMPTION]`` framing the user originally agreed to.
     """
     skipped = skipped or []
     ledger_resolved = ledger_resolved or []
-    answered = [q for q in questions if answers.get(q.id)]
+    answered_items: list[tuple[Question, str]] = []
+    scope_excluded_items: list[tuple[Question, str]] = []
+    for q in questions:
+        raw = answers.get(q.id)
+        if raw is None:
+            continue
+        if isinstance(raw, tuple):
+            resolution, text = raw
+        else:
+            resolution, text = RESOLUTION_ANSWERED, raw
+        if resolution == RESOLUTION_SCOPE_EXCLUSION:
+            scope_excluded_items.append((q, text))
+        else:
+            answered_items.append((q, text))
 
     lines = [
         "# User Answers",
@@ -670,21 +831,29 @@ def format_answers_md(
         "",
         "- **Answered** items: incorporate the answer and remove the corresponding",
         "  `[CLARIFICATION NEEDED]` tag, blocker row, or open-question entry.",
-        "- **Skipped** items: the user is OK proceeding without a definitive answer.",
-        "  Make a reasonable assumption, mark it inline with `[ASSUMPTION: ...]`,",
-        "  and remove the original `[CLARIFICATION NEEDED]` tag / blocker row /",
-        "  open-question entry. **Do NOT re-emit `[CLARIFICATION NEEDED]` for",
-        "  skipped items.**",
+        "- **Skipped** items: the user has chosen NOT to specify this. "
+        "**Drop** the",
+        "  corresponding AC / TC / sub-item entirely from the output and record",
+        "  the drop in a `## Coverage Notes` section at the end of the document.",
+        "  **Do NOT** write `[ASSUMPTION: ...]` — the user's intent is to remove",
+        "  this coverage, not to test it under an invented value.",
+        "- **Scope-excluded** items: the user's answer names a scope to exclude",
+        "  (e.g. \"mobile isn't in scope\"). Remove ACs / TCs / sub-bullets that",
+        "  depend on the excluded scope; keep the in-scope portions. Record the",
+        "  exclusion in `## Coverage Notes`.",
         "- **Previously resolved** items: the user already addressed the same",
-        "  question in an earlier step. Apply that prior answer / assumption",
-        "  verbatim — do NOT re-raise the question to the user.",
+        "  question in an earlier step. Apply that prior decision verbatim —",
+        "  do NOT re-raise the question to the user.",
+        "",
+        "Preserve the `## Coverage Notes` section verbatim across iterations —",
+        "only append new entries; never delete existing ones.",
         "",
     ]
 
-    if answered:
+    if answered_items:
         lines.append("## Answered")
         lines.append("")
-        for q in answered:
+        for q, text in answered_items:
             lines.append(f"### {q.id} ({q.kind})")
             lines.append("")
             lines.append(f"**Question:** {q.prompt_text}")
@@ -692,11 +861,11 @@ def format_answers_md(
                 lines.append("")
                 lines.append(f"**Original context:** {q.context}")
             lines.append("")
-            lines.append(f"**Answer:** {answers[q.id]}")
+            lines.append(f"**Answer:** {text}")
             lines.append("")
 
     if skipped:
-        lines.append("## Skipped — Document As Assumptions")
+        lines.append("## Skipped — Drop From Output")
         lines.append("")
         for q in skipped:
             lines.append(f"### {q.id} ({q.kind})")
@@ -707,9 +876,39 @@ def format_answers_md(
                 lines.append(f"**Original context:** {q.context}")
             lines.append("")
             lines.append(
-                "**Action:** Pick a reasonable default, document it inline with "
-                "`[ASSUMPTION: ...]`, and remove the `[CLARIFICATION NEEDED]` "
-                "tag / blocker row / open-question entry."
+                "**Action:** Remove the `[CLARIFICATION NEEDED]` tag AND the "
+                "entire AC / TC / sub-item the question was attached to from "
+                "the output. Append an entry to `## Coverage Notes` at the end "
+                "of the document recording the dropped ID and the reason "
+                "(e.g. `AC-7: dropped — user skipped clarification on the "
+                "expected aria-label text`). **Do NOT** write "
+                "`[ASSUMPTION: ...]`."
+            )
+            lines.append("")
+
+    if scope_excluded_items:
+        lines.append("## Scope Exclusions — Drop Excluded Items")
+        lines.append("")
+        for q, text in scope_excluded_items:
+            lines.append(f"### {q.id} ({q.kind})")
+            lines.append("")
+            lines.append(f"**Question:** {q.prompt_text}")
+            if q.context and q.context != q.prompt_text:
+                lines.append("")
+                lines.append(f"**Original context:** {q.context}")
+            lines.append("")
+            lines.append(
+                f"**User's answer (interpret as scope-exclusion, NOT a "
+                f"literal value):** {text}"
+            )
+            lines.append("")
+            lines.append(
+                "**Action:** Identify the scope the user is excluding (the "
+                "named element / platform / locale / feature) and REMOVE any "
+                "ACs / TCs / sub-bullets that depend solely on the excluded "
+                "scope. Keep the in-scope portions intact. Append an entry to "
+                "`## Coverage Notes` recording the exclusion and the user's "
+                "exact answer."
             )
             lines.append("")
 
@@ -717,26 +916,55 @@ def format_answers_md(
         lines.append("## Previously Resolved — Apply Prior Decision")
         lines.append("")
         for q, prior in ledger_resolved:
-            lines.append(f"### {q.id} ({q.kind}) — matches {prior.question_id} from step {prior.step}")
+            lines.append(
+                f"### {q.id} ({q.kind}) — matches {prior.question_id} "
+                f"from step {prior.step}"
+            )
             lines.append("")
             lines.append(f"**This-round question:** {q.prompt_text}")
             lines.append("")
             lines.append(f"**Prior question:** {prior.question_text}")
             lines.append("")
-            if prior.resolution == "answered":
+            if prior.resolution == RESOLUTION_ANSWERED:
                 lines.append(f"**Prior answer (apply verbatim):** {prior.answer}")
+            elif prior.resolution == RESOLUTION_SKIPPED_DROP:
+                lines.append(
+                    "**Prior resolution:** user skipped — DROP the "
+                    "corresponding AC / TC from the output and add a "
+                    "`## Coverage Notes` entry. Do NOT re-raise; do NOT "
+                    "write `[ASSUMPTION]`."
+                )
+            elif prior.resolution == RESOLUTION_SCOPE_EXCLUSION:
+                lines.append(
+                    f"**Prior resolution:** scope-exclusion — user answered "
+                    f"`{prior.answer}`. Remove the excluded scope from "
+                    f"coverage and add a `## Coverage Notes` entry. Do NOT "
+                    f"re-raise."
+                )
+            elif prior.resolution == RESOLUTION_SKIPPED_LEGACY:
+                # Pre-rework ledger entry — preserve old assumption framing.
+                lines.append(
+                    "**Prior resolution:** user skipped under the legacy "
+                    "(pre-rework) contract — apply the same "
+                    "`[ASSUMPTION: ...]` framing the earlier agent used. "
+                    "Do NOT re-raise."
+                )
             else:
                 lines.append(
-                    "**Prior resolution:** user skipped — apply the same "
-                    "`[ASSUMPTION: ...]` framing the earlier agent used; do NOT "
-                    "re-raise this item as a blocker / clarification / open question."
+                    "**Prior resolution:** unknown — do NOT re-raise this "
+                    "item to the user."
                 )
             lines.append("")
 
-    if not answered and not skipped and not ledger_resolved:
+    if (
+        not answered_items
+        and not skipped
+        and not scope_excluded_items
+        and not ledger_resolved
+    ):
         lines.append(
-            "_No items were answered or skipped — proceed with reasonable "
-            "assumptions and document them._"
+            "_No items were answered, skipped, or excluded — return the "
+            "document unchanged._"
         )
 
     return "\n".join(lines) + "\n"

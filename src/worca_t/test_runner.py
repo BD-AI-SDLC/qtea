@@ -151,8 +151,27 @@ class RunResult:
 
     @property
     def totals(self) -> dict[str, int]:
-        out = {"tests": len(self.results), "passed": 0, "failed": 0, "skipped": 0, "errors": 0}
+        """Split real test entries from synthetic infrastructure-failure entries.
+
+        Entries with `runner_failure` set (pytest collection ImportError,
+        xdist worker crash, missing module, etc.) are infra, not tests.
+        Counting them as `tests` masked the run 20260611-184450 incident
+        where `tests=2 errors=2` looked like two tests ran when really
+        zero did — both entries were synthetic collection-error artifacts.
+        """
+        out = {
+            "tests": 0,
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "errors": 0,
+            "infrastructure_errors": 0,
+        }
         for r in self.results:
+            if r.runner_failure is not None:
+                out["infrastructure_errors"] += 1
+                continue
+            out["tests"] += 1
             if r.status == "passed":
                 out["passed"] += 1
             elif r.status == "failed":
@@ -207,7 +226,12 @@ def _looks_like_test_command(s: str) -> bool:
     if not s or not s.strip():
         return False
     head = s.strip().split(None, 1)[0]
-    head = head.lstrip("./").lstrip(".\\")
+    # Reduce an absolute or relative path to its final component so an
+    # interpreter referenced by full path — e.g. `sys.executable`
+    # (`C:\...\python.exe`) or POSIX `/usr/bin/python3` — is recognized by
+    # its basename rather than rejected as an unknown token. Splitting on
+    # both separators also subsumes the old `./` / `.\` prefix stripping.
+    head = re.split(r"[\\/]", head)[-1]
     # Strip Windows .exe / .bat suffix and any trailing punctuation.
     head = re.sub(r"\.(exe|bat|cmd|ps1)$", "", head, flags=re.IGNORECASE)
     return head.lower() in _KNOWN_RUNNER_TOKENS
@@ -227,6 +251,40 @@ def _inject_pytest_marker(command: str, marker_filter: str | None) -> str:
     return f"{command} -m \"{marker_filter}\""
 
 
+def _inject_strict_markers(command: str) -> str:
+    """Append --strict-markers to a pytest command if not already present.
+
+    Without this, unregistered marker names in -m expressions silently
+    evaluate to False (fail-open), causing the wrong test set to be
+    collected when the marker registration plugin hasn't loaded.
+    """
+    if "--strict-markers" in command:
+        return command
+    return f"{command} --strict-markers"
+
+
+def _inject_xdist_override(
+    command: str,
+    parallelism: int = 0,
+    cwd: Path | None = None,
+) -> str:
+    """Control xdist worker count for worca-t test runs.
+
+    xdist worker subprocesses crash under worca-t's subprocess
+    environment (ResolverServer socket handle inheritance, captured
+    stdin/stdout pipes, env sanitization). ``-n 0`` keeps the xdist
+    plugin loaded (so the SUT's ``addopts -n 5`` doesn't become an
+    unrecognized flag) but runs tests in-process — no worker
+    subprocess, no crash.
+
+    When the caller passes ``parallelism > 0``, xdist is kept active
+    with that many workers (``-n <value>``). ``parallelism == 0``
+    (default) appends ``-n 0`` to run in-process.
+    """
+    n_flag = f"-n {parallelism}" if parallelism > 0 else "-n 0"
+    return f"{command} {n_flag}"
+
+
 def resolve_command(
     framework: str,
     *,
@@ -234,6 +292,7 @@ def resolve_command(
     cwd: Path,
     profile: StackProfile | None = None,
     marker_filter: str | None = None,
+    parallelism: int = 0,
 ) -> tuple[str, str]:
     """Pick command + parser id.
 
@@ -258,6 +317,10 @@ def resolve_command(
     native suite. No-op on non-pytest frameworks (Cypress / Jest /
     Playwright-TS) and when the command already carries an explicit
     ``-m`` selector.
+
+    `parallelism`: when > 0, overrides the SUT's xdist ``-n`` with this
+    value. When 0 (default), uses ``-n auto`` to let xdist adapt to the
+    machine's CPU availability. Only applied to pytest-family frameworks.
     """
     apply_marker = framework in _PYTEST_FRAMEWORKS
     if detected and _looks_like_test_command(detected):
@@ -266,6 +329,8 @@ def resolve_command(
             detected = f"{detected} --junitxml={(cwd / 'worca-junit.xml').as_posix()}"
         if apply_marker:
             detected = _inject_pytest_marker(detected, marker_filter)
+            detected = _inject_strict_markers(detected)
+            detected = _inject_xdist_override(detected, parallelism)
         return detected, parser
     if detected:
         log.warning(
@@ -281,11 +346,15 @@ def resolve_command(
         wrapped = wrap_command(profile, bare)
         if apply_marker:
             wrapped = _inject_pytest_marker(wrapped, marker_filter)
+            wrapped = _inject_strict_markers(wrapped)
+            wrapped = _inject_xdist_override(wrapped, parallelism)
         return wrapped, parser
     bare = _expand_command("pytest --junitxml={junit}", cwd)
     wrapped = wrap_command(profile, bare)
     if apply_marker:
         wrapped = _inject_pytest_marker(wrapped, marker_filter)
+        wrapped = _inject_strict_markers(wrapped)
+        wrapped = _inject_xdist_override(wrapped, parallelism)
     return wrapped, "junit"
 
 
@@ -325,6 +394,42 @@ def _strip_headless_flag(command: str) -> str:
     return out
 
 
+_PYTEST_HEADLESS_OPTION_RE = re.compile(
+    r"""addoption\s*\(\s*['"]--headless['"]""",
+)
+
+
+def _sut_registers_headless_option(cwd: Path) -> bool:
+    """Detect whether the SUT's conftest registers a ``--headless`` CLI option.
+
+    Many polyglot pytest-playwright SUTs ship a custom ``--headless`` opt-in
+    flag (default headed) — the parent worca-t run must inject ``--headless``
+    on the pytest command for the SUT browser fixture to launch headless,
+    because the ``HEADLESS`` env var alone is not what those conftests read.
+
+    pytest-playwright itself does NOT register ``--headless`` (it defaults
+    to headless and exposes ``--headed`` for opt-in). Blindly adding the
+    flag for such a SUT causes pytest to abort with "unrecognized arguments",
+    so we gate the injection on a literal ``addoption("--headless"...)`` in
+    the SUT's conftest at the root or under ``tests/``.
+    """
+    for candidate in (cwd / "conftest.py", cwd / "tests" / "conftest.py"):
+        try:
+            content = candidate.read_text(encoding="utf-8", errors="ignore")
+        except (FileNotFoundError, OSError, IsADirectoryError):
+            continue
+        if _PYTEST_HEADLESS_OPTION_RE.search(content):
+            return True
+    return False
+
+
+def _inject_headless_flag(command: str) -> str:
+    """Append ``--headless`` to a pytest command if not already present."""
+    if re.search(r"(?:^|\s)--headless(?:\s|=|$)", command):
+        return command
+    return f"{command} --headless"
+
+
 # ---------------------------------------------------------------------------
 # Subprocess wrapper
 # ---------------------------------------------------------------------------
@@ -332,8 +437,18 @@ def _strip_headless_flag(command: str) -> str:
 
 def _split_command(command: str) -> list[str]:
     if os.name == "nt":
-        # On Windows, shlex.split with posix=False keeps backslashes intact.
-        return shlex.split(command, posix=False)
+        # On Windows, posix=False is required to keep backslash paths intact
+        # (e.g. ".venv\\Scripts\\pytest"). The trade-off is that posix=False
+        # preserves literal double quotes around quoted args — so `-m "a or b"`
+        # would arrive at the subprocess as the value `"a or b"` (with quotes),
+        # which pytest can't parse as a marker expression and silently treats
+        # as "match all tests". Strip surrounding double quotes from each
+        # token after splitting to get the actual value.
+        tokens = shlex.split(command, posix=False)
+        return [
+            t[1:-1] if len(t) >= 2 and t[0] == '"' and t[-1] == '"' else t
+            for t in tokens
+        ]
     return shlex.split(command)
 
 
@@ -647,10 +762,18 @@ def run_tests(
     profile: StackProfile | None = None,
     headless: bool = True,
     marker_filter: str | None = None,
+    parallelism: int = 0,
 ) -> RunResult:
     command, parser = resolve_command(
         framework, detected=detected_command, cwd=cwd, profile=profile,
-        marker_filter=marker_filter,
+        marker_filter=marker_filter, parallelism=parallelism,
+    )
+    log.info(
+        "test_runner.resolved_command",
+        command=command,
+        parser=parser,
+        cwd=str(cwd),
+        framework=framework,
     )
 
     # The CLI `--headed` flag is meant to give the user a visible browser
@@ -669,6 +792,11 @@ def run_tests(
     runtime_env["HEADLESS"] = "1" if headless else "0"
     if not headless:
         command = _strip_headless_flag(command)
+    elif framework in _PYTEST_FRAMEWORKS and _sut_registers_headless_option(cwd):
+        # SUT has its own --headless opt-in (default headed). Inject the
+        # flag so worca-t's headless default actually reaches the browser
+        # fixture — the HEADLESS env var alone isn't read by such SUTs.
+        command = _inject_headless_flag(command)
 
     # Force a clean SUT-specific venv for Python managers that own a venv
     # (poetry, uv, pdm, pipenv). Without this, a worca-t process that was
@@ -702,6 +830,44 @@ def run_tests(
         results = parse_robot_xml(cwd / "worca-output.xml")
     elif parser == "surefire":
         results = parse_surefire_dir(cwd / "target" / "surefire-reports")
+
+    # Exit code 3 = pytest internal error. When partial JUnit results
+    # parse but none represent actual test executions (all infrastructure
+    # errors like xdist worker crashes or conftest failures), treat the
+    # same as "no results" — synthesise T-runner-failure so the
+    # pipeline classifies the run as "failed" instead of "warned".
+    if results and exit_code == 3:
+        real_tests = [
+            r for r in results
+            if r.status in ("passed", "failed", "skipped")
+        ]
+        if not real_tests:
+            runner_failure = classify_runner_failure(
+                stderr,
+                package_manager=profile.package_manager if profile else None,
+            ) or {
+                "kind": "internal_error",
+                "module": None,
+                "hint": "pytest exited with code 3 (internal error)",
+                "summary": "pytest internal error; no tests executed",
+            }
+            for r in results:
+                r.runner_failure = runner_failure
+            results.append(
+                TestRunEntry(
+                    id="T-runner-failure",
+                    name="<runner-failure>",
+                    file=str(cwd),
+                    status="error",
+                    message=(
+                        f"pytest internal error (exit_code=3); "
+                        f"no tests passed/failed"
+                    ),
+                    stdout=stdout[-4000:],
+                    stderr=stderr[-4000:],
+                    runner_failure=runner_failure,
+                )
+            )
 
     if not results and exit_code != 0:
         # Synthesise a single 'error' entry so callers see *something*.

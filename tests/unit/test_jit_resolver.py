@@ -154,9 +154,13 @@ def test_resolve_one_cache_hit_skips_llm(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def _fake_anthropic_response(payload: dict) -> str:
-    """Return what _call_anthropic would return: a JSON string starting with `{`."""
-    return json.dumps(payload)
+def _fake_anthropic_response(payload: dict) -> tuple[str, dict[str, int | None]]:
+    """Return what _call_anthropic returns: ``(json_string, usage_dict)``.
+
+    The JSON string starts with `{`; the usage dict carries token telemetry
+    (``input_tokens`` / ``output_tokens``) consumed by resolve_one (Phase 6).
+    """
+    return json.dumps(payload), {"input_tokens": 42, "output_tokens": 17}
 
 
 def test_resolve_one_llm_success_caches_and_returns_agent_source(tmp_path: Path):
@@ -293,5 +297,267 @@ def test_resolution_result_as_dict_round_trip():
     assert d["selector"] == "#x"
     assert d["source"] == "agent"
     assert d["constant_name"] == "LOGIN"
+    assert d["candidates"] is None  # no bundle when not supplied
     # JSON-serializable
     json.dumps(d)
+
+
+# ---------------------------------------------------------------------------
+# Multi-candidate bundle parsing + cache round-trip
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_one_parses_two_candidate_bundle(tmp_path: Path):
+    """LLM returns a {candidates: [primary, fallback]} bundle; resolve_one
+    surfaces it on the result and writes it to the cache so the runtime can
+    use the fallback on TimeoutError without re-calling the LLM."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    with patch(
+        "worca_t.jit_resolver._call_anthropic",
+        return_value=_fake_anthropic_response({
+            "candidates": [
+                {"selector": "[data-testid='login-submit']", "strategy": "data-testid", "confidence": 0.92, "reason": None},
+                {"selector": "role=button[name=\"Sign in\"]", "strategy": "role", "confidence": 0.78, "reason": "fallback if data-testid drops"},
+            ],
+            "reason": None,
+        }),
+    ):
+        result = resolve_one(
+            intent="primary submit button on the login form",
+            snapshot_text='{"role":"button","name":"Sign in"}',
+            constant_name="LOGIN_BUTTON",
+            test_file="tests/test_login.py",
+            cache_dir=cache,
+        )
+    assert result.source == "agent"
+    assert result.selector == "[data-testid='login-submit']"
+    assert result.strategy == "data-testid"
+    assert result.candidates is not None
+    assert len(result.candidates) == 2
+    assert result.candidates[1]["selector"] == "role=button[name=\"Sign in\"]"
+    assert result.candidates[1]["strategy"] == "role"
+
+    # Cache carries the bundle for runtime reuse.
+    cached = read_cache(cache / "locator-cache.json")
+    entry = next(iter(cached.values()))
+    assert entry["selector"] == "[data-testid='login-submit']"
+    assert isinstance(entry.get("candidates"), list)
+    assert len(entry["candidates"]) == 2
+
+
+def test_resolve_one_accepts_single_candidate_bundle(tmp_path: Path):
+    """The LLM is allowed to return just one candidate when no defensible
+    alternate exists — result is still source=agent with len(candidates)==1."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    with patch(
+        "worca_t.jit_resolver._call_anthropic",
+        return_value=_fake_anthropic_response({
+            "candidates": [
+                {"selector": "#unique-id", "strategy": "id", "confidence": 0.95, "reason": None},
+            ],
+        }),
+    ):
+        result = resolve_one(
+            intent="x", snapshot_text="{}", constant_name="X",
+            cache_dir=cache,
+        )
+    assert result.source == "agent"
+    assert result.candidates is not None
+    assert len(result.candidates) == 1
+
+
+def test_resolve_one_drops_xpath_candidates_from_bundle(tmp_path: Path):
+    """Bundle entries that violate the priority chain (XPath) are dropped
+    silently; the remaining valid candidates survive."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    with patch(
+        "worca_t.jit_resolver._call_anthropic",
+        return_value=_fake_anthropic_response({
+            "candidates": [
+                {"selector": "[data-testid='go']", "strategy": "data-testid", "confidence": 0.9},
+                {"selector": "//button[@id='go']", "strategy": "xpath", "confidence": 0.5},
+            ],
+        }),
+    ):
+        result = resolve_one(
+            intent="go", snapshot_text="{}", constant_name="GO",
+            cache_dir=cache,
+        )
+    assert result.source == "agent"
+    assert result.selector == "[data-testid='go']"
+    assert result.candidates is not None
+    assert len(result.candidates) == 1  # XPath entry dropped
+
+
+def test_resolve_one_falls_back_to_flat_shape_for_legacy_response(tmp_path: Path):
+    """If the model regresses to the older single-selector output shape,
+    the parser wraps it into a single-entry bundle (backward-compat)."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    with patch(
+        "worca_t.jit_resolver._call_anthropic",
+        return_value=_fake_anthropic_response({
+            "selector": "#legacy", "strategy": "id", "confidence": 0.8, "reason": None,
+        }),
+    ):
+        result = resolve_one(
+            intent="legacy", snapshot_text="{}", constant_name="L",
+            cache_dir=cache,
+        )
+    assert result.source == "agent"
+    assert result.selector == "#legacy"
+    assert result.candidates is not None
+    assert len(result.candidates) == 1
+    assert result.candidates[0]["selector"] == "#legacy"
+
+
+def test_resolve_one_empty_candidates_array_is_unresolvable(tmp_path: Path):
+    """The new shape's null case: empty candidates array → unresolvable,
+    with the top-level reason surfaced on the result."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    with patch(
+        "worca_t.jit_resolver._call_anthropic",
+        return_value=_fake_anthropic_response({
+            "candidates": [],
+            "reason": "no button with name 'Sign in' present",
+        }),
+    ):
+        result = resolve_one(
+            intent="x", snapshot_text="{}", constant_name="X",
+            cache_dir=cache,
+        )
+    assert result.source == "unresolvable"
+    assert result.selector is None
+    assert "no button" in (result.reason or "")
+
+
+def test_cache_round_trip_preserves_candidates(tmp_path: Path):
+    """Bundle survives write+read so a cache hit on the next call
+    surfaces the same fallback alternates to the runtime."""
+    p = tmp_path / "cache.json"
+    entries = {
+        "abc123": {
+            "key": "abc123",
+            "selector": "[data-testid='go']",
+            "strategy": "data-testid",
+            "confidence": 0.9,
+            "candidates": [
+                {"selector": "[data-testid='go']", "strategy": "data-testid", "confidence": 0.9},
+                {"selector": "text=Go", "strategy": "text", "confidence": 0.7},
+            ],
+            "source": "agent",
+            "intent": "go",
+        },
+    }
+    write_cache(p, entries, run_id="20260615-test")
+    out = read_cache(p)
+    assert len(out["abc123"]["candidates"]) == 2
+    assert out["abc123"]["candidates"][1]["selector"] == "text=Go"
+
+
+def test_resolve_one_cache_hit_surfaces_bundle(tmp_path: Path):
+    """When the cache already has a bundle, resolve_one returns it on the
+    result so the runtime's _RetryingLocator can walk the fallback."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    key = cache_key("tests/t.py", "GO", "go button")
+    write_cache(
+        cache / "locator-cache.json",
+        {
+            key: {
+                "key": key,
+                "test_file": "tests/t.py",
+                "constant_name": "GO",
+                "intent": "go button",
+                "selector": "[data-testid='go']",
+                "strategy": "data-testid",
+                "confidence": 0.9,
+                "candidates": [
+                    {"selector": "[data-testid='go']", "strategy": "data-testid", "confidence": 0.9},
+                    {"selector": "text=Go", "strategy": "text", "confidence": 0.7},
+                ],
+                "source": "agent",
+            },
+        },
+    )
+    with patch("worca_t.jit_resolver._call_anthropic", side_effect=AssertionError("LLM called on cache hit")):
+        result = resolve_one(
+            intent="go button",
+            snapshot_text="{}",
+            constant_name="GO",
+            test_file="tests/t.py",
+            cache_dir=cache,
+        )
+    assert result.source == "cached"
+    assert result.candidates is not None
+    assert len(result.candidates) == 2
+
+
+# ---------------------------------------------------------------------------
+# Vertex-AI compatibility: no assistant-message prefill (rejected by Vertex
+# and the Bosch BMF Vertex relay with "This model does not support
+# assistant message prefill. The conversation must end with a user
+# message.")
+# ---------------------------------------------------------------------------
+
+
+def test_parse_response_tolerates_leading_prose():
+    """`_parse_response` must find the first balanced JSON object even when
+    the model emits a leading newline, whitespace, or a stray token before
+    the opening brace. Without the assistant-prefill nudge this is the
+    safety net against rare format slips."""
+    from worca_t.jit_resolver import _parse_response
+
+    payload = '{"candidates": [{"selector": "#x", "strategy": "id", "confidence": 0.9}]}'
+    for prefix in ("", "\n", "  ", "```json\n", "Here is the JSON:\n"):
+        parsed = _parse_response(prefix + payload)
+        assert parsed["candidates"][0]["selector"] == "#x"
+
+
+def test_call_anthropic_messages_end_with_user_role(tmp_path: Path):
+    """Regression test for the Vertex AI 400 'assistant prefill' error.
+    The `messages` list sent to the Anthropic SDK must end with a user-role
+    message — never assistant — so the same call works on both native
+    Anthropic and Vertex backends."""
+    from worca_t.jit_resolver import _call_anthropic
+
+    captured: dict = {}
+
+    class _FakeUsage:
+        input_tokens = 10
+        output_tokens = 5
+
+    class _FakeBlock:
+        type = "text"
+        text = '{"candidates": []}'
+
+    class _FakeResponse:
+        content = [_FakeBlock()]
+        usage = _FakeUsage()
+
+    class _FakeMessages:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return _FakeResponse()
+
+    class _FakeClient:
+        messages = _FakeMessages()
+
+    with patch("worca_t.config.use_vertex_backend", return_value=False), \
+         patch("anthropic.Anthropic", return_value=_FakeClient()):
+        body, _ = _call_anthropic("sys", "user", model="claude-sonnet-4-6")
+
+    msgs = captured["messages"]
+    assert msgs[-1]["role"] == "user", (
+        f"Vertex AI rejects assistant-prefill; final message must be user. "
+        f"Got: {[m['role'] for m in msgs]}"
+    )
+    assert all(m["role"] == "user" for m in msgs), (
+        f"Only user-role messages expected in single-turn resolver call; "
+        f"got: {[m['role'] for m in msgs]}"
+    )
+    assert body.startswith("{"), f"body should start with JSON open brace, got: {body!r}"

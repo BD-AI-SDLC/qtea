@@ -140,8 +140,8 @@ def test_commit_step_records_sha_and_subject(tmp_path: Path):
     ensure_git_repo_and_branch(dst, "rid")
 
     # Add a "step output" and commit.
-    (dst / "tests" / "worca_test_x.py").parent.mkdir(parents=True, exist_ok=True)
-    (dst / "tests" / "worca_test_x.py").write_text("def test_x(): pass\n", encoding="utf-8")
+    (dst / "tests" / "worca_x_test.py").parent.mkdir(parents=True, exist_ok=True)
+    (dst / "tests" / "worca_x_test.py").write_text("def test_x(): pass\n", encoding="utf-8")
     sha = commit_step(dst, 7, "codegen", message_detail="1 file, 1 test")
 
     assert sha is not None and len(sha) >= 7

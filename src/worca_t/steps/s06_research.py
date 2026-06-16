@@ -163,6 +163,38 @@ def _run_scan_skill(sut: Path, out_path: Path) -> bool:
         return False
 
 
+def _run_detect_framework(sut: Path) -> dict | None:
+    """Run skills/detect-test-framework/scripts/detect_framework.py against the SUT.
+
+    Returns the parsed JSON dict on success, or None on failure/missing.
+    """
+    skill_root = package_resource_root() / "skills" / "detect-test-framework"
+    script = skill_root / "scripts" / "detect_framework.py"
+    if not script.exists():
+        log.warning("detect_framework.skill_missing", path=str(script))
+        return None
+    try:
+        result = subprocess.run(
+            [sys.executable, str(script), "--root", str(sut)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=with_proxy_env(),
+            check=False,
+        )
+        if result.returncode != 0:
+            log.warning(
+                "detect_framework.skill_failed",
+                returncode=result.returncode,
+                stderr=(result.stderr or "").strip()[:200],
+            )
+            return None
+        return json.loads(result.stdout)
+    except Exception as e:
+        log.warning("detect_framework.error", error=str(e))
+        return None
+
+
 _ENV_TEMPLATE_FILES = (
     ".env.example", ".env.template", ".env.sample",
     ".env.local", ".env.test", ".env.development", ".env.production",
@@ -511,14 +543,31 @@ def _extract_commands(md_text: str) -> dict[str, str]:
 
 
 def _project_research(
-    md_text: str, scan_text: str | None, *, sut_env_keys: list[str] | None = None,
+    md_text: str,
+    scan_text: str | None,
+    *,
+    sut_env_keys: list[str] | None = None,
+    detected_fw: dict | None = None,
 ) -> dict:
     root = parse_markdown(md_text)
     title = root.children[0].title if root.children else "research"
     commands = _extract_commands(md_text)
+
+    # Prefer the script-based framework detection (manifest/config) over the
+    # regex fallback when confidence is high or medium.
+    regex_stack = _detect_stack(md_text + ("\n" + (scan_text or "")))
+    if (
+        detected_fw
+        and detected_fw.get("framework")
+        and detected_fw.get("confidence") in ("high", "medium")
+    ):
+        stack = detected_fw["framework"]
+    else:
+        stack = regex_stack
+
     projection: dict = {
         "title": title,
-        "detected_stack": _detect_stack(md_text + ("\n" + (scan_text or ""))),
+        "detected_stack": stack,
         "commands": commands,
         "summary_bullets": extract_bullets(root.content),
         "sections": [section_to_dict(c) for c in root.children],
@@ -567,6 +616,16 @@ class ResearchStep(Step):
                 error="scan skill failed; see step-06/scan.stderr.log",
             )
         scan_text = scan_out.read_text(encoding="utf-8") if scan_out.exists() else None
+
+        # Deterministic framework detection (Tier 1: manifests, Tier 2: config
+        # files, Tier 3: file globs). Best-effort — None on failure.
+        detected_fw = _run_detect_framework(ctx.workspace.sut)
+        if detected_fw and detected_fw.get("framework"):
+            log.info(
+                "step06.detected_framework",
+                framework=detected_fw["framework"],
+                confidence=detected_fw.get("confidence"),
+            )
 
         # Deterministic toolchain + URL discovery. Run before the agent so its
         # prompt can reference the pre-computed artifacts; the agent's role
@@ -667,7 +726,11 @@ class ResearchStep(Step):
         agents_root = package_resource_root() / "agents"
         skills_root = package_resource_root() / "skills"
         agent = agents_root / "polyglot-test-researcher.agent.md"
-        claude_md = package_resource_root() / "CLAUDE.md"
+        # CLAUDE.md is intentionally NOT staged: the worca-t repo's CLAUDE.md
+        # documents the pipeline architecture for developers working on
+        # worca-t itself — it has no instructions the researcher agent
+        # needs. The agent's own .agent.md is sufficient guidance. Skipping
+        # saves ~5k tokens of per-turn context.
 
         extras: list[Path] = []
         for skill in ("stack-catalog",):
@@ -713,7 +776,6 @@ class ResearchStep(Step):
             step=6,
             max_turns=25,
             model=researcher_model,
-            claude_md=claude_md if claude_md.exists() else None,
         )
         log.info(
             "step06.researcher_model",
@@ -845,7 +907,9 @@ class ResearchStep(Step):
                 )
 
         projection = _project_research(
-            md_dst.read_text(encoding="utf-8"), scan_text, sut_env_keys=sut_env_keys,
+            md_dst.read_text(encoding="utf-8"), scan_text,
+            sut_env_keys=sut_env_keys,
+            detected_fw=detected_fw,
         )
         projection["stack_profile"] = stack_profile.as_dict()
         projection["url_resolution"] = url_resolution.as_dict()

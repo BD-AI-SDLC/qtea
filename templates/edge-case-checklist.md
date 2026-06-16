@@ -1,9 +1,3 @@
-
----
-
-## 3. `/docs/edge-case-checklist.md`
-
-```markdown
 # Edge Case Discovery Checklist
 
 A systematic checklist for identifying edge cases and boundary conditions in any feature.

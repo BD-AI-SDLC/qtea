@@ -133,6 +133,58 @@ def slugify(s: str, *, prefix: str = "") -> str:
     return f"{prefix}{base}" if prefix else base
 
 
+_COVERAGE_NOTE_RE = re.compile(
+    r"\*\*([^*]+?):\*\*\s*([A-Za-z][A-Za-z\- ]*?)\s*[—–\-]+\s*(.+)",
+    re.I,
+)
+_COVERAGE_RESOLUTION_MAP = {
+    "dropped": "dropped",
+    "drop": "dropped",
+    "excluded": "scope_excluded",
+    "exclude": "scope_excluded",
+    "scope-excluded": "scope_excluded",
+    "scope excluded": "scope_excluded",
+    "accepted risk": "accepted_risk",
+    "accepted-risk": "accepted_risk",
+    "accept risk": "accepted_risk",
+    "risk accepted": "accepted_risk",
+    "assumption": "legacy_assumption",
+    "legacy assumption": "legacy_assumption",
+}
+
+
+def extract_coverage_notes(root: Section) -> list[dict]:
+    """Parse a top-level `## Coverage Notes` section into structured entries.
+
+    Format expected:
+      ## Coverage Notes
+      - **AC-7:** Dropped — user skipped clarification on aria-label text.
+      - **<Topic>:** Excluded — user said "<exact answer>"
+
+    Bullets without the `**<ID>:** <word> — <reason>` pattern are skipped.
+    """
+    section = root.find("coverage notes")
+    if section is None:
+        return []
+    notes: list[dict] = []
+    raw_lines = (section.content or "").splitlines()
+    for child in section.children:
+        raw_lines.extend((child.content or "").splitlines())
+    for line in raw_lines:
+        text = line.strip()
+        if text.startswith(("- ", "* ", "+ ")):
+            text = text[2:].strip()
+        m = _COVERAGE_NOTE_RE.match(text)
+        if not m:
+            continue
+        item_id = m.group(1).strip()
+        word = m.group(2).strip().lower()
+        reason = m.group(3).strip()
+        resolution = _COVERAGE_RESOLUTION_MAP.get(word, "accepted_risk")
+        notes.append({"item_id": item_id, "reason": reason, "resolution": resolution})
+    return notes
+
+
 def section_to_dict(s: Section) -> dict:
     """Recursive dict projection useful for *-spec.json / plan.json / etc."""
     return {

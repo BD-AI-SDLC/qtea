@@ -17,6 +17,7 @@ from worca_t.steps.s09_execute import (
     _build_fixer_prompt,
     _count_xpath_markers,
     _filter_command_for_tests,
+    _lazy_probe_heal_mcp,
     _patch_introduces_xpath,
     _run_dep_install,
 )
@@ -32,13 +33,36 @@ from ._sut_setup import seed_sut
 
 
 def test_filter_command_for_tests_pytest_adds_k_expr():
-    cmd = _filter_command_for_tests("pytest tests/", ["T-login-1", "T-logout-2"])
+    failing = [
+        TestRunEntry(id="T-login-1", name="test_login", file="t.py", status="failed"),
+        TestRunEntry(id="T-logout-2", name="test_logout", file="t.py", status="failed"),
+    ]
+    cmd = _filter_command_for_tests("pytest tests/", failing)
     assert cmd.startswith("pytest tests/ -k ")
-    assert "1" in cmd or "login" in cmd
+    assert "test_login" in cmd and "test_logout" in cmd
+
+
+def test_filter_command_for_tests_strips_parametrization_suffix():
+    """`-k` matches on the base function name, so a parametrized id like
+    `test_x[case-1]` must collapse to `test_x` (and dedupe across params)."""
+    failing = [
+        TestRunEntry(id="T-1", name="test_x[case-1]", file="t.py", status="failed"),
+        TestRunEntry(id="T-2", name="test_x[case-2]", file="t.py", status="failed"),
+    ]
+    cmd = _filter_command_for_tests("pytest tests/", failing)
+    assert cmd == 'pytest tests/ -k "test_x"'
+
+
+def test_filter_command_for_tests_preserves_existing_k_selector():
+    """An explicit `-k` already on the command must not be clobbered."""
+    failing = [TestRunEntry(id="T-1", name="test_x", file="t.py", status="failed")]
+    cmd = _filter_command_for_tests('pytest tests/ -k "smoke"', failing)
+    assert cmd == 'pytest tests/ -k "smoke"'
 
 
 def test_filter_command_for_tests_other_frameworks_unchanged():
-    cmd = _filter_command_for_tests("npx playwright test", ["T-a"])
+    failing = [TestRunEntry(id="T-a", name="logs in", file="t.spec.ts", status="failed")]
+    cmd = _filter_command_for_tests("npx playwright test", failing)
     assert cmd == "npx playwright test"
 
 
@@ -214,6 +238,31 @@ def test_build_fixer_prompt_includes_required_fields():
     assert "long\ntb" in prompt
 
 
+def test_build_fixer_prompt_includes_wait_for_mcp_servers_gate():
+    """The heal prompt's live-diagnosis block must instruct the agent to
+    call `WaitForMcpServers` (when present in its tool list) before any
+    `browser_*` tool use. The tool is auto-added by the SDK only while
+    MCPs are still booting; the gate eliminates the race where
+    `browser_navigate` fires before Playwright MCP finishes connecting
+    (see run 20260611-075728-0aa560 RCA for the original `pending` race).
+
+    Live-diagnosis only fires when `sut_base_url` is set — without it,
+    the live_block is empty and the gate isn't needed.
+    """
+    entry = TestRunEntry(
+        id="T-x", name="logs in", file="tests/login.spec.ts", status="failed",
+        message="locator missing", traceback="tb",
+    )
+    prompt = _build_fixer_prompt(
+        entry, Path("/sut/worca-tests"), sut_base_url="http://app.example",
+    )
+    assert "WaitForMcpServers" in prompt, (
+        "Step 9 heal prompt must instruct the agent to call "
+        "WaitForMcpServers before browser_navigate. Without this gate, "
+        "Playwright MCP boot races the first tool call."
+    )
+
+
 def test_build_bug_candidates_shape():
     entries = [
         TestRunEntry(id="T-1", name="a", file="t.py", status="failed", message="m"),
@@ -279,6 +328,14 @@ _JUNIT_FAIL = """<testsuites><testsuite name="s" file="tests/a.py">
   </testcase>
 </testsuite></testsuites>"""
 
+# What a scoped `-k test_bad` heal re-run reports: ONLY the previously-failing
+# test, now passing. test_ok is absent because the narrowed command (see
+# `_filter_command_for_tests`) targets just the healed subset. Step 9 must MERGE
+# this by id back into the first run's results (preserving test_ok).
+_JUNIT_RERUN_PASS = """<testsuites><testsuite name="s" file="tests/a.py">
+  <testcase name="test_bad" file="tests/a.py" time="0.02"/>
+</testsuite></testsuites>"""
+
 
 def _make_fake_pytest(
     script_path: Path,
@@ -309,7 +366,7 @@ def _make_flaky_pytest(script_path: Path, marker_path: Path) -> str:
         f"    junit = {_JUNIT_FAIL!r}\n"
         "    code = 1\n"
         "else:\n"
-        f"    junit = {_JUNIT_PASS!r}\n"
+        f"    junit = {_JUNIT_RERUN_PASS!r}\n"
         "    code = 0\n"
         "open(os.path.join(os.getcwd(), 'worca-junit.xml'), 'w', encoding='utf-8').write(junit)\n"
         "sys.exit(code)\n"
@@ -403,6 +460,12 @@ async def test_step09_failures_without_heal_yield_warned_and_bugs(tmp_path: Path
     cmd = _make_fake_pytest(tmp_path / "pt.py", junit_xml=_JUNIT_FAIL, exit_code=1)
     _seed_minimal_inputs(ctx, command=cmd)
 
+    # Stub the lazy MCP probe so the heal loop runs (no real `.mcp.json` in tests).
+    monkeypatch.setattr(
+        "worca_t.steps.s09_execute._lazy_probe_heal_mcp",
+        lambda server, env=None: (True, "ok"),
+    )
+
     # Fake claude that returns no usable patch (no files).
     install_fake_query(
         monkeypatch,
@@ -431,6 +494,13 @@ async def test_step09_self_heal_repairs_and_passes(tmp_path: Path, monkeypatch):
     cmd = _make_flaky_pytest(tmp_path / "pt.py", marker)
     _seed_minimal_inputs(ctx, command=cmd)
 
+    # Stub the lazy MCP probe so the heal loop runs in unit tests (no real
+    # `.mcp.json` / `npx` in the test environment).
+    monkeypatch.setattr(
+        "worca_t.steps.s09_execute._lazy_probe_heal_mcp",
+        lambda server, env=None: (True, "ok"),
+    )
+
     # Fake fixer that DOES write a replacement file - this triggers the rerun.
     # Use distinct content so the patch detector sees an actual change.
     install_fake_query(
@@ -444,10 +514,53 @@ async def test_step09_self_heal_repairs_and_passes(tmp_path: Path, monkeypatch):
     payload = json.loads((ctx.workspace.step_dir(9) / "run-results.json").read_text(encoding="utf-8"))
     assert payload["self_heal"]["attempts"] == 2
     assert payload["self_heal"]["patches_applied"] >= 1
-    # After re-run with the marker present, the flaky pytest reports only the
-    # passing junit; the merged result should have no failures.
+    # After the scoped `-k test_bad` heal re-run, the flaky pytest reports only
+    # `test_bad` (now passing). Step 9 MERGES that by id into the first run's
+    # results: `test_bad` flips to passed while `test_ok` is preserved — so the
+    # merged totals show 2 passed / 0 failed (a wholesale replace would lose
+    # test_ok and report only 1 passed).
     assert payload["totals"]["failed"] == 0
+    assert payload["totals"]["passed"] == 2
     assert result.status == "completed"
+
+
+_JUNIT_ALL_ERROR = """<testsuites><testsuite name="s" file="tests/a.py">
+  <testcase name="test_a" file="tests/a.py" time="0.01">
+    <error message="DNS failed">setup failed: net::ERR_NAME_NOT_RESOLVED</error>
+  </testcase>
+  <testcase name="test_b" file="tests/a.py" time="0.01">
+    <error message="DNS failed">setup failed: net::ERR_NAME_NOT_RESOLVED</error>
+  </testcase>
+</testsuite></testsuites>"""
+
+
+async def test_step09_fails_when_all_tests_error_none_pass(tmp_path: Path, monkeypatch):
+    """When every test errors (e.g. DNS unreachable, auth fixture crash) and
+    none pass, no assertion was evaluated. Previously this yielded `warned` +
+    `success=True`, masking total environment failures. The new contract:
+    `failed` + `success=False` so the pipeline halts and the report doesn't
+    claim partial success."""
+    ctx = _ctx(tmp_path)
+    cmd = _make_fake_pytest(tmp_path / "pt.py", junit_xml=_JUNIT_ALL_ERROR, exit_code=1)
+    _seed_minimal_inputs(ctx, command=cmd)
+
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "no fix"}],
+        files={},
+    )
+
+    result = await ExecuteStep().run(ctx)
+    assert result.success is False
+    assert result.status == "failed"
+    assert "all" in (result.error or "").lower()
+    assert "zero passing" in (result.error or "").lower()
+    # Artifacts still written for downstream inspection.
+    payload = json.loads(
+        (ctx.workspace.step_dir(9) / "run-results.json").read_text(encoding="utf-8")
+    )
+    assert payload["totals"]["passed"] == 0
+    assert payload["totals"]["errors"] == 2
 
 
 async def test_step09_fails_when_only_runner_failure_results(tmp_path: Path):
@@ -775,6 +888,12 @@ async def test_step09_rejects_xpath_heal_and_reverts(tmp_path: Path, monkeypatch
     cmd = _make_fake_pytest(tmp_path / "pt.py", junit_xml=_JUNIT_FAIL, exit_code=1)
     _seed_minimal_inputs(ctx, command=cmd)
 
+    # Stub the lazy MCP probe so the heal loop runs (no real `.mcp.json` in tests).
+    monkeypatch.setattr(
+        "worca_t.steps.s09_execute._lazy_probe_heal_mcp",
+        lambda server, env=None: (True, "ok"),
+    )
+
     # Fake fixer writes a "patched" file laced with XPath into the heal workdir.
     # s09's _apply_fixer_outputs copies it into the SUT's tests dir, then our
     # XPath gate must catch and revert.
@@ -850,3 +969,348 @@ def test_pre_attempt_cleanup_noop_when_heal_log_empty(tmp_path: Path):
     (out_dir / "self-heal" / "heal-log.jsonl").write_text("", encoding="utf-8")
     step.pre_attempt_cleanup(ctx, attempt=2)  # empty heal-log
     assert not (out_dir / "self-heal" / "heal-log.attempt-1.jsonl").exists()
+
+
+# ---------------------------------------------------------------------------
+# Lazy Playwright MCP probe (only fires when heal is actually needed)
+# ---------------------------------------------------------------------------
+
+
+def test_execute_step_mcp_servers_required_is_empty():
+    """Pipeline-level MCP preflight must skip Step 9 — the probe is lazy.
+    Eager preflight would pay the 5-15s warmup on every Step 9 run, even
+    when no test fails and the heal agent never spawns."""
+    assert ExecuteStep.mcp_servers_required == frozenset()
+    assert ExecuteStep._LAZY_MCP_SERVER == "playwright"
+
+
+def test_lazy_probe_returns_failure_when_mcp_json_missing(monkeypatch):
+    """A missing .mcp.json yields a descriptive failure detail — the
+    caller logs and skips heal without crashing the whole step."""
+    def fake_load(path=None, env=None):
+        raise FileNotFoundError(".mcp.json not found")
+    monkeypatch.setattr(
+        "worca_t.mcp_manager.load_mcp_config", fake_load,
+    )
+    ok, detail = _lazy_probe_heal_mcp("playwright")
+    assert ok is False
+    assert ".mcp.json" in detail
+
+
+def test_lazy_probe_returns_failure_when_server_not_declared(monkeypatch):
+    """When the server name isn't declared in .mcp.json, fail cleanly."""
+    monkeypatch.setattr(
+        "worca_t.mcp_manager.load_mcp_config", lambda env=None: {},
+    )
+    ok, detail = _lazy_probe_heal_mcp("playwright")
+    assert ok is False
+    assert "playwright" in detail
+    assert "not declared" in detail
+
+
+def test_lazy_probe_returns_success_when_server_probes_ok(monkeypatch):
+    """Happy path: server is declared + probes OK."""
+    fake_server = object()
+    monkeypatch.setattr(
+        "worca_t.mcp_manager.load_mcp_config",
+        lambda path=None, env=None: {"playwright": fake_server},
+    )
+    monkeypatch.setattr(
+        "worca_t.mcp_manager.probe_server",
+        lambda srv, timeout_s=30.0: (True, "ok"),
+    )
+    ok, detail = _lazy_probe_heal_mcp("playwright")
+    assert ok is True
+
+
+def test_lazy_probe_returns_failure_when_probe_fails(monkeypatch):
+    """Probe failure (e.g. npx missing, server crash) surfaces the detail."""
+    fake_server = object()
+    monkeypatch.setattr(
+        "worca_t.mcp_manager.load_mcp_config",
+        lambda path=None, env=None: {"playwright": fake_server},
+    )
+    monkeypatch.setattr(
+        "worca_t.mcp_manager.probe_server",
+        lambda srv, timeout_s=30.0: (False, "npx not on PATH"),
+    )
+    ok, detail = _lazy_probe_heal_mcp("playwright")
+    assert ok is False
+    assert "npx" in detail
+
+
+async def test_step09_skips_heal_when_mcp_probe_fails(tmp_path: Path, monkeypatch):
+    """When the lazy MCP probe fails just before the heal loop, the heal
+    is skipped (best-effort), per-test heal-log entries record the skip
+    reason, and the failing tests still flow to bug-candidates.json so
+    Step 10 sees them."""
+    ctx = _ctx(tmp_path)
+    cmd = _make_fake_pytest(tmp_path / "pt.py", junit_xml=_JUNIT_FAIL, exit_code=1)
+    _seed_minimal_inputs(ctx, command=cmd)
+
+    # Probe always fails — no Playwright MCP available.
+    probe_calls: list[str] = []
+
+    def fake_probe(server_name, env=None):
+        probe_calls.append(server_name)
+        return False, "npx not on PATH"
+
+    monkeypatch.setattr("worca_t.steps.s09_execute._lazy_probe_heal_mcp", fake_probe)
+
+    # Fake claude — should NEVER be called when MCP probe fails.
+    claude_calls: list = []
+
+    async def fake_run_agent(*args, **kwargs):
+        claude_calls.append((args, kwargs))
+        from worca_t.claude_runner import RunResult as _RR
+        return _RR(success=False, error="should not run", workdir=kwargs.get("workdir"))
+
+    monkeypatch.setattr("worca_t.steps.s09_execute.run_agent", fake_run_agent)
+
+    result = await ExecuteStep().run(ctx)
+    # Step still completes (heal is best-effort). Real failures flow downstream.
+    assert result.success
+    assert result.status == "warned"
+    # Probe was attempted exactly once with the "playwright" server name.
+    assert probe_calls == ["playwright"]
+    # Heal agent was NEVER invoked.
+    assert claude_calls == []
+    # Heal-log records the skip with the probe failure reason.
+    heal_log = ctx.workspace.step_dir(9) / "self-heal" / "heal-log.jsonl"
+    lines = [
+        json.loads(ln)
+        for ln in heal_log.read_text(encoding="utf-8").splitlines()
+        if ln.strip()
+    ]
+    assert len(lines) == 1  # one per failing test (_JUNIT_FAIL has 1 fail)
+    assert lines[0]["applied"] is False
+    assert "Playwright MCP probe failed" in lines[0]["agent_error"]
+    assert "npx not on PATH" in lines[0]["agent_error"]
+    # Bug-candidates still emitted so Step 10 sees the failure.
+    bugs = json.loads(
+        (ctx.workspace.step_dir(9) / "bug-candidates.json").read_text(encoding="utf-8")
+    )
+    assert len(bugs["candidates"]) >= 1
+
+
+async def test_step09_skips_probe_when_no_failing_tests(tmp_path: Path, monkeypatch):
+    """Green run (all tests pass): lazy probe must NOT fire at all — the
+    whole point of moving it inside `run()`. Validates the optimization."""
+    ctx = _ctx(tmp_path)
+    cmd = _make_fake_pytest(tmp_path / "pt.py", junit_xml=_JUNIT_PASS, exit_code=0)
+    _seed_minimal_inputs(ctx, command=cmd)
+
+    probe_calls: list[str] = []
+
+    def fake_probe(server_name, env=None):
+        probe_calls.append(server_name)
+        return True, "ok"
+
+    monkeypatch.setattr("worca_t.steps.s09_execute._lazy_probe_heal_mcp", fake_probe)
+
+    result = await ExecuteStep().run(ctx)
+    assert result.success
+    assert result.status == "completed"
+    # The optimization: probe was NEVER called because no test failed.
+    assert probe_calls == []
+
+
+async def test_step09_skips_probe_when_no_llm_resolve_set(
+    tmp_path: Path, monkeypatch,
+):
+    """WORCA_T_NO_LLM_RESOLVE=1 short-circuits the heal loop BEFORE the
+    lazy probe. Verify the probe is skipped — symmetric with the env flag's
+    "no LLM spend" contract (probing MCP also burns time/cache)."""
+    monkeypatch.setenv("WORCA_T_NO_LLM_RESOLVE", "1")
+    ctx = _ctx(tmp_path)
+    cmd = _make_fake_pytest(tmp_path / "pt.py", junit_xml=_JUNIT_FAIL, exit_code=1)
+    _seed_minimal_inputs(ctx, command=cmd)
+
+    probe_calls: list[str] = []
+
+    def fake_probe(server_name, env=None):
+        probe_calls.append(server_name)
+        return True, "ok"
+
+    monkeypatch.setattr("worca_t.steps.s09_execute._lazy_probe_heal_mcp", fake_probe)
+
+    result = await ExecuteStep().run(ctx)
+    # Tests failed but heal was disabled by the env flag.
+    assert result.success
+    assert result.status == "warned"
+    # Probe skipped — the env flag is the single "no extra cost" dial.
+    assert probe_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Storage-state injection (Playwright MCP --storage-state= flag)
+# ---------------------------------------------------------------------------
+
+
+async def test_step09_storage_state_arg_threaded_into_mcp_env_when_resolved(
+    tmp_path: Path, monkeypatch,
+):
+    """When a storage-state file exists at the SUT convention path,
+    Step 9 resolves it, computes the ``--storage-state=<path>`` CLI flag,
+    and threads it into the MCP env overlay passed to
+    ``_lazy_probe_heal_mcp`` (and downstream to ``stage_mcp_config`` for
+    the agent SDK)."""
+    ctx = _ctx(tmp_path)
+    cmd = _make_fake_pytest(tmp_path / "pt.py", junit_xml=_JUNIT_FAIL, exit_code=1)
+    _seed_minimal_inputs(ctx, command=cmd)
+
+    # Drop a storage-state file at the SUT convention path so the
+    # 4-tier resolver picks it up.
+    storage_path = ctx.workspace.sut / ".worca-t" / "storage-state.json"
+    storage_path.parent.mkdir(parents=True, exist_ok=True)
+    storage_path.write_text('{"cookies":[],"origins":[]}', encoding="utf-8")
+
+    captured_env: dict[str, dict[str, str] | None] = {"env": None}
+
+    def fake_probe(server, env=None):
+        captured_env["env"] = env
+        # Probe fails so we don't try to actually run the heal agent (no
+        # MCP available in unit test env). The env-capture is what matters.
+        return False, "stub"
+
+    monkeypatch.setattr(
+        "worca_t.steps.s09_execute._lazy_probe_heal_mcp", fake_probe,
+    )
+
+    await ExecuteStep().run(ctx)
+
+    assert captured_env["env"] is not None
+    arg = captured_env["env"]["WORCA_T_STORAGE_STATE_ARG"]
+    assert arg.startswith("--storage-state=")
+    assert "storage-state.json" in arg
+
+
+async def test_step09_storage_state_arg_picked_up_after_same_run_auto_capture(
+    tmp_path: Path, monkeypatch,
+):
+    """**The whole point of Use case B**: storage state file does NOT exist
+    at Step 9 start. Test runner writes it (simulating the runtime plugin's
+    auto-capture on first passing test). The heal loop re-resolves AFTER
+    run_tests returns and now sees the workspace path — the MCP env passed
+    to the lazy probe carries the freshly-captured file.
+
+    Without the post-run re-resolve this test would fail with an empty
+    ARG (the early resolve, which ran before the test runner wrote the
+    file, would have returned None).
+    """
+    ctx = _ctx(tmp_path)
+    cmd = _make_fake_pytest(tmp_path / "pt.py", junit_xml=_JUNIT_FAIL, exit_code=1)
+    _seed_minimal_inputs(ctx, command=cmd)
+
+    # Verify the workspace file does NOT exist before the step starts.
+    expected_path = ctx.workspace.root / "storage-state.json"
+    assert not expected_path.exists()
+
+    # Wrap run_tests so it also writes the workspace storage-state.json
+    # before returning — this is exactly what the runtime plugin does inside
+    # the pytest subprocess on the first passing test.
+    from worca_t import test_runner as _tr_mod
+    real_run_tests = _tr_mod.run_tests
+
+    def fake_run_tests(*args, **kwargs):
+        result = real_run_tests(*args, **kwargs)
+        # Simulate the runtime plugin's pytest_runtest_teardown capture.
+        expected_path.parent.mkdir(parents=True, exist_ok=True)
+        expected_path.write_text(
+            '{"cookies":[{"name":"session"}],"origins":[]}',
+            encoding="utf-8",
+        )
+        return result
+
+    monkeypatch.setattr("worca_t.steps.s09_execute.run_tests", fake_run_tests)
+
+    captured_env: dict[str, dict[str, str] | None] = {"env": None}
+
+    def fake_probe(server, env=None):
+        captured_env["env"] = dict(env or {})  # snapshot at probe time
+        return False, "stub"
+
+    monkeypatch.setattr(
+        "worca_t.steps.s09_execute._lazy_probe_heal_mcp", fake_probe,
+    )
+
+    await ExecuteStep().run(ctx)
+
+    # File was indeed written by the fake runner.
+    assert expected_path.is_file()
+    # MCP env at probe time carries the freshly-captured file's path
+    # (this would be "" without the post-run re-resolve).
+    assert captured_env["env"] is not None
+    arg = captured_env["env"]["WORCA_T_STORAGE_STATE_ARG"]
+    assert arg.startswith("--storage-state=")
+    assert "storage-state.json" in arg
+
+
+async def test_step09_storage_state_arg_empty_when_no_source(
+    tmp_path: Path, monkeypatch,
+):
+    """No CLI flag, no env var, no convention file, no workspace
+    auto-capture → arg is the empty string (mcp_manager filters it out
+    before reaching the MCP subprocess)."""
+    ctx = _ctx(tmp_path)
+    cmd = _make_fake_pytest(tmp_path / "pt.py", junit_xml=_JUNIT_FAIL, exit_code=1)
+    _seed_minimal_inputs(ctx, command=cmd)
+    # Make sure no env var leaks in.
+    monkeypatch.delenv("WORCA_T_STORAGE_STATE", raising=False)
+
+    captured_env: dict[str, dict[str, str] | None] = {"env": None}
+
+    def fake_probe(server, env=None):
+        captured_env["env"] = env
+        return False, "stub"
+
+    monkeypatch.setattr(
+        "worca_t.steps.s09_execute._lazy_probe_heal_mcp", fake_probe,
+    )
+
+    await ExecuteStep().run(ctx)
+
+    assert captured_env["env"] is not None
+    assert captured_env["env"]["WORCA_T_STORAGE_STATE_ARG"] == ""
+
+
+def test_build_fixer_prompt_includes_storage_state_directive_when_path_set(
+    tmp_path: Path,
+):
+    """The heal prompt must surface the storage-state directive when a
+    path is provided — agent skips the SUT's sign-in helper and goes
+    direct to the failing page URL."""
+    storage_path = tmp_path / ".worca-t" / "storage-state.json"
+    storage_path.parent.mkdir(parents=True, exist_ok=True)
+    storage_path.write_text('{"cookies":[],"origins":[]}', encoding="utf-8")
+    entry = TestRunEntry(
+        id="T-x", name="logs in", file="tests/login.spec.ts", status="failed",
+        message="locator missing", traceback="tb",
+    )
+    prompt = _build_fixer_prompt(
+        entry, Path("/sut/worca-tests"),
+        sut_base_url="http://app.example",
+        storage_state_path=storage_path,
+    )
+    assert "PRE-LOADED STORAGE STATE" in prompt
+    assert "DO NOT call the SUT's sign-in helper" in prompt
+    # Workflow step (1) variant for storage-state path
+    assert "pre-loaded storage state" in prompt.lower()
+    assert "do NOT call the SUT's sign-in helper" in prompt
+
+
+def test_build_fixer_prompt_omits_storage_state_block_when_unset():
+    """No storage-state path → no directive in the prompt. Agent follows
+    the SUT's auth flow as before."""
+    entry = TestRunEntry(
+        id="T-x", name="logs in", file="tests/login.spec.ts", status="failed",
+        message="locator missing", traceback="tb",
+    )
+    prompt = _build_fixer_prompt(
+        entry, Path("/sut/worca-tests"),
+        sut_base_url="http://app.example",
+        storage_state_path=None,
+    )
+    assert "PRE-LOADED STORAGE STATE" not in prompt
+    # And the standard auth-replay workflow IS present.
+    assert "follow the SUT's auth flow" in prompt

@@ -91,8 +91,11 @@ def _poetry_build(sut: Path) -> dict[str, Any]:
         "language": "python",
         "package_manager": "poetry",
         "wrapper_prefix": "poetry run",
+        # --local writes poetry.toml into the SUT root, scoping the setting to
+        # this project only (no global Poetry config change on the host machine).
+        "pre_install_command": "poetry config virtualenvs.in-project true --local",
         "install_command": "poetry install --no-interaction",
-        "venv_path": None,  # poetry-managed, lives outside the project
+        "venv_path": ".venv",
     }
 
 

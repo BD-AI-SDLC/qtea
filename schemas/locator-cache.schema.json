@@ -44,6 +44,29 @@
             "minimum": 0,
             "maximum": 1
           },
+          "candidates": {
+            "type": "array",
+            "description": "Ranked selector candidates from the LLM resolver (Tier 4). Index 0 mirrors the top-level selector/strategy/confidence. Index 1 is a fallback the retry proxy tries on TimeoutError before invalidating the cache. Absent for non-agent sources (dev/cached/heuristic/hitl/unresolvable).",
+            "minItems": 1,
+            "maxItems": 2,
+            "items": {
+              "type": "object",
+              "required": ["selector", "strategy"],
+              "properties": {
+                "selector": { "type": "string" },
+                "strategy": {
+                  "type": ["string", "null"],
+                  "enum": ["id", "data-testid", "role", "label", "text", "placeholder", "css", null]
+                },
+                "confidence": {
+                  "type": ["number", "null"],
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "reason": { "type": ["string", "null"] }
+              }
+            }
+          },
           "source": {
             "type": "string",
             "enum": ["dev_verified", "dev_unverified", "cached", "agent", "hitl", "unresolvable"],

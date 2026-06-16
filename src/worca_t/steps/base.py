@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
 import shutil
+import sys
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
+
+from rich.console import Console
+from rich.prompt import Prompt
 
 from worca_t.checkpoints import RunState, StepRecord, hash_paths
 from worca_t.claude_runner import AgentResult, run_agent
 from worca_t.config import package_resource_root
 from worca_t.hitl import (
+    RESOLUTION_SKIPPED_DROP,
     HitlDecision,
     append_ledger,
     extract_questions,
@@ -32,6 +38,67 @@ log = get_logger(__name__)
 
 MAX_ATTEMPTS = 2
 HITL_MAX_ITERATIONS = 3
+
+# Sentinel string that the claude_runner.`_ApiRetryStorm` exception text
+# always starts with. Matching by prefix lets `Step.execute` distinguish a
+# transient upstream incident from a deterministic agent failure, even
+# though `StepResult` only carries the error text (not the exit_code).
+# Tightly coupled to the message format in `claude_runner._ApiRetryStorm`
+# — keep these in sync.
+_API_RETRY_STORM_PREFIX = "SDK api_retry storm"
+_API_FATAL_ERROR_PREFIX = "API fatal error: HTTP"
+
+# Wall-clock wait when the user picks "wait then retry" on a storm prompt.
+# 5 min is the empirically-observed median duration of a Vertex transient
+# incident window (run 20260611-075728-0aa560 was the longer end of the
+# tail at ~30 min, but most clear within 2-5 min). Short enough that the
+# user doesn't lose context, long enough that attempt 2 isn't landing
+# inside the same incident as attempt 1.
+_STORM_RETRY_WAIT_S = 300
+
+
+def _is_api_retry_storm(error: str | None) -> bool:
+    """True when `error` looks like the api_retry_storm sentinel from claude_runner."""
+    return bool(error) and error.lstrip().startswith(_API_RETRY_STORM_PREFIX)
+
+
+def _is_api_fatal_error(error: str | None) -> bool:
+    """True when `error` is a non-retryable HTTP 4xx/5xx from claude_runner."""
+    return bool(error) and error.lstrip().startswith(_API_FATAL_ERROR_PREFIX)
+
+
+async def _prompt_storm_retry_decision(
+    *, step_num: int, step_name: str, attempt: int, error: str, console: Console
+) -> str:
+    """Block until the user picks how to handle a transient-upstream storm.
+
+    Returns one of: ``"retry"``, ``"wait"``, ``"abort"``. Caller decides
+    what to do — this function only collects the answer. Caller is also
+    responsible for the TTY / --no-hitl / --yes gate; this function
+    unconditionally prompts.
+
+    Async because the "wait" branch in the caller sleeps inside the
+    event loop and we want a consistent await-able shape.
+    """
+    console.print()
+    console.print(
+        f"[yellow]step {step_num:02d} {step_name} attempt {attempt} "
+        f"hit an upstream API storm.[/]"
+    )
+    console.print(f"[dim]  {error.splitlines()[0]}[/]")
+    console.print(
+        "[dim]  The harness can retry now, wait "
+        f"{_STORM_RETRY_WAIT_S // 60} min for the upstream to recover, "
+        "or abort.[/]"
+    )
+    choice = Prompt.ask(
+        "[bold]How do you want to proceed?[/] "
+        r"[dim](\[r\]etry now / \[w\]ait & retry / \[a\]bort)[/]",
+        choices=["r", "w", "a"],
+        default="w",
+        show_choices=False,
+    )
+    return {"r": "retry", "w": "wait", "a": "abort"}[choice]
 
 
 @dataclass
@@ -62,12 +129,127 @@ def _snapshot_debug_artifacts(step_num: int, ctx: StepContext, attempt: int) -> 
     workdir = ctx.workspace.step_workdir(step_num)
     if not workdir.exists():
         return
-    # Glob covers both the new per-call numbered names
-    # (transcript-00.jsonl, transcript-01.jsonl, ...) and the legacy
-    # single-file names from older runs (transcript.jsonl, etc.).
+    # Per-call audit files live under <workdir>/logs/ now; older runs (and
+    # any test scaffold that drops files directly into the workdir root)
+    # may still have them at the legacy top-level path, so glob both.
+    search_dirs = [workdir / "logs", workdir]
     for pattern in ("transcript*.jsonl", "stderr*.log", "metrics*.json"):
-        for src in workdir.glob(pattern):
-            shutil.copy2(src, dst / src.name)
+        for search_dir in search_dirs:
+            if not search_dir.exists():
+                continue
+            for src in search_dir.glob(pattern):
+                shutil.copy2(src, dst / src.name)
+
+
+def _build_failure_context(
+    step_num: int, step_name: str, record: StepRecord, result: StepResult
+) -> str:
+    """Render a small Markdown blob describing a failed attempt.
+
+    Shared by the debug-RCA flow and the fix-proposal flow so both
+    agents see the same framing.
+    """
+    return (
+        f"# Step {step_num} ({step_name}) failure\n\n"
+        f"**Attempts:** {record.attempts}\n"
+        f"**Status:** {record.status}\n"
+        f"**Error:** {result.error or 'unknown'}\n"
+        f"**Notes:** {result.notes or 'none'}\n"
+    )
+
+
+def _should_run_debug_rca(ctx: StepContext, has_more_attempts: bool) -> bool:
+    """Gate the debug-RCA invocation.
+
+    - Always fires on a FINAL failure (last attempt or no retry available):
+      gives the user a diagnosis artifact and supplies the ``--fix`` flow
+      with structured RCA input.
+    - On non-final failures (the retry will run regardless), only fires when
+      ``--debug`` is set. Keeps token cost at zero for the common case where
+      attempt 2 succeeds and the user never needs the intermediate RCA.
+    """
+    if not has_more_attempts:
+        return True
+    return bool(getattr(ctx.options, "debug", False))
+
+
+async def _run_debug_rca(
+    step_num: int, ctx: StepContext, failure_context: str, attempt: int
+) -> Path | None:
+    """Invoke ``debug.agent.md`` for structured root-cause analysis.
+
+    Read-only diagnosis — the agent's own contract forbids editing source,
+    fixtures, or env (see ``agents/debug.agent.md``). The RCA artifact
+    lands at ``<workspace>/debug/step-NN-attemptM-debug-rca.md`` and is
+    stashed on ``ctx.extras`` so the ``--fix`` chain can pick it up.
+    Returns the artifact path on success, ``None`` on failure (logged).
+    """
+    agent = package_resource_root() / "agents" / "debug.agent.md"
+    if not agent.exists():
+        log.warning("debug.agent_missing", path=str(agent))
+        return None
+
+    rca_workdir = ctx.workspace.debug / f"step-{step_num:02d}-attempt{attempt}-rca"
+    rca_workdir.mkdir(parents=True, exist_ok=True)
+
+    context_file = rca_workdir / "failure-context.md"
+    context_file.write_text(failure_context, encoding="utf-8")
+
+    # Grant read access to the failing step's workdir (transcripts, stderr,
+    # metrics under <workdir>/logs/) without copying. The agent decides
+    # what to ingest based on what its agent.md prompt tells it to read.
+    step_workdir = ctx.workspace.step_workdir(step_num)
+    add_dirs = [step_workdir] if step_workdir.exists() else None
+
+    out_path = ctx.workspace.debug / f"step-{step_num:02d}-attempt{attempt}-debug-rca.md"
+
+    try:
+        result = await run_agent(
+            agent,
+            workdir=rca_workdir,
+            inputs={"failure-context.md": context_file},
+            user_prompt=(
+                f"Step {step_num} attempt {attempt} failed. Read "
+                f"`./failure-context.md` plus any transcripts under "
+                f"`{step_workdir / 'logs'}/` you need. Produce a structured "
+                f"root-cause analysis at `./debug-rca.md` following the "
+                f"Phase 1-3 protocol in your agent.md. Diagnosis only — "
+                f"do NOT edit source, fixtures, or env."
+            ),
+            add_dirs=add_dirs,
+            timeout_s=300,
+            max_turns=10,
+        )
+    except Exception as e:
+        log.warning("debug.rca_failed", step=step_num, error=str(e))
+        return None
+
+    produced = rca_workdir / "debug-rca.md"
+    if result.success and produced.exists():
+        shutil.copy2(produced, out_path)
+        log.info(
+            "debug.rca_written",
+            step=step_num,
+            attempt=attempt,
+            path=str(out_path),
+        )
+        return out_path
+    if result.final_text:
+        out_path.write_text(result.final_text, encoding="utf-8")
+        log.info(
+            "debug.rca_final_text",
+            step=step_num,
+            attempt=attempt,
+            path=str(out_path),
+        )
+        return out_path
+    log.warning(
+        "debug.rca_empty",
+        step=step_num,
+        attempt=attempt,
+        agent_error=result.error,
+    )
+    return None
 
 
 async def _run_fix_proposal(step_num: int, ctx: StepContext, failure_context: str) -> Path | None:
@@ -179,12 +361,17 @@ async def run_agent_with_hitl(
     max_turns: int | None = 25,
     claude_md: Path | None = None,
     max_iterations: int = HITL_MAX_ITERATIONS,
+    enable_mcp: bool = False,
 ) -> AgentResult:
     """Run an agent; if its output contains unresolved questions, prompt user
     and re-invoke with answers staged as ``user-answers.md``. Loops until the
     output is clean or ``max_iterations`` is reached.
 
     Skips the prompt loop when ``--no-hitl`` is set or stdin is not a TTY.
+
+    ``enable_mcp`` mirrors the `run_agent` flag and forwards as-is. Default
+    False matches the `run_agent` default; pass True only when the agent
+    invoked through HITL actually uses MCP tools.
     """
     extras = list(extra_paths or [])
     current_inputs = dict(inputs)
@@ -226,8 +413,11 @@ async def run_agent_with_hitl(
             f"**Note:** `./prior-decisions.md` lists items the user already "
             f"addressed in earlier steps of this run. Treat each entry as "
             f"final — do NOT re-emit them as new blockers, clarifications, "
-            f"or open questions. For skipped items, apply the same "
-            f"`[ASSUMPTION]` framing the earlier agent used."
+            f"or open questions. Each entry carries its own directive on "
+            f"how to honor it (answered → apply verbatim; dropped → remove "
+            f"coverage and record in `## Coverage Notes`; scope-exclusion → "
+            f"exclude the named scope; legacy-skipped → preserve "
+            f"`[ASSUMPTION]` framing)."
         )
 
     for iteration in range(1, max_iterations + 1):
@@ -242,6 +432,7 @@ async def run_agent_with_hitl(
             max_turns=max_turns,
             claude_md=claude_md,
             resume=resume_session,
+            enable_mcp=enable_mcp,
         )
         # Capture session for the next iteration, regardless of whether we
         # actually re-invoke -- harmless if we don't.
@@ -315,28 +506,40 @@ async def run_agent_with_hitl(
             answers = prompt_user(new_questions, agent_label=agent_label)
         else:
             answers = {}
+        # prompt_user now returns dict[str, tuple[str, str]] — skipped items
+        # absent from the dict; answered/scope-exclusion items carry
+        # (resolution, text).
         skipped_this_round = [q for q in new_questions if q.id not in answers]
         for q in skipped_this_round:
             skipped_keys.add(question_key(q))
             step_decisions.setdefault(
                 question_key(q),
                 HitlDecision.from_question(
-                    q, step=step or 0, agent_label=agent_label, resolution="skipped"
-                ),
-            )
-        for q in new_questions:
-            if q.id in answers:
-                step_decisions[question_key(q)] = HitlDecision.from_question(
                     q,
                     step=step or 0,
                     agent_label=agent_label,
-                    resolution="answered",
-                    answer=answers[q.id],
-                )
+                    resolution=RESOLUTION_SKIPPED_DROP,
+                ),
+            )
+        for q in new_questions:
+            entry = answers.get(q.id)
+            if entry is None:
+                continue
+            resolution, text = entry
+            step_decisions[question_key(q)] = HitlDecision.from_question(
+                q,
+                step=step or 0,
+                agent_label=agent_label,
+                resolution=resolution,
+                answer=text,
+            )
 
         # Always re-invoke so the agent can either incorporate answers OR
-        # convert skipped clarifications into `[ASSUMPTION]` notes. Skipping
-        # the re-run would leave `[CLARIFICATION NEEDED]` tags in the output.
+        # drop skipped clarifications. Skipping the re-run would leave
+        # `[CLARIFICATION NEEDED]` tags in the output.
+        # Mirrors the iteration prompt in
+        # `call_reasoning_llm_with_hitl` (src/worca_t/llm/reasoning.py) —
+        # semantics must stay aligned across both HITL paths.
         hitl_dir.mkdir(parents=True, exist_ok=True)
         answers_src = write_answers_file(
             hitl_dir,
@@ -355,19 +558,34 @@ async def run_agent_with_hitl(
             f"{user_prompt}\n\n"
             f"The user has reviewed your clarification questions. See "
             f"`./user-answers.md` for their responses, which include "
-            f"answered items, items the user chose to skip, and items "
-            f"that were already resolved earlier in this run.\n\n"
+            f"answered items, items the user chose to skip (drop), items "
+            f"the user excluded by scope, and items already resolved "
+            f"earlier in this run.\n\n"
             f"- For ANSWERED items: incorporate the answer and remove the "
             f"corresponding `[CLARIFICATION NEEDED]` tag, blocker row, or "
             f"open-question entry.\n"
-            f"- For SKIPPED items: make a reasonable assumption, mark it "
-            f"inline with `[ASSUMPTION: ...]`, and remove the original "
-            f"`[CLARIFICATION NEEDED]` tag / blocker row / open-question "
-            f"entry. **Do NOT re-emit `[CLARIFICATION NEEDED]` for skipped "
-            f"items** — the user has explicitly opted to defer them.\n"
-            f"- For PREVIOUSLY RESOLVED items: apply the prior answer / "
-            f"assumption verbatim and remove the duplicate entry. **Do "
-            f"NOT re-raise these to the user.**\n\n"
+            f"- For SKIPPED items: REMOVE the entire AC / TC / sub-item "
+            f"the question was attached to from the document body. Append "
+            f"an entry to a `## Coverage Notes` section at the end of the "
+            f"document recording the dropped ID and the reason. **Do NOT "
+            f"write `[ASSUMPTION: ...]`** — the user's intent is to drop "
+            f"this coverage, not test it under an invented value. Do NOT "
+            f"re-emit `[CLARIFICATION NEEDED]` for skipped items.\n"
+            f"- For SCOPE-EXCLUDED items: interpret the user's answer as "
+            f"a scope-exclusion (e.g. \"mobile isn't in scope\" → "
+            f"exclude mobile). Remove ACs / TCs / sub-bullets that depend "
+            f"solely on the excluded scope; keep the in-scope portions. "
+            f"Append an entry to `## Coverage Notes` recording the "
+            f"exclusion and the user's exact answer. Do NOT include the "
+            f"typed answer as a literal value in the document body.\n"
+            f"- For PREVIOUSLY RESOLVED items: follow the per-item "
+            f"directive in `./user-answers.md` (answered → apply verbatim; "
+            f"skipped-drop → drop; scope-exclusion → exclude). Do NOT "
+            f"re-raise these to the user.\n\n"
+            f"**Preserve `## Coverage Notes` across iterations.** If the "
+            f"document already has a `## Coverage Notes` section from a "
+            f"prior iteration, preserve its entries verbatim and only "
+            f"append new ones.\n\n"
             f"Rewrite `./{output_filename}` accordingly. Keep the rest of "
             f"the document intact."
         )
@@ -440,6 +658,14 @@ class Step(ABC):
     number: int = 0
     name: str = ""
     timeout_s: int | None = None
+    # Names of MCP servers (from `.mcp.json`) this step's agent calls require.
+    # The pipeline runs `probe_server()` JUST for these names, just before
+    # the step executes, so the npx cache + lazy server init complete
+    # contiguously with the SDK spawn — fixing the "playwright reports
+    # pending at SDK init" race observed in run 20260611-184450 step 9.
+    # Empty (default) means the step doesn't use MCP and preflight is
+    # skipped entirely. See `pipeline._mcp_preflight_for_step`.
+    mcp_servers_required: ClassVar[frozenset[str]] = frozenset()
 
     @abstractmethod
     async def run(self, ctx: StepContext) -> StepResult:  # pragma: no cover (abstract)
@@ -470,7 +696,149 @@ class Step(ABC):
 
         result = await self._attempt(ctx, record)
 
+        # Debug RCA on attempt-1 failure. Sidecar — fires before any retry
+        # decision and never blocks the retry path. Default gating fires it
+        # only when this is the FINAL failure (last attempt); --debug
+        # promotes it to fire on every failed attempt. See
+        # `_should_run_debug_rca`.
+        if not result.success and _should_run_debug_rca(
+            ctx, has_more_attempts=record.attempts < MAX_ATTEMPTS
+        ):
+            fc = _build_failure_context(self.number, self.name, record, result)
+            rca = await _run_debug_rca(
+                self.number, ctx, fc, attempt=record.attempts
+            )
+            if rca:
+                ctx.extras[f"step{self.number}_rca_path"] = str(rca)
+
         if not result.success and record.attempts < MAX_ATTEMPTS:
+            # Classify the failure for audit + hint propagation. The
+            # category is logged for the audit trail; when the classifier
+            # returns a fix_hint dict it gets merged into ctx.extras so
+            # the next attempt's run() can pick it up (e.g. a prompt
+            # clarification for schema violations). Pure-Python; no LLM
+            # call. See worca_t/failure_classifiers.py for category list.
+            from worca_t.failure_classifiers import classify_failure
+            classification = classify_failure(result, ctx)
+            log.info(
+                "step.failure_classified",
+                step=self.number,
+                category=classification.category.value,
+                safe_to_auto_retry=classification.safe_to_auto_retry,
+                explanation=classification.explanation,
+            )
+            if classification.fix_hint:
+                ctx.extras.update(classification.fix_hint)
+                log.info(
+                    "step.fix_hint_applied",
+                    step=self.number,
+                    hint_keys=list(classification.fix_hint.keys()),
+                )
+            # Stash the classification for downstream consumers (pipeline.py
+            # uses it to gate the fix-proposal chain on the final failure).
+            ctx.extras[f"step{self.number}_failure_category"] = (
+                classification.category.value
+            )
+
+            # Non-retryable HTTP errors (4xx auth/quota, 5xx outage):
+            # skip retry entirely — no debug agent, no attempt 2. The
+            # error won't resolve by retrying; surface it immediately.
+            if _is_api_fatal_error(result.error):
+                log.error(
+                    "step.api_fatal_no_retry",
+                    step=self.number,
+                    error=result.error,
+                )
+                return result
+
+            # API-retry-storm classification gate. For transient upstream
+            # failures (exit_code -10 inside the runner, surfaced as
+            # error text matching `_API_RETRY_STORM_PREFIX`), the default
+            # "immediate retry" lands attempt 2 inside the same incident
+            # window — observed in run 20260611-075728-0aa560 step 8
+            # where both attempts hit the storm at the same trajectory
+            # point ~16 s apart. Prompt the user for a smarter choice
+            # when we have a TTY. Non-interactive paths
+            # (--no-hitl / --yes / no-TTY) keep the immediate-retry
+            # behavior so CI / batch runs are unaffected.
+            storm = _is_api_retry_storm(result.error)
+            decision = "retry"
+            interactive = (
+                storm
+                and sys.stdin.isatty()
+                and not getattr(ctx.options, "no_hitl", False)
+                and not getattr(ctx.options, "yes", False)
+            )
+            if interactive:
+                console = Console()
+                decision = await _prompt_storm_retry_decision(
+                    step_num=self.number,
+                    step_name=self.name,
+                    attempt=record.attempts,
+                    error=result.error or "",
+                    console=console,
+                )
+                log.info(
+                    "step.storm_decision",
+                    step=self.number,
+                    decision=decision,
+                )
+
+            if decision == "abort":
+                console_abort = Console()
+                console_abort.print(
+                    f"[dim]step {self.number:02d} aborted by user "
+                    "after upstream storm.[/]"
+                )
+                # Skip retry. Caller treats !success as failure and stops.
+                return result
+
+            if decision == "wait":
+                console_wait = Console()
+                console_wait.print(
+                    f"[dim]waiting {_STORM_RETRY_WAIT_S} s for the "
+                    "upstream to recover before retrying…[/]"
+                )
+                log.info(
+                    "step.storm_wait",
+                    step=self.number,
+                    wait_s=_STORM_RETRY_WAIT_S,
+                )
+                try:
+                    await asyncio.sleep(_STORM_RETRY_WAIT_S)
+                except (KeyboardInterrupt, asyncio.CancelledError):
+                    # User Ctrl-C during the wait — treat as abort, not
+                    # an exception that crashes the pipeline.
+                    console_wait.print("[dim]wait interrupted; aborting step.[/]")
+                    return result
+
+            # Retry-classification gate: should attempt 2 RESUME the prior
+            # SDK session, or START FRESH?
+            #
+            # - Transient transport failure (api_retry_storm): RESUME is
+            #   the right call. The agent already read its inputs and made
+            #   progress; resume skips the re-Read cost and picks up at
+            #   the turn that the relay dropped.
+            # - Content / validation failure (everything else): START
+            #   FRESH. Resuming would re-play the agent's prior reasoning
+            #   path and reproduce the same flawed output — observed in
+            #   run 20260611-075728-0aa560 step 8 where both attempts
+            #   resumed the same Haiku session and emitted the same 5
+            #   `wait_for_timeout` violations.
+            #
+            # Steps that opt into resume-on-retry stash their session id
+            # at `ctx.extras["step{N}_resume_session"]`. We clear that key
+            # for non-transient failures so attempt 2's run() reads None
+            # and starts a fresh conversation.
+            if not _is_api_retry_storm(result.error):
+                resume_key = f"step{self.number}_resume_session"
+                if ctx.extras.pop(resume_key, None) is not None:
+                    log.info(
+                        "step.resume_cleared",
+                        step=self.number,
+                        reason="non_transient_failure",
+                    )
+
             _snapshot_debug_artifacts(self.number, ctx, record.attempts)
             ctx.extras["debug_live"] = True
             try:
@@ -485,17 +853,26 @@ class Step(ABC):
             log.info("step.retry", step=self.number, name=self.name)
             result = await self._attempt(ctx, record)
 
+            # Debug RCA on attempt-2 failure. This is always the FINAL
+            # failure path (MAX_ATTEMPTS=2), so `has_more_attempts=False`.
+            if not result.success and _should_run_debug_rca(
+                ctx, has_more_attempts=False
+            ):
+                fc = _build_failure_context(self.number, self.name, record, result)
+                rca = await _run_debug_rca(
+                    self.number, ctx, fc, attempt=record.attempts
+                )
+                if rca:
+                    ctx.extras[f"step{self.number}_rca_path"] = str(rca)
+
             if result.success and result.status not in ("skipped",):
                 result.status = "warned"
                 record.status = "warned"
                 record.notes = f"succeeded on retry (attempt {record.attempts})"
 
         if not result.success and getattr(ctx.options, "fix", False):
-            failure_context = (
-                f"# Step {self.number} ({self.name}) failure\n\n"
-                f"**Attempts:** {record.attempts}\n"
-                f"**Error:** {result.error or 'unknown'}\n"
-                f"**Notes:** {result.notes or 'none'}\n"
+            failure_context = _build_failure_context(
+                self.number, self.name, record, result
             )
             await _run_fix_proposal(self.number, ctx, failure_context)
 
@@ -545,6 +922,12 @@ class Step(ABC):
                 tokens_output=record.tokens_output,
                 cost_usd=record.cost_usd,
                 agent_calls=record.agent_calls,
+                # Surface error + notes so structured-log consumers can see
+                # *why* a step failed without grepping the console transcript.
+                # Run 20260614-190647-ab7dac: Step 7 failed twice with no
+                # error info in run.log.jsonl because of this omission.
+                error=result.error,
+                notes=result.notes,
             )
             return result
         finally:

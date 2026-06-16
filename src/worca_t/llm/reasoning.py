@@ -341,6 +341,7 @@ async def call_reasoning_llm(
     success = False
     models_attempted: list[str] = []
     used_model: str | None = None
+    stop_reason: str | None = None
 
     # Backend selection: Vertex AI (or Vertex-mimicking proxy like Bosch's
     # model farm) when CLAUDE_CODE_USE_VERTEX=1 or ANTHROPIC_VERTEX_BASE_URL
@@ -377,9 +378,10 @@ async def call_reasoning_llm(
                     "messages_count": len(messages),
                     "has_schema": output_schema is not None,
                 })
+                stop_reason = getattr(response, "stop_reason", None)
                 transcript.append({
                     "type": "response",
-                    "stop_reason": getattr(response, "stop_reason", None),
+                    "stop_reason": stop_reason,
                     "id": getattr(response, "id", None),
                     "model": getattr(response, "model", None),
                 })
@@ -504,6 +506,7 @@ async def call_reasoning_llm(
         metrics=accumulated,
         mcp_servers_failed=[],
         session_id=None,
+        stop_reason=stop_reason,
     )
 
 
@@ -552,6 +555,7 @@ async def call_reasoning_llm_with_hitl(
     # Lazy import — ``worca_t.hitl`` is heavy (rich) and pulls in modules
     # we'd otherwise not need for non-HITL reasoning calls.
     from worca_t.hitl import (
+        RESOLUTION_SKIPPED_DROP,
         HitlDecision,
         append_ledger,
         extract_questions,
@@ -592,9 +596,12 @@ async def call_reasoning_llm_with_hitl(
             f"**Note:** The file `prior-decisions.md` (below) lists items the "
             f"user already addressed in earlier steps of this run. Treat each "
             f"entry as final — do NOT re-emit them as new blockers, "
-            f"clarifications, or open questions in your output. For skipped "
-            f"items, apply the same `[ASSUMPTION]` framing the earlier agent "
-            f"used."
+            f"clarifications, or open questions in your output. Each entry "
+            f"carries its own directive on how to honor it: answered items "
+            f"apply verbatim; dropped items REMOVE the corresponding "
+            f"coverage (record in `## Coverage Notes`, no `[ASSUMPTION]`); "
+            f"scope-exclusions remove the named scope; legacy-skipped items "
+            f"(pre-rework runs) still use `[ASSUMPTION]` framing."
         )
 
     # Pre-render the iteration-1 user message (prompt + inlined inputs) so
@@ -708,24 +715,34 @@ async def call_reasoning_llm_with_hitl(
             answers = prompt_user(new_questions, agent_label=agent_label)
         else:
             answers = {}
+        # prompt_user now returns dict[str, tuple[str, str]] — skipped items
+        # are absent from the dict (matching the historical convention),
+        # answered items carry (RESOLUTION_ANSWERED, text), scope-exclusion
+        # items carry (RESOLUTION_SCOPE_EXCLUSION, text).
         skipped_this_round = [q for q in new_questions if q.id not in answers]
         for q in skipped_this_round:
             skipped_keys.add(question_key(q))
             step_decisions.setdefault(
                 question_key(q),
                 HitlDecision.from_question(
-                    q, step=step or 0, agent_label=agent_label, resolution="skipped"
-                ),
-            )
-        for q in new_questions:
-            if q.id in answers:
-                step_decisions[question_key(q)] = HitlDecision.from_question(
                     q,
                     step=step or 0,
                     agent_label=agent_label,
-                    resolution="answered",
-                    answer=answers[q.id],
-                )
+                    resolution=RESOLUTION_SKIPPED_DROP,
+                ),
+            )
+        for q in new_questions:
+            entry = answers.get(q.id)
+            if entry is None:
+                continue
+            resolution, text = entry
+            step_decisions[question_key(q)] = HitlDecision.from_question(
+                q,
+                step=step or 0,
+                agent_label=agent_label,
+                resolution=resolution,
+                answer=text,
+            )
 
         # Persist user answers for audit (mirrors run_agent_with_hitl).
         hitl_dir.mkdir(parents=True, exist_ok=True)
@@ -753,20 +770,35 @@ async def call_reasoning_llm_with_hitl(
         )
         current_prompt = (
             f"The user has reviewed your clarification questions. Their "
-            f"responses (and any items they chose to skip) are below — "
-            f"along with any items that were already resolved earlier in "
-            f"this run.\n\n"
+            f"responses (and any items they chose to skip or exclude) are "
+            f"below — along with any items that were already resolved "
+            f"earlier in this run.\n\n"
             f"{answers_md}\n\n"
             f"- For ANSWERED items: incorporate the answer and remove the "
             f"corresponding `[CLARIFICATION NEEDED]` tag, blocker row, or "
             f"open-question entry.\n"
-            f"- For SKIPPED items: make a reasonable assumption, mark it "
-            f"inline with `[ASSUMPTION: ...]`, and remove the original "
-            f"`[CLARIFICATION NEEDED]` tag. **Do NOT re-emit "
-            f"`[CLARIFICATION NEEDED]` for skipped items.**\n"
-            f"- For PREVIOUSLY RESOLVED items: apply the prior answer / "
-            f"assumption verbatim and remove the duplicate entry. **Do "
-            f"NOT re-raise these to the user.**\n\n"
+            f"- For SKIPPED items: REMOVE the entire AC / TC / sub-item "
+            f"the question was attached to from the document body. Append "
+            f"an entry to a `## Coverage Notes` section at the end of the "
+            f"document recording the dropped ID and the reason. **Do NOT "
+            f"write `[ASSUMPTION: ...]`** — the user's intent is to drop "
+            f"this coverage, not to test it under an invented value. Do "
+            f"NOT re-emit `[CLARIFICATION NEEDED]` for skipped items.\n"
+            f"- For SCOPE-EXCLUDED items: interpret the user's answer as a "
+            f"scope-exclusion (e.g. \"mobile isn't in scope\" → exclude "
+            f"mobile). Remove ACs / TCs / sub-bullets that depend solely on "
+            f"the excluded scope; keep the in-scope portions. Append an "
+            f"entry to `## Coverage Notes` recording the exclusion and the "
+            f"user's exact answer. Do NOT include the typed answer as a "
+            f"literal value anywhere in the document body.\n"
+            f"- For PREVIOUSLY RESOLVED items: follow the per-item "
+            f"directive in `## Previously Resolved` above (answered → "
+            f"apply verbatim; skipped-drop → drop; scope-exclusion → "
+            f"exclude). Do NOT re-raise these to the user.\n\n"
+            f"**Preserve `## Coverage Notes` across iterations.** If the "
+            f"document already has a `## Coverage Notes` section from a "
+            f"prior iteration, preserve its entries verbatim and only "
+            f"append new ones for this iteration's drops / exclusions.\n\n"
             f"Rewrite the document above accordingly. Keep the rest of "
             f"the document intact. Return only the updated document."
         )

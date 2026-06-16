@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from worca_t.mcp_manager import _substitute_env, load_mcp_config, stage_mcp_config
+from worca_t.mcp_manager import _substitute_env, load_mcp_config, stage_empty_mcp_config, stage_mcp_config
 
 
 def test_env_substitution(monkeypatch):
@@ -40,6 +40,23 @@ def test_stage_mcp_config(tmp_path: Path):
     assert out.exists()
     data = json.loads(out.read_text(encoding="utf-8"))
     assert "x" in data["mcpServers"]
+
+
+def test_stage_empty_mcp_config_writes_no_servers(tmp_path: Path):
+    """stage_empty_mcp_config writes an explicitly empty `mcpServers` so
+    the SDK reads zero servers, instead of relying on file absence (which
+    is ambiguous when setting_sources=['project']).
+
+    The empty config is the default `_stage_resources` writes when
+    `run_agent(enable_mcp=False)` — verifying the bytes here so a refactor
+    of either side doesn't silently re-enable MCP spawning everywhere.
+    """
+    target = tmp_path / "wd"
+    out = stage_empty_mcp_config(target)
+    assert out == target / ".mcp.json"
+    assert out.exists()
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert data == {"mcpServers": {}}
 
 
 def test_probe_server_strips_secrets(monkeypatch):
@@ -164,3 +181,93 @@ def test_stage_mcp_config_does_not_rewrite_playwright_args(tmp_path: Path):
     args = json.loads(out.read_text(encoding="utf-8"))["mcpServers"]["playwright"]["args"]
     assert args == base_args
     assert "--headed" not in args
+
+
+# ---------------------------------------------------------------------------
+# Per-call env overlay (Step 9 storage-state injection)
+# ---------------------------------------------------------------------------
+
+
+def test_substitute_env_uses_explicit_env_dict_first(monkeypatch):
+    """When ``env`` is provided, its values win over ``os.environ`` —
+    lets Step 9 inject ``WORCA_T_STORAGE_STATE_ARG`` per-run without
+    mutating process env (which would leak into Step 10+)."""
+    monkeypatch.setenv("FOO", "from-os")
+    out = _substitute_env({"a": "${FOO}"}, env={"FOO": "from-env-dict"})
+    assert out == {"a": "from-env-dict"}
+
+
+def test_substitute_env_falls_back_to_os_environ_when_token_missing_from_env(monkeypatch):
+    """Tokens not in ``env`` still resolve via ``os.environ`` — so the
+    overlay is additive, not replacing."""
+    monkeypatch.setenv("FROM_OS", "os-value")
+    out = _substitute_env(
+        {"a": "${FROM_OS}", "b": "${FROM_OVERLAY}"},
+        env={"FROM_OVERLAY": "overlay-value"},
+    )
+    assert out == {"a": "os-value", "b": "overlay-value"}
+
+
+def test_load_mcp_config_filters_empty_args_after_substitution(tmp_path: Path, monkeypatch):
+    """Optional ``${OPTIONAL}`` tokens collapse to empty strings when
+    unset; those empty entries must be filtered before reaching the MCP
+    subprocess (which would otherwise treat ``""`` as a positional arg
+    and error out)."""
+    monkeypatch.delenv("OPTIONAL_FLAG", raising=False)
+    cfg = tmp_path / ".mcp.json"
+    cfg.write_text(json.dumps({
+        "mcpServers": {
+            "x": {
+                "command": "echo",
+                "args": ["--headless", "${OPTIONAL_FLAG}", "--strict"],
+            }
+        }
+    }), encoding="utf-8")
+    servers = load_mcp_config(cfg)
+    assert servers["x"].args == ["--headless", "--strict"]
+
+
+def test_load_mcp_config_threads_env_overlay(tmp_path: Path):
+    """Verify the full ``load_mcp_config(env=...)`` round-trip — token
+    in args resolves from the overlay, and the resolved arg is preserved
+    (not filtered, since it's non-empty)."""
+    cfg = tmp_path / ".mcp.json"
+    cfg.write_text(json.dumps({
+        "mcpServers": {
+            "playwright": {
+                "command": "npx",
+                "args": ["-y", "@playwright/mcp", "--headless",
+                         "${WORCA_T_STORAGE_STATE_ARG}"],
+            }
+        }
+    }), encoding="utf-8")
+    servers = load_mcp_config(
+        cfg,
+        env={"WORCA_T_STORAGE_STATE_ARG": "--storage-state=/abs/path/s.json"},
+    )
+    assert servers["playwright"].args == [
+        "-y", "@playwright/mcp", "--headless",
+        "--storage-state=/abs/path/s.json",
+    ]
+
+
+def test_stage_mcp_config_threads_env_overlay_and_filters_empty(
+    tmp_path: Path, monkeypatch,
+):
+    """The staged file (what the spawned ``claude`` CLI reads) must match
+    ``load_mcp_config`` output: tokens substituted from the overlay AND
+    empty args filtered. Otherwise the staged config diverges from what
+    the parent process expected."""
+    monkeypatch.delenv("ABSENT", raising=False)
+    src = tmp_path / ".mcp.json"
+    src.write_text(json.dumps({
+        "mcpServers": {
+            "x": {
+                "command": "echo",
+                "args": ["--keep", "${ABSENT}", "${SET}"],
+            }
+        }
+    }), encoding="utf-8")
+    out = stage_mcp_config(tmp_path / "wd", source=src, env={"SET": "--present"})
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert data["mcpServers"]["x"]["args"] == ["--keep", "--present"]
