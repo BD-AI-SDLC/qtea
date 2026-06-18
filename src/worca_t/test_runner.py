@@ -39,7 +39,7 @@ from pathlib import Path
 
 from worca_t.logging_setup import get_logger
 from worca_t.md_parser import slugify
-from worca_t.proxy import safe_subprocess_env, with_proxy_env
+from worca_t.proxy import safe_subprocess_env
 from worca_t.stack_profile import PYTHON_VENV_MANAGERS, StackProfile, wrap_command
 
 log = get_logger(__name__)
@@ -862,8 +862,8 @@ def run_tests(
                     file=str(cwd),
                     status="error",
                     message=(
-                        f"pytest internal error (exit_code=3); "
-                        f"no tests passed/failed"
+                        "pytest internal error (exit_code=3); "
+                        "no tests passed/failed"
                     ),
                     stdout=stdout[-4000:],
                     stderr=stderr[-4000:],
@@ -1136,7 +1136,10 @@ def _run_subprocess_step(
         )
     except subprocess.TimeoutExpired as e:
         dur = (datetime.now(UTC) - started).total_seconds()
-        return 124, _coerce_stream(e.stdout), _coerce_stream(e.stderr) + f"\n[timeout after {timeout_s}s]", dur
+        return (
+            124, _coerce_stream(e.stdout),
+            _coerce_stream(e.stderr) + f"\n[timeout after {timeout_s}s]", dur,
+        )
     except FileNotFoundError as e:
         dur = (datetime.now(UTC) - started).total_seconds()
         return 127, "", f"command not found: {e}", dur
@@ -1175,17 +1178,19 @@ def _detect_stale_venv_scripts(venv_dir: Path, env: dict[str, str]) -> bool:
         res = subprocess.run(
             [str(python_exe), "-c", "import sys; print(sys.prefix)"],
             capture_output=True, text=True, timeout=15, env=env,
+            check=False,
         )
         if res.returncode != 0:
             return False
         python_prefix = Path(res.stdout.strip()).resolve()
-    except Exception:  # noqa: BLE001
+    except Exception:
         return False
 
     try:
         res = subprocess.run(
             [str(pip_script), "--version"],
             capture_output=True, text=True, timeout=15, env=env,
+            check=False,
         )
         if res.returncode != 0:
             return False
@@ -1199,7 +1204,7 @@ def _detect_stale_venv_scripts(venv_dir: Path, env: dict[str, str]) -> bool:
             return False  # pip's site-packages are under the same prefix — healthy
         except ValueError:
             return True  # pip resolves to a different prefix — stale wrappers
-    except Exception:  # noqa: BLE001
+    except Exception:
         return False
 
 
@@ -1468,10 +1473,10 @@ def _declared_python_deps(sut_root: Path) -> set[str]:
     for req in sut_root.glob("requirements*.txt"):
         try:
             for line in req.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or line.startswith(("#", "-")):
+                stripped = line.strip()
+                if not stripped or stripped.startswith(("#", "-")):
                     continue
-                declared.add(_norm_pkg(_split_req(line)))
+                declared.add(_norm_pkg(_split_req(stripped)))
         except OSError:
             continue
 

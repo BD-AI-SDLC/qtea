@@ -21,7 +21,6 @@ from collections import defaultdict
 from collections.abc import Iterable
 from typing import Any
 
-
 # ---------------------------------------------------------------------------
 # Constants + helpers
 # ---------------------------------------------------------------------------
@@ -172,9 +171,7 @@ def audit_refined_spec(spec: dict[str, Any]) -> list[str]:
             return True
         if any(norm in t or (t and t in norm) for t in ac_texts):
             return True
-        if any(norm in f or (f and f in norm) for f in ac_user_flows):
-            return True
-        return False
+        return bool(any(norm in f or (f and f in norm) for f in ac_user_flows))
 
     def _walk_sections(sections: list[dict] | None) -> Iterable[dict]:
         if not sections:

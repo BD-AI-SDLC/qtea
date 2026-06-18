@@ -9,14 +9,13 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 
 from worca_t.auth_capture import (
-    AuthFlowSpec,
     DEFAULT_OUTPUT_REL,
+    AuthFlowSpec,
     _active_module,
     _build_auth_flow_spec,
     _find_sut_inventory,
@@ -24,7 +23,6 @@ from worca_t.auth_capture import (
     _wrapper_script,
     cmd_auth_capture,
 )
-
 
 # ---------------------------------------------------------------------------
 # _find_sut_inventory + _active_module
@@ -245,13 +243,13 @@ def test_cmd_auth_capture_honors_explicit_output(tmp_path, monkeypatch):
 def test_cmd_auth_capture_raises_when_no_inventory(tmp_path):
     sut = tmp_path / "sut-no-inventory"
     sut.mkdir()
-    with pytest.raises(FileNotFoundError, match="No sut_inventory.json"):
+    with pytest.raises(FileNotFoundError, match=r"No sut_inventory\.json"):
         cmd_auth_capture(sut=sut)
 
 
 def test_cmd_auth_capture_raises_when_non_python_sut(tmp_path):
     sut = _seed_sut_for_capture(tmp_path, language="typescript")
-    with pytest.raises(NotImplementedError, match="Python\\+Playwright SUTs only"):
+    with pytest.raises(NotImplementedError, match=r"Python\+Playwright SUTs only"):
         cmd_auth_capture(sut=sut)
 
 

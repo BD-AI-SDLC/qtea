@@ -277,7 +277,7 @@ class BoschProxyTransport(httpx.HTTPTransport):
         try:
             response.read()
             response.close()
-        except Exception:  # noqa: BLE001 - best-effort cleanup
+        except Exception:
             pass
 
         return self._powershell_fallback(request)

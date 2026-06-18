@@ -31,6 +31,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from worca_t._sut_git import commit_step
+from worca_t.auth_helpers import (
+    auth_relevant_sut_files as _auth_relevant_sut_files,
+)
+from worca_t.auth_helpers import (
+    auth_summary_for_prompt as _auth_summary_for_prompt,
+)
 from worca_t.claude_runner import run_agent
 from worca_t.config import (
     HEAL_AGENT_MAX_TURNS,
@@ -44,10 +50,6 @@ from worca_t.resolver_server import ResolverServer
 from worca_t.schemas import is_valid
 from worca_t.stack_profile import PYTHON_VENV_MANAGERS, StackProfile, wrap_command
 from worca_t.steps.base import Step, StepContext, StepResult
-from worca_t.auth_helpers import (
-    auth_relevant_sut_files as _auth_relevant_sut_files,
-    auth_summary_for_prompt as _auth_summary_for_prompt,
-)
 from worca_t.test_runner import (
     _PYTEST_PLUGIN_PROVIDERS,
     RunResult,
@@ -131,6 +133,7 @@ def _patch_introduces_xpath(pre: bytes | None, post: bytes | None) -> bool:
 # Assertion-immutability gate (mirrors XPath gate above)
 # ---------------------------------------------------------------------------
 
+import contextlib
 import re as _re_module
 
 _ASSERTION_LINE_PATTERNS: tuple[_re_module.Pattern, ...] = (
@@ -177,10 +180,7 @@ def _patch_modifies_assertions(pre: bytes | None, post: bytes | None) -> bool:
 
     pre_counts = Counter(pre_assertions)
     post_counts = Counter(post_assertions)
-    for assertion, count in pre_counts.items():
-        if post_counts.get(assertion, 0) < count:
-            return True
-    return False
+    return any(post_counts.get(assertion, 0) < count for assertion, count in pre_counts.items())
 
 
 # File-shape predicates that heal is forbidden to touch. Mirrors the
@@ -214,9 +214,7 @@ def _heal_path_is_forbidden(rel_posix: str) -> bool:
             return True
     if basename.endswith((".spec.ts", ".spec.js", ".test.ts", ".test.js")):
         return True
-    if basename.endswith("Test.java"):
-        return True
-    return False
+    return bool(basename.endswith("Test.java"))
 
 
 def _heal_allowlist_dirs(active_module: dict | None) -> set[str]:
@@ -443,6 +441,7 @@ def _run_dep_install(
             capture_output=True,
             text=True,
             timeout=timeout_s,
+            check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         with install_log_path.open("a", encoding="utf-8") as fh:
@@ -644,12 +643,12 @@ def _build_fixer_prompt(
         # When absent, the agent follows the SUT's auth flow as before.
         if storage_state_path is not None:
             step_one = (
-                f"(1) The browser is already authenticated via the pre-loaded "
-                f"storage state described above. Call `mcp__playwright__browser_navigate` "
-                f"to go directly to the failing page URL — do NOT call the SUT's "
-                f"sign-in helper. (If the page redirects to login, the state "
-                f"is stale: log a note and fall back to the auth-replay path "
-                f"via the helpers below.) "
+                "(1) The browser is already authenticated via the pre-loaded "
+                "storage state described above. Call `mcp__playwright__browser_navigate` "
+                "to go directly to the failing page URL — do NOT call the SUT's "
+                "sign-in helper. (If the page redirects to login, the state "
+                "is stale: log a note and fall back to the auth-replay path "
+                "via the helpers below.) "
             )
         else:
             step_one = (
@@ -845,11 +844,11 @@ def _summarize_resolver_spend(jit_cache_dir: Path) -> dict | None:
     try:
         with p.open(encoding="utf-8") as f:
             for line in f:
-                line = line.strip()
-                if not line:
+                stripped = line.strip()
+                if not stripped:
                     continue
                 try:
-                    entry = json.loads(line)
+                    entry = json.loads(stripped)
                 except json.JSONDecodeError:
                     continue
                 count += 1
@@ -879,7 +878,7 @@ def _summarize_resolver_spend(jit_cache_dir: Path) -> dict | None:
             est_cost_usd = (est_cost_usd or 0.0) + estimate_cost(
                 m, total_input, total_output,
             )
-    except Exception:  # noqa: BLE001 - pricing table is optional
+    except Exception:
         est_cost_usd = None
     return {
         "total_resolutions": count,
@@ -965,16 +964,14 @@ def _hitl_resolve_unresolvable(
             remaining.append(entry)
             continue
         if answer.startswith("//") or answer.startswith("xpath=") or "By.XPATH" in answer:
-            print(f"       [rejected] XPath selectors are forbidden by worca-t.")
+            print("       [rejected] XPath selectors are forbidden by worca-t.")
             remaining.append(entry)
             continue
         entry["_user_selector"] = answer
         resolved.append(entry)
         # Best-effort: also remove the pending file so next runs don't re-prompt.
-        try:
+        with contextlib.suppress(OSError):
             Path(entry.get("_pending_path", "")).unlink(missing_ok=True)
-        except OSError:
-            pass
 
     if resolved and dev_locators_path is not None:
         _append_resolved_to_dev_locators(resolved, dev_locators_path)
@@ -1425,14 +1422,14 @@ class ExecuteStep(Step):
         if stack_profile and framework in _PW_FRAMEWORKS:
             pw_cmd = wrap_command(stack_profile, "playwright install chromium")
             log.info("step09.playwright_install", command=pw_cmd)
-            rc, out, err, dur = execute_command(
+            rc, out, err, _dur = execute_command(
                 pw_cmd, cwd=ctx.workspace.sut, timeout_s=300,
                 isolate_venv=bool(
                     (stack_profile.package_manager or "").lower()
                     in PYTHON_VENV_MANAGERS
                 ),
             )
-            with open(install_log_path, "a", encoding="utf-8") as f:
+            with install_log_path.open("a", encoding="utf-8") as f:
                 f.write(
                     f"\n$ {pw_cmd}\n# exit_code: {rc}\n"
                     f"# STDOUT\n{out}\n\n# STDERR\n{err}\n"
@@ -1596,7 +1593,7 @@ class ExecuteStep(Step):
             # Persist raw test-runner stdout/stderr as a standalone artifact
             # so humans can diagnose without parsing run-results.json.
             test_output_path = out_dir / "test-output.log"
-            try:
+            with contextlib.suppress(OSError):
                 test_output_path.write_text(
                     f"# framework: {framework}\n"
                     f"$ {first.command}\n"
@@ -1606,8 +1603,6 @@ class ExecuteStep(Step):
                     f"--- STDERR ---\n{first.stderr or '(empty)'}\n",
                     encoding="utf-8",
                 )
-            except OSError:
-                pass
 
             attempts = 1
             patches_applied = 0
@@ -1683,7 +1678,10 @@ class ExecuteStep(Step):
                         if stack_profile and (pkg_mgr or "").lower() == "pip"
                         else None
                     )
-                    if proceed and install_command_for(pkg_mgr, package, venv_bin=_venv_bin) is not None:
+                    if (
+                        proceed
+                        and install_command_for(pkg_mgr, package, venv_bin=_venv_bin) is not None
+                    ):
                         ok, summary = _run_dep_install(
                             pkg_mgr, package, ctx.workspace.sut, install_log_path,
                             profile=stack_profile,
@@ -1721,9 +1719,12 @@ class ExecuteStep(Step):
                                 len(failing) > 0
                                 and all(r.id == "T-runner-failure" for r in failing)
                             )
-                            if not runner_only and first.exit_code == 3:
-                                if all(r.runner_failure is not None for r in failing):
-                                    runner_only = True
+                            if (
+                                not runner_only
+                                and first.exit_code == 3
+                                and all(r.runner_failure is not None for r in failing)
+                            ):
+                                runner_only = True
                             log.info(
                                 "step09.dep_recover_retry",
                                 runner_only_after=runner_only,
@@ -2012,7 +2013,9 @@ class ExecuteStep(Step):
                         # if the heal created it from scratch) and mark the
                         # patch unapplied. See `docs/qa-orchestrator.instructions.md`
                         # §6 "No XPath (self-heal)".
-                        post_bytes_check = target_in_sut.read_bytes() if target_in_sut.exists() else None
+                        post_bytes_check = (
+                            target_in_sut.read_bytes() if target_in_sut.exists() else None
+                        )
                         if _patch_introduces_xpath(pre_bytes, post_bytes_check):
                             xpath_rejected = True
                             try:
@@ -2036,7 +2039,9 @@ class ExecuteStep(Step):
 
                     assertion_rejected = False
                     if applied and generated_files:
-                        post_bytes_assert = target_in_sut.read_bytes() if target_in_sut.exists() else None
+                        post_bytes_assert = (
+                            target_in_sut.read_bytes() if target_in_sut.exists() else None
+                        )
                         if _patch_modifies_assertions(pre_bytes, post_bytes_assert):
                             assertion_rejected = True
                             try:

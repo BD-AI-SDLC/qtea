@@ -431,7 +431,7 @@ async def call_reasoning_llm(
                 error = None
                 break
 
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 error_text = f"{type(e).__name__}: {e}"
                 log.warning(
                     "reasoning.attempt_failed",
@@ -711,10 +711,7 @@ async def call_reasoning_llm_with_hitl(
         # Only prompt the user about questions we couldn't resolve from the
         # ledger. ledger_resolved go straight into the answers_md so the
         # agent picks up the prior answer/skip on the next turn.
-        if new_questions:
-            answers = prompt_user(new_questions, agent_label=agent_label)
-        else:
-            answers = {}
+        answers = prompt_user(new_questions, agent_label=agent_label) if new_questions else {}
         # prompt_user now returns dict[str, tuple[str, str]] — skipped items
         # are absent from the dict (matching the historical convention),
         # answered items carry (RESOLUTION_ANSWERED, text), scope-exclusion

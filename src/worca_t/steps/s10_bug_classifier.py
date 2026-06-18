@@ -118,9 +118,7 @@ def _synthesize(
         msg = c.get("message") or ""
         if category == "test-code-defect":
             layer = "automation"
-        elif category == "environment" or category == "flaky":
-            layer = "infrastructure"
-        elif any(pat in msg for pat in _INFRA_PATTERNS):
+        elif category in {"environment", "flaky"} or any(pat in msg for pat in _INFRA_PATTERNS):
             layer = "infrastructure"
         else:
             layer = _LAYER_DEFAULT
@@ -192,8 +190,11 @@ def _render_markdown(report: dict) -> str:
         lines.append(f"### {b.get('id')} - {b.get('title')}")
         lines.append("")
         lines.append(f"- Test: `{b.get('test_id')}`")
-        lines.append(f"- Severity / Priority / Category / Layer: "
-                     f"**{b.get('severity')}** / **{b.get('priority')}** / **{b.get('category')}** / **{b.get('layer', 'unknown')}**")
+        lines.append(
+            f"- Severity / Priority / Category / Layer: "
+            f"**{b.get('severity')}** / **{b.get('priority')}** / "
+            f"**{b.get('category')}** / **{b.get('layer', 'unknown')}**"
+        )
         if b.get("requirement_id"):
             lines.append(f"- Requirement: {b['requirement_id']}")
         if b.get("rationale"):

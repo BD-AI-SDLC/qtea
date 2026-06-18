@@ -61,7 +61,7 @@ def install_fake_query(
     msgs = messages or [{"type": "result", "result": "ok"}]
     file_map = files or {}
 
-    async def _fake_query(*, prompt, options=None, transport=None):  # noqa: ARG001
+    async def _fake_query(*, prompt, options=None, transport=None):
         if on_call is not None:
             on_call(prompt, options)
         cwd = Path(options.cwd) if options and getattr(options, "cwd", None) else Path.cwd()

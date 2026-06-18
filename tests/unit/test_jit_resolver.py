@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import ClassVar
 from unittest.mock import patch
 
 import pytest
@@ -23,7 +24,6 @@ from worca_t.jit_resolver import (
     snapshot_hash,
     write_cache,
 )
-
 
 # ---------------------------------------------------------------------------
 # Pure helpers
@@ -536,7 +536,7 @@ def test_call_anthropic_messages_end_with_user_role(tmp_path: Path):
         text = '{"candidates": []}'
 
     class _FakeResponse:
-        content = [_FakeBlock()]
+        content: ClassVar[list] = [_FakeBlock()]
         usage = _FakeUsage()
 
     class _FakeMessages:

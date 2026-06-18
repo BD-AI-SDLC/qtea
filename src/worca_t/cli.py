@@ -68,7 +68,6 @@ def list_workspaces(
     By default, empty workspaces (zero completed steps) are hidden; pass
     --all to include them. Use the run-id with `worca-t run --run-id ...`.
     """
-    import json as _json
 
     from rich.table import Table
 
@@ -216,7 +215,7 @@ def run(
         help="Target an existing workspace by run-id (e.g. 20260525-201007-e28a51).",
     ),
     from_step: int | None = typer.Option(None, "--from-step", min=1, max=11),
-    only_step: int | None = typer.Option(None, "--only-step", min=1, max=11),  # noqa: pipeline has 11 steps post test-architect insertion
+    only_step: int | None = typer.Option(None, "--only-step", min=1, max=11),
     force: bool = typer.Option(
         False, "--force", help="Ignore checkpoints; re-run everything."
     ),

@@ -453,13 +453,13 @@ def _js_imports(src: str, known: set[str]) -> dict[str, str]:
     aliases: dict[str, str] = {}
     for m in _JS_IMPORT_RE.finditer(src):
         for part in m.group(1).split(","):
-            part = part.strip()
-            if not part:
+            token = part.strip()
+            if not token:
                 continue
-            if " as " in part:
-                orig, alias = (x.strip() for x in part.split(" as ", 1))
+            if " as " in token:
+                orig, alias = (x.strip() for x in token.split(" as ", 1))
             else:
-                orig = alias = part
+                orig = alias = token
             if orig in known:
                 aliases[alias] = orig
     for m in _JS_NEW_RE.finditer(src):
@@ -769,9 +769,7 @@ def _decorator_is_pytest_fixture(dec: ast.expr) -> bool:
     target = dec.func if isinstance(dec, ast.Call) else dec
     if isinstance(target, ast.Attribute) and target.attr == "fixture":
         return True
-    if isinstance(target, ast.Name) and target.id == "fixture":
-        return True
-    return False
+    return bool(isinstance(target, ast.Name) and target.id == "fixture")
 
 
 def reconcile_fixtures(
@@ -896,7 +894,7 @@ def reconcile_fixtures(
             continue
         reuse_dedup[key] = None
 
-    files_scanned = len(set(by_file.keys()) | {f for f, _ in reuse_dedup.keys()})
+    files_scanned = len(set(by_file.keys()) | {f for f, _ in reuse_dedup})
     return files_scanned, mismatches
 
 

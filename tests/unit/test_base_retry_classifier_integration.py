@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -20,7 +19,6 @@ from worca_t.checkpoints import RunState
 from worca_t.pipeline import PipelineOptions
 from worca_t.steps.base import Step, StepContext, StepResult
 from worca_t.workspace import create_workspace
-
 
 # --- Test scaffolding ------------------------------------------------------
 

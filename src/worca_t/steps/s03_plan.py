@@ -167,13 +167,15 @@ def _extract_tc_roster_from_phase(phase_section: Section, phase_number: int) -> 
             continue
         header_lower = [c.strip().lower() for c in table[0]]
 
-        def col_idx(*names: str) -> int | None:
+        def col_idx(
+            *names: str, _header_lower: list = header_lower,
+        ) -> int | None:
             for n in names:
-                for i, h in enumerate(header_lower):
+                for i, h in enumerate(_header_lower):
                     if h == n:
                         return i
             for n in names:
-                for i, h in enumerate(header_lower):
+                for i, h in enumerate(_header_lower):
                     if n in h:
                         return i
             return None
@@ -192,7 +194,8 @@ def _extract_tc_roster_from_phase(phase_section: Section, phase_number: int) -> 
         for row in table[1:]:
             if all(not c.strip() for c in row):
                 continue
-            cell = lambda i: row[i].strip() if i is not None and i < len(row) else ""
+            def cell(i, _row=row):
+                return _row[i].strip() if i is not None and i < len(_row) else ""
             tc_match = _TC_ID_RE.search(cell(id_i))
             if not tc_match:
                 continue

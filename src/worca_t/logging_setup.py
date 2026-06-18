@@ -31,10 +31,10 @@ warnings.filterwarnings(
 
 import structlog
 from structlog.dev import (
+    _NOTHING,
     Column,
     KeyValueColumnFormatter,
     LogLevelColumnFormatter,
-    _NOTHING,
 )
 from structlog.types import EventDict, WrappedLogger
 

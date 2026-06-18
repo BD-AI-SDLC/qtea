@@ -19,13 +19,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from tests.unit._fake_anthropic import install_fake_anthropic
 from worca_t.checkpoints import RunState
 from worca_t.pipeline import PipelineOptions
 from worca_t.steps.base import StepContext
 from worca_t.steps.s04_strategy import StrategyStep
 from worca_t.workspace import create_workspace
-from tests.unit._fake_anthropic import install_fake_anthropic
-
 
 # ---------- canned markdown fixtures ----------
 

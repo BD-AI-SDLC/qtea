@@ -39,8 +39,6 @@ from pathlib import Path
 from typing import Any
 
 from worca_t._ast_utils import (
-    extract_env_prefix,
-    is_basesettings_base,
     iter_python_files,
     literal_str,
     parse_file,
@@ -263,7 +261,8 @@ def detect_monorepo(sut_path: Path) -> tuple[bool, str | None, list[str]]:
     if not sut_path.exists() or not sut_path.is_dir():
         return False, None, ["."]
 
-    # Order matters: pnpm/yarn/npm-workspaces > lerna > nx > pyproject workspaces > maven > gradle > cargo > go.work.
+    # Order matters: pnpm/yarn/npm-workspaces > lerna > nx >
+    # pyproject workspaces > maven > gradle > cargo > go.work.
     for fn in (
         _detect_pnpm_workspace,
         _detect_npm_yarn_workspaces,
@@ -598,9 +597,11 @@ def _scope_for_name(name: str) -> str:
 def _public_methods(class_def: ast.ClassDef) -> list[str]:
     out: list[str] = []
     for stmt in class_def.body:
-        if isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef):
-            if not stmt.name.startswith("_"):
-                out.append(stmt.name)
+        if (
+            isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and not stmt.name.startswith("_")
+        ):
+            out.append(stmt.name)
     return out
 
 
@@ -719,9 +720,7 @@ def _looks_like_selector(value: str) -> bool:
         return True
     # Single tokens — only accept if they look like a CSS class/id token
     # (alphanumeric + hyphens / underscores), not a freeform sentence.
-    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_\-]*", s):
-        return True
-    return False
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9_\-]*", s))
 
 
 def _truncate_constants(consts: list[LocatorConstant]) -> tuple[list[LocatorConstant], int]:
@@ -1020,12 +1019,14 @@ def scan_python_auth_flow(
             if tree is None:
                 continue
             for node in ast.walk(tree):
-                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-                    if node.name in ("sign_in", "signin", "login", "authenticate"):
-                        rel = relative_posix(src, module_root)
-                        entry_method = f"{rel}:{node.name}"
-                        entry_type = "sso"
-                        break
+                if (
+                    isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+                    and node.name in ("sign_in", "signin", "login", "authenticate")
+                ):
+                    rel = relative_posix(src, module_root)
+                    entry_method = f"{rel}:{node.name}"
+                    entry_type = "sso"
+                    break
             if entry_method:
                 break
 
@@ -1036,7 +1037,11 @@ def scan_python_auth_flow(
         # mentions "page" + whose source file is under tests/fixtures or tests/.
         for f in fixtures:
             depends_str = " ".join(f.depends_on)
-            if "page" in depends_str.lower() or "sign" in f.name.lower() or "auth" in f.name.lower():
+            if (
+                "page" in depends_str.lower()
+                or "sign" in f.name.lower()
+                or "auth" in f.name.lower()
+            ):
                 fixture_entry = f"{f.file}:{f.name}"
                 break
 
@@ -1113,12 +1118,12 @@ def scan_ts_page_objects(module_root: Path) -> list[PageObject]:
             classes = _TS_CLASS_RE.findall(text)
             if not classes:
                 continue
-            methods = sorted(set(
+            methods = sorted({
                 m for m in _TS_METHOD_RE.findall(text)
                 if m not in {"if", "for", "while", "switch", "return",
                              "function", "constructor"}
                 and not m.startswith("_")
-            ))
+            })
             rel = relative_posix(src, module_root)
             for cls in classes:
                 out.append(PageObject(
@@ -1175,7 +1180,11 @@ def scan_ts_auth_flow(module_root: Path, pages: list[PageObject]) -> AuthFlow:
     auth_pages = [p for p in pages if p.scope == "auth"]
     if auth_pages:
         page = auth_pages[0]
-        entry = f"{page.file}:{page.class_name}.{page.methods[0]}" if page.methods else f"{page.file}:{page.class_name}"
+        entry = (
+            f"{page.file}:{page.class_name}.{page.methods[0]}"
+            if page.methods
+            else f"{page.file}:{page.class_name}"
+        )
         return AuthFlow(type="sso", entry_method=entry,
                         credentials_env_vars=[], fixture_entry=None)
     # Fallback: grep export login/signIn functions in *auth*.ts files.
@@ -1183,7 +1192,10 @@ def scan_ts_auth_flow(module_root: Path, pages: list[PageObject]) -> AuthFlow:
         if not _AUTH_FILE_RE.search(src.name):
             continue
         text = _read_text(src)
-        m = re.search(r"export\s+(?:async\s+)?function\s+(login|signIn|signOn|authenticate)\s*\(", text)
+        m = re.search(
+            r"export\s+(?:async\s+)?function\s+(login|signIn|signOn|authenticate)\s*\(",
+            text,
+        )
         if m:
             rel = relative_posix(src, module_root)
             return AuthFlow(
@@ -1276,7 +1288,7 @@ def _common_parent_posix(paths: list[str]) -> str | None:
         if not parts_list:
             return None
         common: list[str] = []
-        for tup in zip(*parts_list):
+        for tup in zip(*parts_list, strict=False):
             if len(set(tup)) == 1:
                 common.append(tup[0])
             else:
@@ -1383,7 +1395,11 @@ def detect_src_directory_layout(
     # ran a previous worca-t codegen may have copies under `tests/pages/...`
     # which must NOT shadow the real src/.
     def _score(d: Path) -> tuple[int, int, int]:
-        rel = d.relative_to(module_root).as_posix() if d.is_relative_to(module_root) else d.as_posix()
+        rel = (
+            d.relative_to(module_root).as_posix()
+            if d.is_relative_to(module_root)
+            else d.as_posix()
+        )
         parts = [a.lower() for a in rel.split("/")]
         ancestry = [a.name.lower() for a in d.parents][:5]
         # Tier 1: src/ + pages/ in ancestry → score 0 (best)
@@ -1434,7 +1450,11 @@ def detect_src_directory_layout(
 
     helpers_dir = _common_parent_posix([h.file for h in helpers])
 
-    convention_source = "detected" if (pages_object_dir or pages_locators_dir or helpers_dir) else "unknown"
+    convention_source = (
+        "detected"
+        if (pages_object_dir or pages_locators_dir or helpers_dir)
+        else "unknown"
+    )
 
     if convention_source == "unknown":
         # Greenfield fallback (Python only — TS/JS conventions vary too
@@ -1801,7 +1821,9 @@ def merge_llm_inventory(
             _fill(f)
         if src_llm.get("convention_source"):
             out.src_directory_layout.convention_source = str(src_llm["convention_source"])
-        elif det_is_fallback and any(src_llm.get(f) for f in ("pages_object_dir", "pages_locators_dir")):
+        elif det_is_fallback and any(
+            src_llm.get(f) for f in ("pages_object_dir", "pages_locators_dir")
+        ):
             out.src_directory_layout.convention_source = "llm_augmented"
 
     # Lists: append LLM items that don't collide on (name, file).
@@ -1996,7 +2018,7 @@ def detect_sut_inventory(
     for rel in module_paths:
         try:
             inv.modules.append(detect_module_inventory(sut_path, rel))
-        except Exception as e:  # noqa: BLE001 — keep going on any one module failure
+        except Exception as e:
             log.warning("sut_inventory.module_failed", module=rel, error=str(e))
             inv.modules.append(ModuleInventory(
                 name="sut" if rel == "." else Path(rel).name,

@@ -31,6 +31,7 @@ review via `git diff worca-t/run-<id>` rather than reading a duplicate copy.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re as _re
@@ -881,10 +882,8 @@ async def _create_helpers(
         existing = ""
         target = sut_root / file_path
         if target.is_file():
-            try:
+            with contextlib.suppress(OSError):
                 existing = target.read_text(encoding="utf-8")
-            except OSError:
-                pass
 
         inputs: dict[str, str] = {
             "helper_specs.json": json.dumps(specs, indent=2),
@@ -1118,10 +1117,8 @@ async def _extend_poms(
                 # Roll back the corrupted write so Phase B.5 sees the
                 # untouched original file (still missing the methods, but
                 # parseable — gives a meaningful mismatch list).
-                try:
+                with contextlib.suppress(OSError):
                     abs_path.write_text(existing_source, encoding="utf-8")
-                except OSError:
-                    pass
                 # Arm smart-retry: stash a 2× budget on ctx.extras so the
                 # step's retry (MAX_ATTEMPTS=2 in base.py) picks it up at
                 # the top of the next _extend_poms call. Capped at the
@@ -1212,11 +1209,10 @@ def _detect_const_indent(lines: list[str], is_java: bool) -> str:
         if is_java:
             if "static final" in s and "=" in s:
                 return ln[: len(ln) - len(ln.lstrip())]
-        else:
-            if "=" in s:
-                head = s.split("=", 1)[0].strip()
-                if head and head.replace("_", "").isalnum() and head.isupper():
-                    return ln[: len(ln) - len(ln.lstrip())]
+        elif "=" in s:
+            head = s.split("=", 1)[0].strip()
+            if head and head.replace("_", "").isalnum() and head.isupper():
+                return ln[: len(ln) - len(ln.lstrip())]
     # No existing constant to mirror. Java constants always live in a class
     # body; Python constants live at class-body indent only when a class wraps
     # the file, otherwise at module level.
@@ -1407,10 +1403,8 @@ async def _create_fixtures(
         existing = ""
         target = sut_root / file_path
         if target.is_file():
-            try:
+            with contextlib.suppress(OSError):
                 existing = target.read_text(encoding="utf-8")
-            except OSError:
-                pass
 
         inputs: dict[str, str] = {
             "fixture_specs.json": json.dumps(specs, indent=2),
@@ -2033,7 +2027,7 @@ async def _auto_fix_intents(
 
     rewritten = 0
     errors: list[str] = []
-    for old, new in zip(flagged, new_intents):
+    for old, new in zip(flagged, new_intents, strict=False):
         old_intent = old.get("intent", "")
         new_intent = (new.get("intent") or "").strip()
         if not new_intent or new_intent == old_intent:
@@ -2235,7 +2229,6 @@ class CodegenStep(Step):
             rules_content = rules_path.read_text(encoding="utf-8")
             log.info("step08.codegen_rules_loaded", path=str(rules_path))
 
-        stack_hint = f"Detected stack: `{detected_stack}`. " if detected_stack else ""
 
         env_hint = ""
         if sut_env_keys:
@@ -2376,7 +2369,10 @@ class CodegenStep(Step):
             # SUT root. Falls back to test-folder if the src layout wasn't
             # detected (greenfield TS/JS, or unknown lang).
             pages_object_dir = src_layout.get("pages_object_dir") or f"{base_dir}/pages/object"
-            pages_locators_dir = src_layout.get("pages_locators_dir") or f"{base_dir}/pages/locators"
+            pages_locators_dir = (
+                src_layout.get("pages_locators_dir")
+                or f"{base_dir}/pages/locators"
+            )
             raw_helpers_dir = src_layout.get("helpers_dir")
             pkg_root = src_layout.get("package_root")
             if raw_helpers_dir and pkg_root and raw_helpers_dir.startswith(base_dir):
@@ -2651,7 +2647,7 @@ class CodegenStep(Step):
                         rules_content=rules_content,
                         ctx=ctx,
                     )
-                except Exception as e:  # noqa: BLE001 - we surface as StepResult
+                except Exception as e:
                     b5_autopatch_error = f"{type(e).__name__}: {e}"
                     log.error(
                         "step08.b5.autopatch_crashed",
@@ -2687,7 +2683,7 @@ class CodegenStep(Step):
                         active_module=active_module_dict, step=8,
                         rules_content=rules_content,
                     )
-                except Exception as e:  # noqa: BLE001
+                except Exception as e:
                     log.error(
                         "step08.b5.fixture_autopatch_crashed",
                         error=f"{type(e).__name__}: {e}",
@@ -2852,7 +2848,7 @@ class CodegenStep(Step):
                 framework=framework,
             )
             fix_agent = agents_root / "ui-test-automation.agent.md"
-            fix_result = await run_agent(
+            await run_agent(
                 fix_agent,
                 workdir=wd,
                 inputs={},

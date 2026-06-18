@@ -50,6 +50,7 @@ def test_anthropic_auth_kwargs_prefers_auth_token(monkeypatch):
     """
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "farm-bearer-xyz")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
     assert anthropic_auth_kwargs() == {"auth_token": "farm-bearer-xyz"}
 
 
@@ -57,6 +58,7 @@ def test_anthropic_auth_kwargs_falls_back_to_api_key(monkeypatch):
     """When only ANTHROPIC_API_KEY is set, return api_key= (x-api-key header)."""
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-abc")
+    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
     assert anthropic_auth_kwargs() == {"api_key": "sk-ant-abc"}
 
 
@@ -64,6 +66,7 @@ def test_anthropic_auth_kwargs_auth_token_wins_when_both_set(monkeypatch):
     """When both are set, AUTH_TOKEN takes precedence — same as the claude CLI."""
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "farm-bearer-xyz")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-abc")
+    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
     assert anthropic_auth_kwargs() == {"auth_token": "farm-bearer-xyz"}
 
 
@@ -71,6 +74,7 @@ def test_anthropic_auth_kwargs_returns_empty_when_neither_set(monkeypatch):
     """No env vars set → empty dict; let the SDK raise its own clear error."""
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
     assert anthropic_auth_kwargs() == {}
 
 
@@ -78,7 +82,7 @@ def test_anthropic_auth_kwargs_treats_empty_string_as_unset(monkeypatch):
     """Empty AUTH_TOKEN should fall through to API_KEY, not return empty Bearer."""
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-abc")
-    # Current behaviour: empty string is falsy → falls through to api_key.
+    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
     assert anthropic_auth_kwargs() == {"api_key": "sk-ant-abc"}
 
 
@@ -123,6 +127,7 @@ def test_anthropic_vertex_kwargs_bosch_farm_shape(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "farm-token-xyz")
     monkeypatch.setenv("ANTHROPIC_VERTEX_PROJECT_ID", "_")
     monkeypatch.setenv("CLOUD_ML_REGION", "_")
+    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
     assert anthropic_vertex_kwargs() == {
         "base_url": "https://aoai-farm.bosch-temp.com/api/google/v1",
         "access_token": "farm-token-xyz",
@@ -148,4 +153,5 @@ def test_anthropic_vertex_kwargs_omits_unset_fields(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
     monkeypatch.delenv("CLOUD_ML_REGION", raising=False)
+    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
     assert anthropic_vertex_kwargs() == {}

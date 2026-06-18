@@ -44,8 +44,8 @@ log = get_logger(__name__)
 
 
 async def review_step_7_plan(
-    ctx: "StepContext",
-    result: "StepResult",
+    ctx: StepContext,
+    result: StepResult,
     console: Console,
 ) -> bool:
     """Run the post-step-7 plan review gate. Return True on approve.
@@ -99,7 +99,7 @@ async def review_step_7_plan(
 async def _apply_nlp_edit(
     plan: dict,
     plan_path: Path,
-    ctx: "StepContext",
+    ctx: StepContext,
     console: Console,
 ) -> dict | None:
     """Prompt for free-text instructions, apply via LLM, persist.
@@ -182,7 +182,7 @@ async def _apply_nlp_edit(
 def _persist_and_refresh_hashes(
     plan: dict,
     plan_path: Path,
-    ctx: "StepContext",
+    ctx: StepContext,
 ) -> None:
     """Write the updated plan to disk and refresh checkpoint hashes."""
     plan_path.write_text(
@@ -240,7 +240,7 @@ def _render_plan(plan: dict, console: Console) -> None:
         for f in fixtures:
             src = f.get("source", "?")
             totals["fixtures"][src] = totals["fixtures"].get(src, 0) + 1
-            tag = f"[green]reuse[/]" if src == "reuse" else "[yellow]create[/]"
+            tag = "[green]reuse[/]" if src == "reuse" else "[yellow]create[/]"
             ref = f.get("from") or f.get("at") or "?"
             fix_lines.append(f"{tag} {f.get('name')} ← {ref}")
         fix_cell = "\n".join(fix_lines) or "—"
@@ -252,7 +252,7 @@ def _render_plan(plan: dict, console: Console) -> None:
             totals["page_objects"][src] = totals["page_objects"].get(src, 0) + 1
             mm = p.get("missing_methods") or []
             totals["page_objects"]["missing_methods"] += len(mm)
-            tag = f"[green]reuse[/]" if src == "reuse" else "[yellow]create[/]"
+            tag = "[green]reuse[/]" if src == "reuse" else "[yellow]create[/]"
             ref = p.get("from") or p.get("at") or "?"
             suffix = f" (+{len(mm)} methods)" if mm else ""
             pom_lines.append(f"{tag} {p.get('name')} ← {ref}{suffix}")
@@ -305,8 +305,8 @@ def _render_plan(plan: dict, console: Console) -> None:
 
 
 async def review_step_8_intents(
-    ctx: "StepContext",
-    result: "StepResult",
+    ctx: StepContext,
+    result: StepResult,
     console: Console,
 ) -> bool:
     """Surface WARN/FAIL intent entries from Phase D for human review.
@@ -393,7 +393,7 @@ def _render_intent_warnings(
 
 async def _apply_intent_edit(
     warnings: list[dict],
-    ctx: "StepContext",
+    ctx: StepContext,
     console: Console,
 ) -> list[dict] | None:
     """Prompt for free-text instructions, rewrite intents via LLM + source patch.
@@ -474,7 +474,7 @@ async def _apply_intent_edit(
     failed: list[str] = []
     updated_warnings: list[dict] = []
 
-    for old, new in zip(warnings, new_intents):
+    for old, new in zip(warnings, new_intents, strict=False):
         new_intent_str = (new.get("intent") or "").strip()
         old_intent_str = old.get("intent", "")
         # Skip files where the editor returned an unchanged intent — no-op.

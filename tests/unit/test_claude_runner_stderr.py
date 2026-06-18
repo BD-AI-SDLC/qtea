@@ -41,7 +41,7 @@ async def test_stderr_callback_is_registered(tmp_path: Path, monkeypatch):
 
     captured: dict[str, object] = {}
 
-    async def _fake_query(*, prompt, options=None, transport=None):  # noqa: ARG001
+    async def _fake_query(*, prompt, options=None, transport=None):
         captured["stderr_callback"] = getattr(options, "stderr", None)
         yield _make_message({"type": "result", "result": "ok",
                              "session_id": "sess-stderr"})
@@ -77,7 +77,7 @@ async def test_stderr_callback_writes_lines_to_disk(tmp_path: Path, monkeypatch)
         lambda *_a, **_kw: "/fake/claude",
     )
 
-    async def _fake_query(*, prompt, options=None, transport=None):  # noqa: ARG001
+    async def _fake_query(*, prompt, options=None, transport=None):
         # Simulate what the real subprocess_cli transport does: feed lines
         # into the callback one at a time. The CLI emits debug lines with
         # AND without trailing newlines — the callback must handle both.
@@ -128,7 +128,7 @@ async def test_stderr_callback_swallows_writes_after_file_closed(
 
     captured_cb: dict[str, object] = {}
 
-    async def _fake_query(*, prompt, options=None, transport=None):  # noqa: ARG001
+    async def _fake_query(*, prompt, options=None, transport=None):
         captured_cb["cb"] = options.stderr
         yield _make_message({"type": "result", "result": "ok",
                              "session_id": "sess-close"})
@@ -175,14 +175,13 @@ async def test_runner_banner_appended_below_cli_stderr(tmp_path: Path, monkeypat
     surfaced only the runner banner, with no underlying transport error
     from the CLI to point at the root cause.
     """
-    from ._fake_claude import _make_message
 
     monkeypatch.setattr(
         "worca_t.claude_runner.shutil.which",
         lambda *_a, **_kw: "/fake/claude",
     )
 
-    async def _fake_query(*, prompt, options=None, transport=None):  # noqa: ARG001
+    async def _fake_query(*, prompt, options=None, transport=None):
         # CLI writes some diagnostics, then the SDK raises — simulating
         # a transport error (ECONNRESET / 5xx with no body / etc.) that
         # also leaves a useful trail in stderr.
@@ -190,7 +189,7 @@ async def test_runner_banner_appended_below_cli_stderr(tmp_path: Path, monkeypat
         cb("[ERROR] socket hang up\n")
         cb("[DEBUG] giving up after 5 retries\n")
         raise RuntimeError("upstream API failure")
-        yield  # noqa: unreachable — keep generator shape
+        yield  # unreachable — keep generator shape
 
     monkeypatch.setattr("worca_t.claude_runner.query", _fake_query)
 

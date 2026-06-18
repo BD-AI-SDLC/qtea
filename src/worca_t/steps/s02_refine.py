@@ -139,18 +139,18 @@ def _extract_edge_cases_structured(root: Section) -> list[dict]:
             if not table:
                 continue
             header_lower = [c.lower() for c in table[0]]
-            has_id_col = any("id" == h or h.startswith("id ") for h in header_lower)
+            has_id_col = any(h == "id" or h.startswith("id ") for h in header_lower)
             has_ec_col = any("edge" in h for h in header_lower)
             if not (has_id_col or has_ec_col):
                 continue
             idx = {col: header_lower.index(col) for col in header_lower}
 
-            def col_for(*names: str) -> int | None:
+            def col_for(*names: str, _idx: dict = idx) -> int | None:
                 for n in names:
-                    if n in idx:
-                        return idx[n]
+                    if n in _idx:
+                        return _idx[n]
                 for n in names:
-                    for h, i in idx.items():
+                    for h, i in _idx.items():
                         if n in h:
                             return i
                 return None
@@ -165,7 +165,10 @@ def _extract_edge_cases_structured(root: Section) -> list[dict]:
                     continue
                 raw_id = row[id_i].strip() if id_i is not None and id_i < len(row) else ""
                 ec_text_cell = row[ec_i].strip() if ec_i is not None and ec_i < len(row) else ""
-                sev_cell = row[sev_i].strip().lower() if sev_i is not None and sev_i < len(row) else ""
+                sev_cell = (
+                    row[sev_i].strip().lower()
+                    if sev_i is not None and sev_i < len(row) else ""
+                )
                 auto_cell = row[auto_i].strip() if auto_i is not None and auto_i < len(row) else ""
                 mit_cell = row[mit_i].strip() if mit_i is not None and mit_i < len(row) else ""
                 ec_match = _EC_ID_RE.search(raw_id) or _EC_ID_RE.search(ec_text_cell)
@@ -174,7 +177,11 @@ def _extract_edge_cases_structured(root: Section) -> list[dict]:
                 if ec_id in seen_ids:
                     continue
                 seen_ids.add(ec_id)
-                severity = sev_cell if sev_cell in {"critical", "high", "medium", "low"} else "UNKNOWN"
+                severity = (
+                    sev_cell
+                    if sev_cell in {"critical", "high", "medium", "low"}
+                    else "UNKNOWN"
+                )
                 automation_tag = None
                 tag_m = _AUTO_TAG_RE.search(auto_cell)
                 if tag_m:

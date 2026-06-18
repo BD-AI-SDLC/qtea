@@ -484,7 +484,9 @@ async def test_model_fallback_on_unavailable_error(tmp_path, monkeypatch):
             if self.call_n == 1:
                 raise RuntimeError("model overloaded — please retry")
             from tests.unit._fake_anthropic import (
-                FakeResponse, FakeTextBlock, FakeUsage,
+                FakeResponse,
+                FakeTextBlock,
+                FakeUsage,
             )
             return FakeResponse(content=[FakeTextBlock(text="ok")], usage=FakeUsage())
 

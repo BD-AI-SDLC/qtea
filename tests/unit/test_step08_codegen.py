@@ -348,7 +348,7 @@ async def test_step08_vendored_runtime_excluded_from_index(tmp_path: Path, monke
     index = json.loads(
         (ctx.workspace.step_dir(8) / "tbd-index.json").read_text(encoding="utf-8")
     )
-    indexed_paths = [f for f in index["files"]]
+    indexed_paths = list(index["files"])
     assert not any("worca-t-runtime" in p for p in indexed_paths), (
         f"Pre-vendored runtime leaked into tbd-index: {indexed_paths}"
     )

@@ -135,7 +135,7 @@ async def test_api_retry_storm_aborts_at_default_threshold(tmp_path: Path, monke
         {"type": "result", "result": "should-not-reach", "session_id": sid},
     ]
 
-    async def _fake_query(*, prompt, options=None, transport=None):  # noqa: ARG001
+    async def _fake_query(*, prompt, options=None, transport=None):
         for spec in storm:
             yield _make_message(spec)
 
@@ -192,7 +192,7 @@ async def test_api_retry_below_threshold_does_not_abort(tmp_path: Path, monkeypa
         {"type": "result", "result": "recovered after burst", "session_id": sid},
     ]
 
-    async def _fake_query(*, prompt, options=None, transport=None):  # noqa: ARG001
+    async def _fake_query(*, prompt, options=None, transport=None):
         for spec in messages:
             yield _make_message(spec)
 
@@ -248,7 +248,7 @@ async def test_api_retry_counter_resets_on_progress(tmp_path: Path, monkeypatch)
         {"type": "result", "result": "recovered twice", "session_id": sid},
     ]
 
-    async def _fake_query(*, prompt, options=None, transport=None):  # noqa: ARG001
+    async def _fake_query(*, prompt, options=None, transport=None):
         for spec in messages:
             yield _make_message(spec)
 
@@ -295,7 +295,7 @@ async def test_api_retry_env_override_lowers_threshold(tmp_path: Path, monkeypat
         {"type": "result", "result": "should-not-reach", "session_id": sid},
     ]
 
-    async def _fake_query(*, prompt, options=None, transport=None):  # noqa: ARG001
+    async def _fake_query(*, prompt, options=None, transport=None):
         for spec in messages:
             yield _make_message(spec)
 
@@ -360,7 +360,7 @@ async def test_api_fatal_error_aborts_on_first_4xx(tmp_path: Path, monkeypatch):
         {"type": "result", "result": "should-not-reach", "session_id": sid},
     ]
 
-    async def _fake_query(*, prompt, options=None, transport=None):  # noqa: ARG001
+    async def _fake_query(*, prompt, options=None, transport=None):
         for spec in messages:
             yield _make_message(spec)
 
@@ -405,7 +405,7 @@ async def test_api_fatal_error_aborts_on_first_5xx(tmp_path: Path, monkeypatch):
         {"type": "result", "result": "should-not-reach", "session_id": sid},
     ]
 
-    async def _fake_query(*, prompt, options=None, transport=None):  # noqa: ARG001
+    async def _fake_query(*, prompt, options=None, transport=None):
         for spec in messages:
             yield _make_message(spec)
 

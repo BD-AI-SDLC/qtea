@@ -16,7 +16,14 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from worca_t.checkpoints import RunState, StepRecord, is_step_complete, load_state, outputs_match, save_state
+from worca_t.checkpoints import (
+    RunState,
+    StepRecord,
+    is_step_complete,
+    load_state,
+    outputs_match,
+    save_state,
+)
 from worca_t.config import load_env
 from worca_t.logging_setup import configure_logging, get_logger
 
@@ -229,7 +236,10 @@ def _cleanup_step_artifacts(ws: Workspace, from_step: int, console: Console | No
         return
 
     # Confirm with user
-    console.print(f"[yellow]cleanup:[/] found {len(items_to_clean)} artifact(s) from step {from_step:02d} onward:")
+    console.print(
+        f"[yellow]cleanup:[/] found {len(items_to_clean)} artifact(s)"
+        f" from step {from_step:02d} onward:"
+    )
     for item_type, path in items_to_clean[:10]:
         relative = path.relative_to(ws.root)
         console.print(f"  [dim]-[/] {item_type}: {relative}")
@@ -269,12 +279,14 @@ def _cleanup_step_artifacts(ws: Workspace, from_step: int, console: Console | No
             failed_count=failed_count,
         )
         console.print(
-            f"[green]cleanup:[/] removed {deleted_count} artifact(s) from step {from_step:02d} onward"
+            f"[green]cleanup:[/] removed {deleted_count} artifact(s)"
+            f" from step {from_step:02d} onward"
         )
 
     if failed_count > 0:
         console.print(
-            f"[yellow]cleanup:[/] failed to remove {failed_count} artifact(s) (see logs for details)"
+            f"[yellow]cleanup:[/] failed to remove {failed_count}"
+            " artifact(s) (see logs for details)"
         )
 
 
@@ -305,6 +317,7 @@ def _mcp_preflight_for_step(
         return True
 
     import sys
+
     from worca_t.mcp_manager import load_mcp_config, probe_server
 
     while True:
@@ -511,7 +524,6 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
     # already on the expected branch with step 8's commits intact.
     # Re-materializing would wipe those commits (the generated test files).
     import subprocess
-    import sys
 
     from worca_t._sut_git import branch_name as _branch_name_early
     from worca_t._sut_git import current_branch as _current_branch_early
@@ -624,7 +636,7 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
     try:
         from worca_t.steps.s06_research import replay_env_from_artifacts
         replay_env_from_artifacts(ws, opts)
-    except Exception as e:  # noqa: BLE001 — defensive; never block the pipeline
+    except Exception as e:
         log.warning("pipeline.env_replay_failed", error=str(e))
 
     ctx = StepContext(
@@ -696,14 +708,17 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
         # ctx.extras, surface them for human review on TTY. FAILs that should
         # block already aborted Step 8 itself; what reaches here is the
         # WARN-tier (plus FAILs when WORCA_T_INTENT_FAIL_AS_WARN=1).
-        if step_num == 8 and ctx.extras.get("step8_intent_warnings"):
-            if not await review_step_8_intents(ctx, result, console):
-                save_state(state, ws.state_file)
-                console.print(
-                    "[yellow]step 08 rejected at intent-review gate — aborting[/]"
-                )
-                exit_code = 1
-                break
+        if (
+            step_num == 8
+            and ctx.extras.get("step8_intent_warnings")
+            and not await review_step_8_intents(ctx, result, console)
+        ):
+            save_state(state, ws.state_file)
+            console.print(
+                "[yellow]step 08 rejected at intent-review gate — aborting[/]"
+            )
+            exit_code = 1
+            break
 
         save_state(state, ws.state_file)
 

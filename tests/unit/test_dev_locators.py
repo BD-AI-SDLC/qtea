@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
-
-import pytest
 
 from worca_t.runtime.dev_locators import (
     DevLocator,

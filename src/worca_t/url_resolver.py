@@ -65,7 +65,9 @@ _ROLE_RANK = {
 }
 
 
-_URL_KEY_RE = re.compile(r"^([A-Z]+)(?:_BASE)?_URL$|^([A-Z]+)_URL_[A-Z]+$|^URL$|^BASE_URL$|^APP_URL$|^API_URL$")
+_URL_KEY_RE = re.compile(
+    r"^([A-Z]+)(?:_BASE)?_URL$|^([A-Z]+)_URL_[A-Z]+$|^URL$|^BASE_URL$|^APP_URL$|^API_URL$"
+)
 _PORT_RE = re.compile(r"(?:--port|--port[= ]|-p)\s*[= ]?\s*(\d{2,5})\b")
 _ENV_PORT_RE = re.compile(r"\bPORT\s*=\s*(\d{2,5})\b")
 _VITE_PORT_RE = re.compile(r"\bport\s*:\s*(\d{2,5})\b")
@@ -533,7 +535,7 @@ def detect_qa_base_url(sut_path: Path) -> UrlResolution:
 
 
 __all__ = [
-    "UrlResolution",
     "UrlCandidate",
+    "UrlResolution",
     "detect_qa_base_url",
 ]

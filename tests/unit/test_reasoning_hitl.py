@@ -17,15 +17,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
-
-import pytest
 
 from tests.unit._fake_anthropic import (
     FakeResponse,
     FakeTextBlock,
     FakeUsage,
-    disable_vertex_env,
 )
 from worca_t.llm.reasoning import call_reasoning_llm_with_hitl
 
@@ -49,7 +45,7 @@ def _fake_ctx(
     return SimpleNamespace(
         options=SimpleNamespace(no_hitl=no_hitl),
         extras={},
-        workspace=SimpleNamespace(root=workspace_root or Path(".")),
+        workspace=SimpleNamespace(root=workspace_root or Path()),
     )
 
 

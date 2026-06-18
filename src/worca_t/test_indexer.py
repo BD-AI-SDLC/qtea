@@ -623,9 +623,7 @@ def _is_in_comment(file_text: str, match_start: int) -> bool:
     prefix = file_text[line_start:match_start]
     if "#" in prefix:
         return True
-    if "//" in prefix:
-        return True
-    return False
+    return "//" in prefix
 
 
 def _scan_violations(file_text: str, rel_path: str) -> list[Violation]:

@@ -154,7 +154,7 @@ class Settings(BaseSettings):
         description="long description",
     )
 """)
-    req, opt = _discover_pydantic_env_keys(sut)
+    req, _opt = _discover_pydantic_env_keys(sut)
     assert "QA_URL" in req
 
 
@@ -198,7 +198,7 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     log_level: str | None = None
 """)
-    req, opt = _discover_pydantic_env_keys(sut)
+    _req, opt = _discover_pydantic_env_keys(sut)
     assert "LOG_LEVEL" in opt
 
 
@@ -215,7 +215,7 @@ class Settings(BaseSettings):
     class Config:
         env_prefix = "APP_"
 """)
-    req, opt = _discover_pydantic_env_keys(sut)
+    req, _opt = _discover_pydantic_env_keys(sut)
     assert "APP_TIMEOUT" in req
 
 
@@ -230,7 +230,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="MY_")
     host: str = Field(...)
 """)
-    req, opt = _discover_pydantic_env_keys(sut)
+    req, _opt = _discover_pydantic_env_keys(sut)
     assert "MY_HOST" in req
 
 
@@ -246,7 +246,7 @@ _ALIAS = "MY_VAR"
 class Settings(BaseSettings):
     my_var: str = Field(..., alias=_ALIAS)
 """)
-    req, opt = _discover_pydantic_env_keys(sut)
+    req, _opt = _discover_pydantic_env_keys(sut)
     # alias was non-literal — fall back to uppercased field name
     assert "MY_VAR" in req
 
@@ -426,7 +426,7 @@ from pydantic import Field
 class Settings(pydantic_settings.BaseSettings):
     qa_url: str = Field(..., alias="QA_URL")
 """)
-    req, opt = _discover_pydantic_env_keys(sut)
+    req, _opt = _discover_pydantic_env_keys(sut)
     assert "QA_URL" in req
 
 
@@ -435,7 +435,6 @@ class Settings(pydantic_settings.BaseSettings):
 # ---------------------------------------------------------------------------
 
 import pytest
-
 
 _SONNET = "claude-sonnet-4-6"
 _HAIKU_LANGUAGES = {"python", "typescript", "javascript"}

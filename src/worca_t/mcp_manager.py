@@ -68,7 +68,7 @@ from pathlib import Path
 from typing import Any
 
 from worca_t.config import package_resource_root
-from worca_t.proxy import safe_subprocess_env, with_proxy_env
+from worca_t.proxy import safe_subprocess_env
 
 _ENV_VAR_PATTERN = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
 

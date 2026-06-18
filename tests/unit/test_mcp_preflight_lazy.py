@@ -54,7 +54,7 @@ class _PlaywrightStep(Step):
 @pytest.fixture
 def _console():
     from rich.console import Console
-    return Console(file=open(__file__ + ".consolelog", "w", encoding="utf-8"))
+    return Console(file=Path(__file__ + ".consolelog").open("w", encoding="utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +64,7 @@ def _console():
 
 def test_preflight_skipped_when_step_declares_no_mcp(_console):
     """A step with empty mcp_servers_required must not call probe_server."""
-    opts = PipelineOptions(workspace_base=Path("."))
+    opts = PipelineOptions(workspace_base=Path())
     step = _NoMcpStep()
 
     with patch("worca_t.mcp_manager.load_mcp_config") as load_mock, \
@@ -79,7 +79,7 @@ def test_preflight_skipped_when_step_declares_no_mcp(_console):
 def test_preflight_probes_only_declared_servers(_console):
     """Only servers in `mcp_servers_required` should be probed — not every
     server in `.mcp.json`."""
-    opts = PipelineOptions(workspace_base=Path("."))
+    opts = PipelineOptions(workspace_base=Path())
     step = _PlaywrightStep()
 
     fake_config = {
@@ -109,7 +109,7 @@ def test_preflight_probes_only_declared_servers(_console):
 
 def test_preflight_fails_when_required_server_missing_from_config(_console):
     """If `.mcp.json` doesn't declare a server the step needs, fail fast."""
-    opts = PipelineOptions(workspace_base=Path("."), no_hitl=True)
+    opts = PipelineOptions(workspace_base=Path(), no_hitl=True)
     step = _PlaywrightStep()
 
     with patch(
@@ -123,7 +123,7 @@ def test_preflight_fails_when_required_server_missing_from_config(_console):
 
 def test_preflight_fails_fast_on_probe_failure_in_non_tty(_console):
     """Non-TTY / --no-hitl / --yes must NOT enter the retry-prompt loop."""
-    opts = PipelineOptions(workspace_base=Path("."), no_hitl=True)
+    opts = PipelineOptions(workspace_base=Path(), no_hitl=True)
     step = _PlaywrightStep()
     fake_config = {"playwright": McpServer(name="x", command="echo", args=[], env={})}
 

@@ -130,7 +130,8 @@ def load_dev_locators(
             continue
         if _is_xpath(selector):
             warnings.append(
-                f"dev-locators[{name}] selector is XPath ({selector!r}); rejected per locator-priority gate"
+                f"dev-locators[{name}] selector is XPath"
+                f" ({selector!r}); rejected per locator-priority gate"
             )
             continue
         out[name] = DevLocator(

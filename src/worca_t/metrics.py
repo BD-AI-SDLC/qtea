@@ -69,10 +69,7 @@ def extract_agent_metrics(
         return out
 
     def _get(name: str) -> int:
-        if isinstance(usage, dict):
-            v = usage.get(name)
-        else:
-            v = getattr(usage, name, None)
+        v = usage.get(name) if isinstance(usage, dict) else getattr(usage, name, None)
         try:
             return int(v) if v is not None else 0
         except (TypeError, ValueError):

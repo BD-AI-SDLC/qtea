@@ -52,7 +52,7 @@ def test_write_validated_writes_or_raises(tmp_path):
         "requirement_id": "REQ-x",
         "title": "x",
         "sections": [],
-        "acceptance_criteria": [],
+        "acceptance_criteria": ["AC-1: verify feature works"],
     }
     out = tmp_path / "spec.json"
     schemas.write_validated(out, good, "refined-spec")
