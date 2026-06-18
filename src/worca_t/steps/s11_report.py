@@ -82,7 +82,7 @@ class ReportStep(Step):
         # background server process (allure open requires a server; file://
         # doesn't work for allure's XHR-based data loading). Use the full
         # path from shutil.which so Windows .bat shims resolve correctly.
-        if allure_ok and mode in ("allure", "both"):
+        if allure_ok and mode in ("auto", "allure", "both"):
             allure_bin = shutil.which("allure")
             if allure_bin:
                 try:
