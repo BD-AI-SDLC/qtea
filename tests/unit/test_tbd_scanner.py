@@ -5,12 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from worca_t.tbd_scanner import (
-    TbdIntent,
     detect_language,
     scan_file,
     scan_tbd_intents,
 )
-
 
 # ---------------------------------------------------------------------------
 # Language detection

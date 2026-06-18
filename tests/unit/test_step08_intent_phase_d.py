@@ -8,13 +8,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
-
 from worca_t.review_gate import _replace_intent_at_line, review_step_8_intents
 from worca_t.steps.s08_codegen import _phase_d_score_intents
 
 from ._fake_anthropic import install_fake_anthropic
-
 
 # ---------------------------------------------------------------------------
 # _phase_d_score_intents
@@ -140,7 +137,7 @@ async def test_phase_d_excludes_jit_runtime_files(tmp_path: Path, monkeypatch):
     ]})
     install_fake_anthropic(monkeypatch, text=scorer_response)
 
-    ok, summary, warnings, error = await _phase_d_score_intents(
+    ok, summary, _warnings, _error = await _phase_d_score_intents(
         produced_in_sut=[real_test, jit_file],
         jit_files_added=[jit_file],
         sut_root=tmp_path,
@@ -231,7 +228,7 @@ async def test_phase_d_warn_only_succeeds_with_stash(
     ]})
     install_fake_anthropic(monkeypatch, text=scorer_response)
 
-    ok, summary, warnings, error = await _phase_d_score_intents(
+    ok, summary, warnings, _error = await _phase_d_score_intents(
         produced_in_sut=[src],
         jit_files_added=[],
         sut_root=tmp_path,
@@ -322,7 +319,7 @@ async def test_phase_d_handles_unparseable_scorer_response(
 
     install_fake_anthropic(monkeypatch, text="this is not json {")
 
-    ok, summary, warnings, error = await _phase_d_score_intents(
+    ok, summary, _warnings, _error = await _phase_d_score_intents(
         produced_in_sut=[src],
         jit_files_added=[],
         sut_root=tmp_path,
@@ -352,7 +349,7 @@ async def test_phase_d_pads_missing_scorer_entries_to_warn(
         {"intent": "b", "score": "PASS", "rationale": "ok"},
     ]}))
 
-    ok, summary, warnings, error = await _phase_d_score_intents(
+    ok, summary, warnings, _error = await _phase_d_score_intents(
         produced_in_sut=[src],
         jit_files_added=[],
         sut_root=tmp_path,

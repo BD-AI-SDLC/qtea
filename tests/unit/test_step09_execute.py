@@ -158,7 +158,7 @@ def test_run_dep_install_pip_uses_venv_pip_from_profile(tmp_path, monkeypatch):
     profile = StackProfile(
         language="python", package_manager="pip", wrapper_prefix=".venv/bin",
     )
-    ok, summary = _run_dep_install(
+    ok, _summary = _run_dep_install(
         "pip", "requests", tmp_path, tmp_path / "log", profile=profile,
     )
     assert ok is True
@@ -187,7 +187,7 @@ def test_run_dep_install_isolates_for_all_python_venv_managers(tmp_path, monkeyp
 
     monkeypatch.setenv("VIRTUAL_ENV", "/worca-t/.venv")
     monkeypatch.setattr("worca_t.steps.s09_execute.subprocess.run", lambda argv, **kw:
-        (kw.setdefault("_seen", kw.get("env", {})),  # noqa: ARG005
+        (kw.setdefault("_seen", kw.get("env", {})),
          sp.CompletedProcess(argv, 0, "installed", ""))[1])
 
     for pm in ("poetry", "uv", "pdm", "pipenv"):
@@ -1027,7 +1027,7 @@ def test_lazy_probe_returns_success_when_server_probes_ok(monkeypatch):
         "worca_t.mcp_manager.probe_server",
         lambda srv, timeout_s=30.0: (True, "ok"),
     )
-    ok, detail, _warmup_s = _lazy_probe_heal_mcp("playwright")
+    ok, _detail, _warmup_s = _lazy_probe_heal_mcp("playwright")
     assert ok is True
 
 

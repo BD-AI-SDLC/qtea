@@ -12,7 +12,7 @@ Covers:
 
 from __future__ import annotations
 
-from worca_t.md_parser import extract_coverage_notes, parse_markdown, Section
+from worca_t.md_parser import Section, extract_coverage_notes, parse_markdown
 from worca_t.schemas import is_valid
 from worca_t.steps.s02_refine import (
     _extract_acceptance_criteria_structured,
@@ -24,9 +24,7 @@ from worca_t.steps.s03_plan import _project_plan
 from worca_t.steps.s04_strategy import (
     _looks_like_test_case,
     _project_strategy,
-    _project_test_case,
 )
-
 
 # ---------- s02 refine ----------
 

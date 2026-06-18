@@ -12,18 +12,14 @@ Verifies the PR 3 wiring:
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock
 
-import pytest
-
+from tests.unit._fake_anthropic import install_fake_anthropic
 from worca_t.checkpoints import RunState
 from worca_t.pipeline import PipelineOptions
 from worca_t.steps.base import StepContext
 from worca_t.steps.s02_refine import RefineStep
 from worca_t.steps.s03_plan import PlanStep
 from worca_t.workspace import create_workspace
-from tests.unit._fake_anthropic import install_fake_anthropic
-
 
 # ---------- canned markdown fixtures ----------
 
@@ -169,8 +165,9 @@ async def _seed_refined_spec(ctx: StepContext, *, clean: bool = True) -> None:
     md_path = ctx.workspace.step_dir(2) / "refined-spec.md"
     md_path.write_text(refined_md, encoding="utf-8")
     # Build the JSON projection the audit needs.
-    from worca_t.steps.s02_refine import _project_to_json
     import json
+
+    from worca_t.steps.s02_refine import _project_to_json
     projection = _project_to_json(refined_md)
     (ctx.workspace.step_dir(2) / "refined-spec.json").write_text(
         json.dumps(projection, indent=2), encoding="utf-8",

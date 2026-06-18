@@ -16,6 +16,7 @@ to disk.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import re
@@ -93,12 +94,12 @@ def classify_env_keys(
         try:
             text = env_example.read_text(encoding="utf-8", errors="replace")
             for line in text.splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
                     continue
-                eq = line.find("=")
+                eq = stripped.find("=")
                 if eq > 0:
-                    required_from_example.add(line[:eq].strip())
+                    required_from_example.add(stripped[:eq].strip())
         except OSError:
             pass
 
@@ -215,10 +216,8 @@ class DotenvFileStrategy(EnvStrategy):
 
         combined: dict[str, str | None] = {}
         for p in self._paths:
-            try:
+            with contextlib.suppress(OSError):
                 combined.update(dotenv_values(p))
-            except OSError:
-                pass
 
         out: dict[str, str] = {}
         for k in keys:
@@ -347,7 +346,7 @@ class InteractivePromptStrategy(EnvStrategy):
     def resolve(
         self,
         keys: list[str],
-        already_resolved: dict[str, str],  # noqa: ARG002 — intentionally ignored
+        already_resolved: dict[str, str],
     ) -> dict[str, str]:
         if not keys or not sys.stdin.isatty():
             return {}

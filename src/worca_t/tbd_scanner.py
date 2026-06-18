@@ -17,9 +17,10 @@ Callers control which files are in scope.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Literal
 
 Language = Literal["python", "typescript", "javascript", "java"]
 
@@ -249,7 +250,7 @@ def _iter_source_files(p: Path) -> Iterable[Path]:
     for child in p.rglob("*"):
         if not child.is_file():
             continue
-        if any(part in _EXCLUDE_DIRS or part.startswith(".") and part != "."
+        if any(part in _EXCLUDE_DIRS or (part.startswith(".") and part != ".")
                for part in child.parts):
             continue
         if detect_language(child) is None:

@@ -103,7 +103,8 @@ def test_project_handles_duplicate_ids():
 """
     proj = _project_strategy(md)
     ids = [tc["id"] for tc in proj["test_cases"]]
-    assert ids == ["TC-DUP-1", "TC-DUP-1-2"]
+    assert ids == ["TC-DUP-1", "TC-DUP-1"]
+    assert proj["_duplicate_tc_ids"] == ["TC-DUP-1"]
 
 
 def _ctx(tmp_path: Path, *, with_plan: bool = True) -> StepContext:

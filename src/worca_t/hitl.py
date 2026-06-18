@@ -194,9 +194,9 @@ _STOPWORDS: frozenset[str] = frozenset({
     # HITL-domain noise — every other prompt contains these:
     "blocker", "blockers", "clarification", "needed", "question", "questions",
     "answer", "answers", "value", "values", "field", "fields", "thing",
-    "things", "item", "items", "exact", "specific", "given", "when", "then",
-    "able", "available", "possible", "needed", "required", "anything",
-    "something", "still", "without", "unconfirmed",
+    "things", "item", "items", "exact", "specific", "given", "able",
+    "available", "possible", "required", "anything",
+    "something", "still", "unconfirmed",
 })
 
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_\-./@]*")
@@ -350,11 +350,11 @@ def load_ledger(workspace_root: Path) -> list[HitlDecision]:
     out: list[HitlDecision] = []
     try:
         for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
+            stripped = line.strip()
+            if not stripped:
                 continue
             try:
-                out.append(HitlDecision.from_jsonable(json.loads(line)))
+                out.append(HitlDecision.from_jsonable(json.loads(stripped)))
             except (json.JSONDecodeError, TypeError, ValueError) as e:
                 log.warning("hitl.ledger_line_corrupt", error=str(e))
     except OSError as e:

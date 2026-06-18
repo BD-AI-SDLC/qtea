@@ -18,7 +18,6 @@ from worca_t.coverage_audit import (
 )
 from worca_t.schemas import is_valid
 
-
 # ---------- helpers ----------
 
 def _spec(

@@ -8,13 +8,10 @@ tmp_path to keep tests hermetic — no network, no external clones.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from worca_t.sut_inventory import (
-    AuthFlow,
     Fixture,
-    Helper,
     LocatorClass,
     LocatorConstant,
     ModuleInventory,
@@ -623,7 +620,7 @@ def test_resolve_active_module_explicit_wins():
         ModuleInventory(name="a", path="a"),
         ModuleInventory(name="b", path="b"),
     ])
-    name, err = resolve_active_module(inv, explicit="b")
+    name, _err = resolve_active_module(inv, explicit="b")
     assert name == "b"
 
 

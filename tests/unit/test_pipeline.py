@@ -127,7 +127,7 @@ async def test_resume_recovers_spec_and_sut_from_state(tmp_path: Path, monkeypat
     ws_prior = create_workspace(tmp_path)
 
     # Stub SUT materialization + preflight — unrelated to the fallback we're testing.
-    def _fake_materialize(src, dest, run_id):  # noqa: ARG001
+    def _fake_materialize(src, dest, run_id):
         dest.mkdir(parents=True, exist_ok=True)
         (dest / ".git").mkdir(exist_ok=True)
     monkeypatch.setattr("worca_t.steps.s06_research._materialize_sut", _fake_materialize)
@@ -247,8 +247,6 @@ def test_claude_runner_forwards_disable_prompt_caching():
     disable knobs even though they don't match the WORCA_/ANTHROPIC_/HTTP
     prefix set. Without this forward, setting the var in pipeline.py is
     inert because the subprocess never sees it."""
-    import os
-    from unittest.mock import patch
 
     # Read the forwarded_env construction block source-level — it lives
     # inside run_agent and only runs end-to-end. The deterministic check:

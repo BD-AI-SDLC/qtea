@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 
 from worca_t.claude_runner import (
-    _DriveState,
     _agent_key,
     _force_cleanup,
     _is_model_unavailable,
@@ -403,7 +402,7 @@ async def test_run_agent_passes_resume_to_sdk(tmp_path: Path, monkeypatch):
     """resume=<session_id> is propagated to ClaudeAgentOptions."""
     captured: dict = {}
 
-    def _capture(prompt, options):  # noqa: ARG001
+    def _capture(prompt, options):
         captured["resume"] = getattr(options, "resume", None)
 
     install_fake_query(
@@ -532,7 +531,7 @@ async def test_run_agent_timeout_preserves_partial_metrics(tmp_path: Path, monke
 
     from claude_agent_sdk import ResultMessage, SystemMessage
 
-    async def _slow_query(*, prompt, options=None, transport=None):  # noqa: ARG001
+    async def _slow_query(*, prompt, options=None, transport=None):
         # First yield an init with a session_id (captured instantly).
         sysmsg = SystemMessage.__new__(SystemMessage)
         sysmsg.subtype = "init"
@@ -591,11 +590,11 @@ async def test_force_cleanup_is_bounded_by_grace_s(tmp_path: Path, monkeypatch):
 
     # No psutil children to clean up — patch to return empty list.
     class FakeMe:
-        def children(self, recursive=True):  # noqa: ARG002
+        def children(self, recursive=True):
             return []
     monkeypatch.setattr(
         "worca_t.claude_runner.psutil.Process",
-        lambda pid: FakeMe(),  # noqa: ARG005
+        lambda pid: FakeMe(),
     )
 
     start = _asyncio.get_event_loop().time()
@@ -626,23 +625,23 @@ async def test_force_cleanup_spares_pre_existing_children(tmp_path: Path, monkey
             killed.append(self.pid)
         def kill(self):
             killed.append(self.pid)
-        def wait(self, timeout=None):  # noqa: ARG002
+        def wait(self, timeout=None):
             return 0
 
     class FakeMe:
         def __init__(self, all_children):
             self._all = all_children
-        def children(self, recursive=True):  # noqa: ARG002
+        def children(self, recursive=True):
             return self._all
 
     all_children = [FakeProc(101), FakeProc(102), FakeProc(103)]
     monkeypatch.setattr(
         "worca_t.claude_runner.psutil.Process",
-        lambda pid: FakeMe(all_children),  # noqa: ARG005
+        lambda pid: FakeMe(all_children),
     )
     monkeypatch.setattr(
         "worca_t.claude_runner.psutil.wait_procs",
-        lambda procs, timeout=None: (procs, []),  # noqa: ARG005
+        lambda procs, timeout=None: (procs, []),
     )
 
     # Pre-existing PIDs include 101, 102. Only 103 should be killed.
@@ -693,14 +692,13 @@ def test_get_model_chain_unknown_model_returns_singleton():
 
 async def test_run_agent_falls_back_on_model_unavailable(tmp_path: Path, monkeypatch):
     """When the primary model is unavailable, run_agent retries with the fallback."""
-    import asyncio as _asyncio
 
     from claude_agent_sdk import ResultMessage
 
     call_count = 0
     models_seen: list[str | None] = []
 
-    async def _query_with_fallback(*, prompt, options=None, transport=None):  # noqa: ARG001
+    async def _query_with_fallback(*, prompt, options=None, transport=None):
         nonlocal call_count
         call_count += 1
         model = getattr(options, "model", None)
@@ -747,11 +745,11 @@ async def test_run_agent_no_fallback_on_non_model_error(tmp_path: Path, monkeypa
     """Non-model errors should NOT trigger the fallback chain."""
     call_count = 0
 
-    async def _query_that_fails(*, prompt, options=None, transport=None):  # noqa: ARG001
+    async def _query_that_fails(*, prompt, options=None, transport=None):
         nonlocal call_count
         call_count += 1
         raise RuntimeError("some random sdk error")
-        yield  # noqa: unreachable -- make this an async generator
+        yield  # unreachable -- make this an async generator
 
     monkeypatch.setattr(
         "worca_t.claude_runner.shutil.which",

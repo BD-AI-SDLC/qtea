@@ -5,7 +5,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from worca_t.mcp_manager import _substitute_env, load_mcp_config, stage_empty_mcp_config, stage_mcp_config
+from worca_t.mcp_manager import (
+    _substitute_env,
+    load_mcp_config,
+    stage_empty_mcp_config,
+    stage_mcp_config,
+)
 
 
 def test_env_substitution(monkeypatch):

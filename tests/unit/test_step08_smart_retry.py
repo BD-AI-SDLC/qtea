@@ -14,15 +14,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-import pytest
-
 from worca_t.steps.s08_codegen import (
     _POM_EXTENDER_MAX_TOKENS_HARD_CAP,
     _POM_EXTENDER_MAX_TOKENS_OVERRIDE_KEY,
-    _PomTask,
     _extend_poms,
+    _PomTask,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers

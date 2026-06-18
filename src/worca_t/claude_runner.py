@@ -26,7 +26,14 @@ from claude_agent_sdk import (
     query,
 )
 
-from worca_t.config import CLAUDE_SESSION_KEYS, SECRET_ENV_KEYS, get_model_chain, get_settings, model_for_agent, step_timeout
+from worca_t.config import (
+    CLAUDE_SESSION_KEYS,
+    SECRET_ENV_KEYS,
+    get_model_chain,
+    get_settings,
+    model_for_agent,
+    step_timeout,
+)
 from worca_t.logging_setup import get_logger
 from worca_t.mcp_manager import stage_empty_mcp_config, stage_mcp_config
 from worca_t.metrics import CURRENT_STEP_METRICS, AgentMetrics, extract_agent_metrics
@@ -405,9 +412,8 @@ def _extract_text_from_blocks(content: Any) -> str:
     last = ""
     for block in content:
         text = getattr(block, "text", None)
-        if text is None and isinstance(block, dict):
-            if block.get("type") == "text":
-                text = block.get("text")
+        if text is None and isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
         if isinstance(text, str) and text:
             last = text
     return last
@@ -552,10 +558,8 @@ async def _drive_query(
                 pass
 
             if on_event:
-                try:
+                with contextlib.suppress(Exception):
                     on_event(evt)
-                except Exception:
-                    pass
 
 
 def _current_child_pids() -> set[int]:
@@ -594,7 +598,7 @@ def _kill_children(pre_existing_children: set[int]) -> None:
             child.terminate()
     try:
         _gone, alive = psutil.wait_procs(children, timeout=3)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.warning("agent.cleanup_wait_error", error=str(e))
         alive = children
     for proc in alive:
@@ -633,7 +637,7 @@ async def _force_cleanup(
             await asyncio.wait_for(asyncio.shield(task), timeout=grace_s)
         except (TimeoutError, asyncio.CancelledError):
             pass
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             log.warning("agent.cleanup_task_error", error=str(e))
 
 
@@ -893,14 +897,8 @@ async def run_agent(
 
     def _stderr_sink(line: str) -> None:
         """Forward one stderr line from the claude CLI subprocess to disk."""
-        try:
+        with contextlib.suppress(OSError, ValueError):
             stderr_fp.write(line if line.endswith("\n") else line + "\n")
-        except (OSError, ValueError):
-            # File was closed by GC during async cleanup; the SDK's
-            # stderr-reader task is racing our return. Drop the line
-            # rather than propagate — losing a tail line on a clean
-            # exit is preferable to crashing the stream-reader.
-            pass
 
     sdk_options_kwargs["stderr"] = _stderr_sink
 
@@ -973,10 +971,7 @@ async def run_agent(
             # failure, ... — is in `state.final_text` (the `ResultMessage.result`
             # body). Surface both so users don't have to grep transcripts.
             api_detail = (state.final_text or "").strip()
-            if api_detail:
-                error = f"sdk error: {e} | api: {api_detail[:500]}"
-            else:
-                error = f"sdk error: {e}"
+            error = f"sdk error: {e} | api: {api_detail[:500]}" if api_detail else f"sdk error: {e}"
             log.exception(
                 "agent.sdk_error",
                 agent=agent_path.name,
@@ -1045,10 +1040,8 @@ async def run_agent(
         # with the still-open write handle (matters on Windows). Late
         # writes from the SDK's stderr-reader task during async cleanup
         # are absorbed by the sink's try/except.
-        try:
+        with contextlib.suppress(OSError, ValueError):
             stderr_fp.close()
-        except (OSError, ValueError):
-            pass
         # Append the runner's diagnostic banner as a footer so it doesn't
         # overwrite the CLI's own --verbose stderr (which contains the
         # underlying exception text behind `api_retry` events). When the

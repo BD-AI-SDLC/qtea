@@ -158,4 +158,4 @@ def mask_path(p: Path) -> str:
     return Path(p).name
 
 
-__all__ = ["resolve", "to_mcp_arg", "summary_for_prompt", "mask_path"]
+__all__ = ["mask_path", "resolve", "summary_for_prompt", "to_mcp_arg"]

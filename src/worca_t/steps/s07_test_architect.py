@@ -262,13 +262,16 @@ def _validate_plan_against_inventory(
         tc_id = tc.get("id") or "<no-id>"
 
         target = tc.get("test_file_target")
-        if isinstance(target, str) and target:
-            if not _path_under_approved(target, approved):
-                violations.append(
-                    f"{tc_id}: test_file_target `{target}` is not under any "
-                    f"inventory-approved directory (approved: "
-                    f"{sorted(approved) or 'none-detected'})"
-                )
+        if (
+            isinstance(target, str)
+            and target
+            and not _path_under_approved(target, approved)
+        ):
+            violations.append(
+                f"{tc_id}: test_file_target `{target}` is not under any "
+                f"inventory-approved directory (approved: "
+                f"{sorted(approved) or 'none-detected'})"
+            )
 
         for fn in tc.get("test_functions") or []:
             for m in fn.get("markers") or []:
@@ -287,14 +290,19 @@ def _validate_plan_against_inventory(
                         f"{tc_id}: fixture `{f.get('name')}` source=reuse "
                         f"missing `from` field"
                     )
-                elif ref not in symbols["fixtures"]:
+                elif (
+                    ref not in symbols["fixtures"]
                     # Allow file-only references too (e.g. tests/conftest.py:auth_session
                     # where conftest.py is listed but auth_session isn't enumerated).
-                    if not any(s == ref or s.startswith(ref + ":") for s in symbols["fixtures"]):
-                        violations.append(
-                            f"{tc_id}: fixture `{f.get('name')}` reuse-from "
-                            f"`{ref}` not found in sut_inventory"
-                        )
+                    and not any(
+                        s == ref or s.startswith(ref + ":")
+                        for s in symbols["fixtures"]
+                    )
+                ):
+                    violations.append(
+                        f"{tc_id}: fixture `{f.get('name')}` reuse-from "
+                        f"`{ref}` not found in sut_inventory"
+                    )
                 if not (f.get("reuse_justification") or "").strip():
                     violations.append(
                         f"{tc_id}: fixture `{f.get('name')}` source=reuse "

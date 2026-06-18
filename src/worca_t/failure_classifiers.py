@@ -27,7 +27,7 @@ String matching is not reasoning.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
@@ -235,8 +235,8 @@ def _looks_like_test_runner_error(error: str | None) -> bool:
 
 
 def classify_failure(
-    result: "StepResult",
-    ctx: "StepContext | None" = None,
+    result: StepResult,
+    ctx: StepContext | None = None,
 ) -> ClassificationResult:
     """Classify a failed step result into a `FailureCategory`.
 
@@ -280,7 +280,10 @@ def classify_failure(
         # already armed `ctx.extras` before returning the failure.
         return ClassificationResult(
             category=FailureCategory.TRUNCATION_RECOVERABLE,
-            explanation="agent response truncated by max_tokens; smart-retry should re-attempt with higher budget",
+            explanation=(
+                "agent response truncated by max_tokens;"
+                " smart-retry should re-attempt with higher budget"
+            ),
             safe_to_auto_retry=True,
             fix_hint=None,  # step already armed its own override
         )
@@ -386,9 +389,9 @@ def is_recoverable_category(category: FailureCategory) -> bool:
 __all__ = [
     "ClassificationResult",
     "FailureCategory",
-    "classify_failure",
-    "is_recoverable_category",
     # Re-exported sentinels for back-compat with base.py wrappers
     "_is_api_fatal_error",
     "_is_api_retry_storm",
+    "classify_failure",
+    "is_recoverable_category",
 ]

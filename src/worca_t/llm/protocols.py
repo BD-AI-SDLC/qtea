@@ -22,9 +22,9 @@ from worca_t.metrics import (
 )
 
 __all__ = [
-    "AgentResult",
-    "AgentMetrics",
-    "StepMetricsAccumulator",
     "CURRENT_STEP_METRICS",
+    "AgentMetrics",
+    "AgentResult",
+    "StepMetricsAccumulator",
     "extract_agent_metrics",
 ]

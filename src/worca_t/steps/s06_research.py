@@ -60,12 +60,12 @@ def _is_git_url(s: str) -> bool:
 def _rmtree_safe(path: Path) -> None:
     """shutil.rmtree with a Windows readonly/lock error handler."""
 
-    def _on_error(_func, _path, exc_info):  # noqa: ANN001
+    def _on_error(_func, _path, exc_info):
         import stat
 
         try:
-            os.chmod(_path, stat.S_IWRITE)
-            os.unlink(_path)
+            Path(_path).chmod(stat.S_IWRITE)
+            Path(_path).unlink()
         except Exception:
             pass
 
@@ -308,7 +308,11 @@ def _parse_field_call(call: ast.Call) -> tuple[str | None, bool]:
     for kw in call.keywords:
         if kw.arg in ("default", "default_factory"):
             # Treat `default=...` (literal Ellipsis) as still required.
-            if kw.arg == "default" and isinstance(kw.value, ast.Constant) and kw.value.value is Ellipsis:
+            if (
+                kw.arg == "default"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is Ellipsis
+            ):
                 continue
             has_default = True
         elif kw.arg == "alias":
@@ -413,11 +417,10 @@ def _discover_pydantic_env_keys(sut_path: Path) -> tuple[set[str], set[str]]:
                     else:
                         # Non-Field call value — treat as having a default.
                         is_required_field = False
-                else:
-                    # Bare annotation `qa_url: str` (no value) → required if
-                    # not Optional. `qa_url: str = "x"` → optional (has value).
-                    if rhs is None:
-                        is_required_field = not _annotation_is_optional(stmt.annotation)
+                # Bare annotation `qa_url: str` (no value) → required if
+                # not Optional. `qa_url: str = "x"` → optional (has value).
+                elif rhs is None:
+                    is_required_field = not _annotation_is_optional(stmt.annotation)
 
                 # Optional annotation always overrides required classification.
                 if _annotation_is_optional(stmt.annotation):
@@ -994,7 +997,7 @@ def replay_env_from_artifacts(workspace: Any, options: Any) -> bool:
     url_resolution = research.get("url_resolution") or {}
     url_key = url_resolution.get("key")
     if url_key and url_key not in sut_env_keys:
-        sut_env_keys = list(sut_env_keys) + [url_key]
+        sut_env_keys = [*list(sut_env_keys), url_key]
     if not sut_env_keys:
         return False
 

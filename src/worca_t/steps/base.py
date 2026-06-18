@@ -503,10 +503,7 @@ async def run_agent_with_hitl(
             _flush_step_decisions(ledger, step_decisions, workspace_root)
             return result
 
-        if new_questions:
-            answers = prompt_user(new_questions, agent_label=agent_label)
-        else:
-            answers = {}
+        answers = prompt_user(new_questions, agent_label=agent_label) if new_questions else {}
         # prompt_user now returns dict[str, tuple[str, str]] — skipped items
         # absent from the dict; answered/scope-exclusion items carry
         # (resolution, text).

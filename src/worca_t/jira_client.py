@@ -363,7 +363,10 @@ def _adf_node(node: dict[str, Any]) -> str:
     if node_type == "orderedList":
         # Mark items so the listItem handler can number them.
         items = [_adf_node(c) for c in content]
-        return "".join(f"{i + 1}. {item.lstrip('- ').rstrip()}\n" for i, item in enumerate(items)) + "\n"
+        return "".join(
+            f"{i + 1}. {item.lstrip('- ').rstrip()}\n"
+            for i, item in enumerate(items)
+        ) + "\n"
     if node_type == "listItem":
         # Strip trailing blank lines from inner paragraph rendering.
         body = inner.rstrip()

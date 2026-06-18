@@ -148,7 +148,9 @@ def check_schemas() -> Check:
 
 
 def check_workspace_writable(workspace: Path | None) -> Check:
-    ws = workspace or Path(os.environ.get("WORCA_T_DEFAULT_WORKSPACE", str(Path.home() / ".worca-t")))
+    ws = workspace or Path(
+        os.environ.get("WORCA_T_DEFAULT_WORKSPACE", str(Path.home() / ".worca-t"))
+    )
     try:
         ws.mkdir(parents=True, exist_ok=True)
         probe = ws / ".worca-t-probe"

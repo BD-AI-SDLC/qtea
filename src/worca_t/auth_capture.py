@@ -21,10 +21,10 @@ manual conversion and would not capture localStorage).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
-import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -191,7 +191,7 @@ def _set_owner_only_perms(path: Path) -> None:
     personal Windows account, but we don't enforce it)."""
     if os.name == "posix":
         try:
-            os.chmod(path, 0o600)
+            path.chmod(0o600)
         except OSError as e:
             log.warning("auth_capture.chmod_failed %s", e)
     else:
@@ -229,8 +229,8 @@ def cmd_auth_capture(
     module = _active_module(inventory)
     if module is None:
         raise ValueError(
-            f"sut_inventory.json has no active_module set (or it points at "
-            f"a name not in modules[]). Fix the inventory and retry."
+            "sut_inventory.json has no active_module set (or it points at "
+            "a name not in modules[]). Fix the inventory and retry."
         )
     spec = _build_auth_flow_spec(module)
     if spec.language != "python":
@@ -280,10 +280,8 @@ def cmd_auth_capture(
             f"--timeout if MFA / SSO needs more interactive time."
         ) from e
     finally:
-        try:
+        with contextlib.suppress(OSError):
             wrapper_path.unlink(missing_ok=True)
-        except OSError:
-            pass
 
     if proc.returncode != 0:
         # Surface stderr tail so the operator sees the actual error.
@@ -311,7 +309,7 @@ def cmd_auth_capture(
 
 
 __all__ = [
-    "AuthFlowSpec",
     "DEFAULT_OUTPUT_REL",
+    "AuthFlowSpec",
     "cmd_auth_capture",
 ]

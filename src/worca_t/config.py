@@ -204,9 +204,7 @@ def use_vertex_backend() -> bool:
     """
     if os.environ.get("CLAUDE_CODE_USE_VERTEX") == "1":
         return True
-    if os.environ.get("ANTHROPIC_VERTEX_BASE_URL"):
-        return True
-    return False
+    return bool(os.environ.get("ANTHROPIC_VERTEX_BASE_URL"))
 
 
 def anthropic_vertex_kwargs() -> dict[str, Any]:
@@ -283,7 +281,7 @@ def model_for_agent(agent_key: str) -> str | None:
 
 def get_model_chain(primary: str) -> list[str]:
     """Return ``[primary, fallback1, fallback2]`` for resilient model selection."""
-    return [primary] + MODEL_FALLBACK_CHAIN.get(primary, [])
+    return [primary, *MODEL_FALLBACK_CHAIN.get(primary, [])]
 
 
 def step_timeout(step: int, override: int | None = None) -> int:

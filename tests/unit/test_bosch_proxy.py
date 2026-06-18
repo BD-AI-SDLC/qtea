@@ -19,14 +19,12 @@ import base64
 from unittest.mock import MagicMock, patch
 
 import httpx
-import pytest
 
 from worca_t.proxy import (
     BoschProxyTransport,
     _build_ps_command,
     _parse_ps_response,
 )
-
 
 # ---------------------------------------------------------------------------
 # _parse_ps_response — PowerShell stdout parser
@@ -42,7 +40,7 @@ def test_parse_ps_response_extracts_status_and_body():
 
 def test_parse_ps_response_missing_status_returns_502():
     stdout = "garbage with no STATUS line\n"
-    status, body = _parse_ps_response(stdout)
+    status, _body = _parse_ps_response(stdout)
     assert status == 502
 
 
@@ -141,13 +139,12 @@ def test_non_407_passes_through_on_any_platform(monkeypatch):
     transport = BoschProxyTransport()
     with patch.object(
         BoschProxyTransport, "_powershell_fallback"
-    ) as mock_fallback:
-        with patch(
-            "httpx.HTTPTransport.handle_request", return_value=upstream
-        ):
-            response = transport.handle_request(
-                httpx.Request("GET", "https://x.atlassian.net/foo")
-            )
+    ) as mock_fallback, patch(
+        "httpx.HTTPTransport.handle_request", return_value=upstream
+    ):
+        response = transport.handle_request(
+            httpx.Request("GET", "https://x.atlassian.net/foo")
+        )
 
     assert response.status_code == 200
     mock_fallback.assert_not_called()
@@ -161,13 +158,12 @@ def test_407_on_non_windows_passes_through(monkeypatch):
     transport = BoschProxyTransport()
     with patch.object(
         BoschProxyTransport, "_powershell_fallback"
-    ) as mock_fallback:
-        with patch(
-            "httpx.HTTPTransport.handle_request", return_value=upstream
-        ):
-            response = transport.handle_request(
-                httpx.Request("GET", "https://x.atlassian.net/foo")
-            )
+    ) as mock_fallback, patch(
+        "httpx.HTTPTransport.handle_request", return_value=upstream
+    ):
+        response = transport.handle_request(
+            httpx.Request("GET", "https://x.atlassian.net/foo")
+        )
 
     assert response.status_code == 407
     mock_fallback.assert_not_called()
@@ -185,13 +181,12 @@ def test_407_on_windows_invokes_powershell_fallback(monkeypatch):
         BoschProxyTransport,
         "_powershell_fallback",
         return_value=fallback_response,
-    ) as mock_fallback:
-        with patch(
-            "httpx.HTTPTransport.handle_request", return_value=upstream
-        ):
-            response = transport.handle_request(
-                httpx.Request("GET", "https://x.atlassian.net/foo")
-            )
+    ) as mock_fallback, patch(
+        "httpx.HTTPTransport.handle_request", return_value=upstream
+    ):
+        response = transport.handle_request(
+            httpx.Request("GET", "https://x.atlassian.net/foo")
+        )
 
     assert response.status_code == 200
     mock_fallback.assert_called_once()

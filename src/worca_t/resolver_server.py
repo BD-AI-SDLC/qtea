@@ -242,7 +242,7 @@ class ResolverServer:
         while not self._shutdown.is_set():
             try:
                 conn, _addr = self._sock.accept()
-            except socket.timeout:
+            except TimeoutError:
                 continue
             except OSError:
                 # Socket closed during shutdown — exit cleanly.
@@ -263,7 +263,7 @@ class ResolverServer:
         try:
             conn.settimeout(_PER_CONN_TIMEOUT_S)
             self._handle_request(conn)
-        except Exception as e:  # noqa: BLE001 - bound to log + close
+        except Exception as e:
             log.warning("worca_t.resolver_server_conn_error %s: %s", type(e).__name__, e)
         finally:
             with contextlib.suppress(OSError):
@@ -275,7 +275,7 @@ class ResolverServer:
     def _handle_request(self, conn: socket.socket) -> None:
         try:
             line = _read_line(conn, _MAX_REQUEST_BYTES)
-        except (ValueError, socket.timeout) as e:
+        except (TimeoutError, ValueError) as e:
             self._send(conn, {"ok": False, "error": f"read: {e}"})
             return
         if not line:
@@ -301,7 +301,7 @@ class ResolverServer:
 
         try:
             response = self._dispatch(req)
-        except Exception as e:  # noqa: BLE001 - return as error
+        except Exception as e:
             with self._stats_lock:
                 self._error_count += 1
             log.warning(

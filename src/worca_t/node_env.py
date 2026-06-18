@@ -72,6 +72,7 @@ def ensure_node(console: Console | None = None) -> bool:
             capture_output=True,
             text=True,
             timeout=300,
+            check=False,
         )
     except subprocess.TimeoutExpired:
         _con.print("[yellow]warn:[/] Node.js bootstrap timed out after 5 minutes.")

@@ -148,7 +148,12 @@ def read_cache(cache_path: Path) -> dict[str, dict[str, Any]]:
     return out
 
 
-def write_cache(cache_path: Path, entries: dict[str, dict[str, Any]], *, run_id: str | None = None) -> None:
+def write_cache(
+    cache_path: Path,
+    entries: dict[str, dict[str, Any]],
+    *,
+    run_id: str | None = None,
+) -> None:
     """Atomically write the cache (tmp + rename, like checkpoints.py)."""
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -225,7 +230,11 @@ def _build_prompt(
     if page_url:
         user_parts.append(f"Current page URL: {page_url}")
     if dev_pool:
-        lines = ["Candidate selectors from the dev team (prefer when they match the intent and resolve in the snapshot):"]
+        lines = [
+            "Candidate selectors from the dev team"
+            " (prefer when they match the intent"
+            " and resolve in the snapshot):"
+        ]
         for e in dev_pool:
             sel = e.get("selector", "")
             ent_intent = e.get("intent") or ""
@@ -437,7 +446,7 @@ def resolve_one(
             raw, usage = _call_anthropic(system, user, model=chosen_model)
             parsed = _parse_response(raw)
             break
-        except Exception as e:  # noqa: BLE001 - SDK exceptions are not pinned to one type
+        except Exception as e:
             last_error = f"{type(e).__name__}: {e}"
             if attempt >= _MAX_API_RETRIES:
                 return ResolutionResult(
@@ -445,7 +454,11 @@ def resolve_one(
                     source="unresolvable", intent=intent,
                     constant_name=constant_name, page_url=page_url,
                     snapshot_hash=snap_hash,
-                    reason=f"resolver API failed after {_MAX_API_RETRIES + 1} attempts: {last_error}",
+                    reason=(
+                        f"resolver API failed after"
+                        f" {_MAX_API_RETRIES + 1} attempts:"
+                        f" {last_error}"
+                    ),
                     resolved_at=datetime.now(UTC).isoformat(),
                     model=chosen_model,
                     duration_ms=int((time.monotonic() - t_call_start) * 1000),

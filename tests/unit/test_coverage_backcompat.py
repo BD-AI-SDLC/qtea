@@ -14,7 +14,6 @@ from worca_t.steps.s02_refine import _project_to_json
 from worca_t.steps.s03_plan import _project_plan
 from worca_t.steps.s04_strategy import _project_strategy
 
-
 # ---------- 1. Hand-crafted legacy artifacts validate ----------
 
 def test_legacy_refined_spec_without_new_fields_still_validates() -> None:
