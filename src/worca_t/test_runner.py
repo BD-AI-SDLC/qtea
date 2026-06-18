@@ -25,8 +25,10 @@ from __future__ import annotations
 import ast
 import json
 import os
+import platform
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -1142,6 +1144,65 @@ def _run_subprocess_step(
     return proc.returncode, proc.stdout or "", proc.stderr or "", dur
 
 
+def _detect_stale_venv_scripts(venv_dir: Path, env: dict[str, str]) -> bool:
+    """Return True when the venv's script wrappers point to a different Python
+    than the venv's own python executable.
+
+    On Windows, Scripts/*.exe wrappers have the Python interpreter path baked
+    in at venv-creation time. When a .venv directory is committed to git or
+    copied from another checkout (a common pattern in monorepos), those
+    wrappers still resolve to the original Python while python.exe itself is
+    correct. The result: running pytest.exe or pip.exe operates on the old
+    environment — the project package is invisible, producing
+    ``ModuleNotFoundError`` at collection time even though
+    ``python.exe -c "import <pkg>"`` succeeds.
+
+    Detection: compare the sys.prefix that ``python.exe`` reports with the
+    site-packages path that ``pip.exe --version`` resolves to. A mismatch
+    means the wrappers are stale and the venv needs rebuilding.
+    """
+    if platform.system() == "Windows":
+        python_exe = venv_dir / "Scripts" / "python.exe"
+        pip_script = venv_dir / "Scripts" / "pip.exe"
+    else:
+        python_exe = venv_dir / "bin" / "python"
+        pip_script = venv_dir / "bin" / "pip"
+
+    if not python_exe.is_file() or not pip_script.is_file():
+        return False
+
+    try:
+        res = subprocess.run(
+            [str(python_exe), "-c", "import sys; print(sys.prefix)"],
+            capture_output=True, text=True, timeout=15, env=env,
+        )
+        if res.returncode != 0:
+            return False
+        python_prefix = Path(res.stdout.strip()).resolve()
+    except Exception:  # noqa: BLE001
+        return False
+
+    try:
+        res = subprocess.run(
+            [str(pip_script), "--version"],
+            capture_output=True, text=True, timeout=15, env=env,
+        )
+        if res.returncode != 0:
+            return False
+        # pip --version: "pip 25.x from /path/to/site-packages/pip (python 3.x)"
+        m = re.search(r"from (.+?) \(python", res.stdout)
+        if not m:
+            return False
+        pip_prefix = Path(m.group(1)).resolve()
+        try:
+            pip_prefix.relative_to(python_prefix)
+            return False  # pip's site-packages are under the same prefix — healthy
+        except ValueError:
+            return True  # pip resolves to a different prefix — stale wrappers
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def prepare_sut(
     profile: StackProfile | None,
     *,
@@ -1214,6 +1275,57 @@ def prepare_sut(
         exit_code=rc,
         duration_s=round(total_duration, 2),
     )
+
+    # Post-install venv health check. Only for Python venv managers with a
+    # known venv_path (poetry, uv, pdm, pipenv). Detects the stale-scripts
+    # problem that arises when .venv is committed to git or copied from
+    # another checkout: Scripts/*.exe wrappers still point to the original
+    # Python, causing ModuleNotFoundError even though python.exe is correct.
+    if rc == 0 and profile.venv_path and isolate_venv:
+        venv_dir = cwd / profile.venv_path
+        if venv_dir.is_dir() and _detect_stale_venv_scripts(venv_dir, env):
+            log.warning(
+                "prepare_sut.stale_venv_detected",
+                venv_dir=str(venv_dir),
+                hint="Scripts wrappers resolve to a different Python than venv/python — rebuilding",
+            )
+            try:
+                shutil.rmtree(venv_dir)
+            except OSError as e:
+                log.warning("prepare_sut.stale_venv_remove_failed", error=str(e))
+            else:
+                log.info("prepare_sut.stale_venv_removed", venv_dir=str(venv_dir))
+                rebuild_label = f"[stale-venv rebuild] {commands_label}"
+                rb_stdout: list[str] = []
+                rb_stderr: list[str] = []
+                rebuild_ok = True
+                if profile.pre_install_command:
+                    rc2, o2, e2, d2 = _run_subprocess_step(
+                        profile.pre_install_command, cwd=cwd, env=env, timeout_s=timeout_s,
+                    )
+                    rb_stdout.append(o2)
+                    rb_stderr.append(e2)
+                    total_duration += d2
+                    if rc2 != 0:
+                        log.warning("prepare_sut.stale_venv_rebuild_pre_failed", exit_code=rc2)
+                        rebuild_ok = False
+                        rc = rc2
+                if rebuild_ok:
+                    rc3, o3, e3, d3 = _run_subprocess_step(
+                        profile.install_command, cwd=cwd, env=env, timeout_s=timeout_s,
+                    )
+                    rb_stdout.append(o3)
+                    rb_stderr.append(e3)
+                    total_duration += d3
+                    rc = rc3
+                    if rc3 == 0:
+                        log.info("prepare_sut.stale_venv_rebuild_ok", venv_dir=str(venv_dir))
+                    else:
+                        log.warning("prepare_sut.stale_venv_rebuild_failed", exit_code=rc3)
+                all_stdout.append(f"# [stale-venv rebuild]\n{chr(10).join(rb_stdout)}")
+                all_stderr.append("\n".join(rb_stderr))
+                commands_label = rebuild_label
+
     return PrepareResult(
         ran=True,
         command=commands_label,

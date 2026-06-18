@@ -143,13 +143,7 @@ When the user prompt includes a "LIVE DIAGNOSIS" section, treat it as authoritat
 ## Output
 
 - Patched POM/locator files in-place (never new test files).
-- Append per-test entry under
-  `<workspace>/artifacts/step09/self-heal/heal-log.jsonl`:
-
-```json
-{ "test_id": "TC-XXX", "drifted_locators": [...], "new_selectors": {...}, "mcp_channel": "playwright", "snapshot_source": "aom|raw_dom_fallback", "fallback_reason": "<only when snapshot_source=raw_dom_fallback>", "outcome": "self_healed|gave_up", "ts": "..." }
-```
-
+- Your final response must be a one-line summary of what you changed (e.g. `"updated GEMINI_ENTERPRISE_LINK selector from '...' to '...'"`). Worca-t records the heal outcome from your exit status — DO NOT write any log file.
 - On give-up: orchestrator handles bug report rendering — do not duplicate.
 
 ## Composed Skills

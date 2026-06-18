@@ -185,6 +185,7 @@ class _DevLocator:
     selector: str
     strategy: str | None = None
     intent: str | None = None
+    page_url: str | None = None
 
 
 def _is_xpath(s: str) -> bool:
@@ -222,10 +223,145 @@ def _load_dev_locators() -> dict[str, _DevLocator]:
                 selector=sel.strip(),
                 strategy=entry.get("strategy") if isinstance(entry.get("strategy"), str) else None,
                 intent=entry.get("intent") if isinstance(entry.get("intent"), str) else None,
+                page_url=entry.get("page_url") if isinstance(entry.get("page_url"), str) else None,
             )
-        log.info("worca_t.dev_locators_loaded path=%s count=%d", p, len(out))
+        pool_count = sum(1 for d in out.values() if d.intent)
+        log.info(
+            "worca_t.dev_locators_loaded path=%s count=%d pool_entries=%d",
+            p, len(out), pool_count,
+        )
         return out
     return {}
+
+
+# ---------------------------------------------------------------------------
+# Tier 1b: intent-based pool match (vendored pure-stdlib fuzzy matcher)
+# ---------------------------------------------------------------------------
+#
+# When a dev-locator entry carries an ``intent`` field, the runtime can
+# match it against the ``tbd("...")`` intent string instead of requiring an
+# exact constant-name match. This lets frontend devs ship dev-locators.json
+# with their own arbitrary key names; the match key becomes the human
+# description, not the JSON key.
+#
+# Why token-set-ratio and not rapidfuzz/embeddings: the runtime template is
+# vendored into the SUT and must run on the SUT's pure-stdlib Python. Adding
+# an external dep (rapidfuzz) would force SUT-side installs; embeddings need
+# a model download. Token-set-ratio is good enough for short descriptive
+# strings and is deterministic + reproducible across runs.
+
+# Tokenizer: split on non-alphanumeric, lowercase, drop common English
+# stop-words and length-1 tokens (noise after splitting). Stop-word list is
+# deliberately tiny — only the words that appear in nearly every UI element
+# description without adding signal. Light stemming (trailing s/es/ed/ing)
+# normalizes "submit"/"submits", "click"/"clicks", etc.
+_TOKEN_SPLIT_RE = None  # lazy-compiled
+_STOPWORDS = frozenset({
+    "the", "a", "an", "of", "to", "for", "on", "in", "at", "is", "are",
+    "and", "or", "with", "by", "that", "this", "it", "be",
+})
+
+
+def _stem(tok: str) -> str:
+    # Cheap suffix strip — good enough for verb tense + plural normalization
+    # on short English descriptors. Skips short tokens to avoid mutilating them.
+    if len(tok) <= 3:
+        return tok
+    for suf in ("ing", "ies", "ed", "es", "s"):
+        if tok.endswith(suf) and len(tok) - len(suf) >= 3:
+            return tok[: -len(suf)]
+    return tok
+
+
+def _tokenize(text: str) -> set[str]:
+    global _TOKEN_SPLIT_RE
+    if _TOKEN_SPLIT_RE is None:
+        import re
+        _TOKEN_SPLIT_RE = re.compile(r"[^a-zA-Z0-9]+")
+    raw = _TOKEN_SPLIT_RE.split((text or "").lower())
+    return {
+        _stem(t) for t in raw
+        if len(t) >= 2 and t not in _STOPWORDS
+    }
+
+
+def _token_set_ratio(a: str, b: str) -> float:
+    """Symmetric token-set similarity in [0.0, 1.0].
+
+    Computes ``2 * |A ∩ B| / (|A| + |B|)`` over the tokenized sets — the
+    Sørensen-Dice coefficient. Robust to word reordering and partial
+    overlaps, which are the dominant variation between two human
+    descriptions of the same UI element.
+    """
+    sa, sb = _tokenize(a), _tokenize(b)
+    if not sa or not sb:
+        return 0.0
+    inter = len(sa & sb)
+    if inter == 0:
+        return 0.0
+    return (2.0 * inter) / (len(sa) + len(sb))
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _pool_match(
+    intent: str, page_url: str | None, pool: dict[str, _DevLocator],
+) -> tuple[_DevLocator | None, float, str, list[tuple[str, float]]]:
+    """Return ``(winner, score, reason, top_candidates)``.
+
+    ``reason`` is one of ``accept`` | ``reject_low_score`` | ``reject_tie``
+    | ``reject_empty_pool``. ``top_candidates`` lists the top 3
+    ``(constant_name, score)`` pairs for telemetry/tuning. ``winner`` is
+    non-None only when ``reason == "accept"``.
+
+    Thresholds (env-overridable for tuning without rebuilding):
+      - ``WORCA_T_DEV_POOL_THRESHOLD`` — min accepted score (default 0.65).
+        Tuned for short descriptive intents after stop-word + light stemming
+        normalization. Lower = more matches but more false positives; higher
+        = stricter. The margin requirement is the primary safety net.
+      - ``WORCA_T_DEV_POOL_MARGIN``    — required gap to second-best (default 0.10).
+        This is what protects against ambiguous matches when multiple pool
+        entries describe similar elements.
+      - ``WORCA_T_DEV_POOL_PAGE_PENALTY`` — score subtracted when entry.page_url
+                                            is set and differs from current page
+                                            (default 0.15; soft penalty, not a filter).
+    """
+    threshold = _env_float("WORCA_T_DEV_POOL_THRESHOLD", 0.65)
+    margin = _env_float("WORCA_T_DEV_POOL_MARGIN", 0.10)
+    page_penalty = _env_float("WORCA_T_DEV_POOL_PAGE_PENALTY", 0.15)
+
+    pool_entries = [d for d in pool.values() if d.intent]
+    if not pool_entries:
+        return None, 0.0, "reject_empty_pool", []
+
+    scored: list[tuple[_DevLocator, float]] = []
+    for entry in pool_entries:
+        score = _token_set_ratio(intent, entry.intent or "")
+        if (
+            page_penalty > 0.0 and entry.page_url and page_url
+            and entry.page_url != page_url
+        ):
+            score = max(0.0, score - page_penalty)
+        scored.append((entry, score))
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    top = [(e.constant_name, round(s, 3)) for e, s in scored[:3]]
+    best_entry, best_score = scored[0]
+    second_score = scored[1][1] if len(scored) > 1 else 0.0
+
+    if best_score < threshold:
+        return None, best_score, "reject_low_score", top
+    if (best_score - second_score) < margin:
+        return None, best_score, "reject_tie", top
+    return best_entry, best_score, "accept", top
 
 
 # ---------------------------------------------------------------------------
@@ -775,7 +911,7 @@ class _Resolution:
     """
 
     selector: str | None
-    source: str  # "dev" | "cached" | "heuristic" | "agent" | "none"
+    source: str  # "dev" | "dev-pool" | "cached" | "heuristic" | "agent" | "none"
     constant_name: str
     intent: str
     test_file: str | None
@@ -784,16 +920,22 @@ class _Resolution:
 
 def _resolve_tiers_1_2(
     intent: str, constant_name: str, test_file: str | None,
+    page_url: str | None,
     *, skip_dev: bool, skip_cache: bool,
 ) -> _Resolution | None:
-    """Check dev-locators (tier 1) and cache (tier 2). Returns a Resolution
-    on hit, or None when both miss (caller proceeds to tier 3/4 with a
-    fresh AOM snapshot). Pure sync — no page touch.
+    """Check dev-locators (tier 1a exact + 1b intent pool) and cache (tier 2).
+    Returns a Resolution on hit, or None when all miss (caller proceeds to
+    tier 3/4 with a fresh AOM snapshot). Pure sync — no page touch.
+
+    ``page_url`` is the current page URL (best-effort; may be None on the
+    first navigation). Used as a soft disambiguator in Tier 1b pool match.
     """
     global _dev_locators_cache
     if _dev_locators_cache is None:
         _dev_locators_cache = _load_dev_locators()
 
+    # Tier 1a: exact constant-name match. Preserves HITL-replay behavior and
+    # the fast path for devs who happen to use the codegen-produced names.
     if not skip_dev and constant_name in _dev_locators_cache:
         dev = _dev_locators_cache[constant_name]
         log.info("worca_t.dev_locator_used constant=%s selector=%s",
@@ -801,6 +943,57 @@ def _resolve_tiers_1_2(
         _append_spend_line({"tier": 1, "source": "dev", "constant": constant_name,
                             "input_tokens": 0, "output_tokens": 0, "success": True})
         return _Resolution(dev.selector, "dev", constant_name, intent, test_file)
+
+    # Tier 1b: intent-based pool match. Activates when the file contains
+    # entries with an ``intent`` field (frontend-dev-supplied selector pool).
+    # Deterministic + zero-LLM; honors WORCA_T_NO_LLM_RESOLVE=1 semantics.
+    if not skip_dev and _dev_locators_cache:
+        winner, score, reason, top = _pool_match(
+            intent, page_url, _dev_locators_cache,
+        )
+        if reason == "accept" and winner is not None:
+            log.info(
+                "worca_t.dev_pool_match constant=%s matched=%s score=%.3f selector=%s",
+                constant_name, winner.constant_name, score,
+                _sanitize_for_log(winner.selector),
+            )
+            _append_spend_line({
+                "tier": 1, "source": "dev-pool", "constant": constant_name,
+                "matched_constant": winner.constant_name, "score": round(score, 3),
+                "input_tokens": 0, "output_tokens": 0, "success": True,
+            })
+            # Write to Tier 2 cache so subsequent resolutions of the same
+            # constant skip fuzzy work entirely.
+            try:
+                cache_for_write = _read_cache()
+                key_for_write = _cache_key(test_file, constant_name, intent)
+                cache_for_write[key_for_write] = {
+                    "key": key_for_write,
+                    "test_file": test_file,
+                    "constant_name": constant_name,
+                    "intent": intent,
+                    "selector": winner.selector,
+                    "strategy": winner.strategy,
+                    "source": "dev-pool",
+                    "page_url": page_url,
+                    "matched_constant": winner.constant_name,
+                    "pool_score": round(score, 3),
+                    "resolved_at": datetime.now(timezone.utc).isoformat(),
+                }
+                _write_cache(cache_for_write)
+            except OSError as e:
+                log.warning("worca_t.dev_pool_cache_write_failed %s", e)
+            return _Resolution(
+                winner.selector, "dev-pool", constant_name, intent, test_file,
+            )
+        elif reason in ("reject_low_score", "reject_tie"):
+            # Structured rejection telemetry — feeds threshold tuning. No
+            # spend line (no successful resolution) but log surface mirrors
+            # the dev_pool_match log shape for grep parity.
+            log.info(
+                "worca_t.dev_pool_reject constant=%s reason=%s best=%.3f top=%s",
+                constant_name, reason, score, top,
+            )
 
     cache = _read_cache()
     key = _cache_key(test_file, constant_name, intent)
@@ -953,9 +1146,10 @@ def _resolve_sentinel(
     intent = parse_sentinel(sentinel)
     constant_name = _walk_stack_for_constant_name() or intent[:64]
     test_file = os.environ.get("PYTEST_CURRENT_TEST", "").split("::", 1)[0] or None
+    current_url = _safe_page_url(page)
 
     early = _resolve_tiers_1_2(
-        intent, constant_name, test_file,
+        intent, constant_name, test_file, current_url,
         skip_dev=skip_dev, skip_cache=skip_cache,
     )
     if early is not None:
@@ -964,7 +1158,7 @@ def _resolve_sentinel(
     snapshot_text, snapshot_dict = _snapshot_page(page)
     return _resolve_tiers_3_4(
         intent, constant_name, test_file,
-        snapshot_text, snapshot_dict, _safe_page_url(page),
+        snapshot_text, snapshot_dict, current_url,
         skip_heuristic=skip_heuristic,
     )
 
@@ -992,9 +1186,10 @@ async def _resolve_sentinel_async(
         constant_name = _walk_stack_for_constant_name()
     constant_name = constant_name or intent[:64]
     test_file = os.environ.get("PYTEST_CURRENT_TEST", "").split("::", 1)[0] or None
+    current_url = _safe_page_url(page)
 
     early = _resolve_tiers_1_2(
-        intent, constant_name, test_file,
+        intent, constant_name, test_file, current_url,
         skip_dev=skip_dev, skip_cache=skip_cache,
     )
     if early is not None:
@@ -1003,7 +1198,7 @@ async def _resolve_sentinel_async(
     snapshot_text, snapshot_dict = await _snapshot_page_async(page)
     return _resolve_tiers_3_4(
         intent, constant_name, test_file,
-        snapshot_text, snapshot_dict, _safe_page_url(page),
+        snapshot_text, snapshot_dict, current_url,
         skip_heuristic=skip_heuristic,
     )
 

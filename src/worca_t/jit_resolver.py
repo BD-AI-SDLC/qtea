@@ -161,7 +161,10 @@ def write_cache(cache_path: Path, entries: dict[str, dict[str, Any]], *, run_id:
     tmp.replace(cache_path)
 
 
-def _build_prompt(intent: str, snapshot_text: str, constant_name: str) -> tuple[str, str]:
+def _build_prompt(
+    intent: str, snapshot_text: str, constant_name: str,
+    *, dev_pool: list[dict] | None = None, page_url: str | None = None,
+) -> tuple[str, str]:
     """Return ``(system_prompt, user_prompt)`` for the resolver LLM call.
 
     Keep the system prompt small and surgical — the model needs to:
@@ -169,7 +172,21 @@ def _build_prompt(intent: str, snapshot_text: str, constant_name: str) -> tuple[
       2. Honour the priority chain.
       3. Refuse XPath.
       4. Express confidence honestly (null when uncertain).
+
+    When ``dev_pool`` is supplied (frontend-dev-curated selector pool that
+    failed Tier 1b fuzzy match), it's appended to the user prompt as a
+    high-priority prior — the model should prefer a pool entry whose
+    intent matches and whose selector resolves in the snapshot, before
+    generating a fresh selector.
     """
+    pool_rule = (
+        "  7. If a CANDIDATE selector from the dev team is present and "
+        "matches the intent AND resolves to an element visible in the AOM "
+        "snapshot, you MUST prefer it as the primary. Set `confidence` "
+        "accordingly and put the matched selector verbatim in `selector`. "
+        "Fall back to AOM-derived selectors only when no candidate matches.\n"
+        if dev_pool else ""
+    )
     system = (
         "You resolve a UI locator from a Playwright accessibility snapshot. "
         "Read the snapshot, find the element matching the locator's intent, "
@@ -193,6 +210,7 @@ def _build_prompt(intent: str, snapshot_text: str, constant_name: str) -> tuple[
         "explaining what you looked for and why it isn't there.\n"
         "  6. `strategy` must be one of: id, data-testid, role, label, text, "
         "placeholder, css, or null.\n"
+        + pool_rule +
         "Output shape: "
         "{\"candidates\": ["
         "{\"selector\": <string>, \"strategy\": <string|null>, "
@@ -200,11 +218,25 @@ def _build_prompt(intent: str, snapshot_text: str, constant_name: str) -> tuple[
         "...up to 2 entries], "
         "\"reason\": <string|null>}"
     )
-    user = (
-        f"Locator constant: `{constant_name}`\n"
-        f"Intent: {intent}\n\n"
-        f"AOM snapshot:\n```json\n{snapshot_text}\n```"
-    )
+    user_parts = [
+        f"Locator constant: `{constant_name}`",
+        f"Intent: {intent}",
+    ]
+    if page_url:
+        user_parts.append(f"Current page URL: {page_url}")
+    if dev_pool:
+        lines = ["Candidate selectors from the dev team (prefer when they match the intent and resolve in the snapshot):"]
+        for e in dev_pool:
+            sel = e.get("selector", "")
+            ent_intent = e.get("intent") or ""
+            ent_url = e.get("page_url") or ""
+            line = f"- selector={sel!r}  intent={ent_intent!r}"
+            if ent_url:
+                line += f"  page_url={ent_url!r}"
+            lines.append(line)
+        user_parts.append("\n".join(lines))
+    user_parts.append(f"AOM snapshot:\n```json\n{snapshot_text}\n```")
+    user = "\n\n".join(user_parts)
     return system, user
 
 
@@ -355,6 +387,7 @@ def resolve_one(
     cache_dir: Path | None = None,
     model: str | None = None,
     run_id: str | None = None,
+    dev_pool: list[dict] | None = None,
 ) -> ResolutionResult:
     """Resolve one TBD locator. Checks cache, then LLM, with bounded retry.
 
@@ -391,7 +424,10 @@ def resolve_one(
         )
 
     chosen_model = model or os.environ.get("WORCA_T_RESOLVER_MODEL") or _DEFAULT_MODEL
-    system, user = _build_prompt(intent, snapshot_text, constant_name)
+    system, user = _build_prompt(
+        intent, snapshot_text, constant_name,
+        dev_pool=dev_pool, page_url=page_url,
+    )
 
     last_error: str | None = None
     usage: dict[str, int | None] = {"input_tokens": None, "output_tokens": None}

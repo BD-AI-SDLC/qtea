@@ -282,11 +282,23 @@ def _render_bug_cards(bugs: list[dict]) -> str:
         expected = _escape(b.get("expected", ""))
         actual = _escape(b.get("actual", ""))
 
+        layer = b.get("layer", "")
+        layer_colors = {
+            "frontend": "#3b82f6",
+            "backend": "#8b5cf6",
+            "infrastructure": "#f59e0b",
+            "automation": "#6b7280",
+        }
+        layer_badge = ""
+        if layer:
+            lc = layer_colors.get(layer, "#6b7280")
+            layer_badge = f' <span class="badge" style="background:{lc}">{_escape(layer)}</span>'
+
         sev_color = _SEVERITY_COLORS.get(severity, "#6b7280")
         card = (
             f'<div class="bug-card" style="border-left-color:{sev_color}">'
             f"<h3>{bid} &mdash; {title}</h3>"
-            f"<p>{_severity_badge(severity)} <strong>{priority}</strong> &middot; {category}"
+            f"<p>{_severity_badge(severity)}{layer_badge} <strong>{priority}</strong> &middot; {category}"
             f" &middot; Test: <code>{test_id}</code></p>"
         )
         if rationale:

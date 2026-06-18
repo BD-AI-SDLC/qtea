@@ -25,6 +25,7 @@ class StepRecord:
     duration_s: float | None = None
     output_hashes: dict[str, str] = field(default_factory=dict)
     notes: str | None = None
+    sub_status: str | None = None
     timed_out: bool = False
     tokens_input: int = 0
     tokens_output: int = 0

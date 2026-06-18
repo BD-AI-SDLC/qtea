@@ -120,6 +120,7 @@ class StepResult:
     outputs: list[Path]
     notes: str | None = None
     error: str | None = None
+    sub_status: str | None = None  # "all_passed" | "bugs_found" | None
 
 
 def _snapshot_debug_artifacts(step_num: int, ctx: StepContext, attempt: int) -> None:
@@ -906,6 +907,7 @@ class Step(ABC):
 
             duration = time.monotonic() - started
             record.status = result.status
+            record.sub_status = result.sub_status
             record.finished_at = datetime.now(UTC).isoformat()
             record.duration_s = round(duration, 3)
             record.notes = result.notes
@@ -916,11 +918,11 @@ class Step(ABC):
                 step=self.number,
                 name=self.name,
                 status=result.status,
+                sub_status=result.sub_status,
                 duration_s=record.duration_s,
                 outputs=[str(p) for p in result.outputs],
                 tokens_input=record.tokens_input,
                 tokens_output=record.tokens_output,
-                cost_usd=record.cost_usd,
                 agent_calls=record.agent_calls,
                 # Surface error + notes so structured-log consumers can see
                 # *why* a step failed without grepping the console transcript.
@@ -928,6 +930,7 @@ class Step(ABC):
                 # error info in run.log.jsonl because of this omission.
                 error=result.error,
                 notes=result.notes,
+                **{f"step{self.number:02d}_total_cost_usd": record.cost_usd},
             )
             return result
         finally:

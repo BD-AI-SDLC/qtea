@@ -29,6 +29,12 @@ DEFAULT_STEP_TIMEOUTS: dict[int, int] = {
     11: 600,  # report
 }
 
+# Max turns for Step 9's polyglot-test-fixer heal agent. Each turn is one
+# read/edit/run cycle. With MCP pre-warmed and tool names fully-qualified in
+# the prompt, a single-test heal completes in ~5-8 turns; 40 is generous
+# headroom for multi-failure heals. Overridable via WORCA_T_HEAL_MAX_TURNS.
+HEAL_AGENT_MAX_TURNS: int = int(os.environ.get("WORCA_T_HEAL_MAX_TURNS", "40"))
+
 # Per-heal-attempt timeout used by Step 9's polyglot-test-fixer invocation.
 # A single heal pass typically does: read test source → read POM source →
 # read snapshot (MCP or live page) → diagnose → write patch. That's 3–6 min

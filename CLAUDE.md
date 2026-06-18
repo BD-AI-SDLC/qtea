@@ -58,8 +58,8 @@ Phases: A = Requirements (1–4) · B = Research & Codegen (5–8) · C = Execut
 - **Snapshot discipline.** AOM only. Playwright Python: `page.locator("body").aria_snapshot(mode="ai")` (v1.59+) with graceful fallback to no-mode (v1.40-1.58) and legacy `page.accessibility.snapshot()` (pre-v1.40). Raw page-source (`page.content()`, `driver.page_source`, etc.) forbidden in generated tests. Raw-DOM fallback is scoped only when target is AOM-invisible — record `snapshot_source="raw_dom_fallback"` + `fallback_reason`.
 - **No hard waits** in generated tests (`time.sleep`, `cy.wait(<n>)`, etc.).
 - **No secrets in code.** Env vars only. Masked in logs: `ANTHROPIC_API_KEY`, `JIRA_API_TOKEN`, `JIRA_XRAY_*`.
-- **Self-heal scope** (Step 9): POM/locator source + codegen-generated test files' *interaction patterns* (e.g. method calls, navigation, dropdown-open before option select). Assertions are immutable — enforced by the Step 9 assertion-immutability gate. Never edit business logic, fixtures, or `conftest.py`. Full allowed/forbidden matrix: `agents/polyglot-test-fixer.agent.md`.
-- **Step 9 status semantics:** `completed` (no fails) / `warned` (mix of pass + fail; Step 10 classifies) / `failed` (runner produced no parseable output OR all tests errored with zero passes — environment failure modes that must halt the pipeline rather than mask as "warned").
+- **Self-heal scope** (Step 9): POM/locator source + codegen-generated test files' *interaction patterns* (e.g. method calls, navigation, dropdown-open before option select). Assertions are immutable — enforced by the Step 9 assertion-immutability gate. Never edit business logic, fixtures, or `conftest.py`. Full allowed/forbidden matrix: `agents/polyglot-test-fixer.agent.md`. Heal detection covers changes to ANY SUT file (test, POM, or locator) — detected via git working-tree diff, not just test-file bytes. When at least one heal patch is applied, Step 9 re-runs the healed tests to verify the fix before reporting the outcome.
+- **Step 9 status semantics:** `completed/all_passed` (all tests pass) / `completed/bugs_found` (some tests fail — bugs are expected QA output; Step 10 classifies) / `warned` (not emitted by Step 9 itself; set by `base.py` retry logic when Step 9 fails attempt 1 and succeeds attempt 2 — sub_status from the passing attempt is preserved) / `failed` (environment failure: runner produced no parseable output OR all tests errored with zero passes).
 - **Retry:** `MAX_ATTEMPTS=2`.
 - **Max step timeout:** 1800 s. Single source: `src/worca_t/config.py:MAX_STEP_TIMEOUT_S`.
 - **Markdown size:** 200 lines soft, 500 lines hard. Enforced by `tools/check_md_size.py`.
@@ -71,13 +71,15 @@ Phases: A = Requirements (1–4) · B = Research & Codegen (5–8) · C = Execut
 
 Step 8 emits unresolved locators as `tbd("intent")` / `Tbd.of("intent")` sentinels. Step 9 vendors a pytest plugin into the SUT that resolves sentinels via this tier ladder:
 
-1. Dev-supplied locator file (`.worca-t/dev-locators.json` or `--dev-locators`)
+1. Dev-supplied locator file (`--dev-locators` flag, `WORCA_T_DEV_LOCATORS` env, or `<workspace>/locator-cache/dev-locators.json` default). Two match modes: **1a exact constant-name** (HITL-replay) → **1b intent pool** (token-set-ratio match against entries with an `intent` field; thresholds via `WORCA_T_DEV_POOL_THRESHOLD`/`MARGIN`/`PAGE_PENALTY`). Tier 1b accepts write to the cache so subsequent runs skip fuzzy work.
 2. Runtime cache (`<workspace>/locator-cache/locator-cache.json`)
 3. In-process AOM heuristic (`role + name` ≥0.9 confidence, no near-tie)
-4. LLM via parent-side `ResolverServer` (loopback TCP + per-run shared secret; `ANTHROPIC_API_KEY` never enters the SUT subprocess)
+4. LLM via parent-side `ResolverServer` (loopback TCP + per-run shared secret; `ANTHROPIC_API_KEY` never enters the SUT subprocess). When the dev-locator pool exists, its entries are passed in as a prior so the LLM prefers dev-supplied selectors over freshly-derived ones.
 5. HITL on TTY / fail-fast with `locator-unresolvable` bug-candidate on non-TTY
 
 Action-time `TimeoutError` → cache invalidate → re-resolve once → replay → fall through to `polyglot-test-fixer` heal agent. `WORCA_T_NO_LLM_RESOLVE=1` disables tiers 4-5 + the heal agent symmetrically (CI default for zero-LLM-spend). Async Playwright is fully patched alongside sync. Full env-var list + implementation: the runtime template docstring.
+
+**TBD promotion.** After a successful test run, Step 9 scans the SUT for remaining `tbd("intent")` sentinels and cross-references them with `locator-cache.json`. Any sentinel whose intent has a cached selector is replaced in-place with the hardcoded string and committed to the worca-t branch — making the code self-sufficient without the JIT plugin on subsequent runs.
 
 ---
 

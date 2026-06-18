@@ -38,6 +38,9 @@ log = get_logger(__name__)
 _SEVERITY_DEFAULT = "major"
 _PRIORITY_DEFAULT = "P2"
 _CATEGORY_DEFAULT = "functional"
+_LAYER_DEFAULT = "frontend"
+
+_INFRA_PATTERNS = ("net::ERR_", "ECONNREFUSED", "ERR_NAME_NOT_RESOLVED", "Target closed")
 
 
 def _load_json(path: Path) -> dict | None:
@@ -86,6 +89,9 @@ def _empty_report(run_id: str) -> dict:
                 "accessibility": 0, "integration": 0, "flaky": 0,
                 "environment": 0, "test-code-defect": 0,
             },
+            "by_layer": {
+                "frontend": 0, "backend": 0, "infrastructure": 0, "automation": 0,
+            },
         },
         "bugs": [],
     }
@@ -109,6 +115,15 @@ def _synthesize(
             category = "flaky" if heal.get("applied") else _CATEGORY_DEFAULT
         else:
             category = _CATEGORY_DEFAULT
+        msg = c.get("message") or ""
+        if category == "test-code-defect":
+            layer = "automation"
+        elif category == "environment" or category == "flaky":
+            layer = "infrastructure"
+        elif any(pat in msg for pat in _INFRA_PATTERNS):
+            layer = "infrastructure"
+        else:
+            layer = _LAYER_DEFAULT
         bug = {
             "id": f"BUG-{slugify(run_id)}-{idx:03d}",
             "test_id": test_id,
@@ -116,6 +131,7 @@ def _synthesize(
             "severity": _SEVERITY_DEFAULT,
             "priority": _PRIORITY_DEFAULT,
             "category": category,
+            "layer": layer,
             "component": "",
             "requirement_id": "",
             "rationale": "auto-classified (agent output unusable)",
@@ -143,6 +159,7 @@ def _synthesize(
         report["summary"]["by_severity"][_SEVERITY_DEFAULT] += 1
         report["summary"]["by_priority"][_PRIORITY_DEFAULT] += 1
         report["summary"]["by_category"][category] += 1
+        report["summary"]["by_layer"][layer] = report["summary"]["by_layer"].get(layer, 0) + 1
     report["summary"]["total_failures"] = len(report["bugs"])
     return report
 
@@ -156,7 +173,7 @@ def _render_markdown(report: dict) -> str:
     summary = report.get("summary", {})
     lines.append("## Summary")
     lines.append(f"- Total failures: {summary.get('total_failures', 0)}")
-    for axis in ("by_severity", "by_priority", "by_category"):
+    for axis in ("by_severity", "by_priority", "by_category", "by_layer"):
         counts = summary.get(axis, {})
         if not any(counts.values()):
             continue
@@ -175,8 +192,8 @@ def _render_markdown(report: dict) -> str:
         lines.append(f"### {b.get('id')} - {b.get('title')}")
         lines.append("")
         lines.append(f"- Test: `{b.get('test_id')}`")
-        lines.append(f"- Severity / Priority / Category: "
-                     f"**{b.get('severity')}** / **{b.get('priority')}** / **{b.get('category')}**")
+        lines.append(f"- Severity / Priority / Category / Layer: "
+                     f"**{b.get('severity')}** / **{b.get('priority')}** / **{b.get('category')}** / **{b.get('layer', 'unknown')}**")
         if b.get("requirement_id"):
             lines.append(f"- Requirement: {b['requirement_id']}")
         if b.get("rationale"):

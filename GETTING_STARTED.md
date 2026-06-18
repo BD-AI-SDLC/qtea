@@ -290,7 +290,7 @@ All `run` flags:
 | `--strict-xray` | false | Fail the pipeline if Xray upload doesn't succeed |
 | `--report MODE` | auto | `auto \| builtin \| allure \| both` |
 | `--report-inline-images` | false | Embed screenshots as base64 in the HTML report |
-| `--open-report` | false | Open the report in your browser when the run finishes |
+| `--open-report` | false | Open the built-in report in your browser when the run finishes (not needed with `--report allure` / `both` — those auto-open the Allure UI) |
 | `--log-level LEVEL` | info | `info \| debug \| trace` |
 | `--env-file PATH` | — | Path to a `.env` file to load (values never appear in logs) |
 | `--no-hitl` | false | Disable interactive prompts (CI mode) |
@@ -477,11 +477,12 @@ Python+Playwright SUTs only; Selenium / Cypress / Robot get a clear
 ```bash
 --report auto       # (default) built-in HTML + Allure when CLI present
 --report builtin    # built-in HTML only (zero dependencies)
---report allure     # Allure only (requires allure CLI)
---report both       # always generate both
+--report allure     # Allure only (requires allure CLI; auto-opens Allure UI)
+--report both       # always generate both (auto-opens Allure UI)
 
 --report-inline-images  # embed screenshots as base64 in HTML
---open-report           # open the report in your browser when done
+--open-report           # open the built-in report in your browser when done
+                        # (not needed with --report allure / both — those auto-open)
 ```
 
 ## Developing worca-t locally

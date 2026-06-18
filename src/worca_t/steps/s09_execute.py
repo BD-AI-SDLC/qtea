@@ -32,7 +32,12 @@ from pathlib import Path
 
 from worca_t._sut_git import commit_step
 from worca_t.claude_runner import run_agent
-from worca_t.config import HEAL_AGENT_TIMEOUT_S, package_resource_root, step_timeout
+from worca_t.config import (
+    HEAL_AGENT_MAX_TURNS,
+    HEAL_AGENT_TIMEOUT_S,
+    package_resource_root,
+    step_timeout,
+)
 from worca_t.logging_setup import get_logger
 from worca_t.proxy import safe_subprocess_env
 from worca_t.resolver_server import ResolverServer
@@ -640,15 +645,15 @@ def _build_fixer_prompt(
         if storage_state_path is not None:
             step_one = (
                 f"(1) The browser is already authenticated via the pre-loaded "
-                f"storage state described above. Use `browser_navigate` to go "
-                f"directly to the failing page URL — do NOT call the SUT's "
+                f"storage state described above. Call `mcp__playwright__browser_navigate` "
+                f"to go directly to the failing page URL — do NOT call the SUT's "
                 f"sign-in helper. (If the page redirects to login, the state "
                 f"is stale: log a note and fall back to the auth-replay path "
                 f"via the helpers below.) "
             )
         else:
             step_one = (
-                f"(1) Use the Playwright MCP `browser_navigate` to open "
+                f"(1) Call `mcp__playwright__browser_navigate` to open "
                 f"`{sut_base_url}` and follow the SUT's auth flow via the "
                 f"existing sign-in helper above. "
             )
@@ -661,16 +666,12 @@ def _build_fixer_prompt(
                f"these files directly): `{sut_root}`\n" if sut_root else "\n")
             + (f"\nKey SUT files for this active module — call these instead "
                f"of reimplementing auth or navigation:\n{files_str}\n\n"
-               f"Workflow: (0) **MCP boot gate.** If your tool list contains "
-               f"`WaitForMcpServers`, call it once with no arguments and wait "
-               f"for it to return before any other tool use. The SDK only "
-               f"includes that tool when the Playwright MCP server hasn't "
-               f"finished connecting yet — if it's absent, MCPs are already "
-               f"connected and you can skip directly to (1). This single call "
-               f"eliminates the race where `browser_navigate` fires before "
-               f"Playwright MCP finishes booting. "
-               f"{step_one}"
-               f"(2) Take a `browser_snapshot` of the page "
+               f"Playwright MCP is pre-warmed and ready — its tools are exposed "
+               f"as `mcp__playwright__<name>` (e.g. `mcp__playwright__browser_navigate`, "
+               f"`mcp__playwright__browser_snapshot`). Use the exact prefixed name; "
+               f"bare `browser_navigate` will not resolve.\n\n"
+               f"Workflow: {step_one}"
+               f"(2) Take a `mcp__playwright__browser_snapshot` of the page "
                f"the failing test targets and compare it to what the traceback "
                f"says the test expected. (3) Patch the test based on what you "
                f"observe live, NOT just from the traceback text. Match the "
@@ -1023,7 +1024,63 @@ def _append_resolved_to_dev_locators(
         log.warning("step09.hitl_dev_locators_write_failed", error=str(e))
 
 
-def _bug_candidates_for_unresolvable_tbds(remaining: list[dict]) -> list[dict]:
+def _promote_resolved_tbds(sut_root: Path, cache_path: Path) -> list[str]:
+    """Replace tbd("intent") sentinels with their resolved selectors in-place.
+
+    Reads locator-cache.json, scans the SUT source tree for remaining tbd()
+    patterns, and replaces any whose intent has a cached selector.  Returns
+    SUT-relative paths of files that were modified.
+    """
+    import re as _re
+
+    from worca_t.tbd_scanner import scan_tbd_intents
+
+    if not cache_path.exists():
+        return []
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+
+    intent_to_selector: dict[str, str] = {
+        e["intent"]: e["selector"]
+        for e in (data.get("entries") or [])
+        if e.get("selector") and e.get("intent") and e.get("source", "none") != "none"
+    }
+    if not intent_to_selector:
+        return []
+
+    scan_roots = [p for p in (sut_root / d for d in ("src", "tests", "pages")) if p.is_dir()]
+    if not scan_roots:
+        scan_roots = [sut_root]
+    hits = scan_tbd_intents(scan_roots, sut_root=sut_root)
+
+    by_file: dict[Path, list] = {}
+    for hit in hits:
+        if hit.intent in intent_to_selector:
+            by_file.setdefault(hit.file, []).append(hit)
+
+    modified: list[str] = []
+    for file_path, file_hits in by_file.items():
+        text = file_path.read_text(encoding="utf-8")
+        new_text = text
+        for hit in file_hits:
+            sel = intent_to_selector[hit.intent]
+            escaped = _re.escape(hit.intent)
+            new_text = _re.sub(
+                rf'tbd\((?P<q>["\']){escaped}(?P=q)\)',
+                f'"{sel}"',
+                new_text,
+            )
+        if new_text != text:
+            file_path.write_text(new_text, encoding="utf-8")
+            modified.append(str(file_path.relative_to(sut_root)))
+    return modified
+
+
+def _bug_candidates_for_unresolvable_tbds(
+    remaining: list[dict], dev_locators_path: Path | None = None,
+) -> list[dict]:
     """Emit a ``locator-unresolvable`` bug-candidate per HITL-unanswered
     TBD. Step 9's classifier sees these alongside test failures.
     """
@@ -1032,6 +1089,11 @@ def _bug_candidates_for_unresolvable_tbds(remaining: list[dict]) -> list[dict]:
     for entry in remaining:
         const = entry.get("constant_name") or "unknown"
         intent = entry.get("intent") or ""
+        locators_hint = (
+            f"Provide a selector via {str(dev_locators_path)!r}"
+            if dev_locators_path
+            else "Provide a selector via --dev-locators or WORCA_T_DEV_LOCATORS"
+        )
         out.append({
             "id": f"BC-locator-unresolvable-{const}",
             "test_id": f"locator-unresolvable:{const}",
@@ -1042,7 +1104,7 @@ def _bug_candidates_for_unresolvable_tbds(remaining: list[dict]) -> list[dict]:
             "message": (
                 f"The JIT runtime could not find any element matching "
                 f"intent {intent!r} on {entry.get('page_url') or '(unknown URL)'}. "
-                f"Provide a selector via .worca-t/dev-locators.json under "
+                f"{locators_hint} under "
                 f"key {const!r}, or update the test to remove the TBD."
             ),
             "traceback": None,
@@ -1059,8 +1121,14 @@ def _bug_candidates_for_unresolvable_tbds(remaining: list[dict]) -> list[dict]:
 def _lazy_probe_heal_mcp(
     server_name: str,
     env: dict[str, str] | None = None,
-) -> tuple[bool, str]:
-    """Probe one MCP server just before the first heal-agent invocation.
+) -> tuple[bool, str, float]:
+    """Warm + probe one MCP server just before the first heal-agent invocation.
+
+    ``probe_server`` spawns the server and lets it run for ~30 s, then kills
+    it. The side effect is a warm npx cache and a completed Playwright
+    binary check, so when the Agent SDK later spawns its own copy of the
+    server it reaches `connected` faster — eliminating the race where the
+    heal agent burns turns calling ``WaitForMcpServers`` before MCP is up.
 
     ``env`` is an optional per-call MCP env overlay (e.g.
     ``{"WORCA_T_STORAGE_STATE_ARG": "--storage-state=/abs/path"}``).
@@ -1068,27 +1136,31 @@ def _lazy_probe_heal_mcp(
     args reflect per-run substitutions (e.g. the storage-state file path
     Step 9 just resolved) without mutating ``os.environ``.
 
-    Returns ``(ok, detail)``. On failure the caller logs + skips the heal
-    loop (heal is best-effort — a missing Playwright MCP shouldn't fail
-    the whole Step 9 run; the failing tests still flow to Step 10 as bug
-    candidates).
+    Returns ``(ok, detail, elapsed_s)``. On failure the caller logs + skips
+    the heal loop (heal is best-effort — a missing Playwright MCP shouldn't
+    fail the whole Step 9 run; the failing tests still flow to Step 10 as
+    bug candidates).
 
     Centralised in a module-level helper so unit tests can monkey-patch
     ``s09_execute._lazy_probe_heal_mcp`` without touching the MCP plumbing.
     """
+    import time as _time
+
     from worca_t.mcp_manager import load_mcp_config, probe_server
 
+    started = _time.monotonic()
     try:
         all_servers = load_mcp_config(env=env)
     except (FileNotFoundError, OSError, ValueError) as e:
-        return False, f"could not load .mcp.json: {e}"
+        return False, f"could not load .mcp.json: {e}", 0.0
 
     server = all_servers.get(server_name)
     if server is None:
-        return False, f"{server_name!r} not declared in .mcp.json"
+        return False, f"{server_name!r} not declared in .mcp.json", 0.0
 
     ok, detail = probe_server(server)
-    return ok, detail or ""
+    elapsed = round(_time.monotonic() - started, 2)
+    return ok, detail or "", elapsed
 
 
 class ExecuteStep(Step):
@@ -1240,12 +1312,16 @@ class ExecuteStep(Step):
         timeout_ms = os.environ.get("WORCA_T_DEFAULT_TIMEOUT_MS")
         if timeout_ms:
             runtime_env["WORCA_T_DEFAULT_TIMEOUT_MS"] = timeout_ms
-        # Dev-locators file: --dev-locators CLI flag wins; env var as fallback.
+        # Dev-locators file: --dev-locators CLI flag wins; env var next; default
+        # to workspace/locator-cache/dev-locators.json so HITL answers are never
+        # written into the SUT (they're run-workspace artifacts, not SUT source).
         dev_locators_opt = getattr(ctx.options, "dev_locators", None)
         if dev_locators_opt:
             runtime_env["WORCA_T_DEV_LOCATORS"] = str(dev_locators_opt)
         elif os.environ.get("WORCA_T_DEV_LOCATORS"):
             runtime_env["WORCA_T_DEV_LOCATORS"] = os.environ["WORCA_T_DEV_LOCATORS"]
+        else:
+            runtime_env["WORCA_T_DEV_LOCATORS"] = str(jit_cache_dir / "dev-locators.json")
 
         # Workspace dir for the runtime plugin's same-run storage-state auto-
         # capture (Use case B in storage_state.py). The plugin reads this on
@@ -1265,6 +1341,9 @@ class ExecuteStep(Step):
         )
         _heal_mcp_env = {
             "WORCA_T_STORAGE_STATE_ARG": _storage_state_mod.to_mcp_arg(_storage_state_path),
+            "WORCA_T_MCP_USER_DATA_DIR_ARG": (
+                f"--user-data-dir={ctx.workspace.root / 'playwright-mcp'}"
+            ),
         }
         if _storage_state_path is not None:
             runtime_env["WORCA_T_STORAGE_STATE"] = str(_storage_state_path)
@@ -1448,6 +1527,7 @@ class ExecuteStep(Step):
                 cache_dir=jit_cache_dir,
                 run_id=ctx.workspace.run_id,
                 model=runtime_env.get("WORCA_T_RESOLVER_MODEL"),
+                dev_locators_path=Path(runtime_env["WORCA_T_DEV_LOCATORS"]),
             )
             _resolver_server.start()
             runtime_env["WORCA_T_RESOLVER_PORT"] = str(_resolver_server.port)
@@ -1467,6 +1547,7 @@ class ExecuteStep(Step):
                 parallelism=getattr(ctx.options, "parallelism", 0),
                 headless=getattr(ctx.options, "headless", True),
             )
+            _applied_marker_filter = _WORCA_PYTEST_MARKER_FILTER
             first = run_tests(
                 framework,
                 cwd=ctx.workspace.sut,
@@ -1475,9 +1556,34 @@ class ExecuteStep(Step):
                 env_extra=runtime_env,
                 profile=stack_profile,
                 headless=getattr(ctx.options, "headless", True),
-                marker_filter=_WORCA_PYTEST_MARKER_FILTER,
+                marker_filter=_applied_marker_filter,
                 parallelism=getattr(ctx.options, "parallelism", 0),
             )
+
+            # Exit code 5 from pytest means "no tests were collected" — the
+            # worca marker filter matched nothing. This is a codegen quality
+            # failure: Step 8 must add @pytest.mark.worca_<phase> to every test
+            # function it writes or modifies (codegen-rules.md §8). Fail fast
+            # with an actionable message rather than silently bypassing the
+            # filter, which would run the wrong test scope.
+            if first.exit_code == 5 and _applied_marker_filter:
+                return StepResult(
+                    success=False,
+                    status="failed",
+                    outputs=[],
+                    error=(
+                        f"pytest collected 0 tests matching the worca marker filter "
+                        f"({_applied_marker_filter!r}). "
+                        f"This is a codegen defect: Step 8 must add "
+                        f"@pytest.mark.worca_<phase> to every test function it "
+                        f"writes or modifies, even when adding to an existing SUT "
+                        f"file. Check the test files in the SUT and ensure each "
+                        f"worca-authored function carries the marker. "
+                        f"Override with WORCA_T_PYTEST_MARKER='' to run without "
+                        f"marker scoping (runs the full SUT suite, not recommended)."
+                    ),
+                )
+
             log.info(
                 "step09.test_run_done",
                 command=first.command,
@@ -1704,7 +1810,7 @@ class ExecuteStep(Step):
                 # On probe failure: log + skip the heal loop entirely. Heal
                 # is best-effort — the failing tests still flow to Step 10
                 # as bug candidates without an MCP-driven patch.
-                mcp_ok, mcp_detail = _lazy_probe_heal_mcp(
+                mcp_ok, mcp_detail, mcp_warmup_s = _lazy_probe_heal_mcp(
                     self._LAZY_MCP_SERVER,
                     env=_heal_mcp_env,
                 )
@@ -1713,6 +1819,7 @@ class ExecuteStep(Step):
                         "step09.heal_mcp_probe_failed",
                         server=self._LAZY_MCP_SERVER,
                         detail=mcp_detail,
+                        warmup_s=mcp_warmup_s,
                         failing_count=len(failing),
                     )
                     # Record per-test skip in heal-log so the audit trail
@@ -1738,6 +1845,7 @@ class ExecuteStep(Step):
                     log.info(
                         "step09.heal_mcp_probe_ok",
                         server=self._LAZY_MCP_SERVER,
+                        warmup_s=mcp_warmup_s,
                     )
             if failing and len(failing) <= _MAX_HEAL_TESTS:
                 fixer_agent = package_resource_root() / "agents" / "polyglot-test-fixer.agent.md"
@@ -1813,7 +1921,7 @@ class ExecuteStep(Step):
                         add_dirs=[ctx.workspace.sut],
                         timeout_s=HEAL_AGENT_TIMEOUT_S,
                         step=9,
-                        max_turns=30,
+                        max_turns=HEAL_AGENT_MAX_TURNS,
                         enable_mcp=True,
                         mcp_env=_heal_mcp_env,
                     )
@@ -1860,13 +1968,14 @@ class ExecuteStep(Step):
                                 agent_error=agent_res.error,
                             )
 
-                    # The fixer now edits the failing test file IN PLACE inside
-                    # the SUT (via add_dirs). Detect a real change by comparing
-                    # the post-run bytes against the snapshot. Fall back to the
-                    # legacy "did the agent drop a candidate file in heal_wd?"
-                    # path for the rare case where the agent wrote to its cwd
-                    # instead of editing in place — _apply_fixer_outputs copies
-                    # that file into the SUT.
+                    # Detect whether the heal agent actually changed something.
+                    # Three detection tiers:
+                    #   1. The failing TEST file's bytes changed (inline edit).
+                    #   2. ANY file in the SUT working tree changed (the agent
+                    #      edited a POM/locator file instead of the test file —
+                    #      this is the most common heal pattern).
+                    #   3. Legacy fallback: the agent dropped a candidate file
+                    #      in its workdir (pre-add_dirs path).
                     applied = False
                     if agent_res.success and not scope_violation:
                         post_bytes: bytes | None = None
@@ -1876,6 +1985,18 @@ class ExecuteStep(Step):
                             except OSError:
                                 post_bytes = None
                         applied = post_bytes is not None and post_bytes != pre_bytes
+                        if not applied:
+                            post_heal_dirty = {
+                                p for _, p in _git_status_porcelain(ctx.workspace.sut)
+                            }
+                            heal_changed = post_heal_dirty - pre_heal_dirty
+                            if heal_changed:
+                                applied = True
+                                log.info(
+                                    "step09.heal_detected_via_git",
+                                    test_id=entry.id,
+                                    changed_files=sorted(heal_changed),
+                                )
                         if not applied:
                             applied = _apply_fixer_outputs(
                                 heal_wd,
@@ -2087,6 +2208,17 @@ class ExecuteStep(Step):
             if not ok_schema:
                 log.warning("step09.schema_invalid", error=schema_err)
 
+            # TBD promotion: any tbd("intent") sentinels whose intent now has a
+            # cached selector get replaced in-place in the SUT source files and
+            # committed, so the code is self-sufficient without the JIT plugin.
+            _promoted = _promote_resolved_tbds(
+                ctx.workspace.sut,
+                jit_cache_dir / "locator-cache.json",
+            )
+            if _promoted:
+                log.info("step09.tbd_promoted", count=len(_promoted), files=_promoted)
+                commit_step(ctx.workspace.sut, 9, self.name, "tbd-promotion")
+
             # HITL escalation pass. The JIT runtime drops `hitl-pending-*.json`
             # files in the cache dir whenever it could not resolve a TBD.
             # On a TTY (and unless --no-hitl) we prompt for a selector and
@@ -2094,9 +2226,7 @@ class ExecuteStep(Step):
             # that key; otherwise the unresolved TBDs flow into the bug
             # candidates as `locator-unresolvable` entries for Step 9.
             hitl_pendings = _collect_hitl_pending(jit_cache_dir)
-            hitl_dev_locators_path = (
-                ctx.workspace.sut / ".worca-t" / "dev-locators.json"
-            )
+            hitl_dev_locators_path = Path(runtime_env["WORCA_T_DEV_LOCATORS"])
             _, hitl_remaining = _hitl_resolve_unresolvable(
                 hitl_pendings,
                 dev_locators_path=hitl_dev_locators_path,
@@ -2107,7 +2237,9 @@ class ExecuteStep(Step):
             final_failing = _failing_tests(first)
             bug_payload = _build_bug_candidates(final_failing)
             bug_payload["candidates"].extend(
-                _bug_candidates_for_unresolvable_tbds(hitl_remaining)
+                _bug_candidates_for_unresolvable_tbds(
+                    hitl_remaining, dev_locators_path=hitl_dev_locators_path,
+                )
             )
             bug_path = out_dir / "bug-candidates.json"
             bug_path.write_text(
@@ -2231,10 +2363,11 @@ class ExecuteStep(Step):
                     notes=notes,
                 )
 
-            status = "completed" if not final_failing else "warned"
+            sub_status = "all_passed" if not final_failing else "bugs_found"
             return StepResult(
                 success=True,
-                status=status,
+                status="completed",
+                sub_status=sub_status,
                 outputs=[run_results_path, bug_path],
                 notes=notes,
             )

@@ -123,10 +123,40 @@ The active module's inventory record is provided to you as context — inlined i
   - **Page objects, locators, and helpers** go under the active module's `src_directory_layout.{pages_object_dir, pages_locators_dir, helpers_dir}`.
   - **Test data and fixtures** stay under `./tests/` since they are test-only assets.
 - Prefix every generated filename with `worca_` to avoid collisions. **Test file naming:** `worca_<feature>_test.py` (start with `worca_`, then the feature, end with `_test.py`). Page objects and locators: `worca_<feature>_page.py` / `worca_<feature>_locators.py`. **Never** `worca_test_*.py`.
+- **NEVER modify existing SUT test files.** worca-t always writes TDD tests from scratch into new `worca_*_test.py` files. Existing test files (e.g. `test_chat_page.py`, `test_login.py`) belong to the SUT team and must not be touched. The "reuse" principle applies to page objects, locators, helpers, and fixtures — not to test files. If you find yourself about to add a `def test_*` function to an existing file, stop: create a new `worca_<feature>_test.py` instead.
 
-## 8. Worca-t Attribution Markers (pytest stacks only)
+## 8. DOM Attribute Diagnostics for POM Methods (Python + pytest + Playwright)
 
-Every generated test function MUST carry a `@pytest.mark.worca_<phase>` decorator where `<phase>` is the test's planning phase (`smoke`, `regression`, `e2e`, or `exploratory` — read from the test strategy entry for that TC; default to `smoke` when absent). The markers are auto-registered by the vendored `tests/worca_t_runtime.py` plugin. Skip this rule on non-pytest stacks.
+Any POM method whose sole purpose is to **read a DOM attribute** (i.e. it calls `.get_attribute("attr_name")` and returns the result) MUST capture the element's opening HTML tag as an Allure attachment immediately before the `return`. This makes the raw attribute value visible in the Allure report without the noise of the full page source.
+
+**Pattern — always split into a named locator variable first:**
+
+```python
+import allure  # top of file, alongside other imports
+
+def get_gemini_button_rel_attribute(self) -> str:
+    loc = self.get_locator(self.locators.GEMINI_ENTERPRISE_LINK)
+    try:
+        allure.attach(
+            loc.evaluate("el => el.outerHTML.split('>')[0] + '>'"),
+            name="element-html",
+            attachment_type=allure.attachment_type.TEXT,
+        )
+    except Exception:
+        pass
+    return loc.get_attribute("rel")
+```
+
+Rules:
+- Extract the locator into a local variable `loc` before both the attachment and the `return` — never inline `self.get_locator(...)` twice.
+- Wrap in `try/except Exception: pass` so a missing `allure` package or an element-not-found error never breaks the test.
+- The JavaScript expression `el.outerHTML.split('>')[0] + '>'` returns only the **opening tag** (e.g. `<a rel="noopener noreferrer" href="...">`) — one line, all attributes, no inner content.
+- Skip this rule for methods that: return `inner_text()`, `text_content()`, `is_visible()`, `count()`, or any non-attribute value — it only applies to `.get_attribute()` calls.
+- Skip on non-pytest stacks (Selenium, Cypress, etc.) — those lack the Playwright `evaluate` bridge.
+
+## 9. Worca-t Attribution Markers (pytest stacks only)
+
+Every test function in a worca-generated test file MUST carry a `@pytest.mark.worca_<phase>` decorator. The phase comes from the test strategy entry for that TC (`smoke`, `regression`, `e2e`, or `exploratory`); default to `smoke` when absent. The markers are auto-registered by the vendored `tests/worca_t_runtime.py` plugin — without them the worca-t runner's marker filter will collect zero tests. Skip this rule on non-pytest stacks.
 
 ```python
 import pytest
