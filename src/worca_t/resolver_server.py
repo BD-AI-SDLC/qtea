@@ -97,6 +97,33 @@ _ACCEPT_TIMEOUT_S: float = 0.5  # how often the accept loop checks the shutdown 
 _MAX_CONCURRENT_CONNS: int = 16
 
 
+def _load_dev_pool_for_llm(path: Path | None) -> list[dict]:
+    """Load dev-locator entries that have an ``intent`` field, projected onto
+    the shape the LLM prompt expects: ``[{selector, intent, page_url}, ...]``.
+
+    Used by the Tier 4 LLM prior. Entries without ``intent`` are silently
+    skipped — they're useful for Tier 1a exact-key match but contribute no
+    signal to the LLM (no description to anchor against).
+
+    Falls back to ``WORCA_T_DEV_LOCATORS`` env var when ``path`` is None.
+    Returns an empty list on any failure (missing file, bad JSON) — the
+    Tier 4 prior is opt-in by content presence, not by configuration.
+    """
+    from worca_t.runtime.dev_locators import load_dev_locators
+
+    locators, _src, _warnings = load_dev_locators(cli_path=path)
+    pool: list[dict] = []
+    for entry in locators.values():
+        if not entry.intent:
+            continue
+        pool.append({
+            "selector": entry.selector,
+            "intent": entry.intent,
+            "page_url": entry.page_url,
+        })
+    return pool
+
+
 def _read_line(sock: socket.socket, max_bytes: int) -> bytes:
     """Read up to a single newline or ``max_bytes``, whichever comes first."""
     buf = bytearray()
@@ -137,6 +164,7 @@ class ResolverServer:
         # Tests inject these; production code uses the defaults.
         port: int = 0,
         token: str | None = None,
+        dev_locators_path: Path | None = None,
     ) -> None:
         self.cache_dir = cache_dir
         self.run_id = run_id
@@ -153,6 +181,11 @@ class ResolverServer:
         self._request_count: int = 0
         self._auth_failures: int = 0
         self._error_count: int = 0
+        # Dev-locator pool for Tier 4 LLM prior. Loaded once at start (not
+        # per-request) — the file is run-scoped and a stat-per-request would
+        # be wasteful. If the file changes mid-run, restart the server.
+        self._dev_locators_path = dev_locators_path
+        self._dev_pool: list[dict] = []
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -174,13 +207,15 @@ class ResolverServer:
         s.settimeout(_ACCEPT_TIMEOUT_S)
         self._sock = s
         self.port = s.getsockname()[1]
+        # Load dev-locator pool once for Tier 4 LLM prior.
+        self._dev_pool = _load_dev_pool_for_llm(self._dev_locators_path)
         self._accept_thread = threading.Thread(
             target=self._accept_loop, name="worca-t-resolver-accept", daemon=True,
         )
         self._accept_thread.start()
         log.info(
-            "worca_t.resolver_server_started host=%s port=%d cache_dir=%s",
-            self.host, self.port, self.cache_dir,
+            "worca_t.resolver_server_started host=%s port=%d cache_dir=%s dev_pool_size=%d",
+            self.host, self.port, self.cache_dir, len(self._dev_pool),
         )
 
     def stop(self, *, timeout: float = 5.0) -> None:
@@ -310,6 +345,7 @@ class ResolverServer:
             cache_dir=self.cache_dir,
             model=self.model,
             run_id=self.run_id,
+            dev_pool=self._dev_pool or None,
         )
         duration_ms = int((time.monotonic() - t0) * 1000)
 

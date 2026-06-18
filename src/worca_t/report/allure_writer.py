@@ -87,12 +87,17 @@ def write_allure_results(report: RunReport, out_dir: Path) -> list[Path]:
 
 
 def generate_allure_html(results_dir: Path, html_dir: Path) -> bool:
-    if not shutil.which("allure"):
+    # On Windows `allure` is installed as `allure.bat` / `allure.cmd`. Without
+    # shell=True, subprocess.run(["allure", ...]) fails with [WinError 2] —
+    # CreateProcess doesn't auto-append extensions. shutil.which() resolves
+    # the full path including extension on every platform.
+    allure_bin = shutil.which("allure")
+    if not allure_bin:
         log.info("report.allure_not_found")
         return False
     try:
         proc = subprocess.run(
-            ["allure", "generate", str(results_dir), "-o", str(html_dir), "--clean"],
+            [allure_bin, "generate", str(results_dir), "-o", str(html_dir), "--clean"],
             capture_output=True,
             text=True,
             timeout=120,

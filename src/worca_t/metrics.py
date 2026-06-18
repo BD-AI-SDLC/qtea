@@ -95,11 +95,9 @@ def format_tokens(n: int) -> str:
 
 
 def format_cost(usd: float) -> str:
-    """Render USD with enough precision that sub-cent agent calls aren't $0.00."""
+    """Render USD to 2 decimal places; 4 for sub-cent amounts to avoid $0.00."""
     if usd == 0:
-        return "$0.0000"
+        return "$0.00"
     if usd < 0.01:
         return f"${usd:.4f}"
-    if usd < 1:
-        return f"${usd:.3f}"
     return f"${usd:.2f}"

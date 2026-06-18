@@ -9,7 +9,7 @@
     "generated_at": { "type": "string", "format": "date-time" },
     "summary": {
       "type": "object",
-      "required": ["total_failures", "by_severity", "by_priority", "by_category"],
+      "required": ["total_failures", "by_severity", "by_priority", "by_category", "by_layer"],
       "properties": {
         "total_failures": { "type": "integer", "minimum": 0 },
         "by_severity": {
@@ -23,6 +23,10 @@
         "by_category": {
           "type": "object",
           "additionalProperties": { "type": "integer", "minimum": 0 }
+        },
+        "by_layer": {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
         }
       }
     },
@@ -30,13 +34,17 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["id", "test_id", "title", "severity", "priority", "category"],
+        "required": ["id", "test_id", "title", "severity", "priority", "category", "layer"],
         "properties": {
           "id": { "type": "string", "pattern": "^BUG-.+-\\d+$" },
           "test_id": { "type": "string", "minLength": 1 },
           "title": { "type": "string", "minLength": 1 },
           "severity": { "enum": ["critical", "major", "minor", "cosmetic"] },
           "priority": { "enum": ["P0", "P1", "P2", "P3"] },
+          "layer": {
+            "enum": ["frontend", "backend", "infrastructure", "automation"],
+            "description": "Stack layer where the defect resides. frontend = UI/DOM/CSS/client-JS. backend = API/server/database. infrastructure = network/DNS/proxy/browser-env. automation = test-code defect (bad assertion, broken import, wrong locator that heal couldn't fix)."
+          },
           "category": {
             "enum": [
               "functional", "ui", "performance", "security",

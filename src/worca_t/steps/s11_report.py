@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 import webbrowser
 
 from worca_t.config import step_timeout
@@ -77,7 +78,23 @@ class ReportStep(Step):
         if mode == "allure" and not allure_ok:
             status = "warned"
 
-        if ctx.options.open_report:
+        # --report allure / both: open the Allure UI automatically via a
+        # background server process (allure open requires a server; file://
+        # doesn't work for allure's XHR-based data loading). Use the full
+        # path from shutil.which so Windows .bat shims resolve correctly.
+        if allure_ok and mode in ("allure", "both"):
+            allure_bin = shutil.which("allure")
+            if allure_bin:
+                try:
+                    subprocess.Popen(
+                        [allure_bin, "open", str(allure_html_dir)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    log.info("report.allure_opened", path=str(allure_html_dir))
+                except Exception as e:
+                    log.warning("report.allure_open_failed", error=str(e))
+        elif ctx.options.open_report:
             html_path = out_dir / "index.html"
             if html_path.exists():
                 try:

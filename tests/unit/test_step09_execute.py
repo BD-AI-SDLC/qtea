@@ -238,16 +238,18 @@ def test_build_fixer_prompt_includes_required_fields():
     assert "long\ntb" in prompt
 
 
-def test_build_fixer_prompt_includes_wait_for_mcp_servers_gate():
-    """The heal prompt's live-diagnosis block must instruct the agent to
-    call `WaitForMcpServers` (when present in its tool list) before any
-    `browser_*` tool use. The tool is auto-added by the SDK only while
-    MCPs are still booting; the gate eliminates the race where
-    `browser_navigate` fires before Playwright MCP finishes connecting
-    (see run 20260611-075728-0aa560 RCA for the original `pending` race).
+def test_build_fixer_prompt_uses_fully_qualified_mcp_tool_names():
+    """The heal prompt must reference Playwright MCP tools by their full
+    `mcp__playwright__<name>` form. Bare `browser_navigate` doesn't resolve
+    against the SDK's tool registry and caused the agent (in run
+    20260616-083235-165ecf) to burn 9 turns guessing prefixes.
+
+    The prompt must NOT instruct the agent to poll `WaitForMcpServers` —
+    Step 9 pre-warms MCP via `_lazy_probe_heal_mcp` before invoking the
+    heal agent, so the agent should never see the boot-gate instruction.
 
     Live-diagnosis only fires when `sut_base_url` is set — without it,
-    the live_block is empty and the gate isn't needed.
+    the live_block is empty and these directives don't apply.
     """
     entry = TestRunEntry(
         id="T-x", name="logs in", file="tests/login.spec.ts", status="failed",
@@ -256,10 +258,15 @@ def test_build_fixer_prompt_includes_wait_for_mcp_servers_gate():
     prompt = _build_fixer_prompt(
         entry, Path("/sut/worca-tests"), sut_base_url="http://app.example",
     )
-    assert "WaitForMcpServers" in prompt, (
-        "Step 9 heal prompt must instruct the agent to call "
-        "WaitForMcpServers before browser_navigate. Without this gate, "
-        "Playwright MCP boot races the first tool call."
+    assert "mcp__playwright__browser_navigate" in prompt, (
+        "Step 9 heal prompt must reference Playwright MCP tools by their "
+        "fully-qualified `mcp__playwright__*` names so the agent doesn't "
+        "waste turns guessing tool-name prefixes."
+    )
+    assert "mcp__playwright__browser_snapshot" in prompt
+    assert "WaitForMcpServers" not in prompt, (
+        "Step 9 pre-warms MCP before invoking the heal agent; the agent "
+        "must not be instructed to poll WaitForMcpServers."
     )
 
 
@@ -463,7 +470,7 @@ async def test_step09_failures_without_heal_yield_warned_and_bugs(tmp_path: Path
     # Stub the lazy MCP probe so the heal loop runs (no real `.mcp.json` in tests).
     monkeypatch.setattr(
         "worca_t.steps.s09_execute._lazy_probe_heal_mcp",
-        lambda server, env=None: (True, "ok"),
+        lambda server, env=None: (True, "ok", 0.0),
     )
 
     # Fake claude that returns no usable patch (no files).
@@ -475,7 +482,8 @@ async def test_step09_failures_without_heal_yield_warned_and_bugs(tmp_path: Path
 
     result = await ExecuteStep().run(ctx)
     assert result.success
-    assert result.status == "warned"
+    assert result.status == "completed"
+    assert result.sub_status == "bugs_found"
     payload = json.loads((ctx.workspace.step_dir(9) / "run-results.json").read_text(encoding="utf-8"))
     assert payload["totals"]["failed"] == 1
     assert payload["self_heal"]["attempts"] == 1
@@ -498,7 +506,7 @@ async def test_step09_self_heal_repairs_and_passes(tmp_path: Path, monkeypatch):
     # `.mcp.json` / `npx` in the test environment).
     monkeypatch.setattr(
         "worca_t.steps.s09_execute._lazy_probe_heal_mcp",
-        lambda server, env=None: (True, "ok"),
+        lambda server, env=None: (True, "ok", 0.0),
     )
 
     # Fake fixer that DOES write a replacement file - this triggers the rerun.
@@ -891,7 +899,7 @@ async def test_step09_rejects_xpath_heal_and_reverts(tmp_path: Path, monkeypatch
     # Stub the lazy MCP probe so the heal loop runs (no real `.mcp.json` in tests).
     monkeypatch.setattr(
         "worca_t.steps.s09_execute._lazy_probe_heal_mcp",
-        lambda server, env=None: (True, "ok"),
+        lambda server, env=None: (True, "ok", 0.0),
     )
 
     # Fake fixer writes a "patched" file laced with XPath into the heal workdir.
@@ -992,7 +1000,7 @@ def test_lazy_probe_returns_failure_when_mcp_json_missing(monkeypatch):
     monkeypatch.setattr(
         "worca_t.mcp_manager.load_mcp_config", fake_load,
     )
-    ok, detail = _lazy_probe_heal_mcp("playwright")
+    ok, detail, _warmup_s = _lazy_probe_heal_mcp("playwright")
     assert ok is False
     assert ".mcp.json" in detail
 
@@ -1002,7 +1010,7 @@ def test_lazy_probe_returns_failure_when_server_not_declared(monkeypatch):
     monkeypatch.setattr(
         "worca_t.mcp_manager.load_mcp_config", lambda env=None: {},
     )
-    ok, detail = _lazy_probe_heal_mcp("playwright")
+    ok, detail, _warmup_s = _lazy_probe_heal_mcp("playwright")
     assert ok is False
     assert "playwright" in detail
     assert "not declared" in detail
@@ -1019,7 +1027,7 @@ def test_lazy_probe_returns_success_when_server_probes_ok(monkeypatch):
         "worca_t.mcp_manager.probe_server",
         lambda srv, timeout_s=30.0: (True, "ok"),
     )
-    ok, detail = _lazy_probe_heal_mcp("playwright")
+    ok, detail, _warmup_s = _lazy_probe_heal_mcp("playwright")
     assert ok is True
 
 
@@ -1034,7 +1042,7 @@ def test_lazy_probe_returns_failure_when_probe_fails(monkeypatch):
         "worca_t.mcp_manager.probe_server",
         lambda srv, timeout_s=30.0: (False, "npx not on PATH"),
     )
-    ok, detail = _lazy_probe_heal_mcp("playwright")
+    ok, detail, _warmup_s = _lazy_probe_heal_mcp("playwright")
     assert ok is False
     assert "npx" in detail
 
@@ -1053,7 +1061,7 @@ async def test_step09_skips_heal_when_mcp_probe_fails(tmp_path: Path, monkeypatc
 
     def fake_probe(server_name, env=None):
         probe_calls.append(server_name)
-        return False, "npx not on PATH"
+        return False, "npx not on PATH", 0.0
 
     monkeypatch.setattr("worca_t.steps.s09_execute._lazy_probe_heal_mcp", fake_probe)
 
@@ -1070,7 +1078,8 @@ async def test_step09_skips_heal_when_mcp_probe_fails(tmp_path: Path, monkeypatc
     result = await ExecuteStep().run(ctx)
     # Step still completes (heal is best-effort). Real failures flow downstream.
     assert result.success
-    assert result.status == "warned"
+    assert result.status == "completed"
+    assert result.sub_status == "bugs_found"
     # Probe was attempted exactly once with the "playwright" server name.
     assert probe_calls == ["playwright"]
     # Heal agent was NEVER invoked.
@@ -1104,7 +1113,7 @@ async def test_step09_skips_probe_when_no_failing_tests(tmp_path: Path, monkeypa
 
     def fake_probe(server_name, env=None):
         probe_calls.append(server_name)
-        return True, "ok"
+        return True, "ok", 0.0
 
     monkeypatch.setattr("worca_t.steps.s09_execute._lazy_probe_heal_mcp", fake_probe)
 
@@ -1130,14 +1139,15 @@ async def test_step09_skips_probe_when_no_llm_resolve_set(
 
     def fake_probe(server_name, env=None):
         probe_calls.append(server_name)
-        return True, "ok"
+        return True, "ok", 0.0
 
     monkeypatch.setattr("worca_t.steps.s09_execute._lazy_probe_heal_mcp", fake_probe)
 
     result = await ExecuteStep().run(ctx)
     # Tests failed but heal was disabled by the env flag.
     assert result.success
-    assert result.status == "warned"
+    assert result.status == "completed"
+    assert result.sub_status == "bugs_found"
     # Probe skipped — the env flag is the single "no extra cost" dial.
     assert probe_calls == []
 
@@ -1171,7 +1181,7 @@ async def test_step09_storage_state_arg_threaded_into_mcp_env_when_resolved(
         captured_env["env"] = env
         # Probe fails so we don't try to actually run the heal agent (no
         # MCP available in unit test env). The env-capture is what matters.
-        return False, "stub"
+        return False, "stub", 0.0
 
     monkeypatch.setattr(
         "worca_t.steps.s09_execute._lazy_probe_heal_mcp", fake_probe,
@@ -1228,7 +1238,7 @@ async def test_step09_storage_state_arg_picked_up_after_same_run_auto_capture(
 
     def fake_probe(server, env=None):
         captured_env["env"] = dict(env or {})  # snapshot at probe time
-        return False, "stub"
+        return False, "stub", 0.0
 
     monkeypatch.setattr(
         "worca_t.steps.s09_execute._lazy_probe_heal_mcp", fake_probe,
@@ -1262,7 +1272,7 @@ async def test_step09_storage_state_arg_empty_when_no_source(
 
     def fake_probe(server, env=None):
         captured_env["env"] = env
-        return False, "stub"
+        return False, "stub", 0.0
 
     monkeypatch.setattr(
         "worca_t.steps.s09_execute._lazy_probe_heal_mcp", fake_probe,

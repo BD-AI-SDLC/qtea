@@ -207,6 +207,22 @@ def _cleanup_step_artifacts(ws: Workspace, from_step: int, console: Console | No
                 elif debug_entry.is_dir():
                     items_to_clean.append(("dir", debug_entry))
 
+    # When step 9 (execute) will rerun, also clear JIT-cache and SUT test
+    # outputs that accumulate across runs and would otherwise mix stale data
+    # with the fresh run's results.
+    if from_step <= 9:
+        jit_cache_dir = ws.root / "locator-cache"
+        cache_json = jit_cache_dir / "locator-cache.json"
+        if cache_json.exists():
+            items_to_clean.append(("file", cache_json))
+        if jit_cache_dir.exists():
+            for pending in jit_cache_dir.glob("hitl-pending-*.json"):
+                items_to_clean.append(("file", pending))
+        for sut_subdir in ("screenshots", "reports"):
+            p = ws.sut / sut_subdir
+            if p.exists():
+                items_to_clean.append(("dir", p))
+
     # Skip if nothing to clean
     if not items_to_clean:
         console.print("[dim]cleanup:[/] no step-specific artifacts to remove")
@@ -625,6 +641,7 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
     selected_steps = _select_steps(opts)
 
     exit_code = 0
+    _after_step_status = False  # True right after printing a step ok/warned/FAILED line
     for step_num in selected_steps:
         if not opts.force and is_step_complete(state, step_num):
             if not outputs_match(state, step_num, ws.step_dir(step_num)):
@@ -641,7 +658,14 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
             console.print(f"[yellow]step {step_num:02d} not yet implemented - skipping[/]")
             continue
 
+        # Blank line before the banner. When a step-status line was just printed
+        # ("step NN ok" / "FAILED"), that line already opened the gap — skip the
+        # extra blank so the status and the next banner stay visually grouped.
+        if not _after_step_status:
+            console.print()
+        _after_step_status = False
         console.print(f"[cyan]>>> step {step_num:02d} {step.name}[/]")
+        console.print()
         if not _mcp_preflight_for_step(step, opts=opts, console=console):
             log.error("step.mcp_preflight_abort", step=step_num)
             exit_code = 2
@@ -651,6 +675,7 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
 
         if not result.success:
             save_state(state, ws.state_file)
+            console.print()
             console.print(f"[red]step {step_num:02d} FAILED:[/] {result.error or result.notes}")
             if record is not None:
                 console.print(f"   {_format_step_metrics_line(record)}")
@@ -682,11 +707,19 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
 
         save_state(state, ws.state_file)
 
-        marker = "warned" if result.status == "warned" else "ok"
+        if result.status == "warned":
+            sub = f" ({result.sub_status.replace('_', ' ')})" if result.sub_status else ""
+            marker = f"warned{sub}"
+        elif result.sub_status and result.sub_status != "all_passed":
+            marker = f"ok ({result.sub_status.replace('_', ' ')})"
+        else:
+            marker = "ok"
         line = f"[green]step {step_num:02d} {marker}[/]  -> {len(result.outputs)} outputs"
         if record is not None:
             line += f"  [dim]{_format_step_metrics_line(record)}[/]"
+        console.print()
         console.print(line)
+        _after_step_status = True
 
     state.finished_at = datetime.now(UTC).isoformat()
     save_state(state, ws.state_file)
@@ -776,10 +809,13 @@ def _render_summary_table(state: RunState, console: Console) -> None:
         duration = f"{rec.duration_s:.1f}s" if rec.duration_s is not None else "-"
         cache_read = format_tokens(rec.tokens_cache_read) if rec.tokens_cache_read else "-"
         cache_write = format_tokens(rec.tokens_cache_creation) if rec.tokens_cache_creation else "-"
+        status_text = rec.status
+        if rec.sub_status and rec.sub_status != "all_passed":
+            status_text = f"{rec.status} ({rec.sub_status.replace('_', ' ')})"
         table.add_row(
             f"{step_num:02d}",
             rec.name or "",
-            f"[{color}]{rec.status}[/]",
+            f"[{color}]{status_text}[/]",
             duration,
             format_tokens(rec.tokens_input),
             format_tokens(rec.tokens_output),

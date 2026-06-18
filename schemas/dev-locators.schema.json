@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://worca-t/schemas/dev-locators.schema.json",
   "title": "DevLocators",
-  "description": "Dev-team-supplied (or external-LLM-produced) mapping of locator-constant names to real selectors. When this file is discoverable (via --dev-locators flag, WORCA_T_DEV_LOCATORS env var, or `<sut>/.worca-t/dev-locators.json` convention path), the JIT runtime plugin consults it BEFORE the LLM resolver. Selectors are verified at first use via Playwright `locator.count()`; mismatches fall through to the resolver and log `dev_selector_mismatch`.",
+  "description": "Dev-team-supplied (or external-LLM-produced) mapping of selectors the JIT runtime consults BEFORE the LLM resolver. Two match modes: Tier 1a (exact key) — JSON keys equal worca-t's generated constant names (HITL-replay path). Tier 1b (intent pool) — entries carry an `intent` description and the runtime fuzzy-matches `tbd(...)` intents against the pool, so frontend devs can use arbitrary key names. Discovery precedence: --dev-locators flag > WORCA_T_DEV_LOCATORS env > `<workspace>/locator-cache/dev-locators.json` default. Selectors are verified at first use; mismatches fall through to the resolver.",
   "type": "object",
   "required": ["locators"],
   "additionalProperties": true,
@@ -35,11 +35,11 @@
             },
             "intent": {
               "type": ["string", "null"],
-              "description": "Optional human description of what this locator targets. Used for traceability; not required for the runtime to use the selector."
+              "description": "Human description of what this locator targets, e.g. 'submits the login form'. When present, this entry participates in Tier 1b intent-pool matching against `tbd(...)` strings (frontend-dev workflow). Without `intent`, the entry is only reachable via Tier 1a exact-key match (HITL-replay). Write the way you'd describe the element to a new teammate, not as a CSS class label."
             },
             "page_url": {
               "type": ["string", "null"],
-              "description": "Optional URL/path of the page where this element lives. Informational."
+              "description": "URL or path of the page where this element lives. Optional but recommended for Tier 1b in multi-page apps with structurally similar elements (e.g. a Submit button on every form): when set and the current page differs, the entry's pool-match score is reduced by WORCA_T_DEV_POOL_PAGE_PENALTY (default 0.15, soft penalty — not a hard filter)."
             },
             "notes": {
               "type": ["string", "null"]

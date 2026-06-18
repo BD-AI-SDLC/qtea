@@ -110,9 +110,12 @@ def test_format_tokens_boundaries():
 
 
 def test_format_cost_precision():
-    assert format_cost(0.0) == "$0.0000"
+    # Zero renders at 2dp like normal-sized costs.
+    assert format_cost(0.0) == "$0.00"
+    # Sub-cent values keep four decimals so a small agent call doesn't show $0.00.
     assert format_cost(0.0042) == "$0.0042"
-    assert format_cost(0.123) == "$0.123"
-    assert format_cost(4.21) == "$4.21"
-    # Sub-cent values keep four decimals so an agent call doesn't show as $0.00.
     assert format_cost(0.0001) == "$0.0001"
+    # Everything ≥ $0.01 renders at 2 decimal places (with rounding).
+    assert format_cost(0.123) == "$0.12"
+    assert format_cost(4.21) == "$4.21"
+    assert format_cost(2.415632) == "$2.42"  # rounds half-up via Python format

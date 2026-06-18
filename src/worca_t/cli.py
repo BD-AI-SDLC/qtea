@@ -238,7 +238,15 @@ def run(
     skip_step: list[int] = typer.Option([], "--skip-step"),
     report: ReportMode = typer.Option(ReportMode.auto, "--report"),
     report_inline_images: bool = typer.Option(False, "--report-inline-images"),
-    open_report: bool = typer.Option(False, "--open-report"),
+    open_report: bool = typer.Option(
+        False,
+        "--open-report",
+        help=(
+            "Open the built-in worca-t HTML report in the browser after the run. "
+            "Not needed with --report allure or --report both — those modes open "
+            "the Allure UI automatically when allure generation succeeds."
+        ),
+    ),
     log_level: LogLevel = typer.Option(LogLevel.info, "--log-level"),
     no_hitl: bool = typer.Option(
         False,
@@ -280,13 +288,17 @@ def run(
         None,
         "--dev-locators",
         help=(
-            "Path to a dev-supplied JSON file mapping locator-constant names "
-            "to real selectors (`{locators: {LOGIN_BUTTON: {selector: ...}}}`)."
-            " When supplied, the JIT runtime plugin consults this file BEFORE "
-            "calling the LLM resolver. Verified at first use via Playwright "
-            "count(); mismatches fall through to LLM resolution. Highest-"
-            "priority discovery channel — overrides $WORCA_T_DEV_LOCATORS and "
-            "the `<sut>/.worca-t/dev-locators.json` convention path."
+            "Path to a dev-supplied JSON file with selectors the runtime "
+            "consults BEFORE the LLM resolver. Two match modes:\n"
+            "  • Tier 1a (exact key) — JSON keys equal worca-t's generated "
+            "constant names (used by HITL-replay).\n"
+            "  • Tier 1b (intent pool) — entries carry an `intent` description "
+            "(plus optional `page_url`); the runtime fuzzy-matches `tbd(...)` "
+            "intents against the pool. Frontend devs can use arbitrary keys.\n"
+            "Tuning env vars: WORCA_T_DEV_POOL_THRESHOLD (default 0.65), "
+            "WORCA_T_DEV_POOL_MARGIN (0.10), WORCA_T_DEV_POOL_PAGE_PENALTY (0.15). "
+            "Overrides $WORCA_T_DEV_LOCATORS and the "
+            "`<workspace>/locator-cache/dev-locators.json` default."
         ),
     ),
     storage_state: Path | None = typer.Option(
@@ -458,12 +470,22 @@ def resolve(
     import json as _json
 
     from worca_t.jit_resolver import resolve_one
+    from worca_t.runtime.dev_locators import load_dev_locators
 
     try:
         snapshot_text = snapshot.read_text(encoding="utf-8")
     except OSError as e:
         console.print(f"[red]cannot read snapshot {snapshot}: {e}[/]")
         raise typer.Exit(code=2) from e
+
+    # Tier 4 LLM prior: pass any dev-locator entries with `intent` so the
+    # model can prefer them over freshly-derived selectors. Discovery uses
+    # the same precedence as the runtime plugin (CLI > env > convention).
+    pool_locators, _src, _warnings = load_dev_locators()
+    dev_pool = [
+        {"selector": e.selector, "intent": e.intent, "page_url": e.page_url}
+        for e in pool_locators.values() if e.intent
+    ] or None
 
     result = resolve_one(
         intent=intent,
@@ -474,6 +496,7 @@ def resolve(
         cache_dir=cache,
         model=model,
         run_id=run_id,
+        dev_pool=dev_pool,
     )
     # Single-line JSON on stdout for the plugin to capture.
     print(_json.dumps(result.as_dict(), ensure_ascii=False))

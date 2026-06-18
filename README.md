@@ -36,7 +36,7 @@ worca-t run --spec ./feature.md --sut ./my-app
 | 6 | Research | `polyglot-test-researcher` | `research.{md,json}` |
 | 7 | Test architect | `test-architect` | `code-modification-plan.json` |
 | 8 | TDD codegen | `ui-test-automation` | test files + `tbd-index.json` |
-| 9 | Run + heal | pure code + `polyglot-test-fixer` (on failure) | `run-results.json` (+ `locator-cache.json` when JIT) |
+| 9 | Run + heal + verify | pure code + `polyglot-test-fixer` (on failure) | `run-results.json` (+ `locator-cache.json` when JIT) |
 | 10 | Bug class. | `bug-report-classifier` | `bug-reports.{md,json}` |
 | 11 | Report | pure code | `report/index.html` + Allure (when available) |
 
@@ -50,6 +50,7 @@ installed) and a zero-dependency built-in HTML report. The built-in report is
 fully offline-viewable and always produced as a fallback.
 
 Force one or the other: `--report allure`, `--report builtin`, `--report both`.
+`--report allure` and `--report both` auto-open the Allure UI when generation succeeds — no `--open-report` flag needed.
 
 ## Resume & debug
 
