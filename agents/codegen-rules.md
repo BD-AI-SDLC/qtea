@@ -166,22 +166,87 @@ def test_should_open_chat_when_landing_page_loads(chat_page):
     ...
 ```
 
+## 10. Network Egress Restrictions
+
+Generated tests, fixtures, and POMs MUST NOT issue HTTP(S) requests, websocket connections, or DNS lookups to any host other than the SUT origin (`base_url` from `research.json`) and explicitly approved test-data services declared in the strategy. No `requests.get("https://…")`, no `fetch("https://attacker…")`, no telemetry pings, no `page.goto(<URL not derived from base_url>)`. The Step 9 runtime monkey-patches `BrowserType.launch` for proxy injection — assume the proxy logs all egress. A prompt-injected codegen call could otherwise emit a test that quietly POSTs captured AOM (internal company UI text) to an external host; this rule is the docs-side counterpart to the selector allowlist.
+
+## 11. Subprocess & Shell Hygiene in Generated Code
+
+Generated tests, fixtures, and POMs MUST NOT use `subprocess.run(..., shell=True)`, `subprocess.Popen(..., shell=True)`, `os.system(...)`, `os.popen(...)`, `eval(...)`, `exec(...)`, `pickle.loads`, Node backtick command substitution, `child_process.exec(<string>)`, or any string-concatenated command construction. When a test genuinely needs to spawn a process, use list-form argv (`subprocess.run(["cmd", arg1, arg2], shell=False, check=True)` / `child_process.execFile("cmd", [args])`) and never interpolate test-derived data into the command. Shell injection in test code is just as exploitable as in production — tests often run under broader credentials (CI tokens, deploy keys) than the SUT itself.
+
+**Subprocess env scrubbing.** When a generated test spawns a child process, pass `env=` explicitly with only the variables the child genuinely needs — never inherit the parent process env wholesale (the default when `env=` is omitted). The parent env contains `WORCA_T_RESOLVER_TOKEN`, `WORCA_T_RESOLVER_PORT`, JIRA tokens, `ANTHROPIC_API_KEY` (in the parent worca-t process, not the SUT), and any CI deploy keys; leaking these into a third-party binary's env (or its log output, or its own subprocess fan-out) is a credential exfiltration path. Pattern: `subprocess.run(["tool", arg], env={"PATH": os.environ["PATH"], "HOME": os.environ["HOME"]}, shell=False, check=True)` — start from an empty dict and copy in only what's required.
+
+## 12. Filesystem Scope for Generated Code
+
+Generated tests, fixtures, and POMs may read files only from inside `<sut>/` and write files only into the SUT's test-artifact dirs (e.g. `<sut>/tests/_artifacts/`, `<sut>/test-results/`) or paths derived from `tmp_path` / `tmpdir` fixtures. Never read `~/.ssh/`, `~/.aws/`, `~/.config/`, `~/.netrc`, `/etc/`, `.env` files, the user's git config, browser profile dirs, sibling repos, or any absolute path outside `<sut>/`. Never write outside the two roots above. Forbidden patterns: `open("/tmp/...")`, `Path.home() / ".secret"`, `os.path.expanduser("~/...")` for read, `os.environ` dumps to disk, `shutil.copy(<credential-file>, …)`. A test that quietly reads `~/.aws/credentials` and posts it via a form field is a one-line exfiltration — closing this surface is non-negotiable.
+
+**Never delete or rename pre-existing SUT files.** Codegen only CREATES new `worca_*_test.py` / `worca_*_page.py` / `worca_*_locators.py` files and EXTENDS existing classes via import. You may not `os.remove`, `Path.unlink`, `shutil.rmtree`, `shutil.move`, or `Path.rename` any file the SUT team authored — tests, POMs, fixtures, configs, lockfiles, `conftest.py`, `.gitignore`, CI workflow files. If you believe an existing file is broken, raise a bug-candidate via the strategy's blocker channel; do not "clean it up". Step 9's git working-tree diff detects removals and reverts the change.
+
 ---
 
 ## Assertion Fidelity (NON-NEGOTIABLE)
 
 The single most common defect in machine-generated tests is **weak assertions**: tests that pass against any non-broken SUT instead of verifying a specific expected behavior. Eliminate them at write time.
 
+### Prefer Playwright `expect()` over bare `assert` (Python + Playwright stacks)
+
+Playwright's `expect()` API provides **auto-retry with configurable timeout** — the assertion polls the DOM until the condition is met or the timeout expires. Bare `assert` evaluates once and fails immediately on transient states (element not yet rendered, text still loading, navigation in progress). **Always prefer `expect()` when the assertion target is a Playwright object** (page, locator, API response).
+
+| Assertion target | Use | Do NOT use |
+| --- | --- | --- |
+| Locator text content | `expect(loc).to_have_text("Expected")` | `assert loc.text_content() == "Expected"` |
+| Locator attribute | `expect(loc).to_have_attribute("href", expected)` | `assert loc.get_attribute("href") == expected` |
+| Locator visibility | `expect(loc).to_be_visible()` | `assert loc.is_visible()` |
+| Locator count | `expect(loc).to_have_count(3)` | `assert loc.count() == 3` |
+| Locator CSS class | `expect(loc).to_have_class(re.compile(r"active"))` | `assert "active" in loc.get_attribute("class")` |
+| Locator value (input) | `expect(loc).to_have_value("hello")` | `assert loc.input_value() == "hello"` |
+| Page URL | `expect(page).to_have_url("https://example.com")` | `assert page.url == "https://example.com"` |
+| Page title | `expect(page).to_have_title("Dashboard")` | `assert page.title() == "Dashboard"` |
+
+**Fall back to bare `assert`** only when the value under test is NOT a Playwright object — e.g. a computed Python value, a parsed JSON field, a length comparison on a collected list, or a return value from a POM helper method that returns a plain Python type:
+
+```python
+# OK — plain Python value, no Playwright expect() available
+items = cart_page.get_item_names()
+assert len(items) == 3
+assert items[0] == "Widget A"
+```
+
+### URL destination assertions: click-then-assert, not href-check
+
+When the strategy says a link "navigates to" / "leads to" / "points to" a URL, **prefer clicking the element and asserting the resulting page URL** over reading the `href` attribute. Enterprise apps commonly use redirect/gateway URLs in `href` that differ from the final destination — an `href` assertion fails even though the user lands on the correct page.
+
+```python
+# PREFERRED — tests the actual user experience
+loc.click()
+expect(page).to_have_url(EXPECTED_DESTINATION_URL)
+
+# ACCEPTABLE — only when the strategy explicitly says "href equals ..."
+expect(loc).to_have_attribute("href", EXPECTED_HREF)
+```
+
+When the link opens in a new tab (`target="_blank"`), use `expect_popup` to capture the new page:
+
+```python
+with page.expect_popup() as popup_info:
+    loc.click()
+new_page = popup_info.value
+expect(new_page).to_have_url(EXPECTED_DESTINATION_URL)
+```
+
+### Exact-value rules
+
 For every test case, walk the strategy's `Steps:` and `Expected Result:` sections and apply these rules:
 
 | When the strategy says... | You MUST emit... | You MUST NOT emit |
 | --- | --- | --- |
-| `Assert href equals "https://example.com/foo"` | `assert actual == "https://example.com/foo"` | `assert actual` (truthy); `assert "http" in actual` (substring) |
-| `Label displays "Zu Gemini Enterprise wechseln"` | `assert actual == "Zu Gemini Enterprise wechseln"` | `assert actual`; `assert "Gemini" in actual` |
-| `count equals 1` | `assert actual == 1` | `assert actual >= 1`; `assert actual` |
-| `target equals "_blank"` | `assert actual == "_blank"` | `assert actual in ("_blank", "_self")` |
-| `rel equals "noopener noreferrer"` | `assert actual == "noopener noreferrer"` | `assert "noopener" in actual` |
-| `aria-label is "X, opens in new tab"` (full string given) | `assert actual == "X, opens in new tab"` | substring / truthy check |
+| `Link navigates to "https://example.com/foo"` | `loc.click()` + `expect(page).to_have_url("https://example.com/foo")` | `assert loc.get_attribute("href") == ...` (href may be a redirect) |
+| `Assert href equals "https://example.com/foo"` | `expect(loc).to_have_attribute("href", "https://example.com/foo")` | `assert actual` (truthy); `assert "http" in actual` (substring) |
+| `Label displays "Zu Gemini Enterprise wechseln"` | `expect(loc).to_have_text("Zu Gemini Enterprise wechseln")` | `assert actual`; `assert "Gemini" in actual` |
+| `count equals 1` | `expect(loc).to_have_count(1)` | `assert actual >= 1`; `assert actual` |
+| `target equals "_blank"` | `expect(loc).to_have_attribute("target", "_blank")` | `assert actual in ("_blank", "_self")` |
+| `rel equals "noopener noreferrer"` | `expect(loc).to_have_attribute("rel", "noopener noreferrer")` | `assert "noopener" in actual` |
+| `aria-label is "X, opens in new tab"` (full string given) | `expect(loc).to_have_attribute("aria-label", "X, opens in new tab")` | substring / truthy check |
 | Localized parametrized values (en/de/...) | Parametrize with `@pytest.mark.parametrize` (or framework equivalent) and assert exact equality per locale | a single non-empty / substring check |
 
 **Substring / truthy / range assertions are ONLY acceptable when the strategy explicitly uses non-exact language** (e.g. "label is non-empty", "count is at least 1", "contains the word Gemini").

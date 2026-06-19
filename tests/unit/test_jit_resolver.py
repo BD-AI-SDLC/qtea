@@ -19,11 +19,13 @@ from worca_t.jit_resolver import (
     cache_key,
     is_xpath,
     normalise_strategy,
+    prewarm_dev_pool_cache,
     read_cache,
     resolve_one,
     snapshot_hash,
     write_cache,
 )
+from worca_t.runtime.dev_locators import DevLocator
 
 # ---------------------------------------------------------------------------
 # Pure helpers
@@ -561,3 +563,131 @@ def test_call_anthropic_messages_end_with_user_role(tmp_path: Path):
         f"got: {[m['role'] for m in msgs]}"
     )
     assert body.startswith("{"), f"body should start with JSON open brace, got: {body!r}"
+
+
+# ---------------------------------------------------------------------------
+# prewarm_dev_pool_cache — Tier 2 #3 dev-pool prewarm
+# ---------------------------------------------------------------------------
+
+
+def _make_dev_pool() -> dict:
+    return {
+        "goToGeminiEnterpriseBtn": DevLocator(
+            constant_name="goToGeminiEnterpriseBtn",
+            selector="[data-testid='Layout-GeminiEnterprise'] p",
+            intent="Gemini Enterprise navigation button in side nav",
+        ),
+        "loginButton": DevLocator(
+            constant_name="loginButton",
+            selector="#login",
+            intent="primary submit button on login form",
+        ),
+    }
+
+
+def test_prewarm_writes_matched_intents_to_cache(tmp_path: Path):
+    """Each TBD intent that fuzzy-matches a dev-pool entry above the
+    threshold gets a cache entry with source=dev-pool. The match score
+    and the originating dev constant are recorded for telemetry."""
+    cache_path = tmp_path / "locator-cache.json"
+    intents = [
+        {
+            "intent": "Gemini Enterprise navigation button in side nav",
+            "constant_name": "GEMINI_ENTERPRISE_BUTTON",
+            "test_file": "tests/smoke/x.py",
+        },
+    ]
+    written = prewarm_dev_pool_cache(
+        tbd_intents=intents,
+        dev_locators=_make_dev_pool(),
+        cache_path=cache_path,
+        run_id="test-run",
+    )
+    assert written == 1
+    entries = read_cache(cache_path)
+    assert len(entries) == 1
+    e = next(iter(entries.values()))
+    assert e["source"] == "dev-pool"
+    assert e["matched_constant"] == "goToGeminiEnterpriseBtn"
+    assert e["selector"] == "[data-testid='Layout-GeminiEnterprise'] p"
+    assert e["intent"] == "Gemini Enterprise navigation button in side nav"
+    assert e.get("prewarmed") is True
+
+
+def test_prewarm_skips_unmatched_intents(tmp_path: Path):
+    """An intent whose tokens don't overlap any dev-pool entry's intent
+    (above threshold) is left for the in-test resolver to handle via
+    AOM / LLM — no cache entry is written."""
+    cache_path = tmp_path / "locator-cache.json"
+    intents = [
+        {
+            "intent": "checkout payment iframe close button",
+            "constant_name": "CHECKOUT_CLOSE",
+            "test_file": "tests/smoke/x.py",
+        },
+    ]
+    written = prewarm_dev_pool_cache(
+        tbd_intents=intents,
+        dev_locators=_make_dev_pool(),
+        cache_path=cache_path,
+        run_id="test-run",
+    )
+    assert written == 0
+    assert read_cache(cache_path) == {}
+
+
+def test_prewarm_is_idempotent_on_retry(tmp_path: Path):
+    """Running prewarm twice doesn't double-write. The second invocation
+    sees the first's entry and skips it — important for the attempt-2
+    retry path which re-enters Step 9 from the top."""
+    cache_path = tmp_path / "locator-cache.json"
+    intents = [
+        {
+            "intent": "Gemini Enterprise navigation button in side nav",
+            "constant_name": "GEMINI_ENTERPRISE_BUTTON",
+            "test_file": "tests/smoke/x.py",
+        },
+    ]
+    first = prewarm_dev_pool_cache(
+        tbd_intents=intents,
+        dev_locators=_make_dev_pool(),
+        cache_path=cache_path,
+        run_id="test-run",
+    )
+    second = prewarm_dev_pool_cache(
+        tbd_intents=intents,
+        dev_locators=_make_dev_pool(),
+        cache_path=cache_path,
+        run_id="test-run",
+    )
+    assert first == 1
+    assert second == 0  # idempotent — no double write
+
+
+def test_prewarm_rejects_xpath_dev_pool_entries(tmp_path: Path):
+    """Defense in depth: even if a malformed dev-pool entry slips through
+    the loader (e.g. via direct dict injection in a custom caller), the
+    prewarmer must not write XPath selectors to the cache — they'd later
+    fail the TBD-promotion safety check anyway."""
+    cache_path = tmp_path / "locator-cache.json"
+    bad_pool = {
+        "submitBtn": DevLocator(
+            constant_name="submitBtn",
+            selector="//button[@id='go']",  # XPath — rejected
+            intent="primary submit button on login form",
+        ),
+    }
+    intents = [
+        {
+            "intent": "primary submit button on login form",
+            "constant_name": "SUBMIT",
+            "test_file": "tests/x.py",
+        },
+    ]
+    written = prewarm_dev_pool_cache(
+        tbd_intents=intents,
+        dev_locators=bad_pool,
+        cache_path=cache_path,
+        run_id="test-run",
+    )
+    assert written == 0

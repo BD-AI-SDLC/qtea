@@ -44,6 +44,16 @@ _API_RETRY_BACKOFF_S = (1.0, 3.0)  # one entry per retry attempt
 # XPath. Mirrors the Step 9 self-heal quality gate in `s09_execute.py`.
 _XPATH_PATTERNS = ("xpath=", "By.XPATH", "by_xpath")
 
+# Selector-safety allowlist gate. Selectors flow from the LLM (or dev-locators
+# JSON) into `locator-cache.json`, and from there are substituted into SUT
+# source by `s09_execute._promote_resolved_tbds` (which then commits the
+# patched file). A poisoned response or hostile dev-locators entry that
+# contains a newline, `<script>` tag, or `javascript:` URI is not a selector
+# — it's an attempt at code injection at promotion time. Reject at cache-
+# write so the unsafe value never lands on disk; the substitution site uses
+# `json.dumps` as a second line of defence.
+_UNSAFE_SELECTOR_SUBSTRINGS = ("\n", "\r", "\x00", "<script", "javascript:")
+
 
 @dataclass(frozen=True)
 class ResolutionResult:
@@ -115,6 +125,22 @@ def is_xpath(selector: str) -> bool:
     return any(p in s for p in _XPATH_PATTERNS)
 
 
+def is_unsafe_selector(selector: str) -> bool:
+    """Reject payloads that break out of string literals or carry executable
+    content when substituted into SUT source by `_promote_resolved_tbds`.
+
+    Re-exported so the substitution site can re-validate at promotion time
+    (defense in depth — the cache file lives on disk and a long-running
+    workspace could be tampered with between resolver write and promoter
+    read).
+    """
+    s = selector or ""
+    if not s.strip():
+        return True
+    lo = s.lower()
+    return any(p in lo for p in _UNSAFE_SELECTOR_SUBSTRINGS)
+
+
 def normalise_strategy(value: str | None) -> str | None:
     """Coerce strategy string to one of the allowed enum values."""
     if not value:
@@ -164,6 +190,137 @@ def write_cache(
     tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(cache_path)
+
+
+# ---------------------------------------------------------------------------
+# Pre-warm: tier-1b dev-pool match at parent-process startup
+# ---------------------------------------------------------------------------
+#
+# Mirrors the tokeniser + scorer in `_resources/runtime/worca_t_runtime.py.tpl`
+# (functions `_tokenize`, `_stem`, `_token_set_ratio`, `_pool_match`). Kept in
+# sync by convention: both are pure Python, deterministic, and tiny — any
+# divergence would surface as a behaviour delta between the in-process tier-1b
+# match (parent) and the in-test fallback match (vendored runtime), which is
+# easy to spot in resolver-spend telemetry. The duplication is the lesser
+# evil compared to making the vendored runtime depend on a `worca_t` import
+# (which is unavailable inside the SUT subprocess).
+
+_INTENT_STOPWORDS = frozenset({
+    "the", "a", "an", "of", "to", "for", "on", "in", "at", "is", "are",
+    "and", "or", "with", "by", "that", "this", "it", "be",
+})
+
+
+def _intent_stem(tok: str) -> str:
+    if len(tok) <= 3:
+        return tok
+    for suf in ("ing", "ies", "ed", "es", "s"):
+        if tok.endswith(suf) and len(tok) - len(suf) >= 3:
+            return tok[: -len(suf)]
+    return tok
+
+
+_INTENT_TOKEN_SPLIT = re.compile(r"[^a-zA-Z0-9]+")
+
+
+def _intent_tokenize(text: str) -> set[str]:
+    return {
+        _intent_stem(t) for t in _INTENT_TOKEN_SPLIT.split((text or "").lower())
+        if len(t) >= 2 and t not in _INTENT_STOPWORDS
+    }
+
+
+def _intent_token_set_ratio(a: str, b: str) -> float:
+    sa, sb = _intent_tokenize(a), _intent_tokenize(b)
+    if not sa or not sb:
+        return 0.0
+    inter = len(sa & sb)
+    if inter == 0:
+        return 0.0
+    return (2.0 * inter) / (len(sa) + len(sb))
+
+
+def prewarm_dev_pool_cache(
+    *,
+    tbd_intents: list[dict],
+    dev_locators: dict[str, Any],
+    cache_path: Path,
+    run_id: str | None = None,
+) -> int:
+    """Pre-populate ``locator-cache.json`` with tier-1b dev-pool matches
+    for every TBD intent known at step-8 codegen time.
+
+    Each ``tbd_intents`` entry must carry ``intent`` and ``constant_name``;
+    ``test_file`` is optional but recommended (it disambiguates same-named
+    constants across test files in the cache key).
+
+    ``dev_locators`` is the dict produced by
+    :func:`worca_t.runtime.dev_locators.load_dev_locators`.
+
+    Returns the number of entries written. Entries already present in the
+    cache are left untouched — this lets the pre-warm run idempotently on
+    retry without clobbering tier-4 LLM resolutions from the prior attempt.
+
+    Side benefits over lazy in-test resolution:
+      - moves the (cheap) fuzzy match off the test's critical path;
+      - lets the human reviewer inspect the prewarm log to see which
+        dev-locator entries fired before any tests run, useful when
+        tuning dev-locators.json.
+    """
+    threshold = float(os.environ.get("WORCA_T_DEV_POOL_THRESHOLD", "0.65"))
+    margin = float(os.environ.get("WORCA_T_DEV_POOL_MARGIN", "0.10"))
+
+    pool_entries = [
+        (name, entry) for name, entry in dev_locators.items()
+        if getattr(entry, "intent", None)
+    ]
+    if not pool_entries or not tbd_intents:
+        return 0
+
+    existing = read_cache(cache_path)
+    added = 0
+    for hit in tbd_intents:
+        intent = (hit.get("intent") or "").strip()
+        constant_name = (hit.get("constant_name") or "").strip()
+        if not intent or not constant_name:
+            continue
+        test_file = hit.get("test_file")
+        key = cache_key(test_file, constant_name, intent)
+        if key in existing:
+            continue
+        # Score every dev-pool entry; require the winner to be above the
+        # threshold AND beat second-best by the margin (mirrors the
+        # runtime tier-1b ambiguity guard).
+        scored: list[tuple[str, Any, float]] = [
+            (name, entry, _intent_token_set_ratio(intent, entry.intent))
+            for name, entry in pool_entries
+        ]
+        scored.sort(key=lambda x: x[2], reverse=True)
+        best_name, best_entry, best_score = scored[0]
+        second_score = scored[1][2] if len(scored) > 1 else 0.0
+        if best_score < threshold or (best_score - second_score) < margin:
+            continue
+        if is_unsafe_selector(best_entry.selector) or is_xpath(best_entry.selector):
+            continue
+        existing[key] = {
+            "key": key,
+            "test_file": test_file,
+            "constant_name": constant_name,
+            "intent": intent,
+            "selector": best_entry.selector,
+            "strategy": getattr(best_entry, "strategy", None),
+            "source": "dev-pool",
+            "page_url": getattr(best_entry, "page_url", None),
+            "matched_constant": best_name,
+            "pool_score": round(best_score, 3),
+            "resolved_at": datetime.now(UTC).isoformat(),
+            "prewarmed": True,
+        }
+        added += 1
+
+    if added:
+        write_cache(cache_path, existing, run_id=run_id)
+    return added
 
 
 def _build_prompt(
@@ -351,7 +508,12 @@ def _normalise_candidates(parsed: dict[str, Any]) -> list[dict[str, Any]]:
         # to the empty-list path so resolve_one can surface the priority-gate
         # rejection reason explicitly.
         flat_sel = parsed.get("selector")
-        if isinstance(flat_sel, str) and flat_sel.strip() and not is_xpath(flat_sel):
+        if (
+            isinstance(flat_sel, str)
+            and flat_sel.strip()
+            and not is_xpath(flat_sel)
+            and not is_unsafe_selector(flat_sel)
+        ):
             return [{
                 "selector": flat_sel.strip(),
                 "strategy": normalise_strategy(parsed.get("strategy")),
@@ -372,7 +534,7 @@ def _normalise_candidates(parsed: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(sel, str) or not sel.strip():
             continue
         sel = sel.strip()
-        if is_xpath(sel):
+        if is_xpath(sel) or is_unsafe_selector(sel):
             continue
         conf = entry.get("confidence")
         out.append({

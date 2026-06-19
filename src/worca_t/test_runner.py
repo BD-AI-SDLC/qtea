@@ -205,6 +205,8 @@ class RunResult:
 
 _PYTEST_FRAMEWORKS = frozenset({"pytest", "playwright-py", "selenium-py"})
 
+_PW_TEST_FRAMEWORKS = frozenset({"playwright-ts", "playwright-js"})
+
 
 _KNOWN_RUNNER_TOKENS = frozenset({
     "pytest", "python", "python3", "py",
@@ -287,6 +289,38 @@ def _inject_xdist_override(
     return f"{command} {n_flag}"
 
 
+def _inject_playwright_file_filter(command: str) -> str:
+    """Scope a Playwright Test command to worca-generated test files only.
+
+    Playwright Test treats positional args as regex patterns matched against
+    file paths. ``"worca_"`` selects all files whose path contains the
+    worca-generated prefix, mirroring pytest's ``-m "worca_*"`` scoping.
+    """
+    if "worca_" in command:
+        return command
+    return f'{command} "worca_"'
+
+
+def _inject_playwright_workers(command: str, parallelism: int) -> str:
+    """Set Playwright Test ``--workers`` count when explicitly requested."""
+    if "--workers" in command:
+        return command
+    if parallelism > 0:
+        return f"{command} --workers {parallelism}"
+    return command
+
+
+def _inject_headed_flag(command: str) -> str:
+    """Append ``--headed`` to a Playwright Test command.
+
+    Playwright Test defaults to headless; ``--headed`` overrides it to show
+    the browser window (e.g. when the user passes ``worca-t run --headed``).
+    """
+    if "--headed" in command:
+        return command
+    return f"{command} --headed"
+
+
 def resolve_command(
     framework: str,
     *,
@@ -316,15 +350,20 @@ def resolve_command(
     ``-m "<filter>"`` so callers can scope a run to a subset of tests
     by marker. Step 8 uses this to select worca-generated tests
     (e.g. ``worca_smoke or worca_regression``) and exclude the SUT's
-    native suite. No-op on non-pytest frameworks (Cypress / Jest /
-    Playwright-TS) and when the command already carries an explicit
+    native suite. No-op when the command already carries an explicit
     ``-m`` selector.
 
+    For Playwright Test frameworks (``playwright-ts``, ``playwright-js``),
+    scoping is file-based: a ``"worca_"`` positional arg is appended so
+    only files with the worca prefix are matched.
+
     `parallelism`: when > 0, overrides the SUT's xdist ``-n`` with this
-    value. When 0 (default), uses ``-n auto`` to let xdist adapt to the
-    machine's CPU availability. Only applied to pytest-family frameworks.
+    value (pytest) or sets ``--workers`` (Playwright Test). When 0
+    (default), pytest gets ``-n 0`` (in-process); Playwright Test keeps
+    its default worker count.
     """
     apply_marker = framework in _PYTEST_FRAMEWORKS
+    apply_pw_filter = framework in _PW_TEST_FRAMEWORKS
     if detected and _looks_like_test_command(detected):
         parser = _DEFAULT_COMMANDS.get(framework, ("", "auto"))[1]
         if parser == "junit" and "--junitxml" not in detected:
@@ -333,6 +372,9 @@ def resolve_command(
             detected = _inject_pytest_marker(detected, marker_filter)
             detected = _inject_strict_markers(detected)
             detected = _inject_xdist_override(detected, parallelism)
+        elif apply_pw_filter:
+            detected = _inject_playwright_file_filter(detected)
+            detected = _inject_playwright_workers(detected, parallelism)
         return detected, parser
     if detected:
         log.warning(
@@ -350,6 +392,9 @@ def resolve_command(
             wrapped = _inject_pytest_marker(wrapped, marker_filter)
             wrapped = _inject_strict_markers(wrapped)
             wrapped = _inject_xdist_override(wrapped, parallelism)
+        elif apply_pw_filter:
+            wrapped = _inject_playwright_file_filter(wrapped)
+            wrapped = _inject_playwright_workers(wrapped, parallelism)
         return wrapped, parser
     bare = _expand_command("pytest --junitxml={junit}", cwd)
     wrapped = wrap_command(profile, bare)
@@ -787,13 +832,16 @@ def run_tests(
     #      lists HEADLESS in its `.env.example`.
     #   2) Strip a literal `--headless` argument from the test command when
     #      we want headed. This covers SUTs that bake `--headless` directly
-    #      into their pytest / playwright invocation. We never *add*
-    #      `--headed` because not all frameworks accept it (and headed is
-    #      the default for most when `--headless` is absent).
+    #      into their pytest / playwright invocation.
+    #   3) For Playwright Test (playwright-ts/js), inject `--headed` when
+    #      the user wants a visible browser — PW Test defaults to headless,
+    #      so removing `--headless` alone isn't sufficient.
     runtime_env = dict(env_extra or {})
     runtime_env["HEADLESS"] = "1" if headless else "0"
     if not headless:
         command = _strip_headless_flag(command)
+        if framework in _PW_TEST_FRAMEWORKS:
+            command = _inject_headed_flag(command)
     elif framework in _PYTEST_FRAMEWORKS and _sut_registers_headless_option(cwd):
         # SUT has its own --headless opt-in (default headed). Inject the
         # flag so worca-t's headless default actually reaches the browser

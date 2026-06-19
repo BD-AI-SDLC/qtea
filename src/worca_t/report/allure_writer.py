@@ -23,6 +23,15 @@ _STATUS_MAP = {
     "skipped": "skipped",
 }
 
+_MIME_BY_TYPE = {
+    "screenshot": "image/png",
+    "trace": "application/zip",
+    "video": "video/webm",
+    "log": "text/plain",
+}
+
+_FAILURE_STATUSES = frozenset({"failed", "broken"})
+
 
 def _to_epoch_ms(iso: str | None) -> int | None:
     if not iso:
@@ -63,6 +72,28 @@ def write_allure_results(report: RunReport, out_dir: Path) -> list[Path]:
         if tb:
             status_details["trace"] = tb
 
+        allure_attachments: list[dict] = []
+        if status in _FAILURE_STATUSES:
+            for a in r.get("attachments") or []:
+                a_path = a.get("path", "")
+                a_type = a.get("type", "other")
+                if not a_path:
+                    continue
+                src = Path(a_path)
+                if not src.is_file():
+                    continue
+                dest_name = f"{result_uuid}-{src.name}"
+                try:
+                    shutil.copy2(src, out_dir / dest_name)
+                except OSError:
+                    continue
+                mime = _MIME_BY_TYPE.get(a_type, "application/octet-stream")
+                allure_attachments.append({
+                    "name": a_type,
+                    "source": dest_name,
+                    "type": mime,
+                })
+
         allure_result = {
             "uuid": result_uuid,
             "historyId": history_id,
@@ -78,6 +109,8 @@ def write_allure_results(report: RunReport, out_dir: Path) -> list[Path]:
         }
         if status_details:
             allure_result["statusDetails"] = status_details
+        if allure_attachments:
+            allure_result["attachments"] = allure_attachments
 
         path = out_dir / f"{result_uuid}-result.json"
         path.write_text(json.dumps(allure_result, indent=2, ensure_ascii=False), encoding="utf-8")

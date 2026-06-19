@@ -88,6 +88,25 @@ from typing import Any
 
 log = logging.getLogger("worca_t.runtime")
 
+# Lazy Playwright Locator bases for the proxy subclassing. We import at module
+# scope (not lazily inside `_install_monkey_patch`) so the proxy classes can
+# inherit from the real Locator — this is what makes
+# ``isinstance(proxy, playwright.sync_api.Locator)`` return True, which is the
+# discriminator Playwright's ``expect._dispatch`` uses before reaching for
+# ``actual._impl_obj``. Without that, ``expect(page.locator(tbd_sentinel))``
+# raises ``ValueError: Unsupported type``. Falling back to ``object`` keeps the
+# template importable on non-Playwright SUTs (sentinel codepaths simply never
+# fire in that case).
+try:
+    from playwright.sync_api import Locator as _SyncLocatorBase  # type: ignore[import-untyped]
+except ImportError:
+    _SyncLocatorBase = object  # type: ignore[assignment,misc]
+
+try:
+    from playwright.async_api import Locator as _AsyncLocatorBase  # type: ignore[import-untyped]
+except ImportError:
+    _AsyncLocatorBase = object  # type: ignore[assignment,misc]
+
 # Sentinel layout: ``__WORCA_T_TBD__::<constant_or_intent>``. The prefix is
 # unique enough that no real CSS selector can collide with it. ``tbd()``
 # constructs the sentinel from the intent string only; the constant name
@@ -1273,7 +1292,7 @@ _RETRIABLE_METHODS = frozenset({
 })
 
 
-class _RetryingLocator:
+class _RetryingLocator(_SyncLocatorBase):
     """Thin wrapper around a Playwright Locator that, on ``TimeoutError``,
     first walks any remaining LLM-supplied fallback candidates against the
     live page (zero token cost) and only falls back to invalidating the
@@ -1303,16 +1322,32 @@ class _RetryingLocator:
     that knows how to construct a fresh Locator with the same parent
     scope (Page / Frame / parent Locator). This lets one proxy class
     serve all three locator entry points without duplicating retry logic.
-    """
 
-    __slots__ = (
-        "_real", "_page", "_sentinel", "_resolution",
-        "_rebuild_locator", "_retried", "_remaining_candidates",
-    )
+    Subclasses ``playwright.sync_api.Locator`` so that
+    ``isinstance(proxy, Locator)`` is True — Playwright's
+    ``expect._dispatch`` uses that check before reaching for
+    ``actual._impl_obj`` to build a ``LocatorAssertionsImpl``. We mirror
+    ``_impl_obj`` from the wrapped real Locator so the assertion impl
+    talks to the right element. ``__slots__`` is intentionally absent:
+    the parent class has a ``__dict__``, so slots in the child are
+    decorative and complicate the subclass story for no real win.
+    """
 
     def __init__(
         self, *, real, page, sentinel, resolution, rebuild_locator,
     ):
+        # Mirror Playwright's internal handle so isinstance-gated callers
+        # (notably ``expect._dispatch`` and any pytest-playwright fixture)
+        # can pull our proxy through their normal codepath. We bypass
+        # ``_SyncLocatorBase.__init__`` to avoid touching Playwright's
+        # internal ``_loop`` / ``_dispatcher_fiber`` plumbing — every
+        # method call on the proxy delegates through ``__getattr__`` to
+        # ``self._real``, which has its own correctly-initialised state.
+        # ``getattr`` with default keeps test fakes (SimpleNamespace) that
+        # have no ``_impl_obj`` working — the attribute simply stays unset.
+        _impl = getattr(real, "_impl_obj", None)
+        if _impl is not None:
+            object.__setattr__(self, "_impl_obj", _impl)
         object.__setattr__(self, "_real", real)
         object.__setattr__(self, "_page", page)
         object.__setattr__(self, "_sentinel", sentinel)
@@ -1335,6 +1370,20 @@ class _RetryingLocator:
     def __repr__(self):  # pragma: no cover (cosmetic)
         return f"<worca-t RetryingLocator wrapping {self._real!r}>"
 
+    def _swap_real(self, fresh_real):
+        """Swap the wrapped real Locator and re-mirror its ``_impl_obj``.
+
+        Necessary because a later ``expect(proxy)`` call dispatches against
+        whatever ``_impl_obj`` is on the proxy at that moment — if we
+        rebuilt ``_real`` (via fallback candidate or LLM re-resolve)
+        without re-mirroring, ``expect`` would still talk to the original
+        stale element. ``getattr(..., None)`` keeps test fakes that lack
+        ``_impl_obj`` working: the slot simply retains its prior value."""
+        object.__setattr__(self, "_real", fresh_real)
+        _impl = getattr(fresh_real, "_impl_obj", None)
+        if _impl is not None:
+            object.__setattr__(self, "_impl_obj", _impl)
+
     def _try_next_candidate(self):
         """Pop and apply the next fallback candidate, swapping `_real` to
         a locator built from its selector. Returns the candidate dict so
@@ -1347,7 +1396,7 @@ class _RetryingLocator:
         if not isinstance(sel, str) or not sel.strip():
             return None
         fresh_real = self._rebuild_locator(sel)
-        object.__setattr__(self, "_real", fresh_real)
+        self._swap_real(fresh_real)
         log.info(
             "worca_t.fallback_candidate_try constant=%s selector=%s strategy=%s",
             self._resolution.constant_name,
@@ -1355,6 +1404,35 @@ class _RetryingLocator:
             nxt.get("strategy"),
         )
         return nxt
+
+    def __getattribute__(self, name):
+        # We subclass ``_SyncLocatorBase`` for the isinstance contract, which
+        # means inherited ``Locator.click`` / ``Locator.count`` / ``Locator.nth``
+        # would normally win attribute lookup BEFORE ``__getattr__`` ever
+        # fires — and they would route into ``self._impl_obj`` directly,
+        # bypassing our retry wrapping and breaking proxies built around
+        # test fakes that have no ``_impl_obj``. Override
+        # ``__getattribute__`` so the proxy keeps its bare-delegation
+        # semantics regardless of what the parent class defines.
+        #
+        # Routing rules:
+        #   - underscored names (our state, private helpers, all dunders)
+        #     → normal MRO lookup via ``object.__getattribute__``.
+        #   - ``_RETRIABLE_METHODS`` → fall through to ``__getattr__``
+        #     so the existing retry wrapper builds around ``self._real``.
+        #   - everything else (chainable ``.nth`` / ``.filter`` / misc)
+        #     → delegate transparently to ``self._real``, matching the
+        #     original bare-proxy behaviour the docstring documents.
+        if name.startswith('_'):
+            return object.__getattribute__(self, name)
+        if name in _RETRIABLE_METHODS:
+            # ``type(self).__getattr__(self, name)`` accesses the method on
+            # the class (not via instance ``__getattribute__``), so no
+            # recursion. ``__getattr__`` then uses ``object.__getattribute__``
+            # internally to reach our slots.
+            return type(self).__getattr__(self, name)
+        real = object.__getattribute__(self, '_real')
+        return getattr(real, name)
 
     def __getattr__(self, name):
         attr = getattr(self._real, name)
@@ -1407,7 +1485,7 @@ class _RetryingLocator:
                             )
                             raise
                         fresh_real = self._rebuild_locator(fresh.selector)
-                        object.__setattr__(self, "_real", fresh_real)
+                        self._swap_real(fresh_real)
                         object.__setattr__(self, "_resolution", fresh)
                         fresh_method = getattr(fresh_real, name)
                         return await fresh_method(*args, **kwargs)
@@ -1460,7 +1538,7 @@ class _RetryingLocator:
                         )
                         raise
                     fresh_real = self._rebuild_locator(fresh.selector)
-                    object.__setattr__(self, "_real", fresh_real)
+                    self._swap_real(fresh_real)
                     object.__setattr__(self, "_resolution", fresh)
                     fresh_method = getattr(fresh_real, name)
                     return fresh_method(*args, **kwargs)
@@ -1494,7 +1572,7 @@ def _is_playwright_timeout(exc: BaseException) -> bool:
     return False
 
 
-class _AsyncLazyLocator:
+class _AsyncLazyLocator(_AsyncLocatorBase):
     """Returned synchronously from ``async_api`` Page/Frame/Locator
     ``.locator(SENTINEL)`` calls. Defers the actual sentinel resolution
     (which needs an awaited AOM snapshot) until the first ACTION method
@@ -1514,10 +1592,19 @@ class _AsyncLazyLocator:
     resolved parent (``page.locator(BUTTON).nth(0)`` works because the
     outer ``page.locator`` is the sentinel intercept and ``.nth`` runs on
     the realized child).
-    """
 
-    __slots__ = ("_page", "_sentinel", "_rebuild_locator", "_constant_name",
-                 "_resolved", "_resolved_real", "_resolved_resolution")
+    Subclasses ``playwright.async_api.Locator`` so that
+    ``isinstance(lazy, Locator)`` is True (Playwright's ``expect._dispatch``
+    discriminates on that). ``_impl_obj`` is populated by
+    :meth:`_ensure_resolved` once the awaited resolve completes. If user
+    code does ``expect(lazy)`` BEFORE any action triggers resolution, the
+    ``_impl_obj`` access inside ``expect._dispatch`` will hit
+    ``__getattr__`` and raise — that's a clearer failure than the bare
+    ``ValueError: Unsupported type`` we shipped before, and the correct
+    async pattern is to either await an action first or fold the
+    sentinel inline (``await expect(page.locator(SENTINEL)).to_*()``
+    after an action elsewhere has populated the cache).
+    """
 
     def __init__(self, *, page, sentinel, rebuild_locator, constant_name=None):
         object.__setattr__(self, "_page", page)
@@ -1549,10 +1636,38 @@ class _AsyncLazyLocator:
                 f"surface this via HITL on the next interactive run, or as a "
                 f"`locator-unresolvable` bug candidate for Step 9."
             )
-        object.__setattr__(self, "_resolved_real",
-                           self._rebuild_locator(resolution.selector))
+        resolved_real = self._rebuild_locator(resolution.selector)
+        object.__setattr__(self, "_resolved_real", resolved_real)
         object.__setattr__(self, "_resolved_resolution", resolution)
         object.__setattr__(self, "_resolved", True)
+        # Late-mirror ``_impl_obj`` so any subsequent ``expect(lazy)`` call
+        # that dispatches via ``isinstance(lazy, Locator)`` finds a real
+        # impl handle. Pre-resolution ``expect`` is still unsupported on
+        # the async surface — see class docstring.
+        _impl = getattr(resolved_real, "_impl_obj", None)
+        if _impl is not None:
+            object.__setattr__(self, "_impl_obj", _impl)
+
+    def __getattribute__(self, name):
+        # Same rationale as ``_RetryingLocator.__getattribute__``: now that
+        # we subclass ``_AsyncLocatorBase`` for the isinstance contract,
+        # inherited ``AsyncLocator.click`` / ``.nth`` / etc. would win
+        # attribute lookup before ``__getattr__`` fires. Force
+        # retriable-method lookups through ``__getattr__`` so the lazy
+        # resolve-then-act flow still runs. Underscored names and dunders
+        # use normal MRO (our state, ``_ensure_resolved``, ``__repr__``,
+        # etc.). Non-retriable public names fall through to ``__getattr__``
+        # which raises the helpful "call an action first" AttributeError.
+        if name.startswith('_'):
+            return object.__getattribute__(self, name)
+        if name in _RETRIABLE_METHODS:
+            return type(self).__getattr__(self, name)
+        # Defer to default lookup; if neither the proxy nor inherited
+        # class defines it, ``__getattr__`` raises with guidance.
+        try:
+            return object.__getattribute__(self, name)
+        except AttributeError:
+            return type(self).__getattr__(self, name)
 
     def __getattr__(self, name):
         if name in _RETRIABLE_METHODS:

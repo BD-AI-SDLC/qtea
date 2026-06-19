@@ -13,13 +13,17 @@ from worca_t.steps.base import StepContext
 from worca_t.steps.s09_execute import (
     ExecuteStep,
     _apply_fixer_outputs,
+    _attempt_state_path,
     _build_bug_candidates,
     _build_fixer_prompt,
+    _compute_install_sig,
     _count_xpath_markers,
     _filter_command_for_tests,
     _lazy_probe_heal_mcp,
+    _load_attempt_state,
     _patch_introduces_xpath,
     _run_dep_install,
+    _save_attempt_state,
 )
 from worca_t.test_runner import TestRunEntry
 from worca_t.workspace import create_workspace
@@ -60,10 +64,26 @@ def test_filter_command_for_tests_preserves_existing_k_selector():
     assert cmd == 'pytest tests/ -k "smoke"'
 
 
+def test_filter_command_for_tests_playwright_adds_grep():
+    failing = [
+        TestRunEntry(id="T-a", name="logs in", file="t.spec.ts", status="failed"),
+        TestRunEntry(id="T-b", name="searches", file="t.spec.ts", status="failed"),
+    ]
+    cmd = _filter_command_for_tests("npx playwright test", failing)
+    assert "--grep" in cmd
+    assert "logs\\ in" in cmd and "searches" in cmd
+
+
+def test_filter_command_for_tests_playwright_preserves_existing_grep():
+    failing = [TestRunEntry(id="T-a", name="logs in", file="t.spec.ts", status="failed")]
+    cmd = _filter_command_for_tests('npx playwright test --grep "smoke"', failing)
+    assert cmd == 'npx playwright test --grep "smoke"'
+
+
 def test_filter_command_for_tests_other_frameworks_unchanged():
     failing = [TestRunEntry(id="T-a", name="logs in", file="t.spec.ts", status="failed")]
-    cmd = _filter_command_for_tests("npx playwright test", failing)
-    assert cmd == "npx playwright test"
+    cmd = _filter_command_for_tests("npx cypress run", failing)
+    assert cmd == "npx cypress run"
 
 
 def test_filter_command_for_tests_empty_returns_unchanged():
@@ -1324,3 +1344,80 @@ def test_build_fixer_prompt_omits_storage_state_block_when_unset():
     assert "PRE-LOADED STORAGE STATE" not in prompt
     # And the standard auth-replay workflow IS present.
     assert "follow the SUT's auth flow" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Cross-attempt state (Tasks 2 + 4 + 5)
+# ---------------------------------------------------------------------------
+
+
+def test_save_and_load_attempt_state_round_trip(tmp_path):
+    """Persistence helper roundtrips failing pairs, no_patch_ids, and
+    install_sig so attempt 2's pre-run logic can read attempt 1's
+    outcomes without depending on in-memory state."""
+    _save_attempt_state(
+        tmp_path, attempt=1,
+        failing=[("T-a", "test_a"), ("T-b", "test_b")],
+        no_patch_ids=["T-b"],
+        install_sig="abc123",
+    )
+    state = _load_attempt_state(tmp_path, 1)
+    assert state is not None
+    assert state["attempt"] == 1
+    assert state["failing"] == [
+        {"id": "T-a", "name": "test_a"},
+        {"id": "T-b", "name": "test_b"},
+    ]
+    assert state["no_patch_ids"] == ["T-b"]
+    assert state["install_sig"] == "abc123"
+
+
+def test_load_attempt_state_missing_file_returns_none(tmp_path):
+    """Cold attempt 1 has no prior state — load returns None and
+    callers must treat that as 'no narrowing' (cold-run semantics)."""
+    assert _load_attempt_state(tmp_path, 1) is None
+
+
+def test_load_attempt_state_corrupt_json_returns_none(tmp_path):
+    """A partial-write or hand-edit shouldn't crash the retry path —
+    the loader must swallow JSON errors and return None so attempt 2
+    falls back to running cold rather than aborting."""
+    _attempt_state_path(tmp_path, 1).write_text("not json", encoding="utf-8")
+    assert _load_attempt_state(tmp_path, 1) is None
+
+
+def test_install_sig_changes_when_lockfile_mtime_changes(tmp_path, monkeypatch):
+    """Same lockfile content but a different mtime/size → different sig.
+    This is the correct behavior: ``poetry install`` re-runs whenever a
+    dependency changes, and mtime+size is a cheap-enough proxy without
+    hashing every byte of large lockfiles."""
+    from dataclasses import dataclass
+    @dataclass
+    class _Profile:
+        package_manager: str = "poetry"
+    lock = tmp_path / "poetry.lock"
+    lock.write_text("contents-v1\n", encoding="utf-8")
+    sig1 = _compute_install_sig(tmp_path, _Profile())
+    # Touch with a different size — sig must differ.
+    lock.write_text("contents-v2-longer\n", encoding="utf-8")
+    sig2 = _compute_install_sig(tmp_path, _Profile())
+    assert sig1 is not None
+    assert sig2 is not None
+    assert sig1 != sig2
+
+
+def test_install_sig_returns_none_when_no_lockfile(tmp_path):
+    """No lockfile → no signature → never skip install. Defensively
+    forces a re-install rather than risk a stale env."""
+    from dataclasses import dataclass
+    @dataclass
+    class _Profile:
+        package_manager: str = "poetry"
+    assert _compute_install_sig(tmp_path, _Profile()) is None
+
+
+def test_install_sig_returns_none_when_profile_is_none(tmp_path):
+    """No stack profile (non-Python stack, broken detection) →
+    signature is None → install logic falls through naturally."""
+    (tmp_path / "poetry.lock").write_text("x\n", encoding="utf-8")
+    assert _compute_install_sig(tmp_path, None) is None

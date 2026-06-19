@@ -20,6 +20,7 @@ Self-heal budget is capped (default 5 tests) to bound runtime.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import os
@@ -27,6 +28,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -52,6 +54,7 @@ from worca_t.stack_profile import PYTHON_VENV_MANAGERS, StackProfile, wrap_comma
 from worca_t.steps.base import Step, StepContext, StepResult
 from worca_t.test_runner import (
     _PYTEST_PLUGIN_PROVIDERS,
+    _PW_TEST_FRAMEWORKS,
     RunResult,
     TestRunEntry,
     execute_command,
@@ -595,7 +598,11 @@ def _attachment_glob(sut_root: Path) -> list[dict]:
         ("test-results/**/trace.zip", "trace"),
         ("test-results/**/*.png", "screenshot"),
         ("test-results/**/*.webm", "video"),
+        ("screenshots/**/*.png", "screenshot"),
+        ("screenshots/**/*.jpg", "screenshot"),
+        ("reports/screenshots/**/*.png", "screenshot"),
         ("playwright-report/**/*", "other"),
+        ("allure-results/**/*.png", "screenshot"),
         ("allure-results/**/*.json", "other"),
     ]
     for pattern, kind in patterns:
@@ -769,28 +776,18 @@ def _apply_fixer_outputs(
 
 
 def _filter_command_for_tests(command: str, failing: list[TestRunEntry]) -> str:
-    """Best-effort narrowing of a pytest re-run command to only the tests we
-    just healed, via ``-k "<name> or <name>"``.
+    """Narrow a re-run command to only the healed tests.
 
-    Uses the real test-function names (which ``-k`` matches as substrings of
-    the node id) rather than reconstructing them from slugified ids, so the
-    expression reliably re-selects exactly the healed tests. Parametrization
-    suffixes (``test_x[case]``) are stripped to the base name so every
-    parametrization of a healed test is re-run.
+    pytest: ``-k "name1 or name2"``
+    Playwright Test: ``--grep "name1|name2"``
 
-    No-op (returns the command unchanged) when:
-      - there are no failing tests,
-      - the command is not pytest-family (re-running everything is safe and
-        avoids brittle CLI assumptions for Cypress/Jest/Playwright-TS/Robot),
-      - a ``-k`` selector is already present (don't clobber an explicit one),
-      - or no usable test names could be extracted.
+    Parametrization suffixes (``test_x[case]``) are stripped to the base
+    name so every parametrization of a healed test is re-run.
+
+    No-op when there are no failing tests, no usable names could be
+    extracted, or the command already carries an explicit filter.
     """
     if not failing:
-        return command
-    tokens = command.lower().split()
-    if "pytest" not in tokens:
-        return command
-    if re.search(r"(?:^|\s)-k(?:\s|=)", command):
         return command
     names: list[str] = []
     for e in failing:
@@ -799,8 +796,203 @@ def _filter_command_for_tests(command: str, failing: list[TestRunEntry]) -> str:
             names.append(name)
     if not names:
         return command
+
+    tokens = command.lower().split()
+
+    # Playwright Test: --grep "name1|name2"
+    if "playwright" in tokens and "test" in tokens:
+        if re.search(r"(?:^|\s)--grep(?:\s|=)", command):
+            return command
+        escaped = [re.escape(n) for n in names]
+        return f'{command} --grep "{"|".join(escaped)}"'
+
+    # pytest: -k "name1 or name2"
+    if "pytest" not in tokens:
+        return command
+    if re.search(r"(?:^|\s)-k(?:\s|=)", command):
+        return command
     expr = " or ".join(names)
     return f'{command} -k "{expr}"'
+
+
+def _narrow_command_to_ids(
+    command: str, all_results: list, allow_ids: set[str],
+) -> str:
+    """Restrict ``command`` to tests whose id is in ``allow_ids``. Wraps
+    :func:`_filter_command_for_tests` so the same -k / --grep narrowing
+    logic applies to attempt-2's initial test run, not just the post-heal
+    re-run."""
+    keep = [e for e in all_results if e.id in allow_ids]
+    return _filter_command_for_tests(command, keep)
+
+
+# ----------------------------------------------------------------------------
+# Cross-attempt state (Tasks 2 + 4 + 5)
+#
+# Persisted per attempt under ``artifacts/step09/attempt-N-state.json`` so the
+# retry path can:
+#   - skip the SUT install when nothing the package manager cares about
+#     changed (Task 4 — saves ~10–30 s);
+#   - narrow attempt 2's initial test run to the subset that failed in
+#     attempt 1, MINUS tests the heal agent classified as real bugs
+#     (Tasks 2 + 5 — saves ~150–300 s plus the LLM cost of re-healing
+#     tests we already know we can't fix);
+#   - skip the heal call for those same real-bug tests on attempt 2.
+# ----------------------------------------------------------------------------
+
+# Heal `summary_text` value that signals "agent ran, found no fixable
+# defect" — i.e. very likely a real product bug, not a flaky selector.
+# Other summary strings ("rejected: heal introduced XPath", scope violation,
+# agent error) are NOT classified as real bug — they mean the heal needs
+# another try with different prompt / scope, not that there's nothing to fix.
+_NO_PATCH_SUMMARY = "no usable patch produced"
+
+
+def _attempt_state_path(out_dir: Path, attempt: int) -> Path:
+    return out_dir / f"attempt-{attempt}-state.json"
+
+
+def _save_attempt_state(
+    out_dir: Path,
+    attempt: int,
+    *,
+    failing: list[tuple[str, str]],
+    no_patch_ids: list[str],
+    install_sig: str | None,
+) -> None:
+    """Persist attempt N outcomes for attempt N+1's pre-run narrowing.
+
+    ``failing`` is a list of ``(id, name)`` tuples — ``id`` for set
+    membership in the heal-skip filter; ``name`` is what
+    :func:`_filter_command_for_tests` needs to build the ``-k`` /
+    ``--grep`` expression for the narrowed test run.
+
+    Best-effort: IO errors log and swallow so an artifact-write failure
+    cannot poison the retry path itself.
+    """
+    path = _attempt_state_path(out_dir, attempt)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({
+                "attempt": attempt,
+                "failing": [{"id": i, "name": n} for i, n in failing],
+                "no_patch_ids": list(no_patch_ids),
+                "install_sig": install_sig,
+                "saved_at": datetime.now(UTC).isoformat(),
+            }, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError as e:
+        log.warning(
+            "step09.attempt_state_save_failed", attempt=attempt, error=str(e),
+        )
+
+
+def _load_attempt_state(out_dir: Path, attempt: int) -> dict | None:
+    """Read attempt-N state. None when missing or corrupt — callers MUST
+    handle None by treating the attempt as cold (no narrowing, no skips)."""
+    path = _attempt_state_path(out_dir, attempt)
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        log.warning(
+            "step09.attempt_state_load_failed", attempt=attempt, error=str(e),
+        )
+        return None
+
+
+def _compute_install_sig(sut_root: Path, stack_profile) -> str | None:
+    """Stable signature of the SUT's dependency state. Two attempts of the
+    same step in the same workspace will see identical sig (heal commits
+    touch SUT source but NOT lockfiles) → install skip is safe.
+
+    Returns None when no lockfile is found — caller MUST treat as
+    "don't skip install" (better to re-install than risk a stale env)."""
+    if stack_profile is None:
+        return None
+    import hashlib
+
+    lock_candidates = (
+        "poetry.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+        "uv.lock", "Pipfile.lock", "Gemfile.lock", "go.sum", "Cargo.lock",
+    )
+    parts: list[str] = [stack_profile.package_manager or ""]
+    found_any = False
+    for name in lock_candidates:
+        p = sut_root / name
+        if p.is_file():
+            try:
+                st = p.stat()
+                parts.append(f"{name}:{st.st_size}:{int(st.st_mtime)}")
+                found_any = True
+            except OSError:
+                continue
+    if not found_any:
+        return None
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+
+
+def _prewarm_jit_cache_dev_pool(
+    *,
+    ctx: StepContext,
+    jit_cache_dir: Path,
+    dev_locators_path: Path,
+) -> int:
+    """Pre-populate the locator cache with tier-1b dev-pool matches for
+    every TBD sentinel currently in the SUT source tree. Returns count.
+
+    Source of truth: the live SUT — scanned via
+    :func:`worca_t.tbd_scanner.scan_tbd_intents`. That guarantees we
+    prewarm the intents the next test run will actually request, even
+    if step 8's archived ``tbd-index.json`` has gone stale (heal
+    agent rewrote a constant, manual edit between steps, etc.).
+    No-op when no TBDs are present or no dev-locator pool is supplied.
+    """
+    from worca_t import jit_resolver
+    from worca_t.runtime.dev_locators import load_dev_locators
+    from worca_t.tbd_scanner import scan_tbd_intents
+
+    sut_root = ctx.workspace.sut
+    scan_roots = [p for p in (sut_root / d for d in ("src", "tests", "pages")) if p.is_dir()]
+    if not scan_roots:
+        scan_roots = [sut_root]
+    hits = scan_tbd_intents(scan_roots, sut_root=sut_root)
+    if not hits:
+        return 0
+
+    # Dedupe by (intent, constant_name) — same intent referenced by
+    # multiple constants or files still needs one prewarm per cache key,
+    # which the resolver will dedupe internally via cache_key().
+    intents_payload: list[dict] = []
+    seen: set[tuple[str, str | None]] = set()
+    for h in hits:
+        intent = (h.intent or "").strip()
+        const = (h.constant_name or "").strip() or intent  # bare tbd() → intent as const
+        dedupe_key = (intent, h.constant_name)
+        if not intent or dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        intents_payload.append({
+            "intent": intent,
+            "constant_name": const,
+            "test_file": str(h.file).replace("\\", "/"),
+        })
+
+    if not intents_payload:
+        return 0
+
+    locators, _src, _warnings = load_dev_locators(cli_path=dev_locators_path)
+    if not locators:
+        return 0
+    return jit_resolver.prewarm_dev_pool_cache(
+        tbd_intents=intents_payload,
+        dev_locators=locators,
+        cache_path=jit_cache_dir / "locator-cache.json",
+        run_id=ctx.workspace.run_id,
+    )
 
 
 def _build_bug_candidates(failing: list[TestRunEntry]) -> dict:
@@ -1030,6 +1222,7 @@ def _promote_resolved_tbds(sut_root: Path, cache_path: Path) -> list[str]:
     """
     import re as _re
 
+    from worca_t.jit_resolver import is_unsafe_selector
     from worca_t.tbd_scanner import scan_tbd_intents
 
     if not cache_path.exists():
@@ -1063,10 +1256,25 @@ def _promote_resolved_tbds(sut_root: Path, cache_path: Path) -> list[str]:
         new_text = text
         for hit in file_hits:
             sel = intent_to_selector[hit.intent]
+            # Defense in depth: re-validate at substitution time. The cache
+            # lives on disk between resolver write and promoter read.
+            if is_unsafe_selector(sel):
+                log.warning(
+                    "step09.tbd_promote_unsafe_selector_skipped",
+                    intent=hit.intent,
+                    file=str(file_path.relative_to(sut_root)),
+                )
+                continue
             escaped = _re.escape(hit.intent)
+            # Lambda replacement (not f-string) so backslash sequences in
+            # `sel` are not interpreted as regex backreferences (\1, \g<name>).
+            # `json.dumps` produces a valid double-quoted string literal for
+            # Python / TS / Java with `"` and `\` properly escaped — prevents
+            # quote-break code injection regardless of selector content.
+            replacement = json.dumps(sel)
             new_text = _re.sub(
                 rf'tbd\((?P<q>["\']){escaped}(?P=q)\)',
-                f'"{sel}"',
+                lambda _m, _r=replacement: _r,
                 new_text,
             )
         if new_text != text:
@@ -1204,6 +1412,31 @@ class ExecuteStep(Step):
         out_dir.mkdir(parents=True, exist_ok=True)
         heal_log_path = out_dir / "self-heal" / "heal-log.jsonl"
         heal_log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Cross-attempt narrowing (Tasks 2 + 4 + 5). When this is a retry,
+        # we can:
+        #   - skip the SUT install (Task 4 — lockfile hasn't changed; heal
+        #     commits don't touch lockfiles);
+        #   - narrow the initial test run to only the previously-failing
+        #     tests minus the ones the prior heal flagged as real bugs
+        #     (Tasks 2 + 5);
+        #   - short-circuit the heal call for those real-bug tests so the
+        #     LLM doesn't burn cost re-discovering "nothing to fix".
+        #
+        # ``record.attempts`` is incremented in ``base.py:_attempt`` BEFORE
+        # ``run()`` is called, so a value > 1 is a true retry.
+        _record = ctx.state.steps.get(self.number)
+        _current_attempt = _record.attempts if _record else 1
+        _prior_state: dict | None = None
+        if _current_attempt > 1:
+            _prior_state = _load_attempt_state(out_dir, _current_attempt - 1)
+            if _prior_state:
+                log.info(
+                    "step09.prior_attempt_state_loaded",
+                    attempt=_current_attempt,
+                    prior_failing=len(_prior_state.get("failing_ids", [])),
+                    prior_no_patch=len(_prior_state.get("no_patch_ids", [])),
+                )
 
         # Pre-flight: SUT must be present + on the worca-t branch. Step 8
         # already wrote into it; step 9 runs tests + heals against it.
@@ -1368,7 +1601,16 @@ class ExecuteStep(Step):
             venv_path=stack_profile.venv_path if stack_profile else None,
             detection_signal=stack_profile.detection_signal if stack_profile else None,
         )
-        if stack_profile and stack_profile.install_command:
+        # Task 4: skip install on retry when the dependency state is byte-
+        # identical to the attempt that ran the install. Lockfile mtime +
+        # size + package_manager give us a cheap-but-sufficient signature.
+        install_sig = _compute_install_sig(ctx.workspace.sut, stack_profile)
+        _skip_install = (
+            _prior_state is not None
+            and install_sig is not None
+            and _prior_state.get("install_sig") == install_sig
+        )
+        if stack_profile and stack_profile.install_command and not _skip_install:
             prep = prepare_sut(
                 stack_profile,
                 cwd=ctx.workspace.sut,
@@ -1393,28 +1635,41 @@ class ExecuteStep(Step):
                 command=prep.command,
                 duration_s=prep.duration_s,
             )
-            if stack_profile.venv_path:
-                venv_abs = ctx.workspace.sut / stack_profile.venv_path
-                log.info(
-                    "step09.venv_check",
-                    venv_path=str(venv_abs),
-                    exists=venv_abs.exists(),
-                    is_dir=venv_abs.is_dir() if venv_abs.exists() else False,
+        elif _skip_install:
+            log.info(
+                "step09.install_skipped_retry",
+                attempt=_current_attempt,
+                install_sig=install_sig,
+                reason="dependency signature matches prior attempt",
+            )
+
+        # Venv detection / wrapper_prefix swap must STILL fire even when
+        # install was skipped — pytest + playwright invocations downstream
+        # rely on ``stack_profile.wrapper_prefix`` pointing at the venv
+        # bin dir. Without this branch, attempt 2 would fall back to
+        # ``poetry run pytest`` (slow path) instead of ``.venv/bin/pytest``.
+        if stack_profile and stack_profile.venv_path:
+            venv_abs = ctx.workspace.sut / stack_profile.venv_path
+            log.info(
+                "step09.venv_check",
+                venv_path=str(venv_abs),
+                exists=venv_abs.exists(),
+                is_dir=venv_abs.is_dir() if venv_abs.exists() else False,
+            )
+            if venv_abs.exists():
+                # Bypass poetry's venv resolution for all subsequent
+                # commands (playwright install, pytest). After
+                # prepare_sut created .venv, invoke directly via its
+                # bin dir — equivalent to activating the venv.
+                bin_dir = str(
+                    venv_abs / ("Scripts" if os.name == "nt" else "bin")
                 )
-                if venv_abs.exists():
-                    # Bypass poetry's venv resolution for all subsequent
-                    # commands (playwright install, pytest). After
-                    # prepare_sut created .venv, invoke directly via its
-                    # bin dir — equivalent to activating the venv.
-                    bin_dir = str(
-                        venv_abs / ("Scripts" if os.name == "nt" else "bin")
-                    )
-                    stack_profile = dataclasses.replace(
-                        stack_profile,
-                        wrapper_prefix=bin_dir,
-                        package_manager="pip",
-                    )
-                    log.info("step09.venv_activated", bin_dir=bin_dir)
+                stack_profile = dataclasses.replace(
+                    stack_profile,
+                    wrapper_prefix=bin_dir,
+                    package_manager="pip",
+                )
+                log.info("step09.venv_activated", bin_dir=bin_dir)
 
         # Playwright stacks need browser binaries installed after the
         # package install. Idempotent — skips if already present.
@@ -1534,6 +1789,70 @@ class ExecuteStep(Step):
                 port=_resolver_server.port,
             )
 
+            # Task 3: pre-warm the dev-pool tier of the JIT cache. We
+            # already know every TBD intent codegen emitted (it's in
+            # ``artifacts/step08/tbd-index.json``) and we have the dev-
+            # locator pool loaded. Running the fuzzy match now (in the
+            # parent, off the test's critical path) means pytest hits a
+            # populated cache for every tier-1b-resolvable intent
+            # instead of paying a snapshot+score round-trip per test.
+            # Idempotent on retry — entries already present in the
+            # cache are not overwritten.
+            try:
+                _prewarm_count = _prewarm_jit_cache_dev_pool(
+                    ctx=ctx,
+                    jit_cache_dir=jit_cache_dir,
+                    dev_locators_path=Path(runtime_env["WORCA_T_DEV_LOCATORS"]),
+                )
+                if _prewarm_count > 0:
+                    log.info(
+                        "step09.jit_cache_prewarmed",
+                        count=_prewarm_count,
+                        tier="dev-pool",
+                    )
+            except Exception as _e:  # noqa: BLE001 — best-effort, never poison run
+                log.warning("step09.jit_cache_prewarm_failed", error=str(_e))
+
+        # Task 5: narrow attempt 2's initial test run to the subset that
+        # failed in attempt 1 minus tests flagged as real bugs (Task 2).
+        # Saves the bulk of the previously-passing tests' wall time —
+        # those passed once on identical code, no need to re-prove it.
+        _retry_subset_count: int | None = None
+        if _prior_state:
+            _prior_failing = _prior_state.get("failing", []) or []
+            _prior_no_patch = set(_prior_state.get("no_patch_ids", []) or [])
+            _rerun_pairs = [
+                (e["id"], e["name"]) for e in _prior_failing
+                if isinstance(e, dict) and e.get("id") and e.get("name")
+                and e["id"] not in _prior_no_patch
+            ]
+            if _rerun_pairs:
+                from types import SimpleNamespace
+                _rerun_entries = [
+                    SimpleNamespace(id=tid, name=tname)
+                    for tid, tname in _rerun_pairs
+                ]
+                _orig_cmd = detected_cmd
+                # Resolve the framework default when codegen didn't pin one,
+                # so the narrowing can append a -k / --grep to a real cmd.
+                _base_cmd, _ = resolve_command(
+                    framework,
+                    detected=detected_cmd,
+                    cwd=ctx.workspace.sut,
+                    profile=stack_profile,
+                    marker_filter=_WORCA_PYTEST_MARKER_FILTER,
+                )
+                detected_cmd = _filter_command_for_tests(_base_cmd, _rerun_entries)
+                _retry_subset_count = len(_rerun_pairs)
+                log.info(
+                    "step09.retry_narrowed_to_subset",
+                    attempt=_current_attempt,
+                    rerun_count=len(_rerun_pairs),
+                    skipped_real_bugs=len(_prior_no_patch),
+                    original_cmd=_orig_cmd or "(framework default)",
+                    narrowed_cmd=detected_cmd,
+                )
+
         try:
             log.info(
                 "step09.test_run_start",
@@ -1543,6 +1862,7 @@ class ExecuteStep(Step):
                 marker_filter=_WORCA_PYTEST_MARKER_FILTER,
                 parallelism=getattr(ctx.options, "parallelism", 0),
                 headless=getattr(ctx.options, "headless", True),
+                retry_subset_count=_retry_subset_count,
             )
             _applied_marker_filter = _WORCA_PYTEST_MARKER_FILTER
             first = run_tests(
@@ -1557,27 +1877,32 @@ class ExecuteStep(Step):
                 parallelism=getattr(ctx.options, "parallelism", 0),
             )
 
-            # Exit code 5 from pytest means "no tests were collected" — the
-            # worca marker filter matched nothing. This is a codegen quality
-            # failure: Step 8 must add @pytest.mark.worca_<phase> to every test
-            # function it writes or modifies (codegen-rules.md §8). Fail fast
-            # with an actionable message rather than silently bypassing the
-            # filter, which would run the wrong test scope.
-            if first.exit_code == 5 and _applied_marker_filter:
+            # Detect "no tests collected" — a codegen quality failure where
+            # Step 8's test scoping filter matched nothing.
+            # pytest: exit code 5 = no tests collected.
+            # Playwright Test: exit code 1 + total==0 = no matching files.
+            _is_empty_collection = (
+                first.exit_code == 5
+                or (
+                    framework in _PW_TEST_FRAMEWORKS
+                    and first.exit_code == 1
+                    and first.total == 0
+                )
+            )
+            if _is_empty_collection and _applied_marker_filter:
                 return StepResult(
                     success=False,
                     status="failed",
                     outputs=[],
                     error=(
-                        f"pytest collected 0 tests matching the worca marker filter "
-                        f"({_applied_marker_filter!r}). "
-                        f"This is a codegen defect: Step 8 must add "
-                        f"@pytest.mark.worca_<phase> to every test function it "
-                        f"writes or modifies, even when adding to an existing SUT "
-                        f"file. Check the test files in the SUT and ensure each "
-                        f"worca-authored function carries the marker. "
+                        f"{framework} collected 0 tests matching the worca "
+                        f"test filter. This is a codegen defect: Step 8 must "
+                        f"generate test files with the 'worca_' prefix "
+                        f"(Playwright Test) or add @pytest.mark.worca_<phase> "
+                        f"to every test function (pytest). Check the test files "
+                        f"in the SUT and ensure they follow the naming convention. "
                         f"Override with WORCA_T_PYTEST_MARKER='' to run without "
-                        f"marker scoping (runs the full SUT suite, not recommended)."
+                        f"scoping (runs the full SUT suite, not recommended)."
                     ),
                 )
 
@@ -1610,6 +1935,47 @@ class ExecuteStep(Step):
 
             failing = _failing_tests(first)
             self_heal_meta: dict[str, dict] = {}
+
+            # Task 2: skip the heal call for tests the prior attempt's
+            # heal agent classified as real product bugs (summary ==
+            # "no usable patch produced"). Heal would only spend more
+            # LLM cycles arriving at the same conclusion. The
+            # classification is conservative: only the exact "no usable
+            # patch" summary qualifies — agent timeouts, scope violations,
+            # and XPath rejections all stay eligible because they indicate
+            # the heal could still succeed under different conditions.
+            if _prior_state:
+                _prior_no_patch = set(_prior_state.get("no_patch_ids", []) or [])
+                if _prior_no_patch:
+                    _skipped_heals = [e for e in failing if e.id in _prior_no_patch]
+                    failing = [e for e in failing if e.id not in _prior_no_patch]
+                    for _entry in _skipped_heals:
+                        _summary = (
+                            "skipped: prior attempt's heal produced no patch "
+                            "(classified as real product bug)"
+                        )
+                        self_heal_meta[_entry.id] = {
+                            "attempted": False,
+                            "applied": False,
+                            "summary": _summary,
+                        }
+                        try:
+                            with heal_log_path.open("a", encoding="utf-8") as _fh:
+                                _fh.write(json.dumps({
+                                    "test_id": _entry.id,
+                                    "file": _entry.file,
+                                    "applied": False,
+                                    "agent_success": False,
+                                    "agent_error": _summary,
+                                    "ts": datetime.now(UTC).isoformat(),
+                                }, ensure_ascii=False) + "\n")
+                        except OSError:
+                            pass
+                        log.info(
+                            "step09.heal_skipped_real_bug",
+                            test_id=_entry.id,
+                            attempt=_current_attempt,
+                        )
 
             # Skip self-heal when the failure is the synthetic `T-runner-failure`
             # entry — the runner blew up at collection / import time and there is
@@ -1854,7 +2220,41 @@ class ExecuteStep(Step):
                 heal_relevant_sut_files = _auth_relevant_sut_files(active_module)
                 heal_allowlist = _heal_allowlist_dirs(active_module)
                 generated_files = _load_generated_files(ctx)
-                for entry in failing:
+
+                # Task 1: parallelize heal agents via asyncio.gather. The
+                # LLM call (run_agent) dominates each heal's wall time
+                # (~1–10 min on Opus); running them concurrently nearly
+                # halves the total when 2+ tests fail. Bounded by
+                # ``WORCA_T_HEAL_CONCURRENCY`` (default 3) to cap memory
+                # — each agent spawns a Playwright MCP browser process.
+                #
+                # Concurrent SUT edits: agents may write to the same POM
+                # file in ``acceptEdits`` mode; the agent whose write
+                # completes second wins. We accept this race for v1; the
+                # post-heal verify re-run catches incorrect patches and
+                # the existing scope guards / quality gates protect
+                # against most catastrophic outcomes. The git commit
+                # itself is sync (blocks the event loop briefly) and so
+                # is naturally serialized — concurrent commits can't
+                # race because Python won't preempt mid-subprocess.
+                #
+                # ``patches_applied`` / ``patches_rejected`` increments
+                # and ``self_heal_meta`` writes are asyncio-safe: they
+                # happen between awaits within each coroutine, and
+                # asyncio guarantees no preemption inside an await-free
+                # span. Same for the per-line heal-log appends.
+                _heal_concurrency = max(
+                    1, int(os.environ.get("WORCA_T_HEAL_CONCURRENCY", "3")),
+                )
+                _heal_sem = asyncio.Semaphore(_heal_concurrency)
+                log.info(
+                    "step09.heal_parallel_start",
+                    failing_count=len(failing),
+                    concurrency=_heal_concurrency,
+                )
+
+                async def _do_one_heal(entry):
+                    nonlocal patches_applied, patches_rejected
                     heal_wd = ctx.workspace.step_workdir(9) / f"heal-{entry.id}"
                     heal_wd.mkdir(parents=True, exist_ok=True)
                     # Snapshot the failing test's current bytes BEFORE the fixer
@@ -1901,31 +2301,36 @@ class ExecuteStep(Step):
                     # (`browser_navigate`, `browser_snapshot`). After the
                     # audit that flipped `run_agent`'s `enable_mcp` default
                     # to False, this call must opt back in.
-                    agent_res = await run_agent(
-                        fixer_agent,
-                        workdir=heal_wd,
-                        inputs={},
-                        user_prompt=_build_fixer_prompt(
-                            entry, sut_tests,
-                            sut_root=ctx.workspace.sut,
-                            sut_base_url=sut_base_url,
-                            active_module=active_module,
-                            staged_files=heal_relevant_sut_files,
-                            storage_state_path=_storage_state_path,
-                            generated_files=generated_files,
-                        ),
-                        extra_paths=[
-                            package_resource_root() / "skills" / "diagnose-test-failure",
-                            package_resource_root() / "skills" / "playwright-explore-website",
-                            package_resource_root() / "skills" / "webapp-testing",
-                        ],
-                        add_dirs=[ctx.workspace.sut],
-                        timeout_s=HEAL_AGENT_TIMEOUT_S,
-                        step=9,
-                        max_turns=HEAL_AGENT_MAX_TURNS,
-                        enable_mcp=True,
-                        mcp_env=_heal_mcp_env,
-                    )
+                    #
+                    # ``_heal_sem`` bounds the in-flight LLM calls so the
+                    # parallel orchestration doesn't spin up more browser
+                    # processes than the host can handle.
+                    async with _heal_sem:
+                        agent_res = await run_agent(
+                            fixer_agent,
+                            workdir=heal_wd,
+                            inputs={},
+                            user_prompt=_build_fixer_prompt(
+                                entry, sut_tests,
+                                sut_root=ctx.workspace.sut,
+                                sut_base_url=sut_base_url,
+                                active_module=active_module,
+                                staged_files=heal_relevant_sut_files,
+                                storage_state_path=_storage_state_path,
+                                generated_files=generated_files,
+                            ),
+                            extra_paths=[
+                                package_resource_root() / "skills" / "diagnose-test-failure",
+                                package_resource_root() / "skills" / "playwright-explore-website",
+                                package_resource_root() / "skills" / "webapp-testing",
+                            ],
+                            add_dirs=[ctx.workspace.sut],
+                            timeout_s=HEAL_AGENT_TIMEOUT_S,
+                            step=9,
+                            max_turns=HEAL_AGENT_MAX_TURNS,
+                            enable_mcp=True,
+                            mcp_env=_heal_mcp_env,
+                        )
 
                     # Scope guard: revert any heal edits to files outside the
                     # POM/locator allowlist (or matching the FORBIDDEN globs).
@@ -2126,6 +2531,22 @@ class ExecuteStep(Step):
                     with heal_log_path.open("a", encoding="utf-8") as fh:
                         fh.write(json.dumps(heal_entry, ensure_ascii=False) + "\n")
 
+                # Launch every heal concurrently. ``return_exceptions=False``
+                # propagates the first failure so we don't silently mask
+                # bugs in the heal harness itself — individual agent errors
+                # are already captured as ``agent_res.success=False`` and
+                # do not raise; anything that DOES raise here is a true
+                # orchestrator bug worth surfacing.
+                _heal_t0 = time.monotonic()
+                await asyncio.gather(*[_do_one_heal(e) for e in failing])
+                log.info(
+                    "step09.heal_parallel_done",
+                    failing_count=len(failing),
+                    duration_s=round(time.monotonic() - _heal_t0, 1),
+                    patches_applied=patches_applied,
+                    patches_rejected=patches_rejected,
+                )
+
                 if patches_applied > 0:
                     # Re-run ONLY the healed tests via `-k`, not the whole
                     # suite. We resolve the command the same way `run_tests`
@@ -2212,6 +2633,29 @@ class ExecuteStep(Step):
             ok_schema, schema_err = is_valid(payload, "run-results")
             if not ok_schema:
                 log.warning("step09.schema_invalid", error=schema_err)
+
+            # Tasks 2 + 4 + 5: persist this attempt's outcomes for any
+            # subsequent retry. ``no_patch_ids`` is the running union with
+            # the prior attempt's so multi-attempt convergence works: once
+            # a test is classified as a real bug it stays skipped on every
+            # later attempt without needing each attempt to rediscover it.
+            _now_failing = [
+                (r.id, r.name) for r in first.results
+                if r.status in ("failed", "error")
+            ]
+            _now_no_patch = {
+                tid for tid, meta in self_heal_meta.items()
+                if not meta.get("applied")
+                and meta.get("summary") == _NO_PATCH_SUMMARY
+            }
+            if _prior_state:
+                _now_no_patch |= set(_prior_state.get("no_patch_ids", []) or [])
+            _save_attempt_state(
+                out_dir, _current_attempt,
+                failing=_now_failing,
+                no_patch_ids=sorted(_now_no_patch),
+                install_sig=install_sig,
+            )
 
             # TBD promotion: any tbd("intent") sentinels whose intent now has a
             # cached selector get replaced in-place in the SUT source files and

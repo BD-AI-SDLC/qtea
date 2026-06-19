@@ -1075,3 +1075,113 @@ def test_pytest_runtest_makereport_sets_rep_call_failed_on_excinfo(runtime):
     item = _Item()
     runtime.pytest_runtest_makereport(item, _Call())
     assert item.rep_call.passed is False
+
+
+# ---------------------------------------------------------------------------
+# Locator subclassing: `expect(page.locator(tbd_sentinel))` regression
+# ---------------------------------------------------------------------------
+#
+# Why this block exists: Playwright's `expect._dispatch` discriminates on
+# `isinstance(actual, Locator)` then reaches for `actual._impl_obj`. If the
+# proxy is not a Locator subclass, dispatch falls through to a
+# `ValueError: Unsupported type`, which is exactly what blew up tests 3 & 4
+# in run 20260619-110723-2623a7. These tests guard against regression of
+# the subclass fix without booting a real browser — we just need the
+# isinstance check and the impl-handle plumbing to be sound.
+
+
+def test_retrying_locator_is_locator_subclass(runtime):
+    """When Playwright is importable, _RetryingLocator MUST be a Locator
+    subclass — that's the discriminator `expect._dispatch` uses."""
+    pytest.importorskip("playwright.sync_api")
+    from playwright.sync_api import Locator
+    assert issubclass(runtime._RetryingLocator, Locator), (
+        "_RetryingLocator must subclass playwright.sync_api.Locator so "
+        "expect(page.locator(tbd_sentinel)) dispatches correctly. Without "
+        "this, Playwright raises ValueError: Unsupported type."
+    )
+
+
+def test_retrying_locator_instance_passes_isinstance_locator(runtime):
+    """An instantiated proxy must satisfy isinstance(proxy, Locator) so
+    `expect(proxy)` finds the Locator branch in _dispatch."""
+    pytest.importorskip("playwright.sync_api")
+    from playwright.sync_api import Locator
+
+    # Fake a real Locator that carries an _impl_obj — that's all
+    # expect._dispatch needs to build a LocatorAssertionsImpl.
+    real = SimpleNamespace(_impl_obj=object(), click=lambda timeout=None: "ok")
+    proxy = runtime._RetryingLocator(
+        real=real, page=None,
+        sentinel=runtime.tbd("submit button"),
+        resolution=_make_resolution(runtime),
+        rebuild_locator=lambda sel: real,
+    )
+    assert isinstance(proxy, Locator)
+
+
+def test_retrying_locator_mirrors_impl_obj_from_real(runtime):
+    """`expect._dispatch` reads `actual._impl_obj` — the proxy must
+    expose the same impl handle the wrapped real Locator carries."""
+    sentinel_impl = object()
+    real = SimpleNamespace(_impl_obj=sentinel_impl, click=lambda timeout=None: "ok")
+    proxy = runtime._RetryingLocator(
+        real=real, page=None,
+        sentinel=runtime.tbd("submit button"),
+        resolution=_make_resolution(runtime),
+        rebuild_locator=lambda sel: real,
+    )
+    assert proxy._impl_obj is sentinel_impl
+
+
+def test_retrying_locator_swap_real_remirrors_impl_obj(runtime, monkeypatch):
+    """After a retry/fallback swaps `_real`, `_impl_obj` MUST follow —
+    otherwise a later expect(proxy) call talks to the stale element."""
+    first_impl = object()
+    fresh_impl = object()
+    first_real = SimpleNamespace(
+        _impl_obj=first_impl,
+        click=lambda timeout=None: (_ for _ in ()).throw(_FakeTimeoutError()),
+    )
+    fresh_real = SimpleNamespace(_impl_obj=fresh_impl, click=lambda timeout=None: "ok")
+
+    monkeypatch.setattr(
+        runtime, "_resolve_sentinel",
+        lambda *a, **k: runtime._Resolution(
+            selector="#fresh", source="agent",
+            constant_name="X", intent="x", test_file=None,
+        ),
+    )
+
+    proxy = runtime._RetryingLocator(
+        real=first_real, page=None,
+        sentinel=runtime.tbd("x"),
+        resolution=_make_resolution(runtime),
+        rebuild_locator=lambda sel: fresh_real,
+    )
+    assert proxy._impl_obj is first_impl
+    proxy.click()  # triggers the retry path → swap to fresh_real
+    assert proxy._impl_obj is fresh_impl
+
+
+def test_retrying_locator_tolerates_missing_impl_obj_on_fake(runtime):
+    """Existing test fakes (SimpleNamespace without _impl_obj) must still
+    construct cleanly — the subclass fix is opportunistic, not a hard
+    requirement on the wrapped object."""
+    real = SimpleNamespace(click=lambda timeout=None: "ok")  # no _impl_obj
+    proxy = runtime._RetryingLocator(
+        real=real, page=None,
+        sentinel=runtime.tbd("submit button"),
+        resolution=_make_resolution(runtime),
+        rebuild_locator=lambda sel: real,
+    )
+    assert proxy.click() == "ok"
+
+
+def test_async_lazy_locator_is_locator_subclass(runtime):
+    """Same isinstance contract for the async surface."""
+    pytest.importorskip("playwright.async_api")
+    from playwright.async_api import Locator as AsyncLocator
+    assert issubclass(runtime._AsyncLazyLocator, AsyncLocator), (
+        "_AsyncLazyLocator must subclass playwright.async_api.Locator."
+    )
