@@ -1,6 +1,6 @@
 """``worca-t auth-capture`` — one-shot Playwright storageState producer.
 
-Spawns the SUT's venv Python with a generated wrapper script that:
+Spawns the SUT's own interpreter with a generated wrapper script that:
 
 1. Opens a HEADED Chromium via Playwright (so the user can interactively
    complete MFA / SSO / captcha).
@@ -13,10 +13,11 @@ by Step 9's storage-state resolver (``worca_t.storage_state.resolve``).
 Subsequent ``worca-t run`` invocations skip the heal-agent's auth-replay
 step entirely because Playwright MCP boots already authenticated.
 
-V1 scope: Playwright Python SUTs only. Non-Playwright stacks raise
-``NotImplementedError`` with a clear message — the storage-state format
-is Playwright-specific (Selenium ``driver.get_cookies()`` would need
-manual conversion and would not capture localStorage).
+Supported stacks: Python + Playwright, Node.js (JavaScript / TypeScript)
++ Playwright. Non-Playwright stacks (Selenium, Cypress, Robot) raise
+``NotImplementedError`` — the storage-state format is Playwright-specific
+(Selenium ``driver.get_cookies()`` would need manual conversion and would
+not capture localStorage).
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -37,6 +39,8 @@ log = get_logger(__name__)
 
 DEFAULT_OUTPUT_REL = Path(".worca-t") / "storage-state.json"
 
+_PLAYWRIGHT_LANGUAGES = frozenset({"python", "javascript", "typescript"})
+
 
 @dataclass(frozen=True)
 class AuthFlowSpec:
@@ -49,7 +53,7 @@ class AuthFlowSpec:
     entry_method: str   # "tests/fixtures/auth.py:sign_in" — file:symbol
     fixture_entry: str | None  # optional fixture wrapping the helper
     credentials_env_vars: tuple[str, ...]
-    language: str  # active module language — must be "python"
+    language: str  # active module language — "python", "javascript", or "typescript"
 
 
 def _find_sut_inventory(sut_root: Path) -> dict | None:
@@ -129,6 +133,48 @@ def _resolve_sut_python(sut_root: Path) -> Path:
     )
 
 
+def _resolve_sut_node(sut_root: Path, language: str) -> list[str]:
+    """Locate a Node.js runner capable of executing the auth-capture wrapper.
+
+    Returns the command prefix (e.g. ``["node"]`` or ``["npx", "tsx"]``).
+    Raises ``FileNotFoundError`` when Playwright is absent from the SUT's
+    ``node_modules`` or Node.js cannot be bootstrapped.
+    """
+    has_pw = (
+        (sut_root / "node_modules" / "playwright").is_dir()
+        or (sut_root / "node_modules" / "@playwright" / "test").is_dir()
+    )
+    if not has_pw:
+        raise FileNotFoundError(
+            f"No playwright package in {sut_root}/node_modules/. "
+            f"Run `npm install playwright` or `npm install @playwright/test` "
+            f"in the SUT first."
+        )
+
+    from worca_t.node_env import ensure_node
+
+    if not ensure_node():
+        raise FileNotFoundError(
+            "Node.js is not available and auto-bootstrap failed. "
+            "Install Node.js manually or check the error above."
+        )
+
+    if language == "typescript":
+        tsx_name = "tsx.cmd" if os.name == "nt" else "tsx"
+        tsx_local = sut_root / "node_modules" / ".bin" / tsx_name
+        if tsx_local.is_file():
+            return [str(tsx_local)]
+        return ["npx", "tsx"]
+
+    node_path = shutil.which("node")
+    if not node_path:
+        raise FileNotFoundError(
+            "node not found on PATH after ensure_node(). "
+            "Install Node.js manually."
+        )
+    return [node_path]
+
+
 def _wrapper_script(
     spec: AuthFlowSpec, output: Path, sut_root: Path, headed: bool,
 ) -> str:
@@ -185,6 +231,82 @@ def _wrapper_script(
     )
 
 
+def _wrapper_script_node(
+    spec: AuthFlowSpec, output: Path, sut_root: Path, headed: bool,
+) -> str:
+    """Generate the Node.js (.mjs) wrapper for auth capture.
+
+    Uses ``createRequire`` anchored at ``sut_root`` so the temp file can
+    live in the OS temp dir while still resolving ``playwright`` from the
+    SUT's ``node_modules``. The SUT's sign-in helper is loaded via dynamic
+    ``import()`` to support both ESM and CJS exports.
+    """
+    file_part, _, symbol = spec.entry_method.partition(":")
+    helper_path = (sut_root / file_part).resolve()
+    headless_str = "false" if headed else "true"
+    sut_root_json = json.dumps(str(sut_root).replace("\\", "/"))
+    helper_json = json.dumps(str(helper_path))
+    symbol_json = json.dumps(symbol)
+    output_json = json.dumps(str(output))
+
+    return (
+        "import { createRequire } from 'module';\n"
+        "import { pathToFileURL } from 'url';\n"
+        "\n"
+        f"const _require = createRequire({sut_root_json} + '/package.json');\n"
+        "let chromium;\n"
+        "try {\n"
+        "  chromium = _require('playwright').chromium;\n"
+        "} catch {\n"
+        "  chromium = _require('@playwright/test').chromium;\n"
+        "}\n"
+        "\n"
+        f"const helperPath = {helper_json};\n"
+        f"const symbol = {symbol_json};\n"
+        f"const outputPath = {output_json};\n"
+        "\n"
+        "const mod = await import(pathToFileURL(helperPath).href);\n"
+        "let fn = mod[symbol];\n"
+        "if (!fn && mod.default) {\n"
+        "  fn = typeof mod.default === 'function' && symbol === 'default'\n"
+        "    ? mod.default\n"
+        "    : mod.default[symbol];\n"
+        "}\n"
+        "if (typeof fn !== 'function') {\n"
+        "  const names = Object.keys(mod).join(', ') || '(none)';\n"
+        "  console.error("
+        "`Could not find export '${symbol}' in ${helperPath}. "
+        "Available: ${names}`);\n"
+        "  process.exit(1);\n"
+        "}\n"
+        "\n"
+        f"const browser = await chromium.launch({{ headless: {headless_str} }});\n"
+        "const context = await browser.newContext();\n"
+        "\n"
+        "const fnStr = fn.toString();\n"
+        "const paramMatch = fnStr.match("
+        "/^\\s*(?:async\\s+)?(?:function\\s*\\w*\\s*)?\\(?\\s*(\\w+)/);\n"
+        "const firstParam = (paramMatch?.[1] || '').toLowerCase();\n"
+        "\n"
+        "if (fn.length > 0) {\n"
+        "  if (firstParam.includes('page')) {\n"
+        "    const page = await context.newPage();\n"
+        "    await fn(page);\n"
+        "  } else {\n"
+        "    await fn(context);\n"
+        "  }\n"
+        "} else {\n"
+        "  console.error("
+        "'sign-in helper takes no args — cannot inject context for capture.');\n"
+        "  process.exit(1);\n"
+        "}\n"
+        "\n"
+        "await context.storageState({ path: outputPath });\n"
+        "await browser.close();\n"
+        f"console.log('[auth-capture] saved', {output_json});\n"
+    )
+
+
 def _set_owner_only_perms(path: Path) -> None:
     """Set file mode 0o600 on POSIX; on Windows, log a note (no reliable
     cross-version chmod equivalent — owner-only is the default on a
@@ -233,40 +355,40 @@ def cmd_auth_capture(
             "a name not in modules[]). Fix the inventory and retry."
         )
     spec = _build_auth_flow_spec(module)
-    if spec.language != "python":
+    if spec.language not in _PLAYWRIGHT_LANGUAGES:
         raise NotImplementedError(
-            f"auth-capture V1 supports Python+Playwright SUTs only "
-            f"(active_module language is {spec.language!r}). For "
-            f"Selenium/Cypress/Robot, produce a Playwright-format "
-            f"storageState.json manually and pass it via --storage-state."
+            f"auth-capture supports Python and Node.js (JS/TS) Playwright "
+            f"SUTs (active_module language is {spec.language!r}). For other "
+            f"stacks, produce a Playwright-format storageState.json manually "
+            f"and pass it via --storage-state."
         )
 
-    sut_python = _resolve_sut_python(sut_root)
     out_path = (output or (sut_root / DEFAULT_OUTPUT_REL)).resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    script_src = _wrapper_script(spec, out_path, sut_root, headed=headed)
+    if spec.language == "python":
+        cmd_prefix = [str(_resolve_sut_python(sut_root))]
+        script_src = _wrapper_script(spec, out_path, sut_root, headed=headed)
+        suffix = "_worca_auth_capture.py"
+    else:
+        cmd_prefix = _resolve_sut_node(sut_root, spec.language)
+        script_src = _wrapper_script_node(spec, out_path, sut_root, headed=headed)
+        suffix = "_worca_auth_capture.mjs"
 
-    # Write the wrapper to a temp file so the SUT Python can import it
-    # (avoids -c quoting nightmares on Windows).
     with tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", suffix="_worca_auth_capture.py", delete=False,
+        "w", encoding="utf-8", suffix=suffix, delete=False,
     ) as fh:
         fh.write(script_src)
         wrapper_path = Path(fh.name)
 
     try:
         log.info(
-            "auth_capture.spawn sut_python=%s wrapper=%s output=%s headed=%s",
-            sut_python, wrapper_path, mask_path(out_path), headed,
+            "auth_capture.spawn cmd=%s wrapper=%s output=%s headed=%s",
+            cmd_prefix, wrapper_path, mask_path(out_path), headed,
         )
-        # Use safe_subprocess_env so the child inherits proxy / locale /
-        # required env (including the credentials env vars the SUT's
-        # sign-in helper reads). isolate_venv=True so VIRTUAL_ENV does
-        # not leak worca-t's own venv into the SUT subprocess.
         env = safe_subprocess_env(isolate_venv=True)
         proc = subprocess.run(
-            [str(sut_python), str(wrapper_path)],
+            cmd_prefix + [str(wrapper_path)],
             cwd=str(sut_root),
             env=env,
             capture_output=True,

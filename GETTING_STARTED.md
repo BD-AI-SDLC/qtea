@@ -56,29 +56,25 @@ SUT_BASE_URL=http://localhost:3000
 **Minimum for a local run:** only `ANTHROPIC_API_KEY` is required. Jira
 and Xray credentials are optional — steps 1 and 5 auto-adapt.
 
-### Prompt caching (BMF sticky sessions)
+### Prompt caching (BMF sticky sessions) — IMPORTANT, set this first
 
-If you use the Bosch Model Farm (BMF) relay, set the sticky-session header
-to enable effective prompt caching. Without it, the relay does not honour
-`cache_control` and caching is a net cost loss. With it, worca-t
-auto-detects the header and enables caching — no `--cache` flag needed.
+> **Set `ANTHROPIC_CUSTOM_HEADERS` as a USER environment variable before running worca-t.** Single most impactful one-time setup. Without the BMF sticky-session header the relay does not honour `cache_control` — caching becomes a net **cost loss** (25% creation surcharge, zero read-side payback). With it, worca-t auto-enables caching on every step; no `--cache` flag needed.
+
+Pick **one** BMF replica (`01` or `02`) and stick with the same value across runs for cache locality:
 
 ```bash
-# Windows user environment variable (System → Advanced → Environment Variables)
-ANTHROPIC_CUSTOM_HEADERS=x-bmf-sticky-session-instance: 01
-
-# Or via Claude Code user config (~/.claude/settings.json):
-{
-  "env": {
-    "ANTHROPIC_CUSTOM_HEADERS": "x-bmf-sticky-session-instance: 01"
-  }
-}
+ANTHROPIC_CUSTOM_HEADERS="x-bmf-sticky-session-instance: 01"   # or 02
 ```
 
-Pick either instance `01` or `02` — they are two BMF replicas. Each user
-should stick to one instance for cache locality. The header is forwarded
-to both Claude Code CLI subprocesses and direct Anthropic SDK calls
-(reasoning, JIT resolver).
+**How to set:**
+- **Windows (recommended):** System → Advanced system settings → Environment Variables → **User variables** → New → Name `ANTHROPIC_CUSTOM_HEADERS`, Value `x-bmf-sticky-session-instance: 01`. Open a fresh terminal afterwards.
+- **macOS / Linux:** add `export ANTHROPIC_CUSTOM_HEADERS="x-bmf-sticky-session-instance: 01"` to `~/.bashrc` / `~/.zshrc`.
+- **Claude Code config (alternative):** add to `~/.claude/settings.json`:
+  ```json
+  { "env": { "ANTHROPIC_CUSTOM_HEADERS": "x-bmf-sticky-session-instance: 01" } }
+  ```
+
+Forwarded to both Claude Code CLI subprocesses and direct Anthropic SDK calls (reasoning, JIT resolver) — every layer benefits automatically.
 
 **MCP servers:** `.mcp.json` references `JIRA_BASE_URL`, `JIRA_EMAIL`,
 `JIRA_API_TOKEN`, `HTTP_PROXY`, and `HTTPS_PROXY` via `${VAR}` syntax.
@@ -94,98 +90,59 @@ worca-t run --spec ./spec.md --sut ./app --env-file /path/to/.env.prod
 
 ### SUT environment variables (interactive resolution)
 
-When the pipeline reaches Step 6 (Research), it scans the SUT codebase for
-environment variable keys used by the application (e.g., in `.env.example`,
-`process.env.VAR`, `os.environ.get("VAR")`). If any **required** keys are
-not yet set in your environment, worca-t prompts you to enter them one by
-one:
+Step 6 scans the SUT for env-var keys (`.env.example`, `process.env.VAR`, `os.environ.get("VAR")`). **Required** keys that aren't already set are prompted interactively; sensitive ones (containing `PASSWORD`, `SECRET`, `TOKEN`, etc.) are masked. Entered values are injected into the process environment for the rest of the run but **never logged or persisted to disk**.
 
 ```text
-╭─ SUT environment input required ──────────────────────╮
-│ Step 6 discovered 3 required SUT environment           │
-│ variable(s) that are not yet set.                      │
-│ Enter a value for each, or press Enter to skip.        │
-╰───────────────────────────────────────────────────────╯
-
   SUT_BASE_URL: https://qa.askbosch.com
   USERNAME: test_user
   PASSWORD: ********
 ```
 
-Sensitive keys (containing `PASSWORD`, `SECRET`, `TOKEN`, etc.) are
-entered with masked input. Entered values are injected into the process
-environment for the rest of the run but **never logged or persisted to
-disk**.
+A key is **required** when it appears in `.env.example` or matches `*BASE_URL*`, `SUT_*`, `*DATABASE_URL*`. All other discovered keys are optional — logged, not prompted.
 
-To skip interactive prompts (e.g., in CI pipelines where variables are
-already set by the pipeline), pass `--no-hitl`:
+CI / non-interactive: pass `--no-hitl` to skip prompts entirely (assumes vars are pre-set by the pipeline):
 
 ```bash
 worca-t run --spec ./spec.md --sut ./app --no-hitl
 ```
 
-A key is classified as **required** when it appears in `.env.example` or
-matches a critical pattern (`*BASE_URL*`, `SUT_*`, `*DATABASE_URL*`).
-All other discovered keys are **optional** — they are logged but not
-prompted for.
-
 ### Remote SUT (git URL)
 
-`--sut` accepts git URLs from any major hosting provider:
+`--sut` accepts git URLs from any major hosting provider (shallow-cloned `--depth=1` into the workspace):
 
 ```bash
-# GitHub / GitLab / Bitbucket
-worca-t run --spec ./spec.md --sut https://github.com/org/app.git
-
-# Azure DevOps (HTTPS)
-worca-t run --spec ./spec.md \
-  --sut https://org@dev.azure.com/org/project/_git/repo
-
-# Azure DevOps (SSH)
-worca-t run --spec ./spec.md \
-  --sut git@ssh.dev.azure.com:v3/org/project/repo
+worca-t run --spec ./spec.md --sut https://github.com/org/app.git                     # GitHub / GitLab / Bitbucket
+worca-t run --spec ./spec.md --sut https://org@dev.azure.com/org/project/_git/repo    # Azure DevOps (HTTPS)
+worca-t run --spec ./spec.md --sut git@ssh.dev.azure.com:v3/org/project/repo          # Azure DevOps (SSH)
 ```
 
-The repository is shallow-cloned (`--depth=1`) into the workspace. Since
-`.env` files are gitignored, they won't be part of the clone. Use
-`--env-file` to point to a local env file, or let the interactive prompt
-ask for missing values.
+`.env` files are gitignored so won't be cloned — use `--env-file` or the interactive prompt for missing values.
 
 ### Azure DevOps Variable Groups
 
-When running in an Azure DevOps pipeline (or any environment with access
-to the Azure DevOps REST API), worca-t can pull SUT environment variables
-directly from a Variable Group. Set these environment variables:
+In an Azure DevOps pipeline (or any env with REST access), worca-t can pull SUT env vars directly from a Variable Group. Set these:
 
 | Env Var | Purpose |
 | --- | --- |
 | `AZDO_ORG` | Azure DevOps organization name |
 | `AZDO_PROJECT` | Azure DevOps project name |
-| `AZDO_VARIABLE_GROUP` | Name of the Variable Group to read from |
-| `AZDO_PAT` | Personal Access Token with **Variable Groups (Read)** scope |
+| `AZDO_VARIABLE_GROUP` | Variable Group name to read from |
+| `AZDO_PAT` | PAT with **Variable Groups (Read)** scope |
 
-When all four are set, Step 6 automatically queries the Variable Group and
-resolves any matching SUT keys. Example pipeline YAML:
+When all four are set, Step 6 queries the Variable Group and resolves matching SUT keys.
 
 ```yaml
 variables:
-  - group: my-qa-variables        # the Variable Group in Library
-  - name: AZDO_ORG
-    value: MyOrg
-  - name: AZDO_PROJECT
-    value: MyProject
-  - name: AZDO_VARIABLE_GROUP
-    value: my-qa-variables
-  - name: AZDO_PAT
-    value: $(System.AccessToken)  # or a PAT stored as a secret
-
+  - group: my-qa-variables                                       # Variable Group in Library
+  - { name: AZDO_ORG,            value: MyOrg }
+  - { name: AZDO_PROJECT,        value: MyProject }
+  - { name: AZDO_VARIABLE_GROUP, value: my-qa-variables }
+  - { name: AZDO_PAT,            value: $(System.AccessToken) }  # or a secret-bound PAT
 steps:
   - script: worca-t run --spec jira:PROJ-123 --sut $(SUT_REPO_URL) --no-hitl
 ```
 
-**Note:** Variables marked as **secret** in Azure DevOps cannot be
-retrieved via the REST API (the API returns `null`). For those, set them
-directly in your pipeline definition or use `--env-file`.
+**Note:** Variables marked **secret** in Azure DevOps cannot be retrieved via REST (API returns `null`) — set them in the pipeline definition or use `--env-file`.
 
 ## 3. Validate your setup
 
@@ -363,98 +320,59 @@ open .worca-t/<run-id>/artifacts/step11/index.html
 
 ## 8. Common workflows
 
-### Re-run only the report (after editing bug classifications)
-
 ```bash
+# Re-run only the report (after editing bug classifications)
 worca-t run --spec ./spec.md --sut ./app --only-step 11
-```
 
-### Resume after a failure
-
-The pipeline auto-resumes from the last completed step:
-
-```bash
-# First run fails at step 9
+# Resume after a failure — pipeline auto-resumes from the last completed step
 worca-t run --spec ./spec.md --sut ./app
-# step 9 FAILED: ...
 
-# Fix the issue, then just re-run — steps 1-8 are skipped
-worca-t run --spec ./spec.md --sut ./app
-```
-
-### Force a clean re-run (ignore checkpoints)
-
-```bash
+# Force a clean re-run (ignore checkpoints)
 worca-t run --spec ./spec.md --sut ./app --force
-```
 
-### Re-run from a specific step
-
-```bash
+# Re-run from a specific step
 worca-t run --spec ./spec.md --sut ./app --from-step 7
-```
 
-### Debug a failing step
-
-```bash
-# Verbose debug logging from step 1
+# Debug a failing step — verbose debug agent from step 1
 worca-t run --spec ./spec.md --sut ./app --debug
 
-# Get a fix proposal when a step fails twice
+# Fix proposal when a step fails twice (suggestions only — never auto-edits)
 worca-t run --spec ./spec.md --sut ./app --fix
 ```
 
-Debug artifacts are written to `.worca-t/<run-id>/debug/`.
-Fix proposals are suggestions only — worca-t never auto-edits your code.
+Debug artifacts land in `.worca-t/<run-id>/debug/`.
 
 ### Skip Xray upload (or enforce it)
 
 ```bash
-# Default: step 5 auto-skips when JIRA_XRAY credentials are unset
-worca-t run --spec ./spec.md --sut ./app
-
-# Enforce: fail the pipeline if Xray upload doesn't succeed
-worca-t run --spec ./spec.md --sut ./app --strict-xray
+worca-t run --spec ./spec.md --sut ./app                # default: step 5 auto-skips when JIRA_XRAY creds are unset
+worca-t run --spec ./spec.md --sut ./app --strict-xray  # enforce: fail the pipeline if Xray upload doesn't succeed
 ```
 
 ### Storage-state reuse (skip auth in Step 9 self-heal)
 
-When Step 9's self-heal agent has to inspect a failing page, its Playwright
-MCP browser runs in a separate process from the test runner — so it inherits
-no cookies and has to replay the SUT's sign-in flow (10-30 s per heal call).
-Two ways to avoid that:
+Step 9's self-heal Playwright MCP browser runs in a separate process from the test runner, so it inherits no cookies and would otherwise replay sign-in per heal call (10-30 s). Two ways to avoid that:
 
-**Use case B — same-run auto-capture (default, fully automatic):** The
-vendored pytest runtime captures `context.storage_state()` on the first
-passing test and writes `<workspace>/storage-state.json`. Step 9
-re-resolves after the test run and injects `--storage-state=<path>` into
-Playwright MCP. Zero user action. Works as long as your tests can
-authenticate on their own (no MFA / captcha).
+**When do you need `auth-capture`?** When your SUT sits behind a login that can't be automated inline — MFA (Okta push, hardware key, TOTP), SSO/SAML redirects, or CAPTCHA-protected pages. You run it once interactively, complete the challenge manually in the headed browser, and worca-t saves the session for all subsequent runs. If your SUT uses standard username/password auth that tests can replay on their own, you don't need it — the auto-capture default below handles that.
 
-**Use case A — one-shot capture (for MFA / SSO / captcha):**
+**Auto-capture (default, no setup):** the vendored pytest runtime captures `context.storage_state()` on the first passing test, writes `<workspace>/storage-state.json`, and Step 9 injects `--storage-state=<path>` into Playwright MCP. Works whenever tests can authenticate on their own (no MFA / captcha).
+
+**One-shot capture (for MFA / SSO / captcha):**
 
 ```bash
-# Run interactively once; user completes MFA / SSO in the headed browser.
-# Output lands at <sut>/.worca-t/storage-state.json (the convention path).
-worca-t auth-capture --sut ./path-to-your-app
-
-# Subsequent runs reuse the captured state automatically — no flag needed.
-worca-t run --spec ./feature-spec.md --sut ./path-to-your-app
+worca-t auth-capture --sut ./path-to-your-app   # interactive headed browser — user completes MFA/SSO once.
+                                                # Output: <sut>/.worca-t/storage-state.json (convention path).
+worca-t run --spec ./feature-spec.md --sut ./path-to-your-app   # subsequent runs reuse it automatically.
 ```
-
-Flags:
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
 | `--sut PATH` | required | SUT root with `.worca-t/sut_inventory.json` from a prior `worca-t run` Step 6 |
-| `--output / -o PATH` | `<sut>/.worca-t/storage-state.json` | Where to write the file |
-| `--headed / --headless` | headed | Browser visibility — keep headed for interactive MFA |
-| `--timeout N` | 600 | Subprocess timeout in seconds |
+| `--output / -o PATH` | `<sut>/.worca-t/storage-state.json` | Output path |
+| `--headed / --headless` | headed | Keep headed for interactive MFA |
+| `--timeout N` | 600 | Subprocess timeout (seconds) |
 
-**Explicit override:** pass `--storage-state PATH` to `worca-t run` to
-force a specific file regardless of the convention path. V1 supports
-Python+Playwright SUTs only; Selenium / Cypress / Robot get a clear
-`NotImplementedError` from `auth-capture`.
+**Explicit override:** pass `--storage-state PATH` to `worca-t run` to force a specific file. **`auth-capture` supports Python and Node.js (JS/TS) Playwright SUTs.** Java / .NET / Selenium / Cypress / Robot SUTs raise `NotImplementedError` — produce a Playwright-format `storageState.json` manually and pass it via `--storage-state`.
 
 ## 9. The 11 steps explained
 
@@ -487,34 +405,28 @@ Python+Playwright SUTs only; Selenium / Cypress / Robot get a clear
 
 ## Developing worca-t locally
 
-The installed wheel contains **two kinds of frozen content** that don't
-auto-update when you edit the source tree:
+The installed wheel holds **two kinds of frozen content** that don't auto-update on source edits:
 
-| What you edited | How to pick it up |
+| Edited content | How to pick it up |
 | --- | --- |
-| Markdown resources: `agents/`, `templates/`, `schemas/`, `skills/`, `examples/`, `CLAUDE.md`, `.mcp.json` | Set `WORCA_T_RESOURCE_ROOT=<repo-root>` — the runner reads from there instead of the frozen `_resources/` snapshot. **No reinstall needed.** |
-| Python code: anything under `src/worca_t/**.py` | Either reinstall the tool, or run the dev venv binary (editable install). The env var does **not** help here — Python imports come from site-packages, not from `WORCA_T_RESOURCE_ROOT`. |
+| Markdown resources: `agents/`, `templates/`, `schemas/`, `skills/`, `examples/`, `CLAUDE.md`, `.mcp.json` | Set `WORCA_T_RESOURCE_ROOT=<repo-root>` — runner reads from there instead of the frozen `_resources/` snapshot. **No reinstall needed.** |
+| Python code: `src/worca_t/**.py` | Reinstall the tool **or** run the dev venv binary (editable install). The env var does **not** help — Python imports come from site-packages. |
 
 ```bash
-# A) Set the resource-root env var (works only for markdown edits).
-export WORCA_T_RESOURCE_ROOT=/path/to/worca-t      # bash / zsh
-$Env:WORCA_T_RESOURCE_ROOT = "C:\path\to\worca-t"  # PowerShell
-set WORCA_T_RESOURCE_ROOT=C:\path\to\worca-t       # cmd
+# A) Resource-root env var (markdown only):
+export WORCA_T_RESOURCE_ROOT=/path/to/worca-t       # bash / zsh
+$Env:WORCA_T_RESOURCE_ROOT = "C:\path\to\worca-t"   # PowerShell
+set WORCA_T_RESOURCE_ROOT=C:\path\to\worca-t        # cmd
 
-# B) Reinstall the tool (covers BOTH markdown and Python changes).
+# B) Reinstall the tool (covers both markdown + Python):
 uv tool install --reinstall --force /path/to/worca-t
 
-# C) Run the dev venv binary directly (editable install — picks up Python
-#    edits live; pair with WORCA_T_RESOURCE_ROOT for markdown edits).
-/path/to/worca-t/.venv/bin/worca-t run ...
-C:\path\to\worca-t\.venv\Scripts\worca-t.exe run ...
+# C) Dev venv binary (editable; pair with WORCA_T_RESOURCE_ROOT for markdown):
+/path/to/worca-t/.venv/bin/worca-t run ...                       # Unix
+C:\path\to\worca-t\.venv\Scripts\worca-t.exe run ...             # Windows
 ```
 
-To disable interactive prompts (e.g., for CI runs), pass `--no-hitl`:
-
-```bash
-worca-t run --spec ... --sut ... --no-hitl
-```
+CI / non-interactive: pass `--no-hitl` to `worca-t run`.
 
 ## Next steps
 

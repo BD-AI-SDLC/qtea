@@ -247,11 +247,25 @@ def _iter_source_files(p: Path) -> Iterable[Path]:
         return
     if not p.is_dir():
         return
+    # Resolve the scan root once so we can take relative paths cheaply.
+    # We filter ``_EXCLUDE_DIRS`` and hidden-prefixed components only on
+    # parts INSIDE the scan root, not on the absolute path. Without this,
+    # a worca-t workspace at ``~/.worca-t/<run>/sut/...`` trips the
+    # hidden-dir filter on every file because ``.worca-t`` is one of the
+    # path's ancestors — and the scanner returns zero hits, silently
+    # disabling TBD promotion across every run.
+    p_resolved = p.resolve()
     for child in p.rglob("*"):
         if not child.is_file():
             continue
+        try:
+            relative_parts = child.resolve().relative_to(p_resolved).parts
+        except ValueError:
+            # Child is outside the scan root (symlink edge case) — fall
+            # back to checking the bare name only.
+            relative_parts = (child.name,)
         if any(part in _EXCLUDE_DIRS or (part.startswith(".") and part != ".")
-               for part in child.parts):
+               for part in relative_parts):
             continue
         if detect_language(child) is None:
             continue

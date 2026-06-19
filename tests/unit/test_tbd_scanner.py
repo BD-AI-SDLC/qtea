@@ -269,3 +269,36 @@ def test_scan_file_returns_empty_for_unsupported_extension(tmp_path: Path):
 def test_scan_handles_unreadable_file_gracefully(tmp_path: Path):
     # Pass a nonexistent file — scan_file should return [] rather than raise.
     assert scan_file(tmp_path / "ghost.py") == []
+
+
+def test_scan_finds_files_under_hidden_prefixed_ancestor(tmp_path: Path):
+    """Regression: when the scan root lives under a hidden-prefixed
+    parent (e.g. worca-t workspaces at ``~/.worca-t/<run>/sut``), the
+    hidden-dir filter MUST NOT match the parent and skip every file.
+    Previously this silently disabled TBD promotion across every run.
+    """
+    # Build  ``<tmp>/.worca-t/run-abc/sut/src/locators.py`` —
+    # the path contains a ``.worca-t`` ancestor that the filter would
+    # historically reject.
+    hidden_root = tmp_path / ".worca-t" / "run-abc" / "sut"
+    (hidden_root / "src").mkdir(parents=True)
+    (hidden_root / "src" / "locators.py").write_text(
+        'BUTTON = tbd("primary submit button")\n', encoding="utf-8",
+    )
+    # Scan the SUT root that itself sits beneath ``.worca-t/``.
+    results = scan_tbd_intents([hidden_root], sut_root=hidden_root)
+    assert len(results) == 1
+    assert results[0].intent == "primary submit button"
+    # And the in-tree ``.venv`` / ``__pycache__`` / dot-dirs are STILL
+    # excluded relative to the scan root.
+    (hidden_root / ".venv").mkdir()
+    (hidden_root / ".venv" / "leak.py").write_text(
+        'X = tbd("venv leak")\n', encoding="utf-8",
+    )
+    (hidden_root / "__pycache__").mkdir()
+    (hidden_root / "__pycache__" / "cache_leak.py").write_text(
+        'Y = tbd("cache leak")\n', encoding="utf-8",
+    )
+    results2 = scan_tbd_intents([hidden_root], sut_root=hidden_root)
+    intents = {r.intent for r in results2}
+    assert intents == {"primary submit button"}  # leaks correctly excluded

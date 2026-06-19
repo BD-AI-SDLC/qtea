@@ -21,20 +21,25 @@ Non-negotiable codegen rules, assertion fidelity requirements, and naming standa
 # Stack: <language>+<framework> (from code-modification-plan.json)
 
 import pytest
+from playwright.sync_api import expect
 from <pom_import_path> import <PomClass>
 from <locator_import_path> import <LocatorClass>
 # ... imports from manifest
 
 # Expected values (lifted verbatim from test-strategy.md)
-EXPECTED_HREF = "https://example.com/path"
+EXPECTED_URL = "https://example.com/path"
 EXPECTED_LABEL_EN = "Switch to Example"
 
 # Test functions
 @pytest.mark.worca_smoke
 def test_should_<action>_when_<condition>(<fixture>):
     ...
-    assert actual == EXPECTED_HREF
+    expect(loc).to_have_text(EXPECTED_LABEL_EN)
+    loc.click()
+    expect(page).to_have_url(EXPECTED_URL)
 ```
+
+Prefer Playwright `expect()` for all assertions on Playwright objects (locators, pages). Fall back to bare `assert` only for plain Python values. See `codegen-rules.md` §"Assertion Fidelity" for the full decision table.
 
 ## Phase Markers
 

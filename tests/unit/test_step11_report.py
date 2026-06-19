@@ -327,6 +327,40 @@ def test_write_allure_results_creates_files(tmp_path: Path):
         assert data["status"] in ("passed", "failed", "skipped", "broken")
 
 
+def test_write_allure_results_includes_attachments_for_failures(tmp_path: Path):
+    screenshot = tmp_path / "screens" / "fail.png"
+    screenshot.parent.mkdir()
+    screenshot.write_bytes(b"\x89PNG fake")
+
+    results = [
+        {
+            "id": "t1", "name": "test_ok", "file": "f.py",
+            "status": "passed", "duration_s": 0.1,
+            "attachments": [{"path": str(screenshot), "type": "screenshot"}],
+        },
+        {
+            "id": "t2", "name": "test_fail", "file": "f.py",
+            "status": "failed", "duration_s": 0.2, "message": "boom",
+            "attachments": [{"path": str(screenshot), "type": "screenshot"}],
+        },
+    ]
+    report = _make_report(results=results)
+    out = tmp_path / "allure-results"
+    written = write_allure_results(report, out)
+    assert len(written) == 2
+
+    passed_data = json.loads(written[0].read_text(encoding="utf-8"))
+    failed_data = json.loads(written[1].read_text(encoding="utf-8"))
+
+    assert "attachments" not in passed_data
+    assert "attachments" in failed_data
+    assert len(failed_data["attachments"]) == 1
+    att = failed_data["attachments"][0]
+    assert att["type"] == "image/png"
+    assert att["name"] == "screenshot"
+    assert (out / att["source"]).exists()
+
+
 def test_generate_allure_html_skips_when_not_on_path(monkeypatch):
     monkeypatch.setattr("shutil.which", lambda _name: None)
     assert generate_allure_html(Path("a"), Path("b")) is False
