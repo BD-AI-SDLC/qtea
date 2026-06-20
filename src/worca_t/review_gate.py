@@ -1,27 +1,29 @@
-"""Post-step-7 human review gate.
+"""Human review gates for pipeline steps.
 
-Surfaces the test-architect's `code-modification-plan.json` for human review
-BEFORE Step 8 (codegen) writes any code. Catches placement mistakes early —
-when fixing them costs nothing.
+Post-step review gates that surface artifacts for human review BEFORE
+downstream steps consume them. Each gate renders a Rich table summary
+and prompts the user with:
 
-What it renders:
-- Per-test-case: test_file_target, function names, fixture decisions
-  (reuse vs create), page-object decisions (reuse vs create + count of
-  missing methods), locator decisions (reuse vs create_tbd with intent).
-- Footer: totals + counts per category (reuse vs create).
+- ``a`` approve → return True, pipeline continues.
+- ``e`` edit (LLM) → free-text instructions applied by an LLM agent.
+- ``f`` file edit → open the artifact ``.md`` in ``$EDITOR``.
+- ``q`` quit → return False, pipeline aborts with exit code 1.
 
-Approve / edit / quit flow:
-- `a` approve → return True, pipeline proceeds to Step 8.
-- `e` edit plan → user types free-text instructions; an LLM applies the
-  delta to the plan JSON, re-validates against the schema, and re-renders.
-- `q` quit → return False, pipeline aborts with exit code 1.
+Auto-approved (no prompt) when stdin is not a TTY or ``--no-hitl`` is set.
 
-Auto-approved (no prompt) when stdin is not a TTY or `--no-hitl` is set.
+Currently implemented gates:
+- **Step 4** — test strategy (``test-strategy.md`` / ``.json``)
+- **Step 7** — code-modification plan (``code-modification-plan.json`` / ``.md``)
+- **Step 8** — TBD intent quality (WARN/FAIL entries)
 """
 
 from __future__ import annotations
 
+import difflib
+import hashlib
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -41,6 +43,276 @@ if TYPE_CHECKING:
     from worca_t.steps.base import StepContext, StepResult
 
 log = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+def _open_in_editor(file_path: Path, console: Console) -> bool:
+    """Open *file_path* in the user's ``$EDITOR`` and return whether it changed."""
+    editor = (
+        os.environ.get("EDITOR")
+        or os.environ.get("VISUAL")
+        or ("notepad" if sys.platform == "win32" else "vi")
+    )
+    before = hashlib.sha256(file_path.read_bytes()).digest()
+    try:
+        subprocess.call([editor, str(file_path)])
+    except OSError as e:
+        console.print(f"[red]could not launch editor ({editor}):[/] {e}")
+        return False
+    after = hashlib.sha256(file_path.read_bytes()).digest()
+    return before != after
+
+
+# ---------------------------------------------------------------------------
+# Step 4 — Test-Strategy review gate
+# ---------------------------------------------------------------------------
+
+
+async def review_step_4_strategy(
+    ctx: StepContext,
+    result: StepResult,
+    console: Console,
+) -> bool:
+    """Post-step-4 review gate for the test strategy.
+
+    Auto-approves when stdin is not a TTY or ``--no-hitl`` is set.
+    """
+    from worca_t.steps.s04_strategy import _project_strategy
+
+    opts = ctx.options
+    if getattr(opts, "no_hitl", False) or not sys.stdin.isatty():
+        log.info("step04.review_gate.skip", reason="non_tty_or_no_hitl")
+        return True
+
+    step_dir = ctx.workspace.step_dir(4)
+    md_path = step_dir / "test-strategy.md"
+    json_path = step_dir / "test-strategy.json"
+
+    if not md_path.exists():
+        log.warning("step04.review_gate.no_md", path=str(md_path))
+        return True
+
+    while True:
+        try:
+            strategy = json.loads(json_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            console.print(f"[red]cannot read strategy JSON:[/] {e}")
+            return False
+
+        _render_strategy(strategy, console)
+        choice = Prompt.ask(
+            "[bold]Approve and continue to step 5?[/bold] "
+            r"[dim](\[a\]pprove / \[e\]dit LLM / \[f\]ile edit / \[q\]uit)[/]",
+            choices=["a", "e", "f", "q"],
+            default="a",
+            show_choices=False,
+        )
+        if choice == "a":
+            log.info("step04.review_gate.approved")
+            return True
+        if choice == "q":
+            log.info("step04.review_gate.rejected")
+            return False
+
+        if choice == "e":
+            updated = await _apply_strategy_nlp_edit(
+                md_path, json_path, ctx, console,
+            )
+        else:
+            updated = await _apply_strategy_file_edit(
+                md_path, json_path, _project_strategy, ctx, console,
+            )
+        if updated is None:
+            return False
+
+
+def _render_strategy(strategy: dict, console: Console) -> None:
+    """Render test-strategy summary as a Rich table."""
+    test_cases = strategy.get("test_cases") or []
+    title_text = strategy.get("title") or "Test Strategy"
+
+    table = Table(
+        title=f"Step 4 — {title_text} ({len(test_cases)} test cases)",
+        show_lines=True,
+        expand=True,
+    )
+    table.add_column("TC ID", style="bold cyan", no_wrap=True)
+    table.add_column("Title", overflow="fold")
+    table.add_column("Pri", no_wrap=True)
+    table.add_column("Type", no_wrap=True)
+    table.add_column("Steps", no_wrap=True, justify="right")
+    table.add_column("ACs", overflow="fold")
+
+    pri_counts: dict[str, int] = {}
+    type_counts: dict[str, int] = {}
+
+    _PRI_STYLE = {"P0": "bold red", "P1": "yellow", "P2": "green", "P3": "dim"}
+
+    for tc in test_cases:
+        tc_id = tc.get("id") or "<no-id>"
+        title = tc.get("title") or ""
+        pri = tc.get("priority") or "UNKNOWN"
+        atype = tc.get("automation_type") or tc.get("type") or "?"
+        steps = tc.get("steps") or []
+        acs = ", ".join(tc.get("ac_ids") or []) or "—"
+
+        pri_style = _PRI_STYLE.get(pri, "")
+        pri_cell = f"[{pri_style}]{pri}[/{pri_style}]" if pri_style else pri
+
+        pri_counts[pri] = pri_counts.get(pri, 0) + 1
+        type_counts[atype] = type_counts.get(atype, 0) + 1
+
+        table.add_row(tc_id, title, pri_cell, atype, str(len(steps)), acs)
+
+    console.print()
+    console.print(table)
+
+    pri_summary = " · ".join(
+        f"{k}={v}" for k, v in sorted(pri_counts.items())
+    )
+    type_summary = " · ".join(
+        f"{k}={v}" for k, v in sorted(type_counts.items())
+    )
+    console.print(Panel(
+        f"test cases: [bold]{len(test_cases)}[/] · "
+        f"by priority: {pri_summary} · by type: {type_summary}"
+        "\n\n[bold]\\[a\\][/]pprove and continue   "
+        "[bold]\\[e\\][/]dit (LLM)   "
+        "[bold]\\[f\\][/]ile edit   "
+        "[bold]\\[q\\][/]uit",
+        title="Strategy review",
+        border_style="cyan",
+    ))
+
+
+async def _apply_strategy_file_edit(
+    md_path: Path,
+    json_path: Path,
+    project_strategy_fn,
+    ctx: StepContext,
+    console: Console,
+) -> dict | None:
+    """Open test-strategy.md in $EDITOR, re-project JSON on save."""
+    if not _open_in_editor(md_path, console):
+        console.print("[dim]file unchanged or editor failed — skipping[/]")
+        return {}  # non-None signals "stay in loop"
+
+    return _reproject_strategy(md_path, json_path, project_strategy_fn, ctx, console)
+
+
+async def _apply_strategy_nlp_edit(
+    md_path: Path,
+    json_path: Path,
+    ctx: StepContext,
+    console: Console,
+) -> dict | None:
+    """Apply free-text instructions to test-strategy.md via LLM."""
+    from worca_t.steps.s04_strategy import _project_strategy
+
+    console.print(Panel(
+        "Describe the changes you want in plain English.\n"
+        "Examples: [dim]\"remove TC-03\"[/], [dim]\"change TC-login "
+        "priority to P0\"[/], [dim]\"add a smoke test for the search "
+        "feature\"[/]",
+        title="Edit strategy",
+        border_style="yellow",
+    ))
+    try:
+        instructions = Prompt.ask("[bold]Your instructions[/]")
+    except (EOFError, KeyboardInterrupt):
+        log.info("step04.review_gate.rejected", reason="interrupt")
+        return None
+
+    if not instructions.strip():
+        console.print("[dim]empty input — skipping edit[/]")
+        return {}
+
+    agent = package_resource_root() / "agents" / "strategy-editor.agent.md"
+    workdir = ctx.workspace.step_dir(4) / "strategy-editor"
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    current_md = md_path.read_text(encoding="utf-8")
+
+    console.print("[dim]applying edits…[/]")
+    llm_result = await call_reasoning_llm(
+        agent,
+        workdir=workdir,
+        user_prompt=instructions,
+        inputs={"test-strategy.md": current_md},
+        output_schema=None,
+        step=4,
+    )
+
+    if not llm_result.success or not llm_result.final_text:
+        console.print(
+            f"[red]LLM edit failed:[/] {llm_result.error or 'no output'}"
+        )
+        recover = Prompt.ask(
+            r"\[r\]etry, \[q\]uit",
+            choices=["r", "q"],
+            default="r",
+            show_choices=False,
+        )
+        return None if recover == "q" else {}
+
+    md_path.write_text(llm_result.final_text, encoding="utf-8")
+    return _reproject_strategy(md_path, json_path, _project_strategy, ctx, console)
+
+
+def _reproject_strategy(
+    md_path: Path,
+    json_path: Path,
+    project_strategy_fn,
+    ctx: StepContext,
+    console: Console,
+) -> dict | None:
+    """Re-project test-strategy.md → .json, validate, persist."""
+    new_md = md_path.read_text(encoding="utf-8")
+    projection = project_strategy_fn(new_md)
+
+    dup_ids = projection.pop("_duplicate_tc_ids", [])
+    if dup_ids:
+        console.print(
+            f"[red]duplicate TC IDs:[/] {', '.join(dup_ids)}. "
+            f"Fix them in the markdown and retry."
+        )
+        recover = Prompt.ask(
+            r"\[r\]etry file edit, \[q\]uit",
+            choices=["r", "q"],
+            default="r",
+            show_choices=False,
+        )
+        return None if recover == "q" else {}
+
+    ok, err = is_valid(projection, "test-strategy")
+    if not ok:
+        console.print(f"[red]edited strategy failed schema validation:[/] {err}")
+        recover = Prompt.ask(
+            r"\[r\]etry, \[q\]uit",
+            choices=["r", "q"],
+            default="r",
+            show_choices=False,
+        )
+        return None if recover == "q" else {}
+
+    json_path.write_text(
+        json.dumps(projection, indent=2, ensure_ascii=False), encoding="utf-8",
+    )
+    record = ctx.state.steps.get(4)
+    if record is not None:
+        record.output_hashes = hash_paths(
+            [p for p in json_path.parent.iterdir() if p.is_file()]
+        )
+    return projection
+
+
+# ---------------------------------------------------------------------------
+# Step 7 — Code-modification plan review gate
+# ---------------------------------------------------------------------------
 
 
 async def review_step_7_plan(
@@ -77,8 +349,8 @@ async def review_step_7_plan(
         _render_plan(plan, console)
         choice = Prompt.ask(
             "[bold]Approve and continue to step 8?[/bold] "
-            r"[dim](\[a\]pprove / \[e\]dit plan / \[q\]uit)[/]",
-            choices=["a", "e", "q"],
+            r"[dim](\[a\]pprove / \[e\]dit LLM / \[f\]ile edit / \[q\]uit)[/]",
+            choices=["a", "e", "f", "q"],
             default="a",
             show_choices=False,
         )
@@ -89,8 +361,12 @@ async def review_step_7_plan(
             log.info("step07.review_gate.rejected")
             return False
 
-        # --- Free-text edit via LLM ---
-        edited_plan = await _apply_nlp_edit(plan, plan_path, ctx, console)
+        if choice == "e":
+            edited_plan = await _apply_nlp_edit(plan, plan_path, ctx, console)
+        else:
+            edited_plan = await _apply_plan_file_edit(
+                plan, plan_path, step_dir, ctx, console,
+            )
         if edited_plan is None:
             return False
         # Loop back to re-render the updated plan and re-prompt.
@@ -195,6 +471,118 @@ def _persist_and_refresh_hashes(
         )
 
 
+async def _apply_plan_file_edit(
+    plan: dict,
+    plan_path: Path,
+    step_dir: Path,
+    ctx: StepContext,
+    console: Console,
+) -> dict | None:
+    """Open code-modification-plan.md in $EDITOR, sync changes back to JSON."""
+    from worca_t.steps.s07_test_architect import _render_plan_markdown
+
+    md_path = step_dir / "code-modification-plan.md"
+    # Re-render .md from current JSON so the file reflects any prior edits.
+    old_md = _render_plan_markdown(plan)
+    md_path.write_text(old_md, encoding="utf-8")
+
+    if not _open_in_editor(md_path, console):
+        console.print("[dim]file unchanged or editor failed — skipping[/]")
+        return plan
+
+    new_md = md_path.read_text(encoding="utf-8")
+    if new_md == old_md:
+        console.print("[dim]no changes detected — skipping[/]")
+        return plan
+
+    return await _sync_md_to_json(old_md, new_md, plan, plan_path, ctx, console)
+
+
+async def _sync_md_to_json(
+    old_md: str,
+    new_md: str,
+    current_plan: dict,
+    plan_path: Path,
+    ctx: StepContext,
+    console: Console,
+) -> dict | None:
+    """Diff old/new .md and have the plan-editor LLM apply changes to JSON."""
+    from worca_t.steps.s07_test_architect import _render_plan_markdown
+
+    diff_lines = list(difflib.unified_diff(
+        old_md.splitlines(), new_md.splitlines(),
+        fromfile="before", tofile="after", lineterm="",
+    ))
+    if not diff_lines:
+        console.print("[dim]no diff detected — skipping[/]")
+        return current_plan
+
+    diff_text = "\n".join(diff_lines)
+
+    agent = package_resource_root() / "agents" / "plan-editor.agent.md"
+    workdir = plan_path.parent / "plan-editor"
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    console.print("[dim]syncing markdown edits to plan JSON…[/]")
+    llm_result = await call_reasoning_llm(
+        agent,
+        workdir=workdir,
+        user_prompt=(
+            "The user directly edited the markdown view of this plan. "
+            "The diff of their changes is below. Apply the equivalent "
+            "changes to the JSON plan. Preserve all fields the diff "
+            "doesn't touch.\n\n```diff\n" + diff_text + "\n```"
+        ),
+        inputs={
+            "code-modification-plan.json": json.dumps(
+                current_plan, indent=2,
+            ),
+        },
+        output_schema=load_schema("code-modification-plan"),
+        step=7,
+    )
+
+    if not llm_result.success or not llm_result.final_text:
+        console.print(
+            f"[red]LLM sync failed:[/] {llm_result.error or 'no output'}"
+        )
+        recover = Prompt.ask(
+            r"\[r\]etry, \[q\]uit",
+            choices=["r", "q"],
+            default="r",
+            show_choices=False,
+        )
+        return None if recover == "q" else current_plan
+
+    try:
+        new_plan: dict = json.loads(llm_result.final_text)
+    except json.JSONDecodeError as e:
+        console.print(f"[red]LLM returned unparseable JSON:[/] {e}")
+        return current_plan
+
+    ok, err = is_valid(new_plan, "code-modification-plan")
+    if not ok:
+        console.print(f"[red]synced plan failed schema validation:[/] {err}")
+        recover = Prompt.ask(
+            r"\[r\]etry, \[a\]pprove anyway (risky), \[q\]uit",
+            choices=["r", "a", "q"],
+            default="r",
+            show_choices=False,
+        )
+        if recover == "q":
+            return None
+        if recover == "a":
+            _persist_and_refresh_hashes(new_plan, plan_path, ctx)
+            return new_plan
+        return current_plan
+
+    _persist_and_refresh_hashes(new_plan, plan_path, ctx)
+    # Re-render .md from the updated JSON for consistency.
+    md_path = plan_path.parent / "code-modification-plan.md"
+    md_path.write_text(_render_plan_markdown(new_plan), encoding="utf-8")
+    return new_plan
+
+
 def _render_plan(plan: dict, console: Console) -> None:
     test_cases = plan.get("test_cases") or []
     active_module = plan.get("active_module") or "?"
@@ -293,7 +681,9 @@ def _render_plan(plan: dict, console: Console) -> None:
     console.print(Panel(
         " · ".join(footer)
         + "\n\n[bold]\\[a\\][/]pprove and continue   "
-        "[bold]\\[e\\][/]dit plan   [bold]\\[q\\][/]uit",
+        "[bold]\\[e\\][/]dit (LLM)   "
+        "[bold]\\[f\\][/]ile edit   "
+        "[bold]\\[q\\][/]uit",
         title="Review",
         border_style="cyan",
     ))

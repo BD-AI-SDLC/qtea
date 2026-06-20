@@ -32,7 +32,7 @@ from worca_t.logging_setup import configure_logging, get_logger
 # `run_pipeline` may continue to use the local for run-id-bound output.
 _log = get_logger(__name__)
 from worca_t.metrics import format_cost, format_tokens
-from worca_t.review_gate import review_step_7_plan, review_step_8_intents
+from worca_t.review_gate import review_step_4_strategy, review_step_7_plan, review_step_8_intents
 from worca_t.steps.base import Step, StepContext
 from worca_t.steps.s01_intake import IntakeStep
 from worca_t.steps.s02_refine import RefineStep
@@ -58,7 +58,7 @@ class PipelineOptions:
     from_step: int | None = None
     only_step: int | None = None
     force: bool = False
-    parallelism: int = 1
+    parallelism: int = 2
     headless: bool = True
     debug: bool = False
     fix: bool = False
@@ -694,10 +694,12 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
             exit_code = 1
             break
 
-        # Lightweight human review of the test architect's plan before step 8
-        # transpiles it into code. Skipped automatically in non-TTY /
-        # `--no-hitl` contexts. On manual edits the gate re-validates the
-        # plan against the schema and re-renders.
+        if step_num == 4 and not await review_step_4_strategy(ctx, result, console):
+            save_state(state, ws.state_file)
+            console.print("[yellow]step 04 rejected by reviewer — aborting[/]")
+            exit_code = 1
+            break
+
         if step_num == 7 and not await review_step_7_plan(ctx, result, console):
             save_state(state, ws.state_file)
             console.print("[yellow]step 07 rejected by reviewer — aborting[/]")
