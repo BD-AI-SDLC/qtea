@@ -612,6 +612,23 @@ def _attachment_glob(sut_root: Path) -> list[dict]:
     return out
 
 
+def _clean_sut_artifacts(sut_root: Path) -> None:
+    """Remove prior-attempt screenshots/traces so only the last run's artifacts survive."""
+    import contextlib
+
+    patterns = [
+        "test-results/**/*.png",
+        "test-results/**/*.webm",
+        "screenshots/**/*.png",
+        "screenshots/**/*.jpg",
+        "reports/screenshots/**/*.png",
+    ]
+    for pattern in patterns:
+        for p in sut_root.glob(pattern):
+            with contextlib.suppress(OSError):
+                p.unlink()
+
+
 def _failing_tests(run: RunResult) -> list[TestRunEntry]:
     return [r for r in run.results if r.status in ("failed", "error")]
 
@@ -2561,6 +2578,7 @@ class ExecuteStep(Step):
                         marker_filter=_WORCA_PYTEST_MARKER_FILTER,
                     )
                     narrowed_cmd = _filter_command_for_tests(base_cmd, failing)
+                    _clean_sut_artifacts(ctx.workspace.sut)
                     second = run_tests(
                         framework,
                         cwd=ctx.workspace.sut,
@@ -2593,13 +2611,26 @@ class ExecuteStep(Step):
                 )
 
             # Attach SUT-side artifacts discovered post-run to entries without any.
+            # Keep only the newest file per artifact type so each failed test
+            # gets at most one screenshot, one trace, one video.
             extra_attachments = _attachment_glob(ctx.workspace.sut)
             if extra_attachments:
+                newest_by_type: dict[str, dict] = {}
+                for a in extra_attachments:
+                    kind = a.get("type", "other")
+                    prev = newest_by_type.get(kind)
+                    if prev is None:
+                        newest_by_type[kind] = a
+                        continue
+                    try:
+                        if Path(a["path"]).stat().st_mtime > Path(prev["path"]).stat().st_mtime:
+                            newest_by_type[kind] = a
+                    except OSError:
+                        pass
+                deduped = list(newest_by_type.values())
                 for r in first.results:
                     if r.status in ("failed", "error") and not r.attachments:
-                        # naive: attach everything (renderer can filter); cheaper
-                        # than walking the per-test trace tree.
-                        r.attachments = extra_attachments
+                        r.attachments = deduped
 
             # Annotate self-heal metadata into per-entry dicts via the serializer.
             payload = first.as_dict()
