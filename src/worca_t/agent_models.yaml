@@ -20,6 +20,7 @@ bug-report-classifier: claude-sonnet-4-6
 
 # -- HITL --
 plan-editor: claude-sonnet-4-6
+strategy-editor: claude-haiku-4-5@20251001
 tbd-intent-editor: claude-haiku-4-5@20251001
 
 # -- Step 8 Phase D (TBD intent quality gate) --

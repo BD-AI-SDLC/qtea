@@ -219,7 +219,7 @@ def run(
     force: bool = typer.Option(
         False, "--force", help="Ignore checkpoints; re-run everything."
     ),
-    parallelism: int = typer.Option(1, "--parallelism", min=1, max=16),
+    parallelism: int = typer.Option(2, "--parallelism", min=0, max=16),
     headless: bool = typer.Option(True, "--headless/--headed"),
     debug: bool = typer.Option(
         False,

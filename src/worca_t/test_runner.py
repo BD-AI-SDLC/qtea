@@ -269,21 +269,14 @@ def _inject_strict_markers(command: str) -> str:
 
 def _inject_xdist_override(
     command: str,
-    parallelism: int = 0,
+    parallelism: int = 2,
     cwd: Path | None = None,
 ) -> str:
     """Control xdist worker count for worca-t test runs.
 
-    xdist worker subprocesses crash under worca-t's subprocess
-    environment (ResolverServer socket handle inheritance, captured
-    stdin/stdout pipes, env sanitization). ``-n 0`` keeps the xdist
-    plugin loaded (so the SUT's ``addopts -n 5`` doesn't become an
-    unrecognized flag) but runs tests in-process — no worker
-    subprocess, no crash.
-
-    When the caller passes ``parallelism > 0``, xdist is kept active
-    with that many workers (``-n <value>``). ``parallelism == 0``
-    (default) appends ``-n 0`` to run in-process.
+    ``parallelism > 0`` pins to that many workers (``-n <value>``).
+    ``parallelism == 0`` appends ``-n 0`` to run in-process (no worker
+    subprocess).
     """
     n_flag = f"-n {parallelism}" if parallelism > 0 else "-n 0"
     return f"{command} {n_flag}"
@@ -302,7 +295,7 @@ def _inject_playwright_file_filter(command: str) -> str:
 
 
 def _inject_playwright_workers(command: str, parallelism: int) -> str:
-    """Set Playwright Test ``--workers`` count when explicitly requested."""
+    """Set Playwright Test ``--workers`` count."""
     if "--workers" in command:
         return command
     if parallelism > 0:
@@ -328,7 +321,7 @@ def resolve_command(
     cwd: Path,
     profile: StackProfile | None = None,
     marker_filter: str | None = None,
-    parallelism: int = 0,
+    parallelism: int = 2,
 ) -> tuple[str, str]:
     """Pick command + parser id.
 
@@ -357,10 +350,10 @@ def resolve_command(
     scoping is file-based: a ``"worca_"`` positional arg is appended so
     only files with the worca prefix are matched.
 
-    `parallelism`: when > 0, overrides the SUT's xdist ``-n`` with this
-    value (pytest) or sets ``--workers`` (Playwright Test). When 0
-    (default), pytest gets ``-n 0`` (in-process); Playwright Test keeps
-    its default worker count.
+    `parallelism`: number of parallel workers. Applies uniformly:
+    pytest gets ``-n <value>`` (xdist), Playwright Test gets
+    ``--workers <value>``. ``0`` runs pytest in-process (``-n 0``)
+    and is a no-op for Playwright Test.
     """
     apply_marker = framework in _PYTEST_FRAMEWORKS
     apply_pw_filter = framework in _PW_TEST_FRAMEWORKS
