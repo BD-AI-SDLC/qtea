@@ -34,7 +34,7 @@ worca-t run --spec ./feature.md --sut ./my-app
 | 5 | Xray | pure code | `xray-mapping.json` |
 | 6 | Research | `polyglot-test-researcher` | `research.{md,json}` |
 | 7 | Test architect | `test-architect` | `code-modification-plan.json` |
-| 8 | TDD codegen | `ui-test-automation` | test files + `tbd-index.json` |
+| 8 | TDD codegen | `codegen-violation-fixer` | test files + `tbd-index.json` |
 | 9 | Run + heal + verify | pure code + `polyglot-test-fixer` (on failure) | `run-results.json` (+ `locator-cache.json` when JIT) |
 | 10 | Bug class. | `bug-report-classifier` | `bug-reports.{md,json}` |
 | 11 | Report | pure code | `report/index.html` + Allure (when available) |
@@ -57,7 +57,7 @@ Force one or the other: `--report allure`, `--report builtin`, `--report both`.
 worca-t list                               # show all workspaces (run-ids, status, last step)
 worca-t run --spec ./spec.md --sut ./app   # resumes from last checkpoint
 worca-t run --run-id <id> --spec ...       # resume a specific workspace by run-id
-worca-t run --from-step 6 --spec ...       # skip steps 1-5
+worca-t run --from-step 6 --run-id ...       # skip steps 1-5
 worca-t run --only-step 11 --spec ...      # regenerate report only
 worca-t run --force --spec ...             # ignore all checkpoints
 worca-t run --debug --spec ...             # verbose debug agent from step 1

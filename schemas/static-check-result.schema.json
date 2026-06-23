@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worca-t/schemas/static-check-result.schema.json",
+  "title": "StaticCheckResult",
+  "description": "Audit artifact for Phase B.6 of Step 8 codegen: native static-check gate. Runs the SUT stack's own type-checker (pyright for Python stacks; tsc for JS/TS stacks) against the worca-generated test files and their direct imports. Persisted to `artifacts/step08/static-check-result.json` on every run, including skipped cases (no checker for the stack, missing tool with no auto-install path, no in-scope files). Caller uses `in_scope_errors > 0` post-fixer to decide whether to fail Step 8.",
+  "type": "object",
+  "required": [
+    "tool",
+    "stack",
+    "ran",
+    "skipped_reason",
+    "duration_s",
+    "exit_code",
+    "in_scope_errors",
+    "out_of_scope_errors",
+    "autofix_attempted",
+    "post_fix_errors",
+    "violations"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "tool": {
+      "type": ["string", "null"],
+      "description": "Static-check tool that was selected for the stack: `pyright` for Python, `tsc` for JS/TS. `null` when the stack has no dispatch entry (java/robot/ruby/go).",
+      "enum": ["pyright", "tsc", null]
+    },
+    "stack": {
+      "type": "string",
+      "description": "Detected test stack (matches the framework enum in `tbd-index.schema.json`).",
+      "minLength": 1
+    },
+    "ran": {
+      "type": "boolean",
+      "description": "True iff the static-checker was actually invoked (subprocess executed) and parsed output was attempted. False when the phase short-circuited for any reason — `skipped_reason` then carries the cause."
+    },
+    "skipped_reason": {
+      "type": ["string", "null"],
+      "description": "Populated when `ran=false`. Common values: `\"no checker for framework=...\"` (stack outside v1 dispatch), `\"no auto-install path for package_manager=...\"` (tool absent and no install argv known), `\"no Python files in worca-touched set\"` / `\"no JS/TS files in worca-touched set\"` (post-filter scope is empty), `\"env_skip\"` (WORCA_T_SKIP_STATIC_CHECK=1), `\"flag_skip\"` (--no-static-check), `\"checker exit N: <stderr head>\"` (tool launched but emitted no parseable output). Null when `ran=true`."
+    },
+    "duration_s": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Wall-clock seconds from phase entry to result construction. Includes any auto-install subprocess time."
+    },
+    "exit_code": {
+      "type": "integer",
+      "description": "Exit code from the static-checker subprocess. 0 when ran=false. Pyright exits non-zero on type errors; tsc exits 1 on type errors and 2 on bad CLI usage."
+    },
+    "in_scope_errors": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Count of error-severity violations whose file is in the worca-touched set after post-parse filtering. This is the count the caller uses to decide whether to invoke the fixer / fail the step."
+    },
+    "out_of_scope_errors": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Count of error-severity violations the checker reported on files OUTSIDE the worca-touched set (e.g. transitively-imported user app source). Retained in `violations[]` with severity=\"out_of_scope\" for audit but never fed to the fixer."
+    },
+    "autofix_attempted": {
+      "type": "boolean",
+      "description": "True iff `codegen-violation-fixer` was invoked on the in-scope violations. Mirrors Phase B.5's single-retry policy: at most one fixer pass per step run."
+    },
+    "post_fix_errors": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "In-scope error count after the fixer pass and a re-run of the checker. Only meaningful when `autofix_attempted=true`. Non-zero here triggers `StepResult(success=False)` and escalates to the global MAX_ATTEMPTS=2 step retry."
+    },
+    "violations": {
+      "type": "array",
+      "description": "Every violation parsed from the checker output, in-scope and out-of-scope together. The in-scope subset is identified by `severity != \"out_of_scope\"`. Capped at 50 entries in the fixer prompt but the artifact persists the full list.",
+      "items": {
+        "type": "object",
+        "required": ["rule", "file", "line", "snippet", "severity"],
+        "additionalProperties": false,
+        "properties": {
+          "rule": {
+            "type": "string",
+            "description": "Single value `\"type-error\"` for everything emitted by Phase B.6. Distinguishes these rows from `xpath` / `hard-wait` / etc. produced by other Step 8 phases.",
+            "const": "type-error"
+          },
+          "file": {
+            "type": "string",
+            "description": "SUT-relative posix path of the file the checker flagged.",
+            "minLength": 1
+          },
+          "line": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "1-based line number (pyright JSON is 0-based; the parser normalises)."
+          },
+          "snippet": {
+            "type": "string",
+            "description": "The checker's message, suffixed with its rule code in brackets when available (e.g. `\"Cannot access attribute \\\"X\\\" for class \\\"Y\\\" [reportAttributeAccessIssue]\"` / `\"Cannot find name 'foo'. [TS2304]\"`). Capped at 280 chars.",
+            "maxLength": 280
+          },
+          "severity": {
+            "type": "string",
+            "description": "`\"error\"` for in-scope rows; `\"out_of_scope\"` for rows whose file is outside the worca-touched set. The fixer only sees `\"error\"` rows. Warnings from the checker are dropped at parse time (they produce noise the fixer can't act on safely).",
+            "enum": ["error", "out_of_scope"]
+          }
+        }
+      }
+    }
+  }
+}

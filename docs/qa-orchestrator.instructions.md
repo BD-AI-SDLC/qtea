@@ -90,8 +90,11 @@ For each step in `_select_steps()` (respecting `--from-step`, `--only-step`, `--
 1. Confirm every expected output artifact exists (see section 3).
 2. Validate each JSON output against its schema in `schemas/` via `schemas.py`.
 3. For step 8 (codegen), additionally scan `tbd-index.json` for `violations[]`.
-   Any violation with rule `xpath`, `hard-wait`, `page-content`, or
-   `raw-secret` is a hard failure -- reject the output.
+   Each violation carries `severity: "error" | "warning"`. Any violation with
+   `severity == "error"` is a hard failure -- reject the output. Rules currently
+   shipping as errors: `xpath`, `hard-wait`, `page-content`, `raw-secret`,
+   `empty-handler`. `warning`-severity rules flow to `violations.log` for
+   audit but do not fail the step (advisory mode for rules being baselined).
 4. If validation fails, treat as a step failure (go to 2.5).
 
 ### 2.4 Checkpoint
@@ -305,7 +308,7 @@ JIT resolver respectively).
 
 | Field | Value |
 |---|---|
-| Sub-agents | `codegen-pom-extender` (Phase A), `codegen-test-writer` (Phase B), `ui-test-automation` (Phase C violation fix only) |
+| Sub-agents | `codegen-pom-extender` (Phase A), `codegen-test-writer` (Phase B), `codegen-violation-fixer` (Phase C violation fix only) |
 | Shared rules | `agents/codegen-rules.md` — canonical quality rules (locator priority, no hard waits, TBD conventions, assertion fidelity, naming). Injected as `inputs["codegen-rules.md"]` into Phase A/B reasoning calls; Phase C agent reads it via tools. |
 | Transport | `call_reasoning_llm` (Phases A/B — single API call per invocation, no multi-turn), `run_agent` (Phase C only) |
 | Input | `artifacts/step07/code-modification-plan.json` (authoritative), `artifacts/step04/test-strategy.md` (assertion values), `artifacts/step06/sut_inventory.json` (style mimicry + dedup), `--sut` path |
@@ -319,7 +322,7 @@ JIT resolver respectively).
 `depends_on` is set), create helpers (`source=create` helper entries from the
 plan);
 **B** — generate test files (`codegen-test-writer`, one call per `test_file_target`, strategy filtered to relevant TCs);
-**C** — quality gate: index tests, fix violations via `run_agent`/`ui-test-automation` if found, commit.
+**C** — quality gate: index tests, fix violations via `run_agent`/`codegen-violation-fixer` if found, commit.
 
 Step 8 also vendors the per-language JIT runtime into the SUT (Playwright
 stacks only — Python/TS/JS/Java) BEFORE any reasoning call, so that
@@ -364,9 +367,9 @@ At test runtime, the vendored runtime intercepts sentinels — `tbd("intent")` (
 4. ResolverServer over loopback TCP (preferred LLM path; legacy `worca-t resolve` subprocess is the fallback when `WORCA_T_RESOLVER_PORT` is unset)
 5. HITL prompt on TTY / `locator-unresolvable` bug-candidate entry for Step 10 on non-TTY
 
-Each returned `Locator` is wrapped in a retry proxy. On `TimeoutError` during an action (click / fill / hover / etc.), the proxy invalidates the failing cache entry, re-resolves via the LLM (skipping dev file + cache + heuristic so a fresh selector is produced from the current page state), and replays the action once. If the retry also fails, the original `TimeoutError` propagates and the standard `polyglot-test-fixer` self-heal flow takes over.
+Each returned `Locator` is wrapped in a retry proxy. On `TimeoutError`, the proxy walks any in-bundle fallback candidates first (zero LLM cost), then invalidates the failing cache entry, re-resolves via the LLM (skipping dev file + cache + heuristic), and replays the action once. If the retry also fails, the `TimeoutError` propagates and `polyglot-test-fixer` self-heal takes over. **Dev-pool quarantine:** when the stale resolution came from tier-1b, the proxy marks the cache entry `quarantined: true`, appends to `<workspace>/locator-cache/dev-pool-quarantine.jsonl`, re-resolves with `skip_pool=True`, and stores the LLM fallback under `_shadow:<key>` — preserving the dev-supplied selector. Step 9 emits a `dev-locator-drifted` bug-candidate per drift.
 
-Resolutions are cached to `<workspace>/locator-cache/locator-cache.json`; Step 9 copies it to `artifacts/step09/locator-cache.json` after the run. HITL answers from Tier 5 prompts are merged into `<sut>/.worca-t/dev-locators.json` so the next run's Tier 1 picks them up without re-prompting.
+Resolutions are cached to `<workspace>/locator-cache/locator-cache.json`; Step 9 copies it to `artifacts/step09/locator-cache.json`. HITL answers from Tier 5 prompts merge into `<sut>/.worca-t/dev-locators.json`. **TBD promotion gate:** after each attempt Step 9 freezes cache entries into SUT source via `_promote_resolved_tbds`, but ONLY when (a) `passing_witnesses` is non-empty (the runtime's teardown hook records nodeids of passing tests) AND (b) `validate_selector_payload` accepts. CSS payloads emit quoted strings; structured payloads (`role`/`text`/`label`/`placeholder`/`test_id`) emit `role_locator(...)` / `text_locator(...)` / etc. helper calls (the promoter extends the runtime import line). Blocked entries surface as `promotion-blocked` bug-candidates alongside `locator-unresolvable` and `dev-locator-drifted`.
 
 **Non-Playwright stacks (Selenium, Cypress, Robot, etc.):** JIT does not apply; `polyglot-test-fixer` heal mode handles `TBD_LOCATOR` markers on failure as the procedure below describes. `WORCA_T_NO_LLM_RESOLVE=1` disables both the runtime LLM tier AND the heal agent symmetrically — zero LLM spend in CI.
 
@@ -460,7 +463,7 @@ Every artifact links back to the requirement that spawned it:
 REQ-<slug>  (step 2: refine-spec assigns)
   --> TC-<slug>  (step 4: test-manager creates test cases)
       --> code-modification-plan entry (step 7: test-architect maps TC → code)
-          --> test files with tc_refs  (step 8: ui-test-automation transpiles)
+          --> test files with tc_refs  (step 8: codegen-violation-fixer transpiles)
               --> run-results per test  (step 9: execute + self-heal)
                   --> BUG-<run-id>-<seq> with requirement_id  (step 10)
                       --> report links all layers  (step 11)
@@ -482,6 +485,12 @@ These are non-negotiable. Violations trigger step rejection and the retry/fix cy
 | No hard waits | Step 8 | `hard-wait` in `violations[]` is a hard rejection |
 | No `page.content()` | Steps 9, 10 | `page-content` in `violations[]` is a hard rejection |
 | No raw secrets | Step 8 | `raw-secret` in `violations[]` is a hard rejection |
+| No empty exception handlers | Step 8 | `empty-handler` in `violations[]` is a hard rejection. Mirrors the Step 9 heal-gate `_count_empty_handlers`; promoted from heal-only to codegen-side so write-time defects don't ship. |
+| Framework/command consistency | Step 8 pre-flight | `research.json.detected_stack` must be consistent with `research.json.commands.test` argv head; mismatch is a hard rejection before any agent runs. |
+| Semantic preflight | Step 8.5 | `preflight-error` rules: generated Python tests must `ast.parse`; plan fixture-graph must be acyclic with all `depends_on` resolving; every `LocatorClass.CONSTANT` referenced in tests must exist in the locator file. |
+| Assertion coverage | Step 8 | `zero-assertions` (Python+pytest): every `def test_*` must contain ≥1 assertion (`assert`, `expect(...)`, `pytest.raises`, `should`) unless tagged `@pytest.mark.worca_setup`. Hard rejection. |
+| Href vs. navigation | Step 8.5 | `href-when-navigates`: when the strategy's Expected Result says navigates/leads/points/redirects to a URL, generated tests must use click-then-`to_have_url(...)` not `to_have_attribute("href", ...)`. Hard rejection. |
+| Bare-assert advisory | Step 8 | `bare-assert-where-expect-available` (warning): `assert loc.text_content() == ...`, `assert loc.is_visible()`, `assert page.url == ...` surface as advisory warnings; promotion to hard-reject pending FP baseline. |
 | TC traceability | Step 8 | Every test must have `tc_refs` linking to `TC-*` IDs |
 | REQ traceability | Steps 2, 11 | Every requirement links to a `REQ-*` ID. Every bug whose `test_id` resolves to a known TC links to that TC's `requirement_id`; orphan failures (test_id not in strategy) may omit it but must include `rationale: "orphan failure"`. |
 | Self-heal scope | Step 9 | Locators ONLY -- never assertions, never business logic |

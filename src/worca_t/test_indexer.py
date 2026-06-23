@@ -7,10 +7,17 @@ raw secrets) into a single structured result.
 
 Rule set (single source of truth for the enforcement layer):
 
-  xpath        -> any XPath-flavoured selector or `By.XPATH`/`xpath=` API call
-  hard-wait    -> sleep/wait-N calls with a numeric argument
-  page-content -> `page.content(` / `await page.content(` style calls
-  raw-secret   -> obvious inline credentials (password = "...", token = "...")
+  xpath          -> any XPath-flavoured selector or `By.XPATH`/`xpath=` API call
+  hard-wait      -> sleep/wait-N calls with a numeric argument
+  page-content   -> `page.content(` / `await page.content(` style calls
+  raw-secret     -> obvious inline credentials (password = "...", token = "...")
+  empty-handler  -> try/except or catch{} blocks with a no-op body
+  invalid-escape -> ``\\s``, ``\\d``, ``\\w`` etc. in non-raw Python strings (SyntaxWarning 3.12+, SyntaxError 3.14+)
+
+Each rule carries a `severity` of `error` (hard-rejects Step 8) or
+`warning` (logged to violations.log only — advisory mode). Step 8's reject
+logic in `s08_codegen.py` filters `violations[]` on severity before deciding
+whether to hard-fail.
 
 The indexer is intentionally language-agnostic: per-rule patterns are precise
 enough that false positives in non-test files are unlikely, and tests files
@@ -224,18 +231,25 @@ _INTENT_PATTERN = re.compile(
 )
 _INTENT_WINDOW = 2
 
-# Forbidden patterns -> rule label.
-_VIOLATION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+# Forbidden patterns -> (rule label, pattern, severity).
+#
+# `severity`:
+#   "error"   — hard-rejects the step (existing behavior for the original 4 rules).
+#   "warning" — surfaces in violations.log + tbd-index but does NOT fail the step.
+#               Reserved for rules being baselined (e.g. style preferences,
+#                join-rules whose false-positive rate is being measured).
+_VIOLATION_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
     # XPath: literal `//tag`-style strings or explicit xpath APIs.
     (
         "xpath",
         re.compile(
             r"""(?P<snippet>(?:By\.XPATH|by_xpath|find_element\s*\(\s*By\.XPATH|xpath\s*=\s*['"]|['"]//[a-zA-Z*\[]|locator\s*\(\s*['"]xpath=))"""
         ),
+        "error",
     ),
     # Hard waits: only flag the listed callables with a NUMERIC argument.
     # Intentionally NOT flagged (already-allowed polling primitives — see
-    # `agents/ui-test-automation.agent.md` §4 for positive guidance to the
+    # `agents/codegen-violation-fixer.agent.md` §4 for positive guidance to the
     # agent on which to use when):
     #   - page.wait_for_function("…", timeout=N)
     #   - page.wait_for_selector("…", timeout=N)
@@ -251,6 +265,7 @@ _VIOLATION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         re.compile(
             r"""(?P<snippet>(?:time\.sleep|Thread\.sleep|setTimeout|page\.wait_for_timeout|waitForTimeout|cy\.wait)\s*\(\s*\d+)"""
         ),
+        "error",
     ),
     # AOM only: page.content / page_source.
     (
@@ -258,6 +273,7 @@ _VIOLATION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         re.compile(
             r"""(?P<snippet>(?:await\s+)?page\.content\s*\(|driver\.page_source\b)"""
         ),
+        "error",
     ),
     # Raw secret heuristic: assignment to a credential-like name with a string literal.
     (
@@ -266,6 +282,70 @@ _VIOLATION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
             r"""(?P<snippet>(?:password|passwd|api_?key|apiKey|secret|token)\s*[:=]\s*['"][^'"\n]{4,}['"])""",
             re.I,
         ),
+        "error",
+    ),
+    # Empty exception handler — exception-swallowing across stacks.
+    # Mirrors the Step 9 heal-gate `_EMPTY_HANDLER_PATTERNS` in
+    # `s09_execute.py`: catches `except X: pass`, `try { } catch { }`,
+    # `try { } catch (e) { }` with no-op body. Promoted from heal-only to
+    # codegen-side so write-time defects don't ship.
+    (
+        "empty-handler",
+        re.compile(
+            r"""(?P<snippet>except\b[^:]*:\s*(?:#[^\n]*)?\n\s*pass\b)""",
+            re.MULTILINE,
+        ),
+        "error",
+    ),
+    (
+        "empty-handler",
+        re.compile(r"""(?P<snippet>catch\s*(?:\([^)]*\))?\s*\{\s*\})"""),
+        "error",
+    ),
+    # Python invalid escape sequence — \s, \d, \w etc. in non-raw strings.
+    # SyntaxWarning in 3.12+, becomes SyntaxError in 3.14+.
+    (
+        "invalid-escape",
+        re.compile(r"""(?P<snippet>(?<!\\)\\[sdwSDWpP])"""),
+        "error",
+    ),
+    # Assertion-fidelity advisory (Change 4c). Bare `assert` on Playwright
+    # objects when the auto-retrying `expect()` API is available — these
+    # tests pass on transient state and miss the polling guarantee. Ships
+    # as severity=warning while we baseline the false-positive rate against
+    # custom POM helpers that return plain Python types.
+    #
+    # Boolean-returning methods (is_visible, etc.) are commonly used in
+    # truthy form (`assert btn.is_visible()`) — comparator is optional.
+    (
+        "bare-assert-where-expect-available",
+        re.compile(
+            r"""(?P<snippet>assert\s+[A-Za-z_][A-Za-z0-9_.\[\]()]*\.(?:is_visible|is_hidden|is_enabled|is_disabled|is_checked)\s*\([^)]*\))"""
+        ),
+        "warning",
+    ),
+    # Value-returning methods require a comparator (otherwise the call is
+    # likely a side-effect, not an assertion target).
+    (
+        "bare-assert-where-expect-available",
+        re.compile(
+            r"""(?P<snippet>assert\s+[A-Za-z_][A-Za-z0-9_.\[\]()]*\.(?:text_content|inner_text|input_value|get_attribute|count)\s*\([^)]*\)\s*(?:==|!=|in\b|is\b))"""
+        ),
+        "warning",
+    ),
+    (
+        "bare-assert-where-expect-available",
+        re.compile(
+            r"""(?P<snippet>assert\s+page\.url\s*(?:==|!=))"""
+        ),
+        "warning",
+    ),
+    (
+        "bare-assert-where-expect-available",
+        re.compile(
+            r"""(?P<snippet>assert\s+page\.title\s*\(\s*\)\s*(?:==|!=))"""
+        ),
+        "warning",
     ),
 ]
 
@@ -340,9 +420,16 @@ class Violation:
     file: str
     line: int
     snippet: str
+    severity: str = "error"  # "error" hard-rejects Step 8; "warning" advises only.
 
     def as_dict(self) -> dict:
-        return {"rule": self.rule, "file": self.file, "line": self.line, "snippet": self.snippet}
+        return {
+            "rule": self.rule,
+            "file": self.file,
+            "line": self.line,
+            "snippet": self.snippet,
+            "severity": self.severity,
+        }
 
 
 @dataclass
@@ -628,7 +715,7 @@ def _is_in_comment(file_text: str, match_start: int) -> bool:
 
 def _scan_violations(file_text: str, rel_path: str) -> list[Violation]:
     out: list[Violation] = []
-    for rule, pat in _VIOLATION_PATTERNS:
+    for rule, pat, severity in _VIOLATION_PATTERNS:
         for m in pat.finditer(file_text):
             if _is_in_comment(file_text, m.start()):
                 continue
@@ -638,8 +725,270 @@ def _scan_violations(file_text: str, rel_path: str) -> list[Violation]:
                     file=rel_path,
                     line=_line_of(file_text, m.start()),
                     snippet=_snippet_at(file_text, m.start()),
+                    severity=severity,
                 )
             )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# AST-based: zero-assertions check (Python+pytest only)
+# ---------------------------------------------------------------------------
+
+# Method-call names that count as assertions for the zero-assertions rule.
+# Includes Playwright `expect(...).<method>()`, pytest.raises, and unittest-
+# style assertEqual/assertTrue/etc. via name match.
+_ASSERTION_CALL_NAMES: frozenset[str] = frozenset({
+    "raises",  # pytest.raises (context manager)
+    "warns", "deprecated_call",  # pytest helpers
+})
+
+
+def _function_has_assertion(node) -> bool:
+    """True iff the AST function body contains at least one assert / expect /
+    raises / should call. Walks all descendants (so asserts inside loops,
+    helper-call return values, etc. count)."""
+    import ast as _ast
+
+    for child in _ast.walk(node):
+        if isinstance(child, _ast.Assert):
+            return True
+        if isinstance(child, _ast.Call):
+            func = child.func
+            # `expect(...)` call form (Playwright's sync_api.expect /
+            # async_api.expect — bare Name).
+            if isinstance(func, _ast.Name) and func.id == "expect":
+                return True
+            # `obj.method(...)` form: assertEqual / assertTrue / should*.
+            if isinstance(func, _ast.Attribute):
+                name = func.attr
+                if name.startswith("assert") or name.startswith("should") \
+                        or name in _ASSERTION_CALL_NAMES:
+                    return True
+                # `.expect(...)` chain (e.g. `await expect(...).to_have_text(...)`).
+                if name == "expect":
+                    return True
+        # `with pytest.raises(...)` form — wraps a Call we already catch.
+        if isinstance(child, _ast.With):
+            for item in child.items:
+                expr = item.context_expr
+                if isinstance(expr, _ast.Call):
+                    func = expr.func
+                    if isinstance(func, _ast.Attribute) and func.attr == "raises":
+                        return True
+                    if isinstance(func, _ast.Name) and func.id == "raises":
+                        return True
+    return False
+
+
+def _function_has_opt_out_marker(node) -> bool:
+    """True iff the AST function carries ``@pytest.mark.worca_setup``."""
+    import ast as _ast
+
+    for deco in node.decorator_list:
+        # `@pytest.mark.worca_setup` -> Attribute(Attribute(Name("pytest"), "mark"), "worca_setup")
+        attr = deco
+        if isinstance(attr, _ast.Call):
+            attr = attr.func
+        if isinstance(attr, _ast.Attribute) and attr.attr == "worca_setup":
+            return True
+    return False
+
+
+def _is_get_by_role_call(node, role: str | tuple[str, ...]) -> bool:
+    """True iff `node` is `<obj>.get_by_role("<role>", ...)` where role
+    matches the given name (or one of the names in a tuple)."""
+    import ast as _ast
+
+    if not isinstance(node, _ast.Call):
+        return False
+    func = node.func
+    if not isinstance(func, _ast.Attribute) or func.attr != "get_by_role":
+        return False
+    if not node.args:
+        return False
+    arg0 = node.args[0]
+    if not isinstance(arg0, _ast.Constant) or not isinstance(arg0.value, str):
+        return False
+    needed = (role,) if isinstance(role, str) else role
+    return arg0.value in needed
+
+
+def _has_preceding_combobox_open(
+    statements, target_lineno: int,
+) -> bool:
+    """Scan `statements` (a function body) for a `.click()` on a
+    `get_by_role("combobox"|"listbox")` that occurs at a line BEFORE
+    `target_lineno`. Returns True when found."""
+    import ast as _ast
+
+    for stmt in statements:
+        if stmt.lineno >= target_lineno:
+            continue
+        for sub in _ast.walk(stmt):
+            if not isinstance(sub, _ast.Call):
+                continue
+            func = sub.func
+            if not isinstance(func, _ast.Attribute) or func.attr != "click":
+                continue
+            # `<expr>.click()` — `<expr>` should be (or contain) a
+            # get_by_role("combobox"|"listbox") call.
+            target = func.value
+            for w in _ast.walk(target):
+                if _is_get_by_role_call(w, ("combobox", "listbox")):
+                    return True
+    return False
+
+
+def _scan_interaction_patterns(
+    text: str, rel_path: str, framework: str,
+) -> list[Violation]:
+    """Two narrow AST-based interaction-pattern checks:
+
+      ``combobox-without-open``: ``get_by_role("option", ...)`` referenced
+      without a preceding ``.click()`` on a combobox/listbox trigger in the
+      same function.
+
+      ``popup-assert-on-original-page``: ``expect(page).to_have_url(...)``
+      called inside a ``with page.expect_popup() as ...:`` block where the
+      asserted ``page`` is the outer page variable (should be the popup).
+    """
+    import ast as _ast
+
+    if framework not in ("pytest", "playwright-py", "selenium-py"):
+        return []
+    try:
+        tree = _ast.parse(text)
+    except SyntaxError:
+        return []
+
+    out: list[Violation] = []
+    for fn in _ast.walk(tree):
+        if not isinstance(fn, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            continue
+
+        # Rule: combobox-without-open. Walk the function body; for each
+        # get_by_role("option", ...) usage, require a preceding combobox
+        # click in the same function.
+        for node in _ast.walk(fn):
+            if not _is_get_by_role_call(node, "option"):
+                continue
+            if _has_preceding_combobox_open(fn.body, node.lineno):
+                continue
+            out.append(
+                Violation(
+                    rule="combobox-without-open",
+                    file=rel_path,
+                    line=node.lineno,
+                    snippet=(
+                        "get_by_role(\"option\", ...) called without a "
+                        "preceding .click() on a get_by_role(\"combobox\") "
+                        "or get_by_role(\"listbox\") trigger in the same "
+                        "function. Open the dropdown first."
+                    ),
+                    severity="error",
+                )
+            )
+
+        # Rule: popup-assert-on-original-page. Find every `with
+        # page.expect_popup() as <popup>:` statement; inside the with-body,
+        # flag `expect(page).to_have_url(...)` calls where `page` is the
+        # outer page variable (the one expect_popup was called on).
+        for node in _ast.walk(fn):
+            if not isinstance(node, (_ast.With, _ast.AsyncWith)):
+                continue
+            for item in node.items:
+                expr = item.context_expr
+                if not isinstance(expr, _ast.Call):
+                    continue
+                func = expr.func
+                if not isinstance(func, _ast.Attribute) or func.attr != "expect_popup":
+                    continue
+                # Extract the outer page variable name (e.g. `page` in
+                # `page.expect_popup()`).
+                outer = func.value
+                if not isinstance(outer, _ast.Name):
+                    continue
+                outer_name = outer.id
+                # Walk the with-body for offending expect(outer).to_have_url.
+                for sub in _ast.walk(node):
+                    if not isinstance(sub, _ast.Call):
+                        continue
+                    f2 = sub.func
+                    if not isinstance(f2, _ast.Attribute):
+                        continue
+                    if f2.attr not in ("to_have_url", "to_have_title"):
+                        continue
+                    # `<expect(<arg>)>.<to_have_url>(...)` → the receiver of
+                    # to_have_url should be a Call to `expect` with our outer.
+                    recv = f2.value
+                    if not isinstance(recv, _ast.Call):
+                        continue
+                    rf = recv.func
+                    if not (isinstance(rf, _ast.Name) and rf.id == "expect"):
+                        continue
+                    if not recv.args:
+                        continue
+                    a0 = recv.args[0]
+                    if isinstance(a0, _ast.Name) and a0.id == outer_name:
+                        out.append(
+                            Violation(
+                                rule="popup-assert-on-original-page",
+                                file=rel_path,
+                                line=sub.lineno,
+                                snippet=(
+                                    f"expect({outer_name}).{f2.attr}(...) called "
+                                    f"inside `with {outer_name}.expect_popup() "
+                                    f"as <popup>:` — the assertion should "
+                                    f"target the popup page, not the outer "
+                                    f"page that triggered it."
+                                ),
+                                severity="error",
+                            )
+                        )
+    return out
+
+
+def _scan_zero_assertion_tests(
+    text: str, rel_path: str, framework: str,
+) -> list[Violation]:
+    """For Python pytest-family stacks, parse the file and flag every
+    ``def test_*`` function whose body contains no assertion AND no
+    ``@pytest.mark.worca_setup`` opt-out marker."""
+    import ast as _ast
+
+    if framework not in ("pytest", "playwright-py", "selenium-py"):
+        return []
+    try:
+        tree = _ast.parse(text)
+    except SyntaxError:
+        # Preflight's AST check reports this defect separately; suppress here
+        # to avoid duplicate noise.
+        return []
+
+    out: list[Violation] = []
+    for node in _ast.walk(tree):
+        if not isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            continue
+        if not node.name.startswith("test_"):
+            continue
+        if _function_has_opt_out_marker(node):
+            continue
+        if _function_has_assertion(node):
+            continue
+        out.append(
+            Violation(
+                rule="zero-assertions",
+                file=rel_path,
+                line=node.lineno,
+                snippet=(
+                    f"def {node.name}(...) has no assert / expect / raises / "
+                    f"should call. Add an assertion or apply "
+                    f"@pytest.mark.worca_setup to opt out."
+                ),
+                severity="error",
+            )
+        )
     return out
 
 
@@ -672,6 +1021,10 @@ def index_tests(tests_root: Path, *, framework: str) -> IndexResult:
         rel_files.append(rel)
 
         violations.extend(_scan_violations(text, rel))
+        # zero-assertions + interaction-pattern checks are AST-based and only
+        # meaningful for the Python family. Skipped silently on other stacks.
+        violations.extend(_scan_zero_assertion_tests(text, rel, framework))
+        violations.extend(_scan_interaction_patterns(text, rel, framework))
 
         blocks = _split_test_blocks(text, family)
         if not blocks:
@@ -729,9 +1082,26 @@ def index_tests(tests_root: Path, *, framework: str) -> IndexResult:
 def violations_summary(result: IndexResult) -> str:
     if not result.violations:
         return ""
-    lines = [f"{len(result.violations)} violation(s):"]
-    for v in result.violations[:20]:
-        lines.append(f"  [{v.rule}] {v.file}:{v.line}  {v.snippet.strip()[:120]}")
-    if len(result.violations) > 20:
-        lines.append(f"  ... and {len(result.violations) - 20} more")
-    return "\n".join(lines)
+    errors = [v for v in result.violations if v.severity == "error"]
+    warnings = [v for v in result.violations if v.severity == "warning"]
+    parts: list[str] = []
+    if errors:
+        parts.append(f"{len(errors)} error(s):")
+        for v in errors[:20]:
+            parts.append(f"  [{v.rule}] {v.file}:{v.line}  {v.snippet.strip()[:120]}")
+        if len(errors) > 20:
+            parts.append(f"  ... and {len(errors) - 20} more")
+    if warnings:
+        if parts:
+            parts.append("")
+        parts.append(f"{len(warnings)} warning(s):")
+        for v in warnings[:20]:
+            parts.append(f"  [{v.rule}] {v.file}:{v.line}  {v.snippet.strip()[:120]}")
+        if len(warnings) > 20:
+            parts.append(f"  ... and {len(warnings) - 20} more")
+    return "\n".join(parts)
+
+
+def blocking_violations(result: IndexResult) -> list[Violation]:
+    """Return only the violations that should hard-fail Step 8 (severity=error)."""
+    return [v for v in result.violations if v.severity == "error"]

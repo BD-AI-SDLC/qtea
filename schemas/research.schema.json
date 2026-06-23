@@ -65,6 +65,7 @@
               "path": { "type": "string" },
               "language": { "type": ["string", "null"] },
               "package_manager": { "type": ["string", "null"] },
+              "custom_test_id_attribute": { "type": ["string", "null"], "description": "Non-default test-id attribute (e.g. data-test, data-cy). null means default data-testid." },
               "source": { "type": ["string", "null"], "enum": ["deterministic", "llm_augmented", "llm_only", null] },
               "test_directory_layout": {
                 "type": ["object", "null"],

@@ -1,4 +1,4 @@
-"""Step 8: TDD codegen via ui-test-automation.
+"""Step 8: TDD codegen via codegen-violation-fixer.
 
 Inputs: code-modification-plan.json (step 7) + sut_inventory.json (step 6).
 The plan is authoritative for placement decisions (which fixtures to reuse,
@@ -47,12 +47,25 @@ from worca_t.codegen_reconcile import (
     reconcile_codegen,
     reconcile_fixtures,
 )
-from worca_t.config import package_resource_root, step_timeout
+from worca_t.config import AUTOFIX_MAX_TURNS, package_resource_root, step_timeout
 from worca_t.llm.reasoning import call_reasoning_llm
 from worca_t.logging_setup import get_logger
+from worca_t.runtime.dev_locators import DevLocator, load_dev_locators
 from worca_t.schemas import is_valid
+from worca_t.static_check import (
+    StaticCheckResult,
+    format_for_fixer,
+    run_static_check,
+)
 from worca_t.steps.base import Step, StepContext, StepResult
-from worca_t.test_indexer import IndexResult, index_tests, resolve_framework, violations_summary
+from worca_t.preflight import run_preflight
+from worca_t.test_indexer import (
+    IndexResult,
+    blocking_violations,
+    index_tests,
+    resolve_framework,
+    violations_summary,
+)
 
 log = get_logger(__name__)
 
@@ -61,6 +74,14 @@ log = get_logger(__name__)
 # failure must hard-fail to Step 9 so a human sees the real bug instead of
 # the orchestrator silently re-extending forever. See plan Phase B.5.
 B5_MAX_AUTOPATCH_RETRIES = 1
+
+# Phase B.6 (native static-check gate) mirrors B.5's single-retry philosophy.
+# If pyright/tsc still reports in-scope type errors after one violation-fixer
+# pass, fail the step — the global MAX_ATTEMPTS=2 will re-run Step 8 from
+# the top, which often resolves the issue (the type error usually reflects
+# upstream POM/locator drift). Persisting errors after that escalate to
+# fix-proposal / human review.
+B6_MAX_AUTOPATCH_RETRIES = 1
 
 # Languages B.5 currently understands. Other languages (Java today) skip
 # reconciliation entirely; the StepResult records `b5_skipped=<lang>` so a
@@ -473,6 +494,103 @@ def _read_research(ctx: StepContext) -> dict:
         return {}
 
 
+# ---------------------------------------------------------------------------
+# Framework ↔ test-command consistency check (pre-flight, runs before vendor)
+# ---------------------------------------------------------------------------
+#
+# `_RUNTIME_VENDORS` dispatches off `research.json.detected_stack`. When
+# Step 6 misdetects the framework (e.g. labels a Robot+SeleniumLibrary repo
+# as `pytest` because of glob accidents), Step 8 vendors the wrong runtime
+# template, conftest registers a plugin that no collector consumes, and
+# Step 9 fails at collection with an opaque trace. Cross-check the detected
+# framework against `commands.test`'s argv head and fail fast on mismatch.
+#
+# The check is intentionally permissive: when either side is unknown / the
+# command is provided as a single freeform string we cannot tokenise, we
+# silently skip rather than risk false-positive blocking. The goal is to
+# catch obvious misclassifications, not to police every command shape.
+
+# Map argv-head tokens (lower-cased, stripped of shell prefixes like `npx`,
+# `uv run`, `poetry run`) to the set of `detected_stack` values that argv
+# is consistent with. Keys are exact match against the first non-prefix
+# token; for multi-word commands like `playwright test`, the first two
+# tokens are joined with a space.
+_TEST_COMMAND_TO_STACKS: dict[str, frozenset[str]] = {
+    "pytest": frozenset({"pytest", "playwright-py", "selenium-py"}),
+    "py.test": frozenset({"pytest", "playwright-py", "selenium-py"}),
+    "playwright test": frozenset({"playwright-ts", "playwright-js"}),
+    "cypress run": frozenset({"cypress"}),
+    "cypress open": frozenset({"cypress"}),
+    "robot": frozenset({"robot"}),
+    "jest": frozenset({"jest"}),
+    "vitest": frozenset({"vitest"}),
+    "mocha": frozenset({"mocha"}),
+    "wdio": frozenset({"wdio"}),
+    "mvn": frozenset({"selenium-java", "junit5-playwright", "testng-playwright"}),
+    "mvnw": frozenset({"selenium-java", "junit5-playwright", "testng-playwright"}),
+    "gradle": frozenset({"selenium-java", "junit5-playwright", "testng-playwright"}),
+    "gradlew": frozenset({"selenium-java", "junit5-playwright", "testng-playwright"}),
+}
+
+# Shell wrapper prefixes that don't carry framework signal — strip and read
+# the next token. `uv run`, `poetry run`, `pdm run`, `pipenv run`, `npx`,
+# `npm run` / `pnpm run` / `yarn run`, `./mvnw`, `./gradlew`.
+_TEST_COMMAND_WRAPPER_PREFIXES: tuple[str, ...] = (
+    "uv", "poetry", "pdm", "pipenv", "npx", "npm", "pnpm", "yarn",
+)
+
+
+def _parse_test_command_head(command: str | None) -> str | None:
+    """Extract the canonical framework token from a test-run command string.
+
+    Returns one of the keys in :data:`_TEST_COMMAND_TO_STACKS`, or ``None``
+    when the command is missing / too freeform to classify safely.
+    """
+    if not command or not isinstance(command, str):
+        return None
+    # Tokenise on whitespace; strip shell wrapper prefixes and their subcommands.
+    tokens = command.strip().split()
+    while tokens and tokens[0].lower() in _TEST_COMMAND_WRAPPER_PREFIXES:
+        # Drop the wrapper plus its sub-token (e.g. `run`, `exec`) when
+        # present.
+        tokens = tokens[1:]
+        if tokens and tokens[0].lower() in ("run", "exec", "x"):
+            tokens = tokens[1:]
+    if not tokens:
+        return None
+    # Normalise `./gradlew` / `.\\mvnw.cmd` / absolute paths to basename.
+    head = tokens[0].lower().lstrip("./\\").replace(".cmd", "").replace(".bat", "")
+    head = head.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    # Multi-word match (e.g. "playwright test", "cypress run") — try the
+    # two-word join first; fall back to single word.
+    if len(tokens) >= 2:
+        two = f"{head} {tokens[1].lower()}"
+        if two in _TEST_COMMAND_TO_STACKS:
+            return two
+    return head if head in _TEST_COMMAND_TO_STACKS else None
+
+
+def _framework_mismatch_message(
+    detected_stack: str | None, command_head: str | None,
+) -> str | None:
+    """Return a one-line mismatch description, or None when consistent /
+    unverifiable."""
+    if not detected_stack or not command_head:
+        return None
+    allowed = _TEST_COMMAND_TO_STACKS.get(command_head)
+    if not allowed:
+        return None
+    if detected_stack in allowed:
+        return None
+    return (
+        f"research.json.detected_stack={detected_stack!r} is inconsistent "
+        f"with research.json.commands.test (argv head: {command_head!r}, "
+        f"expected stack in {sorted(allowed)}). Step 6 likely misdetected "
+        f"the framework — re-run Step 6 with the correct hint, or fix "
+        f"research.json by hand and retry from Step 8."
+    )
+
+
 def _read_detected_stack(ctx: StepContext) -> str | None:
     return _read_research(ctx).get("detected_stack")
 
@@ -619,8 +737,9 @@ def _filter_index_to_worca(
     sut_root: Path,
     *,
     exclude: set[Path] | None = None,
+    include: set[Path] | None = None,
 ) -> IndexResult:
-    """Return a new IndexResult containing only worca-prefixed entries.
+    """Return a new IndexResult containing only worca-relevant entries.
 
     `index_tests` walks the whole SUT and picks up the SUT's own pre-existing
     tests / locators alongside worca-generated ones. The user-facing tbd-index
@@ -631,19 +750,27 @@ def _filter_index_to_worca(
     index — used to skip pre-vendored JIT runtime files (`worca_t_runtime.py`,
     `worca-t-runtime.js`, `WorcaT.java`) so they don't inflate the test/support
     counts. Paths in ``exclude`` must be resolved absolute paths.
+
+    ``include`` keeps non-worca files that codegen modified (e.g. existing POM
+    locator files extended with new TBD constants in Phase A2). Without this,
+    TBD markers in modified existing files are invisible to the quality gate.
+    Paths in ``include`` must be resolved absolute paths.
     """
     exclude_set: set[Path] = exclude or set()
+    include_set: set[Path] = include or set()
 
     def _keep(rel_path: str) -> bool:
-        if not _is_worca_file(rel_path):
-            return False
-        if not exclude_set:
-            return True
         try:
             abs_resolved = (sut_root / rel_path).resolve()
         except OSError:
+            abs_resolved = None
+        if abs_resolved and abs_resolved in exclude_set:
+            return False
+        if _is_worca_file(rel_path):
             return True
-        return abs_resolved not in exclude_set
+        if abs_resolved and abs_resolved in include_set:
+            return True
+        return False
 
     files = [f for f in index.files if _keep(f)]
     tests = [t for t in index.tests if _keep(t.file)]
@@ -928,8 +1055,11 @@ async def _create_helpers(
                 target.write_text(clean, encoding="utf-8")
                 if target.suffix == ".py":
                     import ast as _ast
+                    import warnings as _warnings
                     try:
-                        _ast.parse(clean)
+                        with _warnings.catch_warnings():
+                            _warnings.simplefilter("ignore", SyntaxWarning)
+                            _ast.parse(clean)
                     except SyntaxError as e:
                         try:
                             if existing:
@@ -1111,8 +1241,11 @@ async def _extend_poms(
         # — masking the real failure (file corrupted by truncation).
         if abs_path.suffix == ".py":
             import ast as _ast
+            import warnings as _warnings
             try:
-                _ast.parse(new_content)
+                with _warnings.catch_warnings():
+                    _warnings.simplefilter("ignore", SyntaxWarning)
+                    _ast.parse(new_content)
             except SyntaxError as e:
                 # Roll back the corrupted write so Phase B.5 sees the
                 # untouched original file (still missing the methods, but
@@ -1225,12 +1358,100 @@ def _detect_const_indent(lines: list[str], is_java: bool) -> str:
     return ""
 
 
+def _match_dev_locator(
+    task: _LocatorTask,
+    dev_locators: dict[str, DevLocator],
+) -> DevLocator | None:
+    """Check if a locator task matches a dev-locator entry.
+
+    Tier 1a: exact constant-name key match.
+    Tier 1b: intent match (case-insensitive).
+    """
+    if not dev_locators:
+        return None
+    hit = dev_locators.get(task.constant_name)
+    if hit:
+        return hit
+    intent_lower = (task.intent or "").strip().lower()
+    if not intent_lower:
+        return None
+    for entry in dev_locators.values():
+        if (entry.intent or "").strip().lower() == intent_lower:
+            return entry
+    return None
+
+
+_SELF_ATTR_RE = _re.compile(r"^\s+self\.([A-Z][A-Z_0-9]*)\s*=\s*")
+
+
+def _detect_init_placement(lines: list[str]) -> tuple[bool, str, int]:
+    """Detect if locator class uses ``self.X = ...`` inside ``__init__``.
+
+    Returns ``(use_self, indent, insert_line_idx)`` where:
+      - ``use_self`` — True when new constants should be ``self.X = ...``
+      - ``indent`` — the whitespace prefix to use
+      - ``insert_line_idx`` — line index to insert new constants at
+        (end of ``__init__`` body, before the next ``def`` or dedent)
+    """
+    in_init = False
+    init_indent = ""
+    body_indent = ""
+    last_self_line = -1
+    init_start = -1
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("def __init__"):
+            in_init = True
+            init_indent = line[: len(line) - len(line.lstrip())]
+            init_start = i
+            continue
+        if in_init:
+            if stripped and not stripped.startswith("#"):
+                cur_indent = line[: len(line) - len(line.lstrip())]
+                if len(cur_indent) <= len(init_indent) and stripped.startswith(("def ", "class ", "@")):
+                    break
+                if _SELF_ATTR_RE.match(line):
+                    body_indent = cur_indent
+                    last_self_line = i
+
+    if last_self_line < 0:
+        return False, "", -1
+
+    insert_at = last_self_line + 1
+    for i in range(last_self_line + 1, len(lines)):
+        stripped = lines[i].strip()
+        if not stripped or stripped.startswith("#"):
+            insert_at = i + 1
+            continue
+        cur_indent = lines[i][: len(lines[i]) - len(lines[i].lstrip())]
+        if len(cur_indent) <= len(init_indent) or stripped.startswith(("def ", "class ", "@")):
+            break
+        if _SELF_ATTR_RE.match(lines[i]):
+            insert_at = i + 1
+        else:
+            break
+
+    return True, body_indent, insert_at
+
+
 def _write_tbd_locators(
     locator_tasks: list[_LocatorTask],
     sut_root: Path,
     language: str | None,
+    *,
+    dev_locators: dict[str, DevLocator] | None = None,
 ) -> int:
-    """Phase A3: mechanical append of TBD locator constants (pure Python)."""
+    """Phase A2: mechanical append of TBD locator constants (pure Python).
+
+    When ``dev_locators`` is provided, each task is checked against the
+    dev-locator pool before emitting ``tbd("intent")``.  A match writes
+    the dev-supplied selector directly; a miss writes the usual sentinel.
+
+    The function also detects whether the target locator class uses instance
+    attributes (``self.X = ...`` inside ``__init__``) and places new
+    constants accordingly.
+    """
     if not locator_tasks:
         return 0
 
@@ -1247,6 +1468,7 @@ def _write_tbd_locators(
 
     written = 0
     is_java = (language or "").lower() == "java"
+    dev_locs = dev_locators or {}
 
     for file_path, tasks in by_file.items():
         abs_path = sut_root / file_path
@@ -1257,38 +1479,57 @@ def _write_tbd_locators(
         content = abs_path.read_text(encoding="utf-8")
         lines = content.rstrip().split("\n")
 
+        # Detect instance-attribute placement before potentially adding imports.
+        use_self, self_indent, init_insert_idx = _detect_init_placement(lines)
+
+        # Determine if ANY task will need the tbd import (i.e. has no
+        # dev-locator match). Skip the import when every task is satisfied
+        # by dev-locators — no tbd() calls will be emitted.
+        any_needs_tbd = any(
+            _match_dev_locator(t, dev_locs) is None
+            for t in tasks
+            if t.constant_name not in content
+        )
+
         tbd_import = "from tests.worca_t_runtime import tbd"
         if is_java:
             tbd_import = "import com.worca.runtime.Tbd;"
-        needs_import = tbd_import not in content and "import tbd" not in content.lower()
+        needs_import = (
+            any_needs_tbd
+            and tbd_import not in content
+            and "import tbd" not in content.lower()
+        )
 
         if needs_import:
             if is_java:
-                # Java imports must follow the `package …;` declaration and
-                # precede the type declaration. Insert right after the package
-                # line when present, otherwise at the top of the file.
                 for i, line in enumerate(lines):
                     if line.strip().startswith("package ") and line.rstrip().endswith(";"):
                         lines.insert(i + 1, "")
                         lines.insert(i + 2, tbd_import)
+                        if use_self and init_insert_idx > i:
+                            init_insert_idx += 2
                         break
                 else:
                     lines.insert(0, tbd_import)
+                    if use_self:
+                        init_insert_idx += 1
             else:
                 for i, line in enumerate(lines):
                     if line.startswith("import ") or line.startswith("from "):
                         lines.insert(i, tbd_import)
+                        if use_self and init_insert_idx > i:
+                            init_insert_idx += 1
                         break
                 else:
                     lines.insert(0, tbd_import)
+                    if use_self:
+                        init_insert_idx += 1
 
-        # Determine the indentation new constants should carry. Prefer the
-        # leading whitespace of an existing constant in the same file (handles
-        # both module-level locator modules and class-body POMs). Fall back to
-        # 4-space class-body indent for Java (constants are always class
-        # members) and for Python only when a wrapping `class` is present;
-        # otherwise module-level (no indent).
-        const_indent = _detect_const_indent(lines, is_java)
+        # Determine the indentation new constants should carry.
+        if use_self:
+            const_indent = self_indent
+        else:
+            const_indent = _detect_const_indent(lines, is_java)
 
         new_lines: list[str] = []
         for task in tasks:
@@ -1298,27 +1539,61 @@ def _write_tbd_locators(
                     constant=task.constant_name,
                 )
                 continue
-            if is_java:
-                new_lines.append(
-                    f'{const_indent}public static final String {task.constant_name} = '
-                    f'Tbd.of("{task.intent}");'
+
+            dev_match = _match_dev_locator(task, dev_locs)
+            if dev_match:
+                selector = dev_match.selector
+                if is_java:
+                    new_lines.append(
+                        f'{const_indent}public static final String '
+                        f'{task.constant_name} = "{selector}";'
+                    )
+                elif use_self:
+                    new_lines.append(
+                        f'{const_indent}self.{task.constant_name} = '
+                        f'"{selector}"'
+                    )
+                else:
+                    new_lines.append(
+                        f'{const_indent}{task.constant_name} = "{selector}"'
+                    )
+                log.info(
+                    "step08.tbd_locator_dev_match",
+                    constant=task.constant_name,
+                    selector=selector[:80],
+                    source=dev_match.constant_name,
                 )
             else:
-                new_lines.append(
-                    f'{const_indent}{task.constant_name} = tbd("{task.intent}")'
-                )
+                if is_java:
+                    new_lines.append(
+                        f'{const_indent}public static final String '
+                        f'{task.constant_name} = Tbd.of("{task.intent}");'
+                    )
+                elif use_self:
+                    new_lines.append(
+                        f'{const_indent}self.{task.constant_name} = '
+                        f'tbd("{task.intent}")'
+                    )
+                else:
+                    new_lines.append(
+                        f'{const_indent}{task.constant_name} = '
+                        f'tbd("{task.intent}")'
+                    )
             written += 1
 
         if new_lines:
-            indent_idx = len(lines)
-            for i in range(len(lines) - 1, -1, -1):
-                stripped = lines[i].strip()
-                if stripped and not stripped.startswith("#") and stripped != "":
-                    indent_idx = i + 1
-                    break
+            if use_self and init_insert_idx >= 0:
+                insert_at = init_insert_idx
+            else:
+                insert_at = len(lines)
+                for i in range(len(lines) - 1, -1, -1):
+                    stripped = lines[i].strip()
+                    if stripped and not stripped.startswith("#") and stripped != "":
+                        insert_at = i + 1
+                        break
             for nl in new_lines:
-                lines.insert(indent_idx, nl)
-                indent_idx += 1
+                lines.insert(insert_at, nl)
+                insert_at += 1
 
             abs_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
             log.info(
@@ -1328,6 +1603,109 @@ def _write_tbd_locators(
             )
 
     return written
+
+
+_HARDCODED_LOCATOR_RE = _re.compile(
+    r"^(\s*(?:self\.)?)"          # optional indent + optional self.
+    r"([A-Z][A-Z_0-9]*)"         # UPPERCASE constant name
+    r"\s*=\s*"                    # assignment
+    r"""(["'])(.+?)\3"""          # quoted string value
+    r"\s*$",                      # end of line
+)
+
+
+def _scan_and_convert_hardcoded_locators(
+    sut_root: Path,
+    codegen_modified: set[Path],
+    dev_locators: dict[str, DevLocator] | None,
+) -> int:
+    """Safety net: find hardcoded selector assignments in codegen-modified
+    locator/POM files and convert them to ``tbd()`` sentinels.
+
+    Only processes lines added by codegen (new in the git diff).  Returns
+    the number of constants converted.
+    """
+    import subprocess as _sp
+
+    dev_locs = dev_locators or {}
+    dev_selectors = {e.selector for e in dev_locs.values()}
+    converted = 0
+
+    for abs_path in sorted(codegen_modified):
+        if not abs_path.is_file():
+            continue
+        try:
+            rel = abs_path.relative_to(sut_root)
+        except ValueError:
+            continue
+        name_low = rel.name.lower()
+        parts_low = [p.lower() for p in rel.parts]
+        is_locator_file = (
+            "locator" in name_low
+            or "locators" in parts_low
+            or ("pages" in parts_low and name_low.endswith(".py"))
+        )
+        if not is_locator_file:
+            continue
+
+        diff_result = _sp.run(
+            ["git", "diff", "HEAD", "--", str(rel.as_posix())],
+            cwd=str(sut_root), capture_output=True, text=True,
+            timeout=15,
+        )
+        if diff_result.returncode != 0:
+            continue
+        added_lines: set[str] = set()
+        for line in diff_result.stdout.splitlines():
+            if line.startswith("+") and not line.startswith("+++"):
+                added_lines.add(line[1:])
+
+        try:
+            content = abs_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        lines = content.split("\n")
+        file_converted = 0
+        for i, line in enumerate(lines):
+            if line not in added_lines:
+                continue
+            if "tbd(" in line or "Tbd.of(" in line or "TBD_LOCATOR" in line:
+                continue
+            m = _HARDCODED_LOCATOR_RE.match(line)
+            if not m:
+                continue
+            prefix, const_name, _q, selector = m.groups()
+            if selector in dev_selectors:
+                continue
+            has_self = "self." in prefix
+            indent = prefix.replace("self.", "")
+            if has_self:
+                lines[i] = f'{indent}self.{const_name} = tbd("{const_name}")'
+            else:
+                lines[i] = f'{indent}{const_name} = tbd("{const_name}")'
+            file_converted += 1
+            log.warning(
+                "step08.hardcoded_locator_converted",
+                file=str(rel),
+                constant=const_name,
+                old_selector=selector[:80],
+            )
+
+        converted += file_converted
+        if file_converted:
+            tbd_import = "from tests.worca_t_runtime import tbd"
+            if tbd_import not in content and "import tbd" not in content.lower():
+                for j, ln in enumerate(lines):
+                    if ln.startswith("import ") or ln.startswith("from "):
+                        lines.insert(j, tbd_import)
+                        break
+                else:
+                    lines.insert(0, tbd_import)
+            abs_path.write_text("\n".join(lines), encoding="utf-8")
+
+    if converted:
+        log.info("step08.hardcoded_locator_scan", converted=converted)
+    return converted
 
 
 def _group_fixture_tasks_by_file(
@@ -1510,8 +1888,11 @@ async def _create_fixtures(
                 # from the prior file state (or no file, if newly created).
                 if target.suffix == ".py":
                     import ast as _ast
+                    import warnings as _warnings
                     try:
-                        _ast.parse(clean)
+                        with _warnings.catch_warnings():
+                            _warnings.simplefilter("ignore", SyntaxWarning)
+                            _ast.parse(clean)
                     except SyntaxError as e:
                         try:
                             if existing:
@@ -2064,6 +2445,131 @@ async def _auto_fix_intents(
     return rewritten, errors
 
 
+async def _run_phase_b6(
+    *,
+    sut_root: Path,
+    framework: str,
+    worca_touched: set[Path],
+    agents_root: Path,
+    workdir: Path,
+    timeout_s: int | None,
+) -> StaticCheckResult:
+    """Phase B.6 — native static-check gate.
+
+    Runs the SUT stack's native type-checker on the worca-touched files. On
+    in-scope errors, invokes ``codegen-violation-fixer`` ONCE and re-runs the
+    checker. Returns the final ``StaticCheckResult`` with ``autofix_attempted``
+    and ``post_fix_errors`` set so the caller can decide whether to fail
+    Step 8.
+
+    Honors two opt-outs (matching the WORCA_T_SKIP_INTENT_SCORE precedent at
+    Phase D): WORCA_T_SKIP_STATIC_CHECK=1 and WORCA_T_NO_STATIC_CHECK=1
+    (latter set by the --no-static-check CLI flag in cli.py). When skipped,
+    returns a result row with ran=False so the artifact still records WHY
+    the gate didn't run.
+    """
+    if os.environ.get("WORCA_T_SKIP_STATIC_CHECK") == "1":
+        log.info("step08.phase_b6.skipped", reason="WORCA_T_SKIP_STATIC_CHECK=1")
+        return StaticCheckResult(
+            tool=None, stack=framework, ran=False,
+            skipped_reason="env_skip",
+            duration_s=0.0, exit_code=0,
+            in_scope_errors=0, out_of_scope_errors=0,
+            autofix_attempted=False, post_fix_errors=0,
+        )
+    if os.environ.get("WORCA_T_NO_STATIC_CHECK") == "1":
+        log.info("step08.phase_b6.skipped", reason="--no-static-check")
+        return StaticCheckResult(
+            tool=None, stack=framework, ran=False,
+            skipped_reason="flag_skip",
+            duration_s=0.0, exit_code=0,
+            in_scope_errors=0, out_of_scope_errors=0,
+            autofix_attempted=False, post_fix_errors=0,
+        )
+
+    check_timeout = int(os.environ.get("WORCA_T_STATIC_CHECK_TIMEOUT_S", "120"))
+    result = await asyncio.to_thread(
+        run_static_check,
+        sut_root,
+        framework=framework,
+        worca_touched=worca_touched,
+        timeout_s=check_timeout,
+    )
+
+    if not result.ran:
+        log.info(
+            "step08.phase_b6.no_run",
+            reason=result.skipped_reason, framework=framework,
+        )
+        return result
+
+    if result.in_scope_errors == 0:
+        log.info(
+            "step08.phase_b6.clean",
+            tool=result.tool, framework=framework,
+            duration_s=round(result.duration_s, 2),
+            out_of_scope=result.out_of_scope_errors,
+        )
+        return result
+
+    # In-scope errors present — one autofix attempt via the existing
+    # codegen-violation-fixer agent (same agent that handles xpath/hard-wait
+    # etc.; we just hand it a different violation summary).
+    log.info(
+        "step08.phase_b6.autofix",
+        tool=result.tool, framework=framework,
+        in_scope=result.in_scope_errors,
+        out_of_scope=result.out_of_scope_errors,
+    )
+    fix_agent = agents_root / "codegen-violation-fixer.agent.md"
+    summary = format_for_fixer(result)
+    await run_agent(
+        fix_agent,
+        workdir=workdir,
+        inputs={},
+        user_prompt=(
+            f"The native static-checker ({result.tool}) found "
+            f"{result.in_scope_errors} type error(s) in your generated "
+            f"test code:\n\n```\n{summary}\n```\n\n"
+            f"Each row is rule `type-error`. Read the file, follow the "
+            f"import to find the symbol's REAL definition, and rewrite "
+            f"the call site to match. See `codegen-violation-fixer.agent.md`"
+            f" §3 row `type-error` for the workflow and the prohibitions "
+            f"on `# type: ignore` / `@ts-ignore` / `pytest.skip` (silencing "
+            f"the checker is forbidden — the fix must be a real correction)."
+        ),
+        extra_paths=[package_resource_root() / "skills" / "webapp-testing"],
+        add_dirs=[sut_root],
+        timeout_s=min(timeout_s or 1800, 300),
+        step=8,
+        max_turns=AUTOFIX_MAX_TURNS,
+    )
+
+    # Re-run the checker. B6_MAX_AUTOPATCH_RETRIES = 1 — no further attempts.
+    post = await asyncio.to_thread(
+        run_static_check,
+        sut_root,
+        framework=framework,
+        worca_touched=worca_touched,
+        timeout_s=check_timeout,
+    )
+    result.autofix_attempted = True
+    result.post_fix_errors = post.in_scope_errors
+    # Replace violations with the post-fix set so the persisted artifact
+    # reflects what remains, not what was originally found.
+    result.violations = post.violations
+    result.out_of_scope_errors = post.out_of_scope_errors
+    result.exit_code = post.exit_code
+    result.duration_s = result.duration_s + post.duration_s
+
+    log.info(
+        "step08.phase_b6.postfix",
+        in_scope=result.post_fix_errors,
+        out_of_scope=result.out_of_scope_errors,
+    )
+    return result
+
+
 class CodegenStep(Step):
     number = 8
     name = "codegen"
@@ -2187,6 +2693,42 @@ class CodegenStep(Step):
         sut_env_keys = research.get("sut_env_keys") or []
         sut_inventory_dict = research.get("sut_inventory") or {}
         active_module_dict = _active_module_dict(sut_inventory_dict)
+
+        # E: framework ↔ test-command consistency. Catches Step 6 misdetection
+        # before we vendor a runtime template that won't load. Silent skip
+        # when either side is unverifiable.
+        test_command = (research.get("commands") or {}).get("test")
+        command_head = _parse_test_command_head(test_command)
+        mismatch_msg = _framework_mismatch_message(detected_stack, command_head)
+        if mismatch_msg:
+            log.error(
+                "step08.framework_mismatch",
+                detected_stack=detected_stack,
+                command_head=command_head,
+                test_command=test_command,
+            )
+            return StepResult(
+                success=False,
+                status="failed",
+                outputs=[],
+                error=mismatch_msg,
+            )
+
+        # Load dev-locators (--dev-locators CLI flag / env / convention).
+        # Used in Phase A2 to substitute matched intents with dev-supplied
+        # selectors instead of emitting tbd() sentinels.
+        dev_locators_opt = getattr(ctx.options, "dev_locators", None)
+        dev_locators_map, dev_loc_path, dev_loc_warnings = load_dev_locators(
+            cli_path=dev_locators_opt, sut_root=sut_root,
+        )
+        for w in dev_loc_warnings:
+            log.warning("step08.dev_locators.warning", msg=w)
+        if dev_locators_map:
+            log.info(
+                "step08.dev_locators.loaded",
+                count=len(dev_locators_map),
+                path=str(dev_loc_path),
+            )
 
         # D: when an active module exists, its referenced page-objects /
         # locators / helpers / auth-flow files must actually live under
@@ -2422,7 +2964,10 @@ class CodegenStep(Step):
                 f"  - helpers_dir: `{helpers_dir}`\n\n"
                 f"EXISTING PAGE OBJECTS (reuse these — do NOT redefine):\n"
                 f"{po_lines}\n\n"
-                f"EXISTING FIXTURES:\n{fixture_lines}\n\n"
+                f"EXISTING FIXTURES (auto-discovered by the framework — "
+                f"available by name in test function signatures / DI / "
+                f"setup hooks. Do NOT redefine these in your test file — "
+                f"use them directly):\n{fixture_lines}\n\n"
                 f"EXISTING HELPERS:\n{helper_lines}\n\n"
                 f"EXISTING LOCATORS (reuse these constants — do NOT redefine "
                 f"byte-identical selectors in a new locator class):\n"
@@ -2456,6 +3001,18 @@ class CodegenStep(Step):
                 f"is the worca-t step workdir, NOT the SUT.\n"
                 f"4. Match the active module's language: `{language}`. Never "
                 f"emit Python tests for a TypeScript module or vice versa.\n"
+                f"5. **Fixture reuse discipline:**\n"
+                f"   - `source: reuse` in the code-modification plan means the "
+                f"fixture already exists and is auto-discovered by the "
+                f"framework. Use it by name — do NOT redefine, wrap, copy, "
+                f"or shadow it in the test file.\n"
+                f"   - `source: create` means no suitable fixture exists. "
+                f"Create it in the designated fixtures directory following "
+                f"the SUT's conventions.\n"
+                f"   - This applies to all frameworks with fixture/setup "
+                f"injection (pytest fixtures, JUnit @Before/@BeforeEach, "
+                f"TestNG @BeforeMethod, Mocha before/beforeEach, Jest "
+                f"beforeAll/beforeEach, etc.).\n"
             )
 
         # --- Phased codegen orchestration -----------------------------------
@@ -2491,7 +3048,10 @@ class CodegenStep(Step):
         # Runs BEFORE POM extension so the locator file already contains
         # TBD constants when the POM extender reads it — methods then
         # reference self.locators.<CONSTANT> instead of inline tbd() calls.
-        tbd_written = _write_tbd_locators(locator_tasks, sut_root, language)
+        tbd_written = _write_tbd_locators(
+            locator_tasks, sut_root, language,
+            dev_locators=dev_locators_map,
+        )
         if tbd_written:
             log.info("step08.tbd_locators.total", count=tbd_written)
 
@@ -2789,6 +3349,34 @@ class CodegenStep(Step):
             skipped=b5_skipped_reason,
         )
 
+        # Safety-net scan: catch any hardcoded selector strings the agent
+        # wrote into locator/POM files despite the tbd()-only instruction.
+        # Runs BEFORE indexing so the converted tbd() sentinels appear in
+        # the tbd-index and flow through Phase D intent quality scoring.
+        # We compute `codegen_modified` early so the scanner can diff
+        # against HEAD for new-line detection.
+        import subprocess as _sp
+        _diff_result = _sp.run(
+            ["git", "diff", "--name-only", "HEAD"],
+            cwd=str(sut_root), capture_output=True, text=True,
+            timeout=30,
+        )
+        codegen_modified: set[Path] = set()
+        if _diff_result.returncode == 0 and _diff_result.stdout.strip():
+            for _rel in _diff_result.stdout.strip().splitlines():
+                _rel = _rel.strip()
+                if _rel:
+                    codegen_modified.add((sut_root / _rel).resolve())
+        if codegen_modified:
+            log.info(
+                "step08.codegen_modified_files",
+                count=len(codegen_modified),
+            )
+
+        _scan_and_convert_hardcoded_locators(
+            sut_root, codegen_modified, dev_locators_map,
+        )
+
         # Index the SUT clone, then filter to ONLY worca-prefixed entries so
         # the SUT's own pre-existing tests don't pollute our tbd-index or
         # trigger rule-violation reports for code we didn't write. Also drop
@@ -2811,8 +3399,12 @@ class CodegenStep(Step):
                 if p not in jit_files_added:
                     jit_files_added.append(p)
             jit_resolved.update(p.resolve() for p in late_added)
+
         full_index = index_tests(sut_root, framework=framework)
-        index = _filter_index_to_worca(full_index, sut_root, exclude=jit_resolved)
+        index = _filter_index_to_worca(
+            full_index, sut_root,
+            exclude=jit_resolved, include=codegen_modified,
+        )
         payload = index.as_dict()
 
         index_path = out_dir / "tbd-index.json"
@@ -2824,11 +3416,27 @@ class CodegenStep(Step):
         # Manifest: SUT-relative paths of every file the agent produced. Lets
         # downstream steps and human reviewers see the deliverable without
         # walking the SUT tree.
+        # The vendored JIT runtime (`tests/worca_t_runtime.py`,
+        # `worca-t-runtime.js`, etc.) is captured by the `worca_*` rglob in
+        # `produced_in_sut` but is worca-t's template, not codegen output —
+        # excluding it here keeps Phase B.6 from feeding template errors to
+        # the violation-fixer, which is forbidden from touching it
+        # (`agents/codegen-violation-fixer.agent.md` §"What NOT to Do").
+        all_codegen_files = {
+            p for p in produced_in_sut if p.resolve() not in jit_resolved
+        }
+        all_codegen_files.update(
+            p for p in codegen_modified
+            if p.is_file() and p not in jit_resolved
+        )
         generated_manifest = {
             "sut_root": str(sut_root),
             "branch": f"worca-t/run-{ctx.workspace.run_id}",
-            "files": [str(p.relative_to(sut_root).as_posix())
-                      for p in produced_in_sut],
+            "files": sorted(
+                str(p.relative_to(sut_root).as_posix())
+                for p in all_codegen_files
+                if p.is_relative_to(sut_root)
+            ),
         }
         manifest_path = out_dir / "generated-files.json"
         manifest_path.write_text(
@@ -2840,20 +3448,64 @@ class CodegenStep(Step):
         if not ok_schema:
             log.warning("step08.schema_invalid", error=schema_err)
 
-        if index.violations:
+        # -------------------------------------------------------------------
+        # Phase B.6 — native static-check gate.
+        # Runs the SUT stack's own type-checker (pyright for Python; tsc with
+        # --allowJs --checkJs for JS/TS) against the worca-touched files.
+        # Catches the bug class AST-reconciliation (B.5) cannot see:
+        # class-vs-instance attribute access, missing imports, wrong arg
+        # counts, stale rename references. Single autofix attempt mirroring
+        # B.5's philosophy; persisting errors escalate to step-level retry.
+        # -------------------------------------------------------------------
+        static_check_result = await _run_phase_b6(
+            sut_root=sut_root,
+            framework=framework,
+            worca_touched=all_codegen_files,
+            agents_root=agents_root,
+            workdir=wd,
+            timeout_s=self.timeout_s,
+        )
+        sc_path = out_dir / "static-check-result.json"
+        sc_path.write_text(
+            json.dumps(static_check_result.as_dict(), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        ok_sc, sc_err = is_valid(static_check_result.as_dict(), "static-check-result")
+        if not ok_sc:
+            log.warning("step08.b6_schema_invalid", error=sc_err)
+        if (
+            static_check_result.ran
+            and static_check_result.autofix_attempted
+            and static_check_result.post_fix_errors > 0
+        ):
+            return StepResult(
+                success=False,
+                status="failed",
+                outputs=[index_path, manifest_path, sc_path],
+                error=(
+                    f"static-check (Phase B.6): "
+                    f"{static_check_result.post_fix_errors} "
+                    f"type error(s) remain after one autofix pass"
+                ),
+                notes=format_for_fixer(static_check_result)[:500],
+            )
+
+        blocking = blocking_violations(index)
+        if blocking:
             summary = violations_summary(index)
             log.info(
                 "step08.violation_self_fix",
-                count=len(index.violations),
+                count=len(blocking),
+                advisory=len(index.violations) - len(blocking),
                 framework=framework,
             )
-            fix_agent = agents_root / "ui-test-automation.agent.md"
+            fix_agent = agents_root / "codegen-violation-fixer.agent.md"
             await run_agent(
                 fix_agent,
                 workdir=wd,
                 inputs={},
                 user_prompt=(
-                    f"Your generated code has {len(index.violations)} "
+                    f"Your generated code has {len(blocking)} "
                     f"non-negotiable rule violation(s):\n\n"
                     f"```\n{summary}\n```\n\n"
                     f"Fix each violation IN-PLACE by rewriting the "
@@ -2875,12 +3527,13 @@ class CodegenStep(Step):
                 add_dirs=[sut_root],
                 timeout_s=min(self.timeout_s or 1800, 300),
                 step=8,
-                max_turns=10,
+                max_turns=AUTOFIX_MAX_TURNS,
             )
 
             full_index = index_tests(sut_root, framework=framework)
             index = _filter_index_to_worca(
-                full_index, sut_root, exclude=jit_resolved,
+                full_index, sut_root,
+                exclude=jit_resolved, include=codegen_modified,
             )
             payload = index.as_dict()
             index_path.write_text(
@@ -2888,20 +3541,70 @@ class CodegenStep(Step):
                 encoding="utf-8",
             )
 
+        # Step 8.5 semantic preflight — static-import / fixture-graph /
+        # sentinel-constant checks. Runs AFTER the violation-fix loop because
+        # the fix-agent isn't trained to repair these defect classes; surfacing
+        # them now is cheaper than letting Step 9 collection-time discover them.
+        try:
+            plan_for_preflight = json.loads(plan_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            plan_for_preflight = {}
+        try:
+            inventory_for_preflight = json.loads(
+                sut_inv_json.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            inventory_for_preflight = None
+        preflight_files = {
+            str(p.relative_to(sut_root).as_posix())
+            for p in all_codegen_files
+            if p.is_relative_to(sut_root)
+        }
+        try:
+            strategy_md_text = strategy_md.read_text(encoding="utf-8")
+        except OSError:
+            strategy_md_text = ""
+        preflight_violations = run_preflight(
+            sut_root,
+            framework=framework,
+            generated_files=preflight_files,
+            plan=plan_for_preflight,
+            inventory=inventory_for_preflight,
+            strategy_md=strategy_md_text,
+        )
+        if preflight_violations:
+            log.warning(
+                "step08.preflight_failed",
+                count=len(preflight_violations),
+            )
+            index.violations.extend(preflight_violations)
+            # Re-serialise the index so consumers see preflight rows too.
+            payload = index.as_dict()
+            index_path.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+        # Persist the violations.log when ANY violations exist (errors OR
+        # warnings) so advisory-mode rules are auditable; only hard-fail when
+        # at least one ERROR-severity violation remains.
+        post_fix_blocking = blocking_violations(index)
         if index.violations:
             summary = violations_summary(index)
             (out_dir / "violations.log").write_text(summary, encoding="utf-8")
-            log.error(
+            log.warning(
                 "step08.violations",
-                count=len(index.violations),
+                errors=len(post_fix_blocking),
+                warnings=len(index.violations) - len(post_fix_blocking),
                 framework=framework,
             )
+        if post_fix_blocking:
             return StepResult(
                 success=False,
                 status="failed",
                 outputs=[index_path, manifest_path, out_dir / "violations.log"],
-                error=f"non-negotiable rule violations: {len(index.violations)}",
-                notes=summary[:500],
+                error=f"non-negotiable rule violations: {len(post_fix_blocking)}",
+                notes=violations_summary(index)[:500],
             )
 
         # Phase gate: indexer must find at least one real test function.

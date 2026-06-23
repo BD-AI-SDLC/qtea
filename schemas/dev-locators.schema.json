@@ -33,6 +33,23 @@
               "type": ["string", "null"],
               "enum": ["id", "data-testid", "role", "label", "text", "placeholder", "css", null]
             },
+            "payload": {
+              "type": ["object", "null"],
+              "description": "Structured locator payload for role/text/label/placeholder/test_id strategies. When set, the runtime uses page.get_by_role(...) etc. at action time instead of page.locator(string); TBD promotion writes a role_locator(...) call into source. Optional — when null, the runtime falls back to the `selector` string. Validated by worca_t.jit_resolver.validate_selector_payload at load time.",
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": ["role", "text", "label", "placeholder", "test_id", "css"]
+                },
+                "role": { "type": "string", "description": "Required when kind=role." },
+                "name": { "type": "string", "description": "Optional accessible name for role kind." },
+                "text": { "type": "string", "description": "Required when kind in {text, label, placeholder}." },
+                "value": { "type": "string", "description": "Required when kind=test_id." },
+                "selector": { "type": "string", "description": "Required when kind=css." },
+                "exact": { "type": "boolean", "description": "Match exactly (default false)." }
+              },
+              "required": ["kind"]
+            },
             "intent": {
               "type": ["string", "null"],
               "description": "Human description of what this locator targets, e.g. 'submits the login form'. When present, this entry participates in Tier 1b intent-pool matching against `tbd(...)` strings (frontend-dev workflow). Without `intent`, the entry is only reachable via Tier 1a exact-key match (HITL-replay). Write the way you'd describe the element to a new teammate, not as a CSS class label."

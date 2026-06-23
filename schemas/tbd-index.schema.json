@@ -146,11 +146,32 @@
         "properties": {
           "rule": {
             "type": "string",
-            "enum": ["xpath", "hard-wait", "page-content", "raw-secret"]
+            "enum": [
+              "xpath",
+              "hard-wait",
+              "page-content",
+              "raw-secret",
+              "empty-handler",
+              "framework-mismatch",
+              "preflight-error",
+              "zero-assertions",
+              "href-when-navigates",
+              "bare-assert-where-expect-available",
+              "auth-fixture-missing",
+              "missing-reuse-import",
+              "combobox-without-open",
+              "popup-assert-on-original-page"
+            ]
           },
           "file": { "type": "string" },
           "line": { "type": "integer" },
-          "snippet": { "type": "string" }
+          "snippet": { "type": "string" },
+          "severity": {
+            "type": "string",
+            "enum": ["error", "warning"],
+            "default": "error",
+            "description": "`error` hard-rejects Step 8; `warning` flows to violations.log only (advisory mode for rules being baselined)."
+          }
         }
       }
     }

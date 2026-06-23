@@ -240,7 +240,7 @@ All `run` flags:
 | `--only-step N` | — | Run exactly one step |
 | `--skip-step N` | — | Skip step N (repeatable) |
 | `--force` | false | Ignore checkpoints and re-run everything |
-| `--parallelism N` | 1 | Number of parallel test workers (1–16) |
+| `--parallel-run N` | 2 | Number of parallel test workers (0 = in-process, 1–16) |
 | `--headless / --headed` | headless | Run browser tests headless or with a visible window |
 | `--debug` | false | Run with debug agent live from step 1 |
 | `--fix` | false | Generate a fix proposal after retry exhaustion |
@@ -341,6 +341,18 @@ worca-t run --spec ./spec.md --sut ./app --fix
 ```
 
 Debug artifacts land in `.worca-t/<run-id>/debug/`.
+
+### Review gates (interactive)
+
+On TTY runs (not `--no-hitl`), the pipeline pauses after steps 4, 7, and 8 for human review:
+
+| Gate | Artifact reviewed | Options |
+| --- | --- | --- |
+| Step 4 — Test Strategy | `test-strategy.md` | `[y]` approve, `[n]` reject (abort), `[f]` open in `$EDITOR` to revise |
+| Step 7 — Code-modification plan | `code-modification-plan.md` | `[y]` approve, `[n]` reject (abort), `[f]` open in `$EDITOR` to revise |
+| Step 8 — TBD intents | `tbd-index.json` intent quality | `[y]` approve, `[n]` reject (abort) |
+
+Edits made via the `[f]` option are fed back to the agent for a revision pass before continuing. Pass `--no-hitl` to skip all gates (CI mode).
 
 ### Skip Xray upload (or enforce it)
 

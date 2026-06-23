@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from worca_t.test_indexer import (
+    blocking_violations,
     index_tests,
     resolve_framework,
     violations_summary,
@@ -274,6 +275,284 @@ def test_violation_raw_secret_password_literal(tmp_path: Path):
     assert any(v.rule == "raw-secret" for v in result.violations)
 
 
+def test_violation_empty_handler_python_except_pass(tmp_path: Path):
+    (tmp_path / "test_bad.py").write_text(
+        """\
+def test_x(page):
+    try:
+        page.click("#submit")
+    except Exception:
+        pass
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="pytest")
+    assert any(v.rule == "empty-handler" for v in result.violations)
+    # Severity must be "error" so it hard-rejects Step 8.
+    handlers = [v for v in result.violations if v.rule == "empty-handler"]
+    assert all(v.severity == "error" for v in handlers)
+
+
+def test_violation_empty_handler_typescript_catch(tmp_path: Path):
+    (tmp_path / "bad.spec.ts").write_text(
+        """test('x', async ({ page }) => {
+  try {
+    await page.click('#submit');
+  } catch (e) {}
+});
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="playwright-ts")
+    assert any(v.rule == "empty-handler" for v in result.violations)
+
+
+def test_empty_handler_not_flagged_when_body_present(tmp_path: Path):
+    (tmp_path / "ok.spec.ts").write_text(
+        """test('x', async ({ page }) => {
+  try {
+    await page.click('#submit');
+  } catch (e) {
+    console.error(e);
+  }
+});
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="playwright-ts")
+    assert not any(v.rule == "empty-handler" for v in result.violations)
+
+
+def test_zero_assertions_flagged_on_assertless_pytest(tmp_path: Path):
+    (tmp_path / "test_empty.py").write_text(
+        """def test_navigates(page):
+    page.goto("/login")
+    page.click("#submit")
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="pytest")
+    zeros = [v for v in result.violations if v.rule == "zero-assertions"]
+    assert len(zeros) == 1
+    assert zeros[0].severity == "error"
+    assert "test_navigates" in zeros[0].snippet
+
+
+def test_zero_assertions_opt_out_marker_respected(tmp_path: Path):
+    (tmp_path / "test_setup.py").write_text(
+        """import pytest
+
+@pytest.mark.worca_setup
+def test_seed_state(page):
+    page.goto("/admin")
+    page.click("#seed")
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="pytest")
+    assert not any(v.rule == "zero-assertions" for v in result.violations)
+
+
+def test_zero_assertions_satisfied_by_bare_assert(tmp_path: Path):
+    (tmp_path / "test_ok.py").write_text(
+        """def test_x(page):
+    assert page is not None
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="pytest")
+    assert not any(v.rule == "zero-assertions" for v in result.violations)
+
+
+def test_zero_assertions_satisfied_by_expect_call(tmp_path: Path):
+    (tmp_path / "test_ok.py").write_text(
+        """from playwright.sync_api import expect
+
+def test_x(page):
+    expect(page).to_have_url("/foo")
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="pytest")
+    assert not any(v.rule == "zero-assertions" for v in result.violations)
+
+
+def test_zero_assertions_satisfied_by_pytest_raises(tmp_path: Path):
+    (tmp_path / "test_ok.py").write_text(
+        """import pytest
+
+def test_x(page):
+    with pytest.raises(ValueError):
+        raise ValueError("nope")
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="pytest")
+    assert not any(v.rule == "zero-assertions" for v in result.violations)
+
+
+def test_zero_assertions_skipped_on_non_python_stack(tmp_path: Path):
+    (tmp_path / "x.spec.ts").write_text(
+        "test('x', async ({ page }) => { await page.click('#a'); });\n",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="playwright-ts")
+    assert not any(v.rule == "zero-assertions" for v in result.violations)
+
+
+def test_bare_assert_warning_for_locator_textcontent(tmp_path: Path):
+    (tmp_path / "test_bad.py").write_text(
+        """def test_x(page):
+    btn = page.get_by_role("button")
+    assert btn.text_content() == "Submit"
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="pytest")
+    bares = [v for v in result.violations if v.rule == "bare-assert-where-expect-available"]
+    assert len(bares) >= 1
+    assert all(v.severity == "warning" for v in bares)
+
+
+def test_bare_assert_warning_for_page_url(tmp_path: Path):
+    (tmp_path / "test_bad.py").write_text(
+        """def test_x(page):
+    page.goto("/login")
+    assert page.url == "https://example.com/login"
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="pytest")
+    assert any(
+        v.rule == "bare-assert-where-expect-available" for v in result.violations
+    )
+
+
+def test_bare_assert_warning_does_not_block_step(tmp_path: Path):
+    """The advisory rule must NOT appear in blocking_violations()."""
+    (tmp_path / "test_bad.py").write_text(
+        """def test_x(page):
+    btn = page.get_by_role("button")
+    assert btn.is_visible()
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="pytest")
+    warnings = [v for v in result.violations if v.severity == "warning"]
+    blocking = blocking_violations(result)
+    assert warnings, "expected at least one advisory warning"
+    assert not any(v.rule == "bare-assert-where-expect-available" for v in blocking)
+
+
+def test_combobox_without_open_flagged(tmp_path: Path):
+    (tmp_path / "test_dropdown.py").write_text(
+        """def test_select(page):
+    page.get_by_role("option", name="Berlin").click()
+    assert page is not None
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="pytest")
+    flagged = [v for v in result.violations if v.rule == "combobox-without-open"]
+    assert len(flagged) == 1
+    assert flagged[0].severity == "error"
+
+
+def test_combobox_with_preceding_open_ok(tmp_path: Path):
+    (tmp_path / "test_dropdown.py").write_text(
+        """def test_select(page):
+    page.get_by_role("combobox", name="City").click()
+    page.get_by_role("option", name="Berlin").click()
+    assert page is not None
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="pytest")
+    assert not any(v.rule == "combobox-without-open" for v in result.violations)
+
+
+def test_combobox_with_listbox_open_ok(tmp_path: Path):
+    """`listbox` is equivalent dropdown trigger semantics."""
+    (tmp_path / "test_dropdown.py").write_text(
+        """def test_select(page):
+    page.get_by_role("listbox").click()
+    page.get_by_role("option", name="Berlin").click()
+    assert page is not None
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="pytest")
+    assert not any(v.rule == "combobox-without-open" for v in result.violations)
+
+
+def test_popup_assert_on_original_page_flagged(tmp_path: Path):
+    (tmp_path / "test_popup.py").write_text(
+        """from playwright.sync_api import expect
+
+def test_link_opens_new_tab(page):
+    with page.expect_popup() as popup_info:
+        page.get_by_role("link", name="Docs").click()
+    expect(page).to_have_url("https://example.com/docs")
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="pytest")
+    # The assertion is OUTSIDE the with-block in this minimal repro, so
+    # this should NOT flag — let's flip to inside.
+    assert not any(v.rule == "popup-assert-on-original-page" for v in result.violations)
+
+
+def test_popup_assert_inside_with_flagged(tmp_path: Path):
+    (tmp_path / "test_popup.py").write_text(
+        """from playwright.sync_api import expect
+
+def test_link_opens_new_tab(page):
+    with page.expect_popup() as popup_info:
+        page.get_by_role("link", name="Docs").click()
+        expect(page).to_have_url("https://example.com/docs")
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="pytest")
+    flagged = [v for v in result.violations if v.rule == "popup-assert-on-original-page"]
+    assert len(flagged) == 1
+    assert "expect_popup" in flagged[0].snippet
+
+
+def test_popup_assert_on_popup_var_ok(tmp_path: Path):
+    """Asserting on the popup page is the correct pattern."""
+    (tmp_path / "test_popup.py").write_text(
+        """from playwright.sync_api import expect
+
+def test_link_opens_new_tab(page):
+    with page.expect_popup() as popup_info:
+        page.get_by_role("link", name="Docs").click()
+    new_page = popup_info.value
+    expect(new_page).to_have_url("https://example.com/docs")
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="pytest")
+    assert not any(v.rule == "popup-assert-on-original-page" for v in result.violations)
+
+
+def test_blocking_violations_filters_to_errors(tmp_path: Path):
+    """`blocking_violations()` returns only severity=error rows so advisory
+    rules can be added without changing the hard-fail decision."""
+    (tmp_path / "bad.spec.ts").write_text(
+        """test('x', async ({ page }) => {
+  await page.locator('xpath=//button').click();
+});
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="playwright-ts")
+    assert len(result.violations) >= 1
+    assert len(blocking_violations(result)) == len(
+        [v for v in result.violations if v.severity == "error"]
+    )
+
+
 def test_no_false_positive_for_env_password(tmp_path: Path):
     (tmp_path / "good.spec.ts").write_text(
         """test('x', async ({ page }) => {\n  await page.fill('#pw', process.env.PW);\n});\n""",
@@ -290,7 +569,7 @@ def test_violations_summary_format(tmp_path: Path):
     )
     result = index_tests(tmp_path, framework="playwright-ts")
     summary = violations_summary(result)
-    assert "violation" in summary
+    assert "error" in summary
     assert "[xpath]" in summary
 
 

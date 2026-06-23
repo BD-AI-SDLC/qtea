@@ -109,7 +109,11 @@ def _materialize_sut(src: str, dst: Path, *, run_id: str) -> None:
         if dst.exists():
             _rmtree_safe(dst)
         if p.is_dir():
-            shutil.copytree(p, dst, ignore=shutil.ignore_patterns(".git"))
+            shutil.copytree(
+                p, dst,
+                ignore=shutil.ignore_patterns(".git"),
+                dirs_exist_ok=True,
+            )
         else:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(p, dst)
