@@ -1349,6 +1349,57 @@ def test_build_fixer_prompt_omits_storage_state_block_when_unset():
 
 
 # ---------------------------------------------------------------------------
+# Failure-class-aware heal prompt (Fix 2A)
+# ---------------------------------------------------------------------------
+
+
+def test_build_fixer_prompt_includes_failure_class_assertion_value():
+    """When failure_class='assertion_value', the prompt contains the class
+    label and the assertion-value strategy hint."""
+    entry = TestRunEntry(
+        id="T-x", name="checks aria", file="tests/a11y.spec.ts",
+        status="failed",
+        message="assert None == 'true'",
+        traceback="AssertionError: assert None == 'true'",
+    )
+    prompt = _build_fixer_prompt(
+        entry, Path("/sut/worca-tests"),
+        failure_class="assertion_value",
+    )
+    assert "Failure class: `assertion_value`" in prompt
+    assert "Diagnose from the traceback first" in prompt
+    assert "OUT_OF_SCOPE: assertion-attribute-defect" in prompt
+
+
+def test_build_fixer_prompt_includes_failure_class_locator_timeout():
+    """When failure_class='locator_timeout', the prompt contains the class
+    label but NOT the assertion-value strategy hint."""
+    entry = TestRunEntry(
+        id="T-x", name="clicks btn", file="tests/nav.spec.ts",
+        status="failed",
+        message="TimeoutError waiting for locator",
+        traceback="playwright._impl._errors.TimeoutError",
+    )
+    prompt = _build_fixer_prompt(
+        entry, Path("/sut/worca-tests"),
+        failure_class="locator_timeout",
+    )
+    assert "Failure class: `locator_timeout`" in prompt
+    assert "Diagnose from the traceback first" not in prompt
+
+
+def test_build_fixer_prompt_omits_failure_class_when_none():
+    """Backward compat: failure_class=None (default) produces no class line."""
+    entry = TestRunEntry(
+        id="T-x", name="logs in", file="tests/login.spec.ts",
+        status="failed",
+        message="locator missing", traceback="tb",
+    )
+    prompt = _build_fixer_prompt(entry, Path("/sut/worca-tests"))
+    assert "Failure class:" not in prompt
+
+
+# ---------------------------------------------------------------------------
 # Cross-attempt state (Tasks 2 + 4 + 5)
 # ---------------------------------------------------------------------------
 

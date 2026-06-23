@@ -33,12 +33,17 @@ Indicators:
 
 ### Step C: Assertion Mismatch
 
-Test found the element but the value doesn't match expectations. **Not healable** (business logic).
+Test found the element but the value doesn't match expectations. **Usually not healable** (business logic), but see nuance below.
 
 Indicators:
 - `AssertionError`, `expect(...).toBe(...)`, `assertEqual`, `assert actual == expected`
 - Error shows both `actual` and `expected` values
 - Failure site is in the test body, not POM
+
+**Nuance: locator-drift-mediated assertion failures.** The orchestrator classifies some assertion failures as `assertion_value` and sends them to the heal agent when the mismatch pattern suggests upstream locator drift (e.g. `assert None == 'true'` where `get_attribute` returned `None` because the locator found a different element than intended). When you see `Failure class: assertion_value` in the user prompt, do NOT immediately abort. Instead:
+1. Read the traceback's assertion line. Identify the locator and the attribute/value being checked.
+2. If `get_attribute` / `text_content` / `inner_text` returned `None` or an obviously-wrong value, the locator likely resolved to the wrong element. This IS healable — proceed with live diagnosis to find the correct locator.
+3. If the element was found correctly (locator is specific, e.g. `data-testid`) but the attribute genuinely has a different value, this is an app defect. Emit `OUT_OF_SCOPE: assertion-attribute-defect` and stop.
 
 ### Step D: Auth Failure
 
@@ -121,7 +126,7 @@ None of the above matched. **Not healable.** Abort and let the bug report flow h
 |---|---|---|
 | `locator_drift` | Yes | Proceed with live diagnosis + POM patch |
 | `timeout` | No | Abort — infrastructure issue |
-| `assertion_mismatch` | No | Abort — business logic, forbidden by heal rules |
+| `assertion_mismatch` | Conditional | If `Failure class: assertion_value` is in the prompt, diagnose whether it's locator-drift-mediated (healable) or a genuine app defect (abort). Otherwise abort. |
 | `auth_failure` | No | Abort — emit `AUTH_PATH_UNAVAILABLE` |
 | `navigation_error` | No | Abort — SUT unreachable |
 | `other` | No | Abort — unknown category |

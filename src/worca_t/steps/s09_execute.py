@@ -707,6 +707,7 @@ def _build_fixer_prompt(
     staged_files: list[str] | None = None,
     storage_state_path: Path | None = None,
     generated_files: set[str] | None = None,
+    failure_class: str | None = None,
 ) -> str:
     snippet = (entry.traceback or entry.message or "(no traceback)")[-3000:]
 
@@ -797,6 +798,31 @@ def _build_fixer_prompt(
                 f"{files_list}\n"
             )
 
+    class_block = ""
+    if failure_class:
+        class_block = f"\nFailure class: `{failure_class}`\n"
+        if failure_class == "assertion_value":
+            class_block += (
+                "Strategy hint: this failure was classified as `assertion_value` — "
+                "the traceback shows an assertion mismatch (e.g. `assert None == "
+                "'true'`). This is SOMETIMES downstream of locator drift (wrong "
+                "element found -> wrong attribute value) and SOMETIMES a genuine "
+                "app defect that heal cannot fix.\n\n"
+                "**Diagnose from the traceback first.** Read the assertion line, "
+                "the expected vs actual values, and the locator used. If the "
+                "mismatch clearly indicates a wrong-element problem (e.g. "
+                "`get_attribute` returned `None` because the locator resolved to "
+                "a different element), proceed with live browser navigation to "
+                "find the correct locator.\n\n"
+                "If the mismatch indicates a genuine attribute/content defect in "
+                "the app (e.g. the correct element was found but it genuinely "
+                "lacks the expected attribute, or returns a different value), "
+                "this is an app bug — not locator drift. Emit "
+                "`OUT_OF_SCOPE: assertion-attribute-defect` and stop. Do NOT "
+                "spend turns navigating the browser to confirm what the "
+                "traceback already tells you.\n"
+            )
+
     return (
         "A single test failed. Apply the smallest possible patch to make it "
         "pass without modifying assertions, business logic, or test_ids, and "
@@ -809,6 +835,7 @@ def _build_fixer_prompt(
         f"Status: {entry.status}\n"
         f"Message: {entry.message or '(none)'}\n\n"
         f"Traceback:\n{snippet}\n"
+        f"{class_block}"
         f"{gen_block}"
         f"{live_block}\n"
         f"Edit the failing test file at its absolute path above using the "
@@ -2805,11 +2832,14 @@ class ExecuteStep(Step):
                     # ``_heal_sem`` bounds the in-flight LLM calls so the
                     # parallel orchestration doesn't spin up more browser
                     # processes than the host can handle.
+                    _entry_class = _classify_failure(entry)
+
                     log.info(
                         "step09.heal_start",
                         test_id=entry.id,
                         test_name=entry.name,
                         test_file=entry.file,
+                        failure_class=_entry_class,
                     )
                     async with _heal_sem:
                         agent_res = await run_agent(
@@ -2824,6 +2854,7 @@ class ExecuteStep(Step):
                                 staged_files=heal_relevant_sut_files,
                                 storage_state_path=_storage_state_path,
                                 generated_files=generated_files,
+                                failure_class=_entry_class,
                             ),
                             extra_paths=[
                                 package_resource_root() / "skills" / "diagnose-test-failure",
@@ -3058,6 +3089,7 @@ class ExecuteStep(Step):
                     heal_entry = {
                         "test_id": entry.id,
                         "file": entry.file,
+                        "failure_class": _entry_class,
                         "applied": applied,
                         "agent_success": agent_res.success,
                         "agent_error": agent_res.error,
