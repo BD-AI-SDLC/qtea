@@ -185,4 +185,5 @@ def test_dev_locator_as_dict():
         "intent": "login button",
         "page_url": "/login",
         "notes": "confirmed",
+        "payload": None,
     }

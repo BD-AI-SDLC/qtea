@@ -35,6 +35,16 @@ DEFAULT_STEP_TIMEOUTS: dict[int, int] = {
 # headroom for multi-failure heals. Overridable via WORCA_T_HEAL_MAX_TURNS.
 HEAL_AGENT_MAX_TURNS: int = int(os.environ.get("WORCA_T_HEAL_MAX_TURNS", "40"))
 
+# Max turns for Step 8 Phase B.6 codegen-violation-fixer autofix pass.
+# Each turn is one read/edit cycle. Single-file type-error fixes finish in
+# ~5-8 turns; multi-file refactors (e.g. class-vs-instance attribute
+# corrections that touch every reference across a test module) need 15-25.
+# The previous 10-turn ceiling truncated the autofix in run
+# 20260621-213751-ee0fef (19 type errors remained mid-refactor when the
+# agent hit the limit during a `ChatPageLocators.X` → `chat_page.locators.X`
+# rewrite). Overridable via WORCA_T_AUTOFIX_MAX_TURNS.
+AUTOFIX_MAX_TURNS: int = int(os.environ.get("WORCA_T_AUTOFIX_MAX_TURNS", "40"))
+
 # Per-heal-attempt timeout used by Step 9's polyglot-test-fixer invocation.
 # A single heal pass typically does: read test source → read POM source →
 # read snapshot (MCP or live page) → diagnose → write patch. That's 3–6 min

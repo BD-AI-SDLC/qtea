@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from enum import StrEnum
 from pathlib import Path
@@ -219,7 +220,7 @@ def run(
     force: bool = typer.Option(
         False, "--force", help="Ignore checkpoints; re-run everything."
     ),
-    parallelism: int = typer.Option(2, "--parallelism", min=0, max=16),
+    parallelism: int = typer.Option(2, "--parallel-run", min=0, max=16, help="Number of parallel test workers (0 = in-process)."),
     headless: bool = typer.Option(True, "--headless/--headed"),
     debug: bool = typer.Option(
         False,
@@ -331,10 +332,31 @@ def run(
         "--no-cleanup",
         help="Disable automatic cleanup of step artifacts and debug directories when using --from-step. By default, --from-step cleans step-NN/, artifacts/stepNN/, and debug/step-NN-attempt* directories from the target step onward.",
     ),
+    no_static_check: bool = typer.Option(
+        False,
+        "--no-static-check",
+        help=(
+            "Disable Step 8 Phase B.6 (native static-check gate). By default, "
+            "the SUT stack's own type-checker (pyright for Python; tsc with "
+            "--allowJs --checkJs for JS/TS) runs against worca-generated test "
+            "code BEFORE Step 9 executes them, with one bounded autofix pass "
+            "via codegen-violation-fixer. Pass this flag to skip the gate "
+            "entirely (e.g. CI runs where the SUT's tooling is not available "
+            "or for stacks outside the v1 dispatch). Equivalent to setting "
+            "WORCA_T_NO_STATIC_CHECK=1."
+        ),
+    ),
 ) -> None:
     """Run the full SDLC pipeline."""
     from worca_t.node_env import ensure_node
     from worca_t.pipeline import PipelineOptions, run_pipeline
+
+    if no_static_check:
+        # Phase B.6 reads this env var directly (matches the WORCA_T_SKIP_*
+        # opt-out precedent used by Phase D's intent scorer). Setting it
+        # here from the flag means the flag and the env var are symmetric;
+        # a user can drive the same behavior from either side.
+        os.environ["WORCA_T_NO_STATIC_CHECK"] = "1"
 
     ensure_node(console=console)
     settings = get_settings()

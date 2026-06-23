@@ -54,6 +54,38 @@ _XPATH_PATTERNS = ("xpath=", "By.XPATH", "by_xpath")
 # `json.dumps` as a second line of defence.
 _UNSAFE_SELECTOR_SUBSTRINGS = ("\n", "\r", "\x00", "<script", "javascript:")
 
+# Structured payload kinds. When the resolver returns one of these, the
+# runtime calls the corresponding `page.get_by_*` API at action time instead
+# of `page.locator(string)`. Promotion writes a `role_locator(...)` / etc.
+# call-expression into source, not a raw string. See `validate_selector_payload`.
+_PAYLOAD_KINDS = ("role", "text", "label", "placeholder", "test_id", "css")
+
+# Playwright debug-print syntax — `link "Go to Gemini Enterprise"`,
+# `button "Sign in"`, etc. — appears in Playwright error messages and AOM
+# snapshot tracebacks as a human-readable rendering of a role locator. It is
+# NOT a valid CSS selector and NOT a valid Playwright engine selector. The
+# LLM has been observed to copy this shape back into the `selector` field;
+# `_validate_css_string` catches the regression at cache-write time.
+_PLAYWRIGHT_DEBUG_ROLE_PREFIX = re.compile(
+    r"^(link|button|textbox|combobox|checkbox|radio|tab|tabpanel|listbox|"
+    r"option|menu|menuitem|menubar|heading|cell|row|columnheader|rowheader|"
+    r"alert|alertdialog|dialog|status|article|banner|complementary|"
+    r"contentinfo|navigation|main|region|search|form|group|list|listitem|"
+    r"img|figure|paragraph|generic|separator|switch|slider|spinbutton|"
+    r"progressbar|scrollbar|tooltip|treegrid|tree|treeitem|grid|gridcell|"
+    r"toolbar)\s+['\"]",
+    re.IGNORECASE,
+)
+
+# Playwright engine-selector prefixes — `role=button[name="x"]`, `text=Hello`,
+# etc. Accepted as valid string-form selectors because Playwright's CSS engine
+# understands them natively.
+_PLAYWRIGHT_ENGINE_PREFIXES = frozenset({
+    "role", "text", "css", "id", "label", "placeholder", "data-testid",
+    "alt", "title", "internal:role", "internal:text", "internal:label",
+    "internal:has", "internal:has-text", "internal:control", "nth", "xpath",
+})
+
 
 @dataclass(frozen=True)
 class ResolutionResult:
@@ -89,6 +121,11 @@ class ResolutionResult:
     model: str | None = None
     duration_ms: int | None = None
     candidates: tuple[dict[str, Any], ...] | None = None
+    # Structured payload for role/text/label/placeholder/test_id strategies.
+    # None when the resolver chose a CSS-string form (back-compat: existing
+    # cache entries on disk read back as payload=None and use the legacy
+    # `page.locator(selector_string)` path). See `validate_selector_payload`.
+    payload: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -107,6 +144,7 @@ class ResolutionResult:
             "model": self.model,
             "duration_ms": self.duration_ms,
             "candidates": list(self.candidates) if self.candidates else None,
+            "payload": self.payload,
         }
 
 
@@ -139,6 +177,193 @@ def is_unsafe_selector(selector: str) -> bool:
         return True
     lo = s.lower()
     return any(p in lo for p in _UNSAFE_SELECTOR_SUBSTRINGS)
+
+
+def _validate_css_string(s: str) -> tuple[bool, str | None]:
+    """Lightweight string-selector validator.
+
+    Accepts: standard CSS (`#id`, `[attr=val]`, `.cls`, `tag`, scoped CSS,
+    pseudo-classes), Playwright engine forms (`role=...`, `text=...`,
+    `css=...`), and locator-priority shorthand (`#submit`, `[data-testid=x]`).
+
+    Rejects: Playwright debug-print syntax (`link "..."`), unbalanced brackets,
+    and empty strings. Trusts Playwright's CSS engine for the long tail of
+    valid grammar — this is a sniff test, not a full parser. The contract is
+    "block the specific regressions we've seen", not "validate all of CSS".
+    """
+    s = (s or "").strip()
+    if not s:
+        return False, "empty selector"
+    # Playwright debug-print syntax — the exact bug that bit run 20260621.
+    if _PLAYWRIGHT_DEBUG_ROLE_PREFIX.match(s):
+        return False, (
+            "selector looks like Playwright AOM debug syntax "
+            f"(role + quoted name, no `=`): {s[:80]!r}. "
+            "Use structured payload `{kind: 'role', role: ..., name: ...}` "
+            "or the engine form `role=...[name=\"...\"]` instead."
+        )
+    # Playwright engine prefix (`role=`, `text=`, etc.) — accept verbatim.
+    head = s.split("=", 1)[0].strip().lower() if "=" in s else ""
+    if head in _PLAYWRIGHT_ENGINE_PREFIXES:
+        return True, None
+    # Bracket-balance is the cheapest "this won't parse" check.
+    if s.count("[") != s.count("]"):
+        return False, "unbalanced square brackets"
+    if s.count("(") != s.count(")"):
+        return False, "unbalanced parentheses"
+    if s.count('"') % 2 != 0:
+        return False, "unbalanced double quotes"
+    if s.count("'") % 2 != 0:
+        return False, "unbalanced single quotes"
+    return True, None
+
+
+def validate_selector_payload(
+    payload: dict[str, Any] | None,
+    selector: str | None,
+) -> tuple[bool, str | None]:
+    """Return ``(is_valid, reason_if_invalid)``.
+
+    Called at three sites: candidate normalisation (resolver response →
+    cache), cache write (last line of defence before disk), and TBD-promotion
+    (last line of defence before SUT source substitution).
+
+    Two paths:
+      - Structured payload (``payload`` non-None): validate ``kind`` enum +
+        required fields per kind. ``selector`` is treated as telemetry only.
+      - String selector (``payload`` is None): validate via ``is_unsafe_selector``,
+        ``is_xpath``, and ``_validate_css_string``.
+    """
+    # Structured payload path.
+    if payload is not None:
+        if not isinstance(payload, dict):
+            return False, f"payload must be dict, got {type(payload).__name__}"
+        kind = payload.get("kind")
+        if kind not in _PAYLOAD_KINDS:
+            return False, f"payload.kind must be one of {_PAYLOAD_KINDS}, got {kind!r}"
+        if kind == "role":
+            role = payload.get("role")
+            if not isinstance(role, str) or not role.strip():
+                return False, "role payload requires non-empty 'role' field"
+            name = payload.get("name")
+            if name is not None and (not isinstance(name, str) or not name):
+                return False, "role payload 'name' must be a non-empty string if present"
+        elif kind in ("text", "label", "placeholder"):
+            text = payload.get("text")
+            if not isinstance(text, str) or not text:
+                return False, f"{kind} payload requires non-empty 'text' field"
+        elif kind == "test_id":
+            value = payload.get("value")
+            if not isinstance(value, str) or not value:
+                return False, "test_id payload requires non-empty 'value' field"
+        elif kind == "css":
+            sel = payload.get("selector")
+            if not isinstance(sel, str) or not sel.strip():
+                return False, "css payload requires non-empty 'selector' field"
+            if is_unsafe_selector(sel) or is_xpath(sel):
+                return False, "css payload selector contains unsafe/XPath content"
+            ok, why = _validate_css_string(sel)
+            if not ok:
+                return False, f"css payload: {why}"
+        return True, None
+    # String-only path (back-compat: pre-payload cache entries).
+    if not isinstance(selector, str) or not selector.strip():
+        return False, "empty or non-string selector"
+    if is_unsafe_selector(selector):
+        return False, "selector contains injection markers (newline / <script / javascript:)"
+    if is_xpath(selector):
+        return False, "XPath selectors are forbidden by locator-priority policy"
+    return _validate_css_string(selector)
+
+
+def parse_resolver_payload(entry: dict[str, Any]) -> dict[str, Any]:
+    """Normalise one LLM candidate dict into the canonical cache shape.
+
+    Returns ``{"selector": str, "strategy": str|None, "payload": dict|None,
+    "confidence": float|None, "reason": str|None}``. The LLM may emit either:
+
+      - Structured: ``{"kind": "role", "role": "link", "name": "Sign in",
+        "confidence": 0.95}`` → produces a ``payload`` and a derived telemetry
+        ``selector`` (``"role=link[name=\"Sign in\"]"``) for back-compat reads.
+      - String:     ``{"selector": "#submit", "strategy": "id",
+        "confidence": 0.9}`` → ``payload`` is None.
+
+    Raises ``ValueError`` when the entry is structurally unusable (caller
+    catches and drops the candidate). Validation of the selector content
+    itself happens in ``validate_selector_payload`` — separated so the
+    caller can log a different reason for "malformed shape" vs "shape ok
+    but content rejected".
+    """
+    if not isinstance(entry, dict):
+        raise ValueError(f"candidate must be dict, got {type(entry).__name__}")
+
+    kind = entry.get("kind")
+    confidence = entry.get("confidence")
+    confidence_f: float | None = (
+        float(confidence) if isinstance(confidence, (int, float)) else None
+    )
+    reason = entry.get("reason") if isinstance(entry.get("reason"), str) else None
+
+    if isinstance(kind, str) and kind in _PAYLOAD_KINDS:
+        payload: dict[str, Any] = {"kind": kind}
+        if kind == "role":
+            role = entry.get("role")
+            if not isinstance(role, str) or not role.strip():
+                raise ValueError("role kind requires non-empty 'role'")
+            payload["role"] = role.strip()
+            name = entry.get("name")
+            if isinstance(name, str) and name:
+                payload["name"] = name
+            if entry.get("exact") is True:
+                payload["exact"] = True
+            # Telemetry-only string form for back-compat readers (Allure,
+            # debug logs). Playwright's `role=` engine accepts this verbatim
+            # if someone passes it through `page.locator()`.
+            tele_parts = [f"role={payload['role']}"]
+            if "name" in payload:
+                tele_parts.append(f"[name={json.dumps(payload['name'])}]")
+            derived_selector = "".join(tele_parts)
+        elif kind in ("text", "label", "placeholder"):
+            text = entry.get("text")
+            if not isinstance(text, str) or not text:
+                raise ValueError(f"{kind} kind requires non-empty 'text'")
+            payload["text"] = text
+            if entry.get("exact") is True:
+                payload["exact"] = True
+            derived_selector = f"{kind}={text}"
+        elif kind == "test_id":
+            value = entry.get("value")
+            if not isinstance(value, str) or not value:
+                raise ValueError("test_id kind requires non-empty 'value'")
+            payload["value"] = value
+            derived_selector = f"[data-testid={json.dumps(value)}]"
+        elif kind == "css":
+            sel = entry.get("selector")
+            if not isinstance(sel, str) or not sel.strip():
+                raise ValueError("css kind requires non-empty 'selector'")
+            payload["selector"] = sel.strip()
+            derived_selector = sel.strip()
+        else:  # pragma: no cover - guarded by _PAYLOAD_KINDS check
+            raise ValueError(f"unhandled kind: {kind}")
+        return {
+            "selector": derived_selector,
+            "strategy": kind if kind != "css" else None,
+            "payload": payload,
+            "confidence": confidence_f,
+            "reason": reason,
+        }
+
+    # String-form fallback (legacy LLM shape).
+    sel = entry.get("selector")
+    if not isinstance(sel, str) or not sel.strip():
+        raise ValueError("candidate has neither 'kind' nor non-empty 'selector'")
+    return {
+        "selector": sel.strip(),
+        "strategy": normalise_strategy(entry.get("strategy")),
+        "payload": None,
+        "confidence": confidence_f,
+        "reason": reason,
+    }
 
 
 def normalise_strategy(value: str | None) -> str | None:
@@ -180,12 +405,33 @@ def write_cache(
     *,
     run_id: str | None = None,
 ) -> None:
-    """Atomically write the cache (tmp + rename, like checkpoints.py)."""
+    """Atomically write the cache (tmp + rename, like checkpoints.py).
+
+    Entries whose ``selector`` + ``payload`` fail :func:`validate_selector_payload`
+    are dropped before write (last line of defence — `_normalise_candidates`
+    should have already filtered them upstream, but cache writes also happen
+    from the runtime prewarm + dev-pool path and we don't want a malformed
+    entry to ever land on disk where the TBD promoter could pick it up).
+    Unresolvable entries (``selector=None``, ``source="unresolvable"``) and
+    quarantine markers are allowed through unchanged.
+    """
     cache_path.parent.mkdir(parents=True, exist_ok=True)
+    safe_entries: list[dict[str, Any]] = []
+    for entry in entries.values():
+        sel = entry.get("selector")
+        pload = entry.get("payload") if isinstance(entry.get("payload"), dict) else None
+        # Allow null-selector entries (unresolvable / quarantine bookkeeping).
+        if sel is None and pload is None:
+            safe_entries.append(entry)
+            continue
+        ok, _why = validate_selector_payload(pload, sel)
+        if ok:
+            safe_entries.append(entry)
+        # else: silently dropped — _normalise_candidates already logged.
     payload = {
         "run_id": run_id,
         "produced_at": datetime.now(UTC).isoformat(),
-        "entries": list(entries.values()),
+        "entries": safe_entries,
     }
     tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -300,7 +546,9 @@ def prewarm_dev_pool_cache(
         second_score = scored[1][2] if len(scored) > 1 else 0.0
         if best_score < threshold or (best_score - second_score) < margin:
             continue
-        if is_unsafe_selector(best_entry.selector) or is_xpath(best_entry.selector):
+        pool_payload = getattr(best_entry, "payload", None)
+        ok, _why = validate_selector_payload(pool_payload, best_entry.selector)
+        if not ok:
             continue
         existing[key] = {
             "key": key,
@@ -309,6 +557,7 @@ def prewarm_dev_pool_cache(
             "intent": intent,
             "selector": best_entry.selector,
             "strategy": getattr(best_entry, "strategy", None),
+            "payload": pool_payload,
             "source": "dev-pool",
             "page_url": getattr(best_entry, "page_url", None),
             "matched_constant": best_name,
@@ -349,35 +598,72 @@ def _build_prompt(
         "Fall back to AOM-derived selectors only when no candidate matches.\n"
         if dev_pool else ""
     )
+    # When the runtime captured boxes (Playwright 1.60+, ``boxes=True``),
+    # the snapshot YAML carries ``[box=x,y,w,h]`` annotations on each node.
+    # Detected via substring check on the snapshot text — no protocol
+    # change needed across the resolver socket boundary.
+    boxes_rule = (
+        "  8. Snapshot nodes may carry ``[box=x,y,width,height]`` (CSS "
+        "pixels, viewport-relative). When two candidates share role+name, "
+        "prefer the one whose box position best matches the intent's "
+        "spatial hint ('top', 'header', 'footer', 'first', 'last'). NEVER "
+        "emit the box itself in the selector.\n"
+        if "[box=" in snapshot_text else ""
+    )
     system = (
         "You resolve a UI locator from a Playwright accessibility snapshot. "
         "Read the snapshot, find the element matching the locator's intent, "
-        "and return a ranked bundle of up to two selector candidates so the "
-        "runtime can fall back transparently if the primary mutates.\n"
+        "and return a ranked bundle of up to two selector candidates as a "
+        "STRUCTURED PAYLOAD so the runtime can call the right Playwright API "
+        "(get_by_role / get_by_text / get_by_label / get_by_placeholder / "
+        "get_by_test_id / locator) directly. Stringly-typed CSS is only one "
+        "kind among several — emitting a role match as a CSS string will be "
+        "rejected as it has been observed to corrupt cached entries.\n"
         "Rules:\n"
         "  1. Output ONLY a JSON object. Your first character MUST be `{` "
         "and your last character MUST be `}`. No prose before or after, "
         "no markdown fences, no commentary.\n"
-        "  2. Every selector MUST be findable in the provided snapshot. NEVER "
-        "invent attributes or roles not present.\n"
+        "  2. Every candidate MUST resolve to an element present in the "
+        "provided snapshot. NEVER invent roles, names, testids, or text not "
+        "in the snapshot.\n"
         "  3. Locator priority (use the highest-applicable for the primary): "
-        "id > data-testid > role > label > text > placeholder > scoped css. "
+        "id (via `kind: \"css\"` with `#id` selector) > "
+        "data-testid (via `kind: \"test_id\"`) > "
+        "role (via `kind: \"role\"`) > "
+        "label (via `kind: \"label\"`) > "
+        "text (via `kind: \"text\"`) > "
+        "placeholder (via `kind: \"placeholder\"`) > "
+        "scoped css (via `kind: \"css\"`). "
         "NEVER XPath.\n"
-        "  4. The fallback (if present) MUST use a different `strategy` family "
-        "than the primary (e.g. if primary strategy is `role`, fallback should "
-        "prefer `text`, `label`, or `data-testid`). Omit the fallback when no "
-        "defensible alternate exists in the snapshot.\n"
+        "  4. The fallback (when present) MUST use a different `kind` than "
+        "the primary. Omit the fallback when no defensible alternate exists.\n"
         "  5. If no element clearly matches the intent at confidence >= 0.6, "
-        "return an empty `candidates` array and set the top-level `reason` "
-        "explaining what you looked for and why it isn't there.\n"
-        "  6. `strategy` must be one of: id, data-testid, role, label, text, "
-        "placeholder, css, or null.\n"
-        + pool_rule +
+        "return an empty `candidates` array and set top-level `reason`.\n"
+        "  6. Each candidate is a discriminated union by `kind`:\n"
+        "       `{\"kind\":\"role\", \"role\":<aom-role>, \"name\":<accessible-name|optional>, \"exact\":<bool|optional>}`\n"
+        "       `{\"kind\":\"text\", \"text\":<string>, \"exact\":<bool|optional>}`\n"
+        "       `{\"kind\":\"label\", \"text\":<label-string>}`\n"
+        "       `{\"kind\":\"placeholder\", \"text\":<placeholder-string>}`\n"
+        "       `{\"kind\":\"test_id\", \"value\":<testid>}`\n"
+        "       `{\"kind\":\"css\", \"selector\":<css-string>}`\n"
+        "     plus optional `confidence` (0-1) and `reason`.\n"
+        "  7. NEVER emit Playwright debug-print syntax like "
+        "`\"selector\": \"link \\\"Sign in\\\"\"` — that is what a snapshot "
+        "renders for a role match, not a valid selector. Use "
+        "`{\"kind\":\"role\", \"role\":\"link\", \"name\":\"Sign in\"}` "
+        "instead. Likewise never wrap a CSS string in `getByRole(...)` or "
+        "any other function-call syntax.\n"
+        + pool_rule
+        + boxes_rule +
+        "Worked examples:\n"
+        "  Snapshot has `link \"Go to Gemini Enterprise\" [ref=e24]` →\n"
+        "    `{\"kind\":\"role\",\"role\":\"link\",\"name\":\"Go to Gemini Enterprise\",\"confidence\":0.95}`\n"
+        "  Snapshot has `button \"Sign in\" [ref=e7] data-testid=\"login-submit\"` →\n"
+        "    `{\"kind\":\"test_id\",\"value\":\"login-submit\",\"confidence\":0.98}`\n"
+        "  Snapshot has plain `<input id=\"email\">` →\n"
+        "    `{\"kind\":\"css\",\"selector\":\"#email\",\"confidence\":0.99}`\n"
         "Output shape: "
-        "{\"candidates\": ["
-        "{\"selector\": <string>, \"strategy\": <string|null>, "
-        "\"confidence\": <number 0-1 or null>, \"reason\": <string|null>}, "
-        "...up to 2 entries], "
+        "{\"candidates\": [ <candidate>, ...up to 2 ], "
         "\"reason\": <string|null>}"
     )
     user_parts = [
@@ -401,7 +687,11 @@ def _build_prompt(
                 line += f"  page_url={ent_url!r}"
             lines.append(line)
         user_parts.append("\n".join(lines))
-    user_parts.append(f"AOM snapshot:\n```json\n{snapshot_text}\n```")
+    # The modern ladder (Playwright 1.40+) emits YAML; the legacy
+    # ``page.accessibility.snapshot()`` fallback emits a JSON dict. Label
+    # the fence truthfully so the model parses correctly.
+    fence_lang = "json" if snapshot_text.lstrip().startswith("{") else "yaml"
+    user_parts.append(f"AOM snapshot:\n```{fence_lang}\n{snapshot_text}\n```")
     user = "\n\n".join(user_parts)
     return system, user
 
@@ -495,54 +785,39 @@ def _normalise_candidates(parsed: dict[str, Any]) -> list[dict[str, Any]]:
     """Extract a ranked candidate list from the LLM response, dropping
     malformed entries rather than failing the whole call.
 
-    Accepts both the new shape (``{"candidates": [...]}``) and the legacy
-    flat shape (``{"selector": ..., "strategy": ..., "confidence": ...}``)
-    so a model that regresses to the older instruction format doesn't
-    break the runtime. XPath candidates are dropped; the priority-chain
-    rule is enforced per-entry by :func:`is_xpath` further down.
+    Accepts three shapes:
+      - Structured bundle: ``{"candidates": [{"kind": "role", ...}, ...]}``
+        — the post-payload prompt shape; each candidate carries a discriminated
+        union with `kind` (role/text/label/placeholder/test_id/css).
+      - String bundle (legacy): ``{"candidates": [{"selector": ..., "strategy": ...}, ...]}``.
+      - Flat (legacy): ``{"selector": ..., "strategy": ..., "confidence": ...}``.
+
+    Each candidate is normalised via :func:`parse_resolver_payload`, then
+    content-validated via :func:`validate_selector_payload`. Candidates that
+    fail either gate are dropped silently (logged via the resolver-spend
+    telemetry at the caller); the priority-chain rule on the survivors is
+    enforced by the caller.
     """
     raw = parsed.get("candidates")
     if not isinstance(raw, list):
-        # Legacy flat shape — wrap into a single-candidate bundle if it
-        # carries a usable, non-XPath selector. XPath selectors fall through
-        # to the empty-list path so resolve_one can surface the priority-gate
-        # rejection reason explicitly.
-        flat_sel = parsed.get("selector")
-        if (
-            isinstance(flat_sel, str)
-            and flat_sel.strip()
-            and not is_xpath(flat_sel)
-            and not is_unsafe_selector(flat_sel)
-        ):
-            return [{
-                "selector": flat_sel.strip(),
-                "strategy": normalise_strategy(parsed.get("strategy")),
-                "confidence": (
-                    float(parsed["confidence"])
-                    if isinstance(parsed.get("confidence"), (int, float))
-                    else None
-                ),
-                "reason": parsed.get("reason") if isinstance(parsed.get("reason"), str) else None,
-            }]
-        return []
+        # Legacy flat shape — wrap into a single-candidate list.
+        if parsed.get("selector") or parsed.get("kind"):
+            raw = [parsed]
+        else:
+            return []
 
     out: list[dict[str, Any]] = []
     for entry in raw:
-        if not isinstance(entry, dict):
+        try:
+            normalised = parse_resolver_payload(entry)
+        except ValueError:
             continue
-        sel = entry.get("selector")
-        if not isinstance(sel, str) or not sel.strip():
+        ok, _why = validate_selector_payload(
+            normalised.get("payload"), normalised.get("selector"),
+        )
+        if not ok:
             continue
-        sel = sel.strip()
-        if is_xpath(sel) or is_unsafe_selector(sel):
-            continue
-        conf = entry.get("confidence")
-        out.append({
-            "selector": sel,
-            "strategy": normalise_strategy(entry.get("strategy")),
-            "confidence": float(conf) if isinstance(conf, (int, float)) else None,
-            "reason": entry.get("reason") if isinstance(entry.get("reason"), str) else None,
-        })
+        out.append(normalised)
         if len(out) >= _MAX_CANDIDATES:
             break
     return out
@@ -576,6 +851,7 @@ def resolve_one(
     cached = cache.get(key)
     if cached:
         cached_candidates = cached.get("candidates")
+        cached_payload = cached.get("payload") if isinstance(cached.get("payload"), dict) else None
         return ResolutionResult(
             selector=cached.get("selector"),
             strategy=cached.get("strategy"),
@@ -592,6 +868,7 @@ def resolve_one(
                 if isinstance(cached_candidates, list) and cached_candidates
                 else None
             ),
+            payload=cached_payload,
         )
 
     chosen_model = model or os.environ.get("WORCA_T_RESOLVER_MODEL") or _DEFAULT_MODEL
@@ -682,6 +959,7 @@ def resolve_one(
             model=chosen_model,
             duration_ms=duration_ms,
             candidates=tuple(candidates),
+            payload=primary.get("payload"),
         )
 
     # Persist.
@@ -693,6 +971,7 @@ def resolve_one(
             "intent": intent,
             "selector": result.selector,
             "strategy": result.strategy,
+            "payload": result.payload,
             "confidence": result.confidence,
             "source": result.source,
             "page_url": result.page_url,

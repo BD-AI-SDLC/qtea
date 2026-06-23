@@ -145,6 +145,114 @@ def parse_sentinel(value: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Resolved sentinels — structured locator factories for promoted entries.
+# ---------------------------------------------------------------------------
+#
+# When TBD promotion freezes a resolution into source, CSS-string results
+# can be substituted directly (`self.X = "[data-testid='x']"`). Role / text /
+# label / placeholder / test_id results need to reach `page.get_by_role(...)`
+# instead of `page.locator(...)`. Rather than introduce a new object type that
+# every SUT POM base class would need to handle, we encode the payload into a
+# specially-prefixed string. The runtime wrapper recognizes it and dispatches
+# via `_apply_resolution` WITHOUT going through the resolver tier ladder
+# (already resolved by definition).
+#
+# Why a sentinel string and not a custom class:
+#   - SUT POM base classes already accept strings and pass them to
+#     `page.locator(...)`. A string flows through any existing path
+#     unchanged; a custom class would require every base class to gain a
+#     dispatch.
+#   - JSON-encoding the payload keeps the format readable in diffs / logs
+#     and is safe under `repr()` / log redaction.
+_RESOLVED_SENTINEL_PREFIX = "__WORCA_T_RESOLVED__::"
+
+
+def _make_resolved_sentinel(payload: dict) -> str:
+    """Encode a structured payload as a resolved-sentinel string."""
+    return f"{_RESOLVED_SENTINEL_PREFIX}{json.dumps(payload, sort_keys=True)}"
+
+
+def is_resolved_sentinel(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith(_RESOLVED_SENTINEL_PREFIX)
+
+
+def parse_resolved_sentinel(value: str) -> dict | None:
+    """Return the payload dict embedded in a resolved-sentinel string."""
+    if not is_resolved_sentinel(value):
+        return None
+    try:
+        decoded = json.loads(value[len(_RESOLVED_SENTINEL_PREFIX):])
+    except json.JSONDecodeError:
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def role_locator(role: str, *, name: str | None = None, exact: bool = False) -> str:
+    """Resolved-sentinel factory for role locators.
+
+    Written into POM source by Step 9 TBD promotion when the resolver chose
+    `strategy="role"`. At action time the runtime calls
+    ``page.get_by_role(role, name=name, exact=exact)`` — the CSS string form
+    of a role match (`link "Go to Gemini Enterprise"`) is never used, which
+    fixes the run-20260621 regression where that string flowed into
+    ``page.locator(...)`` and Playwright's CSS parser blew up.
+
+    Direct hand-use in test/POM code is also valid::
+
+        from tests.worca_t_runtime import role_locator
+        class NavLocators:
+            GEMINI = role_locator("link", name="Go to Gemini Enterprise")
+    """
+    if not isinstance(role, str) or not role.strip():
+        raise ValueError("role_locator() requires a non-empty role string")
+    payload: dict = {"kind": "role", "role": role.strip()}
+    if name is not None:
+        if not isinstance(name, str) or not name:
+            raise ValueError("role_locator(name=...) must be a non-empty string when set")
+        payload["name"] = name
+    if exact:
+        payload["exact"] = True
+    return _make_resolved_sentinel(payload)
+
+
+def text_locator(text: str, *, exact: bool = False) -> str:
+    """Resolved-sentinel factory for text locators (dispatches to ``get_by_text``)."""
+    if not isinstance(text, str) or not text:
+        raise ValueError("text_locator() requires a non-empty text string")
+    payload: dict = {"kind": "text", "text": text}
+    if exact:
+        payload["exact"] = True
+    return _make_resolved_sentinel(payload)
+
+
+def label_locator(text: str, *, exact: bool = False) -> str:
+    """Resolved-sentinel factory for label locators (``get_by_label``)."""
+    if not isinstance(text, str) or not text:
+        raise ValueError("label_locator() requires a non-empty text string")
+    payload: dict = {"kind": "label", "text": text}
+    if exact:
+        payload["exact"] = True
+    return _make_resolved_sentinel(payload)
+
+
+def placeholder_locator(text: str, *, exact: bool = False) -> str:
+    """Resolved-sentinel factory for placeholder locators (``get_by_placeholder``)."""
+    if not isinstance(text, str) or not text:
+        raise ValueError("placeholder_locator() requires a non-empty text string")
+    payload: dict = {"kind": "placeholder", "text": text}
+    if exact:
+        payload["exact"] = True
+    return _make_resolved_sentinel(payload)
+
+
+def test_id_locator(value: str) -> str:
+    """Resolved-sentinel factory for data-testid locators (``get_by_test_id``)."""
+    if not isinstance(value, str) or not value:
+        raise ValueError("test_id_locator() requires a non-empty value string")
+    return _make_resolved_sentinel({"kind": "test_id", "value": value})
+
+
+# ---------------------------------------------------------------------------
 # Cache (mirrors worca_t.jit_resolver.read_cache / write_cache)
 # ---------------------------------------------------------------------------
 
@@ -205,6 +313,11 @@ class _DevLocator:
     strategy: str | None = None
     intent: str | None = None
     page_url: str | None = None
+    # Structured payload (role/text/label/placeholder/test_id/css). When
+    # present, the runtime calls page.get_by_role(...) etc. at action time
+    # instead of page.locator(selector). Optional — string-form entries
+    # (payload=None) use the legacy locator() path.
+    payload: dict | None = None
 
 
 def _is_xpath(s: str) -> bool:
@@ -243,6 +356,7 @@ def _load_dev_locators() -> dict[str, _DevLocator]:
                 strategy=entry.get("strategy") if isinstance(entry.get("strategy"), str) else None,
                 intent=entry.get("intent") if isinstance(entry.get("intent"), str) else None,
                 page_url=entry.get("page_url") if isinstance(entry.get("page_url"), str) else None,
+                payload=entry.get("payload") if isinstance(entry.get("payload"), dict) else None,
             )
         pool_count = sum(1 for d in out.values() if d.intent)
         log.info(
@@ -628,49 +742,177 @@ def _walk_stack_for_constant_name() -> str | None:
     return None
 
 
-def _call_aria_snapshot_sync(body_locator: Any) -> str:
-    """Call ``Locator.aria_snapshot()`` preferring ``mode="ai"`` (added in
-    Playwright 1.59 — returns an LLM-optimized YAML tree). Falls back to
-    the no-mode call when the SUT pins an older Playwright that rejects the
-    kwarg (``TypeError`` from the generated stub signature).
+# Capability cache for ``Locator.aria_snapshot`` kwargs. Probed once per
+# process via ``TypeError``-catch (signature introspection is unreliable —
+# Playwright's sync stubs are generated from the async API and have lied
+# about supported kwargs in the past). ``None`` = unprobed; ``True`` /
+# ``False`` = proven supported / unsupported. ``mode_ai`` covers both
+# ``mode="ai"`` and ``depth=`` (both added in Playwright 1.59); ``boxes``
+# covers ``boxes=True`` (added in 1.60). Reset in test fixtures.
+_AOM_CAPS: dict[str, bool | None] = {"mode_ai": None, "boxes": None}
 
-    Returns the empty string on a falsy / unexpected return.
+
+def _read_aom_env() -> tuple[int | None, bool, bool, bool]:
+    """Return ``(depth, want_boxes, force_boxes, legacy_ok)`` from env.
+
+    - ``WORCA_T_AOM_DEPTH`` (unset = no cap): passed as ``depth=`` when
+      the runtime is on Playwright 1.59+. Truncating the snapshot can hide
+      the target element and force an LLM round-trip, so the default is
+      no cap; set this only when token budget is tight on huge SPAs.
+    - ``WORCA_T_AOM_BOXES`` (``"auto"`` default | ``"off"`` | ``"force"``):
+      ``auto`` probes & caches; ``off`` never requests boxes (cheaper
+      snapshots, no tie-breaking signal); ``force`` ignores a cached
+      negative result and re-attempts on every call (debug only).
+    - ``WORCA_T_AOM_LEGACY_OK`` (``"1"`` default): set to ``"0"`` to
+      disable the pre-1.40 ``page.accessibility.snapshot()`` fallback for
+      SUTs that should never silently degrade.
     """
-    try:
-        return body_locator.aria_snapshot(mode="ai") or ""
-    except TypeError:
-        # Older Playwright (1.40-1.58): no `mode` parameter.
-        return body_locator.aria_snapshot() or ""
+    depth: int | None = None
+    raw_depth = os.environ.get("WORCA_T_AOM_DEPTH")
+    if raw_depth:
+        try:
+            parsed = int(raw_depth)
+            depth = parsed if parsed > 0 else None
+        except ValueError:
+            depth = None
+    mode = (os.environ.get("WORCA_T_AOM_BOXES") or "auto").strip().lower()
+    want_boxes = mode != "off"
+    force_boxes = mode == "force"
+    legacy_ok = os.environ.get("WORCA_T_AOM_LEGACY_OK", "1") != "0"
+    return depth, want_boxes, force_boxes, legacy_ok
 
 
-async def _call_aria_snapshot_async(body_locator: Any) -> str:
+def _aom_kwargs_ladder(
+    *, depth: int | None, want_boxes: bool, force_boxes: bool,
+) -> list[dict[str, Any]]:
+    """Return the kwarg-sets to try in order, richest first, honouring the
+    capability cache. Rungs proven unsupported are skipped on subsequent
+    calls so each process pays the probe cost at most once.
+    """
+    rungs: list[dict[str, Any]] = []
+    # Rung A: mode="ai" + boxes=True (+depth) — Playwright 1.60+
+    if (
+        want_boxes
+        and _AOM_CAPS["mode_ai"] is not False
+        and (force_boxes or _AOM_CAPS["boxes"] is not False)
+    ):
+        kw: dict[str, Any] = {"mode": "ai", "boxes": True}
+        if depth is not None:
+            kw["depth"] = depth
+        rungs.append(kw)
+    # Rung B: mode="ai" (+depth) — Playwright 1.59
+    if _AOM_CAPS["mode_ai"] is not False:
+        kw = {"mode": "ai"}
+        if depth is not None:
+            kw["depth"] = depth
+        rungs.append(kw)
+    # Rung C: no kwargs — Playwright 1.40-1.58
+    rungs.append({})
+    return rungs
+
+
+def _update_aom_caps_from_failure(kwargs: dict[str, Any]) -> None:
+    """Cache a ``TypeError`` outcome. We can't reliably string-match the
+    error across Python/Playwright versions, so we attribute the failure
+    to the most-recently-added kwarg in the rung that raised: ``boxes``
+    (v1.60 addition) before ``mode`` (v1.59 addition).
+    """
+    if kwargs.get("boxes") is True:
+        _AOM_CAPS["boxes"] = False
+        return
+    if kwargs.get("mode") == "ai":
+        _AOM_CAPS["mode_ai"] = False
+
+
+def _update_aom_caps_from_success(kwargs: dict[str, Any]) -> None:
+    """Cache a successful kwarg-set's capabilities."""
+    if kwargs.get("mode") == "ai":
+        _AOM_CAPS["mode_ai"] = True
+    if kwargs.get("boxes") is True:
+        _AOM_CAPS["boxes"] = True
+
+
+def _call_aria_snapshot_sync(
+    body_locator: Any, *,
+    depth: int | None = None,
+    want_boxes: bool = True,
+    force_boxes: bool = False,
+) -> str:
+    """Call ``Locator.aria_snapshot()`` with the richest supported kwarg-set.
+
+    Ladder: ``mode="ai", boxes=True`` (Playwright 1.60+) → ``mode="ai"``
+    (1.59) → no-kwargs (1.40-1.58). Capabilities are probed once per
+    process via :data:`_AOM_CAPS` and cached; subsequent calls skip
+    proven-unsupported rungs. Returns the empty string on a falsy return.
+    """
+    last_err: TypeError | None = None
+    for kw in _aom_kwargs_ladder(
+        depth=depth, want_boxes=want_boxes, force_boxes=force_boxes,
+    ):
+        try:
+            result = body_locator.aria_snapshot(**kw)
+        except TypeError as e:
+            _update_aom_caps_from_failure(kw)
+            last_err = e
+            continue
+        _update_aom_caps_from_success(kw)
+        return result or ""
+    # All rungs raised TypeError — re-raise so the caller logs it. Cannot
+    # happen on Playwright 1.40+, which accepts the no-kwargs call.
+    if last_err is not None:
+        raise last_err
+    return ""
+
+
+async def _call_aria_snapshot_async(
+    body_locator: Any, *,
+    depth: int | None = None,
+    want_boxes: bool = True,
+    force_boxes: bool = False,
+) -> str:
     """Async counterpart of :func:`_call_aria_snapshot_sync`."""
-    try:
-        return await body_locator.aria_snapshot(mode="ai") or ""
-    except TypeError:
-        return await body_locator.aria_snapshot() or ""
+    last_err: TypeError | None = None
+    for kw in _aom_kwargs_ladder(
+        depth=depth, want_boxes=want_boxes, force_boxes=force_boxes,
+    ):
+        try:
+            result = await body_locator.aria_snapshot(**kw)
+        except TypeError as e:
+            _update_aom_caps_from_failure(kw)
+            last_err = e
+            continue
+        _update_aom_caps_from_success(kw)
+        return result or ""
+    if last_err is not None:
+        raise last_err
+    return ""
 
 
 def _snapshot_page(page: Any) -> tuple[str, dict[str, Any]]:
     """Capture the page AOM as ``(text, parsed_dict_tree)``.
 
-    Strategy:
-      1. ``page.locator('body').aria_snapshot(mode="ai")`` — Playwright 1.59+,
-         LLM-optimized YAML tree. ``mode="ai"`` was added in v1.59 (verified
-         against the Python docs); the wrapper falls back to a no-mode call
-         on ``TypeError`` so SUTs on 1.40-1.58 still get a snapshot.
-      2. ``page.accessibility.snapshot()`` — pre-1.40 API, returns a dict
-         directly. Removed in Playwright 1.40+; only reached when locator-
-         based capture has already failed.
+    Capability ladder (probed once per process, cached on :data:`_AOM_CAPS`):
+      1. ``aria_snapshot(mode="ai", boxes=True)`` — Playwright 1.60+,
+         LLM-optimized YAML with ``[box=x,y,w,h]`` per element (CSS
+         pixels, viewport-relative). Boxes are stripped from element
+         names by :func:`_parse_aria_snapshot_yaml` and retained on the
+         parsed node dict as ``node["box"]`` for tie-breaking.
+      2. ``aria_snapshot(mode="ai")`` — Playwright 1.59.
+      3. ``aria_snapshot()`` — Playwright 1.40-1.58 (no kwargs).
+      4. ``page.accessibility.snapshot()`` — pre-1.40 fallback. Gated by
+         ``WORCA_T_AOM_LEGACY_OK`` (default on).
 
     Returns ``("", {})`` on total failure so the resolver still receives a
     well-formed input (the LLM tier then cleanly returns "no candidates"
     instead of crashing). Errors are logged but never propagate.
     """
+    depth, want_boxes, force_boxes, legacy_ok = _read_aom_env()
     # ---- Primary: Locator.aria_snapshot (Playwright 1.40+) ----
     try:
         body = page.locator("body")
-        snapshot_text = _call_aria_snapshot_sync(body)
+        snapshot_text = _call_aria_snapshot_sync(
+            body, depth=depth, want_boxes=want_boxes, force_boxes=force_boxes,
+        )
         snapshot_dict = _parse_aria_snapshot_yaml(snapshot_text)
         return snapshot_text, snapshot_dict
     except AttributeError:
@@ -681,6 +923,8 @@ def _snapshot_page(page: Any) -> tuple[str, dict[str, Any]]:
         # Fall through to legacy API — older Playwright might still work.
 
     # ---- Legacy: page.accessibility.snapshot() (Playwright <1.40) ----
+    if not legacy_ok:
+        return "", {}
     try:
         ax = page.accessibility.snapshot() or {}
         return json.dumps(ax, ensure_ascii=False), ax if isinstance(ax, dict) else {}
@@ -708,6 +952,15 @@ def _parse_aria_snapshot_yaml(yaml_text: str) -> dict[str, Any]:
     """Parse a ``Locator.aria_snapshot()`` YAML body into a dict tree
     ``{role, name, children: [...]}`` compatible with :func:`_aom_walk`.
 
+    Annotations emitted by Playwright are stripped from element names
+    BEFORE the role/name matchers run so they don't pollute heuristic
+    matching:
+
+    - ``[box=x,y,w,h]`` (v1.60+): retained as ``node["box"] = (x,y,w,h)``
+      tuple of floats for the heuristic tie-breaker.
+    - ``[ref=eN]`` (v1.59+ ``mode="ai"``): dropped (ephemeral, not addressable).
+    - ``[level=N]`` and other ``[key=val]`` attributes: dropped from the name.
+
     Returns ``{}`` for empty input so callers can rely on truthy checks.
 
     Pure-function: no Playwright import, no I/O. Unit-testable standalone.
@@ -716,6 +969,13 @@ def _parse_aria_snapshot_yaml(yaml_text: str) -> dict[str, Any]:
 
     if not yaml_text or not yaml_text.strip():
         return {}
+
+    # Annotation regexes — stripped from each line before role/name parsing.
+    # ``box`` retains a tuple for the heuristic tie-breaker; ``ref`` and
+    # generic ``[key=val]`` attrs are dropped.
+    _RE_BOX = _re.compile(r'\s*\[box=([\d.,\-]+)\]')
+    _RE_REF = _re.compile(r'\s*\[ref=e?\d+\]')
+    _RE_ATTR = _re.compile(r'\s*\[[A-Za-z_][A-Za-z0-9_-]*=[^\]]*\]')
 
     # Regexes anchored once, not per-line.
     _RE_QUOTED = _re.compile(r'^([A-Za-z][A-Za-z0-9_-]*)\s+"((?:[^"\\]|\\.)*)"(.*)$')
@@ -737,6 +997,27 @@ def _parse_aria_snapshot_yaml(yaml_text: str) -> dict[str, Any]:
         # Skip attribute metadata lines (start with '/' after the dash).
         if body.startswith("/"):
             continue
+
+        # Extract and strip annotations before role/name parsing.
+        box: tuple[float, float, float, float] | None = None
+        m_box = _RE_BOX.search(body)
+        if m_box:
+            parts = m_box.group(1).split(",")
+            if len(parts) == 4:
+                try:
+                    box = (
+                        float(parts[0]), float(parts[1]),
+                        float(parts[2]), float(parts[3]),
+                    )
+                except ValueError:
+                    box = None
+            body = _RE_BOX.sub("", body)
+        body = _RE_REF.sub("", body)
+        # Generic ``[key=val]`` attrs (e.g. ``[level=1]``, ``[disabled]``-form
+        # not covered — these are role-only suffixes that ``_RE_ROLE_ONLY``
+        # already discards). Strip so quoted-name matcher sees a clean tail.
+        body = _RE_ATTR.sub("", body).strip()
+
         # Strip trailing ":" — it just indicates the node has children/attrs;
         # we infer that from indent-level changes anyway.
         had_trailing_colon = body.endswith(":")
@@ -763,6 +1044,8 @@ def _parse_aria_snapshot_yaml(yaml_text: str) -> dict[str, Any]:
                 role = m3.group(1)
 
         node: dict[str, Any] = {"role": role, "name": name, "children": []}
+        if box is not None:
+            node["box"] = box
         # Find parent: pop until we hit something with a strictly smaller indent.
         while len(stack) > 1 and stack[-1][0] >= indent:
             stack.pop()
@@ -881,8 +1164,15 @@ def _heuristic_resolve(intent: str, snapshot: dict[str, Any]) -> str | None:
 
     - intent has no recognised role keyword
     - no node matches with score >= :data:`_HEURISTIC_MIN_SCORE`
-    - multiple candidates score within :data:`_HEURISTIC_TIE_GAP`
+    - multiple candidates score within :data:`_HEURISTIC_TIE_GAP` AND
+      no box-based tie-breaker can choose between them
     - no AOM (empty snapshot)
+
+    Box tie-breaker: when ``boxes=True`` was requested (Playwright 1.60+)
+    and two candidates tie within ``_HEURISTIC_TIE_GAP``, prefer the one
+    with the smaller ``y`` coordinate (visually higher on the page —
+    common case is "primary CTA above secondary"). Skipped when only one
+    candidate has a box, to avoid an asymmetric bias.
     """
     if not snapshot:
         return None
@@ -890,28 +1180,37 @@ def _heuristic_resolve(intent: str, snapshot: dict[str, Any]) -> str | None:
     if role is None or not name_tokens:
         return None
 
-    candidates: list[tuple[float, str]] = []
+    candidates: list[tuple[float, str, tuple[float, float, float, float] | None]] = []
     for node in _aom_walk(snapshot):
         if node.get("role") != role:
             continue
         node_name = (node.get("name") or "").lower()
         if not node_name:
             continue
+        box = node.get("box") if isinstance(node.get("box"), tuple) else None
         if name_hint and name_hint in node_name:
-            candidates.append((1.0, node.get("name") or ""))
+            candidates.append((1.0, node.get("name") or "", box))
         elif name_tokens and all(t in node_name for t in name_tokens):
-            candidates.append((0.95, node.get("name") or ""))
+            candidates.append((0.95, node.get("name") or "", box))
         elif name_tokens and any(t in node_name for t in name_tokens):
-            candidates.append((0.6, node.get("name") or ""))
+            candidates.append((0.6, node.get("name") or "", box))
 
     if not candidates:
         return None
     candidates.sort(key=lambda c: -c[0])
-    top_score, top_name = candidates[0]
+    top_score, top_name, top_box = candidates[0]
     if top_score < _HEURISTIC_MIN_SCORE:
         return None
     if len(candidates) > 1 and (top_score - candidates[1][0]) < _HEURISTIC_TIE_GAP:
-        return None
+        # Tie within the gap — collect all tied candidates and try a
+        # box-based tie-break. Both/all must have boxes to participate;
+        # asymmetric box availability is treated as no tie-break.
+        tied = [c for c in candidates if (top_score - c[0]) < _HEURISTIC_TIE_GAP]
+        if all(c[2] is not None for c in tied):
+            tied.sort(key=lambda c: c[2][1])  # smaller y first
+            top_name = tied[0][1]
+        else:
+            return None
     return _format_role_selector(role, top_name)
 
 
@@ -935,12 +1234,89 @@ class _Resolution:
     intent: str
     test_file: str | None
     candidates: tuple[dict[str, Any], ...] | None = None
+    # Structured payload for role/text/label/placeholder/test_id strategies.
+    # None for CSS-string resolutions (the legacy path: runtime calls
+    # `scope.locator(selector)` exactly as before). When present, the locator
+    # wrapper calls `scope.get_by_role(...)` / `.get_by_text(...)` etc. via
+    # :func:`_apply_resolution`. Required to fix the run-20260621 regression
+    # where `link "Go to Gemini Enterprise"` was cached as a CSS string,
+    # fed to Playwright's CSS parser, and exploded at action time.
+    payload: dict | None = None
+
+
+def _apply_resolution(scope, resolution, original_locator, args, kwargs):
+    """Build a Playwright Locator for ``resolution`` against ``scope``.
+
+    Dispatch rules:
+      - ``payload is None`` → call ``original_locator(scope, selector, *args, **kwargs)``
+        (legacy path; preserves chained-locator kwargs like ``has_text=...``).
+      - ``payload["kind"] == "css"`` → same as legacy, using ``payload["selector"]``.
+      - ``payload["kind"] in {"role","text","label","placeholder","test_id"}``
+        → call the corresponding ``scope.get_by_*`` method directly with
+        ``payload``-derived arguments. ``original_locator``/``args``/``kwargs``
+        are intentionally ignored — those are ``locator()``-specific options
+        that have no analogue on the strongly-typed Playwright getters.
+
+    Returns the raw Playwright Locator (the caller wraps it in
+    :class:`_RetryingLocator`).
+    """
+    payload = resolution.payload if isinstance(resolution.payload, dict) else None
+    if payload is None:
+        return original_locator(scope, resolution.selector, *args, **kwargs)
+    kind = payload.get("kind")
+    if kind == "css":
+        sel = payload.get("selector") or resolution.selector
+        return original_locator(scope, sel, *args, **kwargs)
+    if kind == "role":
+        kw: dict[str, Any] = {}
+        if isinstance(payload.get("name"), str) and payload["name"]:
+            kw["name"] = payload["name"]
+        if payload.get("exact") is True:
+            kw["exact"] = True
+        return scope.get_by_role(payload["role"], **kw)
+    if kind == "text":
+        kw = {"exact": True} if payload.get("exact") is True else {}
+        return scope.get_by_text(payload["text"], **kw)
+    if kind == "label":
+        kw = {"exact": True} if payload.get("exact") is True else {}
+        return scope.get_by_label(payload["text"], **kw)
+    if kind == "placeholder":
+        kw = {"exact": True} if payload.get("exact") is True else {}
+        return scope.get_by_placeholder(payload["text"], **kw)
+    if kind == "test_id":
+        return scope.get_by_test_id(payload["value"])
+    # Unknown kind — fall back to the legacy string path with whatever the
+    # telemetry selector happens to be. The validator at write-time prevents
+    # this in practice; this branch is defence in depth.
+    log.warning("worca_t.apply_resolution_unknown_kind kind=%s", kind)
+    return original_locator(scope, resolution.selector, *args, **kwargs)
+
+
+def _resolution_from_candidate(
+    candidate: dict[str, Any], stale: "_Resolution",
+) -> "_Resolution":
+    """Build a synthetic ``_Resolution`` from one fallback-candidate dict so
+    the retry path can reuse :func:`_apply_resolution`. Inherits constant /
+    intent / test_file from the stale parent; carries the candidate's payload
+    (when structured) or selector (when string-only).
+    """
+    payload = candidate.get("payload") if isinstance(candidate.get("payload"), dict) else None
+    sel = candidate.get("selector")
+    return _Resolution(
+        selector=sel,
+        source=stale.source,
+        constant_name=stale.constant_name,
+        intent=stale.intent,
+        test_file=stale.test_file,
+        candidates=None,
+        payload=payload,
+    )
 
 
 def _resolve_tiers_1_2(
     intent: str, constant_name: str, test_file: str | None,
     page_url: str | None,
-    *, skip_dev: bool, skip_cache: bool,
+    *, skip_dev: bool, skip_cache: bool, skip_pool: bool = False,
 ) -> _Resolution | None:
     """Check dev-locators (tier 1a exact + 1b intent pool) and cache (tier 2).
     Returns a Resolution on hit, or None when all miss (caller proceeds to
@@ -961,12 +1337,18 @@ def _resolve_tiers_1_2(
                  constant_name, _sanitize_for_log(dev.selector))
         _append_spend_line({"tier": 1, "source": "dev", "constant": constant_name,
                             "input_tokens": 0, "output_tokens": 0, "success": True})
-        return _Resolution(dev.selector, "dev", constant_name, intent, test_file)
+        return _Resolution(
+            dev.selector, "dev", constant_name, intent, test_file,
+            payload=dev.payload,
+        )
 
     # Tier 1b: intent-based pool match. Activates when the file contains
     # entries with an ``intent`` field (frontend-dev-supplied selector pool).
     # Deterministic + zero-LLM; honors WORCA_T_NO_LLM_RESOLVE=1 semantics.
-    if not skip_dev and _dev_locators_cache:
+    # ``skip_pool`` is the tier-1b-specific suppressor — set by the retry path
+    # when a dev-pool selector failed at action time, so re-resolve does not
+    # bounce back to the same fuzzy answer.
+    if not skip_dev and not skip_pool and _dev_locators_cache:
         winner, score, reason, top = _pool_match(
             intent, page_url, _dev_locators_cache,
         )
@@ -993,6 +1375,7 @@ def _resolve_tiers_1_2(
                     "intent": intent,
                     "selector": winner.selector,
                     "strategy": winner.strategy,
+                    "payload": winner.payload,
                     "source": "dev-pool",
                     "page_url": page_url,
                     "matched_constant": winner.constant_name,
@@ -1004,6 +1387,7 @@ def _resolve_tiers_1_2(
                 log.warning("worca_t.dev_pool_cache_write_failed %s", e)
             return _Resolution(
                 winner.selector, "dev-pool", constant_name, intent, test_file,
+                payload=winner.payload,
             )
         elif reason in ("reject_low_score", "reject_tie"):
             # Structured rejection telemetry — feeds threshold tuning. No
@@ -1018,22 +1402,35 @@ def _resolve_tiers_1_2(
     key = _cache_key(test_file, constant_name, intent)
     if not skip_cache:
         cached = cache.get(key)
-        if cached and cached.get("selector"):
+        # Quarantined entries (dev-pool selectors that failed at action time
+        # in this session) are kept on disk for provenance but ignored by
+        # tier-2 reads — the LLM fallback under the `_shadow:<key>` entry
+        # gets first dibs instead.
+        if cached and cached.get("quarantined"):
+            shadow = cache.get(f"_shadow:{key}")
+            if shadow and (shadow.get("selector") or shadow.get("payload")):
+                cached = shadow
+            else:
+                cached = None
+        if cached and (cached.get("selector") or cached.get("payload")):
             log.info("worca_t.cache_hit constant=%s selector=%s",
-                     constant_name, _sanitize_for_log(cached["selector"]))
+                     constant_name, _sanitize_for_log(cached.get("selector") or ""))
             cached_bundle = cached.get("candidates")
             bundle_tuple = (
                 tuple(cached_bundle)
                 if isinstance(cached_bundle, list) and cached_bundle
                 else None
             )
+            cached_payload = (
+                cached["payload"] if isinstance(cached.get("payload"), dict) else None
+            )
             _append_spend_line({"tier": 2, "source": "cached",
                                 "constant": constant_name,
                                 "candidates_count": len(bundle_tuple) if bundle_tuple else 1,
                                 "input_tokens": 0, "output_tokens": 0, "success": True})
             return _Resolution(
-                cached["selector"], "cached", constant_name, intent, test_file,
-                candidates=bundle_tuple,
+                cached.get("selector"), "cached", constant_name, intent, test_file,
+                candidates=bundle_tuple, payload=cached_payload,
             )
     return None
 
@@ -1083,22 +1480,24 @@ def _resolve_tiers_3_4(
                             "reason": "resolver_call_failed"})
         return _Resolution(None, "none", constant_name, intent, test_file)
     selector = result.get("selector")
+    result_payload = result.get("payload") if isinstance(result.get("payload"), dict) else None
     raw_candidates = result.get("candidates")
     bundle_tuple = (
         tuple(raw_candidates)
         if isinstance(raw_candidates, list) and raw_candidates
         else None
     )
+    has_resolution = bool(selector) or result_payload is not None
     spend_entry = {
         "tier": 4, "source": result.get("source") or "agent",
         "constant": constant_name,
-        "candidates_count": len(bundle_tuple) if bundle_tuple else (1 if selector else 0),
+        "candidates_count": len(bundle_tuple) if bundle_tuple else (1 if has_resolution else 0),
         "input_tokens": result.get("input_tokens") or 0,
         "output_tokens": result.get("output_tokens") or 0,
         "model": result.get("model"), "duration_ms": result.get("duration_ms"),
-        "success": bool(selector),
+        "success": has_resolution,
     }
-    if not selector:
+    if not has_resolution:
         log.warning("worca_t.resolver_no_selector constant=%s reason=%s",
                     constant_name, result.get("reason"))
         spend_entry["reason"] = result.get("reason")
@@ -1106,26 +1505,29 @@ def _resolve_tiers_3_4(
         return _Resolution(None, "none", constant_name, intent, test_file)
     log.info(
         "worca_t.resolver_ok constant=%s selector=%s source=%s confidence=%s candidates=%d",
-        constant_name, _sanitize_for_log(selector),
+        constant_name, _sanitize_for_log(selector or ""),
         result.get("source"), result.get("confidence"),
         len(bundle_tuple) if bundle_tuple else 1,
     )
     _append_spend_line(spend_entry)
     return _Resolution(
         selector, "agent", constant_name, intent, test_file,
-        candidates=bundle_tuple,
+        candidates=bundle_tuple, payload=result_payload,
     )
 
 
 async def _snapshot_page_async(page: Any) -> tuple[str, dict[str, Any]]:
-    """Async counterpart of :func:`_snapshot_page`. Same fallback chain:
-    aria_snapshot(mode="ai") → aria_snapshot() → legacy
-    page.accessibility.snapshot().
+    """Async counterpart of :func:`_snapshot_page`. Same capability ladder
+    and env-var contract; differs only in the ``await`` on the snapshot
+    call and on the legacy ``accessibility.snapshot()``.
     """
+    depth, want_boxes, force_boxes, legacy_ok = _read_aom_env()
     # ---- Primary: Locator.aria_snapshot (Playwright 1.40+) ----
     try:
         body = page.locator("body")
-        snapshot_text = await _call_aria_snapshot_async(body)
+        snapshot_text = await _call_aria_snapshot_async(
+            body, depth=depth, want_boxes=want_boxes, force_boxes=force_boxes,
+        )
         snapshot_dict = _parse_aria_snapshot_yaml(snapshot_text)
         return snapshot_text, snapshot_dict
     except AttributeError:
@@ -1134,6 +1536,8 @@ async def _snapshot_page_async(page: Any) -> tuple[str, dict[str, Any]]:
         log.warning("worca_t.snapshot_failed_aria_async %s", e)
 
     # ---- Legacy: page.accessibility.snapshot() (Playwright <1.40) ----
+    if not legacy_ok:
+        return "", {}
     try:
         ax = await page.accessibility.snapshot() or {}
         return json.dumps(ax, ensure_ascii=False), ax if isinstance(ax, dict) else {}
@@ -1158,6 +1562,7 @@ def _resolve_sentinel(
     skip_dev: bool = False,
     skip_cache: bool = False,
     skip_heuristic: bool = False,
+    skip_pool: bool = False,
 ) -> _Resolution:
     """Sync sentinel resolver. Tier order: dev → cache → heuristic → LLM → fail.
     Used by the sync API (``playwright.sync_api``) patch.
@@ -1169,17 +1574,20 @@ def _resolve_sentinel(
 
     early = _resolve_tiers_1_2(
         intent, constant_name, test_file, current_url,
-        skip_dev=skip_dev, skip_cache=skip_cache,
+        skip_dev=skip_dev, skip_cache=skip_cache, skip_pool=skip_pool,
     )
     if early is not None:
+        _record_resolution_use(early)
         return early
 
     snapshot_text, snapshot_dict = _snapshot_page(page)
-    return _resolve_tiers_3_4(
+    res = _resolve_tiers_3_4(
         intent, constant_name, test_file,
         snapshot_text, snapshot_dict, current_url,
         skip_heuristic=skip_heuristic,
     )
+    _record_resolution_use(res)
+    return res
 
 
 async def _resolve_sentinel_async(
@@ -1188,6 +1596,7 @@ async def _resolve_sentinel_async(
     skip_dev: bool = False,
     skip_cache: bool = False,
     skip_heuristic: bool = False,
+    skip_pool: bool = False,
 ) -> _Resolution:
     """Async sentinel resolver. Same tier ladder as the sync version, but
     awaits the snapshot. Used by the async API (``playwright.async_api``)
@@ -1209,17 +1618,20 @@ async def _resolve_sentinel_async(
 
     early = _resolve_tiers_1_2(
         intent, constant_name, test_file, current_url,
-        skip_dev=skip_dev, skip_cache=skip_cache,
+        skip_dev=skip_dev, skip_cache=skip_cache, skip_pool=skip_pool,
     )
     if early is not None:
+        _record_resolution_use(early)
         return early
 
     snapshot_text, snapshot_dict = await _snapshot_page_async(page)
-    return _resolve_tiers_3_4(
+    res = _resolve_tiers_3_4(
         intent, constant_name, test_file,
         snapshot_text, snapshot_dict, current_url,
         skip_heuristic=skip_heuristic,
     )
+    _record_resolution_use(res)
+    return res
 
 
 def _invalidate_cache_entry(constant_name: str, intent: str, test_file: str | None) -> None:
@@ -1234,6 +1646,109 @@ def _invalidate_cache_entry(constant_name: str, intent: str, test_file: str | No
             log.info("worca_t.cache_invalidated constant=%s", constant_name)
         except OSError as e:
             log.warning("worca_t.cache_invalidate_failed %s", e)
+
+
+def _quarantine_dev_pool_entry(
+    stale: "_Resolution", *, page_url: str | None, exception: BaseException,
+) -> None:
+    """Mark a dev-pool cache entry as quarantined and append to the
+    session-scoped quarantine log.
+
+    Effects:
+      - Sets ``quarantined: True`` on the cache entry under the standard key
+        (preserves the dev-supplied selector for provenance; tier-2 reads
+        now skip it and prefer the shadow LLM fallback).
+      - Appends a JSONL record to ``<cache_dir>/dev-pool-quarantine.jsonl``.
+        Step 9 reads this at end-of-run and emits a ``dev-locator-drifted``
+        bug-candidate per record.
+
+    Best-effort: file I/O errors degrade silently (the next read will see
+    the still-quarantined entry; the bug-candidate gets emitted on the
+    following run after a retry).
+    """
+    key = _cache_key(stale.test_file, stale.constant_name, stale.intent)
+    cache = _read_cache()
+    entry = cache.get(key)
+    if entry is None:
+        # Nothing to quarantine — race with another worker, or entry already
+        # purged. Still log the action-time failure for telemetry.
+        entry = {
+            "key": key, "intent": stale.intent,
+            "constant_name": stale.constant_name,
+            "test_file": stale.test_file, "source": "dev-pool",
+            "selector": stale.selector,
+        }
+    entry["quarantined"] = True
+    cache[key] = entry
+    try:
+        _write_cache(cache)
+    except OSError as e:
+        log.warning("worca_t.quarantine_cache_write_failed %s", e)
+
+    cache_dir = _cache_path()
+    if cache_dir is None:
+        return
+    log_path = cache_dir.parent / "dev-pool-quarantine.jsonl"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "intent": stale.intent,
+            "constant_name": stale.constant_name,
+            "test_file": stale.test_file,
+            "page_url": page_url,
+            "stale_selector": stale.selector,
+            "matched_constant": entry.get("matched_constant"),
+            "pool_score": entry.get("pool_score"),
+            "exception": f"{type(exception).__name__}: {exception}"[:500],
+            "run_id": os.environ.get("WORCA_T_RUN_ID"),
+        }
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as e:
+        log.warning("worca_t.quarantine_log_write_failed %s", e)
+
+
+def _shadow_dev_pool_fallback(stale: "_Resolution", fresh: "_Resolution") -> None:
+    """Move the fresh LLM resolution to the ``_shadow:<key>`` cache slot so
+    the dev-pool primary key keeps its quarantined record and the LLM answer
+    becomes the active tier-2 hit for the rest of the session.
+
+    Called AFTER ``_resolve_sentinel`` returns from the re-resolve path. The
+    parent ResolverServer wrote the fresh entry under the standard key; we
+    relocate it and restore the quarantined dev-pool entry in its place.
+    """
+    key = _cache_key(stale.test_file, stale.constant_name, stale.intent)
+    cache = _read_cache()
+    fresh_entry = cache.get(key)
+    if not fresh_entry or fresh_entry.get("source") not in ("agent", "cached"):
+        # No fresh entry to relocate (resolver was skipped, or wrote
+        # somewhere unexpected). Leave the quarantined entry as-is.
+        return
+    # Restore the quarantined dev-pool entry under the standard key. The
+    # session-scoped tier-2-skip-quarantined rule routes future tier-2 reads
+    # to the shadow slot we're about to populate.
+    quarantined_entry = {
+        "key": key,
+        "intent": stale.intent,
+        "constant_name": stale.constant_name,
+        "test_file": stale.test_file,
+        "selector": stale.selector,
+        "payload": stale.payload,
+        "source": "dev-pool",
+        "quarantined": True,
+        # Preserve any provenance fields that were on the original entry.
+        "matched_constant": fresh_entry.get("matched_constant"),
+        "pool_score": fresh_entry.get("pool_score"),
+    }
+    shadow_entry = dict(fresh_entry)
+    shadow_entry["key"] = f"_shadow:{key}"
+    cache[key] = quarantined_entry
+    cache[f"_shadow:{key}"] = shadow_entry
+    try:
+        _write_cache(cache)
+    except OSError as e:
+        log.warning("worca_t.shadow_cache_write_failed %s", e)
 
 
 def _promote_candidate_in_cache(
@@ -1335,6 +1850,7 @@ class _RetryingLocator(_SyncLocatorBase):
 
     def __init__(
         self, *, real, page, sentinel, resolution, rebuild_locator,
+        rebuild_from_resolution=None,
     ):
         # Mirror Playwright's internal handle so isinstance-gated callers
         # (notably ``expect._dispatch`` and any pytest-playwright fixture)
@@ -1353,6 +1869,13 @@ class _RetryingLocator(_SyncLocatorBase):
         object.__setattr__(self, "_sentinel", sentinel)
         object.__setattr__(self, "_resolution", resolution)
         object.__setattr__(self, "_rebuild_locator", rebuild_locator)
+        # New callback: rebuild from a full `_Resolution` so structured
+        # payload kinds (role/text/label/…) reach the right `get_by_*` API.
+        # Falls back to the legacy string-only path when callers don't pass one.
+        object.__setattr__(
+            self, "_rebuild_from_resolution",
+            rebuild_from_resolution or (lambda r: rebuild_locator(r.selector)),
+        )
         object.__setattr__(self, "_retried", False)
         # candidates[0] is what's already wrapped in `_real`; everything
         # past it is a fallback the retry path can try without a new
@@ -1386,22 +1909,25 @@ class _RetryingLocator(_SyncLocatorBase):
 
     def _try_next_candidate(self):
         """Pop and apply the next fallback candidate, swapping `_real` to
-        a locator built from its selector. Returns the candidate dict so
-        the caller can promote it in the cache on success, or ``None``
-        when the bundle is exhausted."""
+        a locator built from its selector or structured payload. Returns the
+        candidate dict so the caller can promote it in the cache on success,
+        or ``None`` when the bundle is exhausted."""
         if not self._remaining_candidates:
             return None
         nxt = self._remaining_candidates.pop(0)
-        sel = nxt.get("selector")
-        if not isinstance(sel, str) or not sel.strip():
+        # Structured payload takes precedence over the string `selector`
+        # (which for structured kinds is telemetry-only).
+        synthetic = _resolution_from_candidate(nxt, self._resolution)
+        if synthetic.selector is None and synthetic.payload is None:
             return None
-        fresh_real = self._rebuild_locator(sel)
+        fresh_real = self._rebuild_from_resolution(synthetic)
         self._swap_real(fresh_real)
         log.info(
-            "worca_t.fallback_candidate_try constant=%s selector=%s strategy=%s",
+            "worca_t.fallback_candidate_try constant=%s selector=%s strategy=%s kind=%s",
             self._resolution.constant_name,
-            _sanitize_for_log(sel),
+            _sanitize_for_log(synthetic.selector or ""),
             nxt.get("strategy"),
+            (synthetic.payload or {}).get("kind"),
         )
         return nxt
 
@@ -1468,23 +1994,34 @@ class _RetryingLocator(_SyncLocatorBase):
                             continue  # retry against the fallback candidate
                         # Bundle exhausted (or never existed) → LLM re-resolve.
                         object.__setattr__(self, "_retried", True)
-                        _invalidate_cache_entry(
-                            stale.constant_name, stale.intent, stale.test_file,
-                        )
+                        is_dev_pool = stale.source == "dev-pool"
+                        if is_dev_pool:
+                            _quarantine_dev_pool_entry(
+                                stale,
+                                page_url=_safe_page_url(self._page),
+                                exception=exc,
+                            )
+                        else:
+                            _invalidate_cache_entry(
+                                stale.constant_name, stale.intent, stale.test_file,
+                            )
                         fresh = await _resolve_sentinel_async(
                             self._page, self._sentinel,
                             constant_name=stale.constant_name,
                             skip_dev=(stale.source == "dev"),
+                            skip_pool=is_dev_pool,
                             skip_cache=True,
                             skip_heuristic=(stale.source == "heuristic"),
                         )
-                        if fresh.selector is None:
+                        if fresh.selector is None and fresh.payload is None:
                             log.warning(
                                 "worca_t.retry_unresolvable constant=%s",
                                 stale.constant_name,
                             )
                             raise
-                        fresh_real = self._rebuild_locator(fresh.selector)
+                        if is_dev_pool:
+                            _shadow_dev_pool_fallback(stale, fresh)
+                        fresh_real = self._rebuild_from_resolution(fresh)
                         self._swap_real(fresh_real)
                         object.__setattr__(self, "_resolution", fresh)
                         fresh_method = getattr(fresh_real, name)
@@ -1522,22 +2059,33 @@ class _RetryingLocator(_SyncLocatorBase):
                     if nxt is not None:
                         continue
                     object.__setattr__(self, "_retried", True)
-                    _invalidate_cache_entry(
-                        stale.constant_name, stale.intent, stale.test_file,
-                    )
+                    is_dev_pool = stale.source == "dev-pool"
+                    if is_dev_pool:
+                        _quarantine_dev_pool_entry(
+                            stale,
+                            page_url=_safe_page_url(self._page),
+                            exception=exc,
+                        )
+                    else:
+                        _invalidate_cache_entry(
+                            stale.constant_name, stale.intent, stale.test_file,
+                        )
                     fresh = _resolve_sentinel(
                         self._page, self._sentinel,
                         skip_dev=(stale.source == "dev"),
+                        skip_pool=is_dev_pool,
                         skip_cache=True,
                         skip_heuristic=(stale.source == "heuristic"),
                     )
-                    if fresh.selector is None:
+                    if fresh.selector is None and fresh.payload is None:
                         log.warning(
                             "worca_t.retry_unresolvable constant=%s",
                             stale.constant_name,
                         )
                         raise
-                    fresh_real = self._rebuild_locator(fresh.selector)
+                    if is_dev_pool:
+                        _shadow_dev_pool_fallback(stale, fresh)
+                    fresh_real = self._rebuild_from_resolution(fresh)
                     self._swap_real(fresh_real)
                     object.__setattr__(self, "_resolution", fresh)
                     fresh_method = getattr(fresh_real, name)
@@ -1606,10 +2154,17 @@ class _AsyncLazyLocator(_AsyncLocatorBase):
     after an action elsewhere has populated the cache).
     """
 
-    def __init__(self, *, page, sentinel, rebuild_locator, constant_name=None):
+    def __init__(
+        self, *, page, sentinel, rebuild_locator,
+        rebuild_from_resolution=None, constant_name=None,
+    ):
         object.__setattr__(self, "_page", page)
         object.__setattr__(self, "_sentinel", sentinel)
         object.__setattr__(self, "_rebuild_locator", rebuild_locator)
+        object.__setattr__(
+            self, "_rebuild_from_resolution",
+            rebuild_from_resolution or (lambda r: rebuild_locator(r.selector)),
+        )
         object.__setattr__(self, "_constant_name", constant_name)
         object.__setattr__(self, "_resolved", False)
         object.__setattr__(self, "_resolved_real", None)
@@ -1624,7 +2179,7 @@ class _AsyncLazyLocator(_AsyncLocatorBase):
         resolution = await _resolve_sentinel_async(
             self._page, self._sentinel, constant_name=self._constant_name,
         )
-        if resolution.selector is None:
+        if resolution.selector is None and resolution.payload is None:
             _write_hitl_pending(
                 resolution.intent, resolution.constant_name,
                 resolution.test_file, _safe_page_url(self._page),
@@ -1636,7 +2191,7 @@ class _AsyncLazyLocator(_AsyncLocatorBase):
                 f"surface this via HITL on the next interactive run, or as a "
                 f"`locator-unresolvable` bug candidate for Step 9."
             )
-        resolved_real = self._rebuild_locator(resolution.selector)
+        resolved_real = self._rebuild_from_resolution(resolution)
         object.__setattr__(self, "_resolved_real", resolved_real)
         object.__setattr__(self, "_resolved_resolution", resolution)
         object.__setattr__(self, "_resolved", True)
@@ -1679,6 +2234,7 @@ class _AsyncLazyLocator(_AsyncLocatorBase):
                     sentinel=self._sentinel,
                     resolution=self._resolved_resolution,
                     rebuild_locator=self._rebuild_locator,
+                    rebuild_from_resolution=self._rebuild_from_resolution,
                 )
                 method = getattr(retrying, name)
                 return await method(*args, **kwargs)
@@ -1828,6 +2384,22 @@ def _wrap_async_locator_method(original: Any, _kind: str):
     action methods, which ARE awaited by the caller.
     """
     def wrapper(self, selector, *args, **kwargs):
+        # Pre-resolved structured sentinel: dispatch directly. Sync because
+        # the corresponding Playwright getters (get_by_role/text/...) are
+        # sync constructors even on the async API surface; the awaited part
+        # is the action method on the returned Locator.
+        if is_resolved_sentinel(selector):
+            payload = parse_resolved_sentinel(selector)
+            if payload is None:
+                return original(self, selector, *args, **kwargs)
+            synthetic = _Resolution(
+                selector=None, source="resolved-inline",
+                constant_name=_walk_stack_for_constant_name() or "<inline>",
+                intent=f"resolved:{payload.get('kind')}",
+                test_file=(os.environ.get("PYTEST_CURRENT_TEST", "").split("::", 1)[0] or None),
+                candidates=None, payload=payload,
+            )
+            return _apply_resolution(self, synthetic, original, args, kwargs)
         if not is_sentinel(selector):
             return original(self, selector, *args, **kwargs)
         page = _resolve_page_from_receiver(self)
@@ -1840,6 +2412,7 @@ def _wrap_async_locator_method(original: Any, _kind: str):
         return _AsyncLazyLocator(
             page=page, sentinel=selector,
             rebuild_locator=lambda new_sel: original(self, new_sel, *args, **kwargs),
+            rebuild_from_resolution=lambda r: _apply_resolution(self, r, original, args, kwargs),
             constant_name=constant_name,
         )
     wrapper.__name__ = f"_wrapped_async_{_kind}_locator"
@@ -1857,10 +2430,24 @@ def _wrap_locator_method(original: Any, _kind: str):
     def wrapper(self, selector, *args, **kwargs):
         page = _resolve_page_from_receiver(self)
         _inflate_timeouts_for_page(page)
+        # Pre-resolved structured sentinel (role_locator / text_locator / …
+        # from a promoted POM entry): skip the tier ladder, dispatch directly.
+        if is_resolved_sentinel(selector):
+            payload = parse_resolved_sentinel(selector)
+            if payload is None:
+                return original(self, selector, *args, **kwargs)
+            synthetic = _Resolution(
+                selector=None, source="resolved-inline",
+                constant_name=_walk_stack_for_constant_name() or "<inline>",
+                intent=f"resolved:{payload.get('kind')}",
+                test_file=(os.environ.get("PYTEST_CURRENT_TEST", "").split("::", 1)[0] or None),
+                candidates=None, payload=payload,
+            )
+            return _apply_resolution(self, synthetic, original, args, kwargs)
         if not is_sentinel(selector):
             return original(self, selector, *args, **kwargs)
         resolution = _resolve_sentinel(page, selector)
-        if resolution.selector is None:
+        if resolution.selector is None and resolution.payload is None:
             # Drop a hitl-pending file so the parent (Step 8) can surface
             # the unresolved TBD via HITL prompt or as a structured bug
             # candidate. Failing fast here keeps the test result clean;
@@ -1884,13 +2471,14 @@ def _wrap_locator_method(original: Any, _kind: str):
                 f"as a `locator-unresolvable` bug candidate for Step 9. "
                 f"See run.log for the resolution-tier trace."
             )
-        real = original(self, resolution.selector, *args, **kwargs)
+        real = _apply_resolution(self, resolution, original, args, kwargs)
         return _RetryingLocator(
             real=real,
             page=page,
             sentinel=selector,
             resolution=resolution,
             rebuild_locator=lambda new_sel: original(self, new_sel, *args, **kwargs),
+            rebuild_from_resolution=lambda r: _apply_resolution(self, r, original, args, kwargs),
         )
     wrapper.__name__ = f"_wrapped_{_kind}_locator"
     return wrapper
@@ -2120,6 +2708,11 @@ def _install_monkey_patch() -> None:
 
 
 _WORCA_PHASE_MARKERS = ("smoke", "regression", "e2e", "exploratory")
+# Opt-out marker for the Step 8 zero-assertions gate. Apply to tests that
+# legitimately perform setup-only work (state mutation under a fixture, smoke
+# probes that rely on fixture-internal asserts, etc.). Use sparingly — the
+# gate logs every worca_setup-marked function for audit.
+_WORCA_OPT_OUT_MARKERS = ("setup",)
 
 
 def pytest_configure(config):  # noqa: D401 - pytest hook signature
@@ -2135,6 +2728,12 @@ def pytest_configure(config):  # noqa: D401 - pytest hook signature
         config.addinivalue_line(
             "markers",
             f"worca_{phase}: worca-t generated {phase} test",
+        )
+    for marker in _WORCA_OPT_OUT_MARKERS:
+        config.addinivalue_line(
+            "markers",
+            f"worca_{marker}: worca-t generated {marker} test (opts out of "
+            f"the zero-assertions gate)",
         )
 
 
@@ -2173,6 +2772,88 @@ def pytest_runtest_setup(item):  # noqa: D401, ARG001 - pytest hook signature
 _storage_state_captured: bool = False
 
 
+# ---------------------------------------------------------------------------
+# Passing-test witnesses for TBD promotion
+# ---------------------------------------------------------------------------
+#
+# Step 9 freezes resolved cache entries back into SUT source via
+# `_promote_resolved_tbds`. To avoid promoting an LLM guess that has never
+# been validated by a real assertion, the promoter requires each candidate
+# entry to carry at least one passing-test witness. This module records
+# which sentinel resolutions each test consumed; at teardown we append the
+# test's nodeid to `passing_witnesses` on every touched cache entry IF the
+# test passed. Failing tests contribute nothing — their selectors don't get
+# a vote on promotion.
+#
+# Implemented as in-process state (not in the cache) so the recording cost
+# is one set insert per resolution; the actual cache update happens once
+# per test at teardown.
+
+_test_resolutions: dict[str, set] = {}
+
+
+def _current_test_nodeid() -> str | None:
+    """Strip the phase suffix pytest appends (`(call)` / `(setup)`)."""
+    raw = os.environ.get("PYTEST_CURRENT_TEST", "")
+    if not raw:
+        return None
+    nodeid = raw.rsplit(" (", 1)[0]
+    return nodeid or None
+
+
+def _record_resolution_use(resolution: "_Resolution") -> None:
+    """Note that the currently-running test consumed this resolution.
+
+    No-op when no test is active (e.g. fixture-stage resolution), or when
+    the resolution failed (source="none"). Idempotent — uses a set per
+    nodeid so repeat resolutions within one test count once.
+    """
+    nodeid = _current_test_nodeid()
+    if not nodeid:
+        return
+    if resolution.source in (None, "none"):
+        return
+    bucket = _test_resolutions.setdefault(nodeid, set())
+    bucket.add((resolution.intent, resolution.constant_name, resolution.test_file))
+
+
+def _record_passing_witnesses(nodeid: str) -> None:
+    """Append `nodeid` to `passing_witnesses` on each cache entry the test used.
+
+    Called from `pytest_runtest_teardown` ONLY when the test passed. Updates
+    are atomic via `_write_cache` (temp + rename), so concurrent xdist
+    workers won't corrupt the file — last-writer-wins on overlap, which is
+    fine because all writers are appending the same nodeid.
+    """
+    bucket = _test_resolutions.pop(nodeid, None)
+    if not bucket:
+        return
+    try:
+        cache = _read_cache()
+    except OSError:
+        return
+    dirty = False
+    for intent, constant_name, test_file in bucket:
+        key = _cache_key(test_file, constant_name, intent)
+        entry = cache.get(key)
+        if not entry:
+            continue
+        witnesses = entry.get("passing_witnesses")
+        if not isinstance(witnesses, list):
+            witnesses = []
+        if nodeid in witnesses:
+            continue
+        witnesses.append(nodeid)
+        entry["passing_witnesses"] = witnesses
+        cache[key] = entry
+        dirty = True
+    if dirty:
+        try:
+            _write_cache(cache)
+        except OSError as e:
+            log.warning("worca_t.passing_witness_write_failed %s", e)
+
+
 def pytest_runtest_makereport(item, call):  # noqa: D401, ARG001 - pytest hook signature
     """Stash per-phase reports on the item so :func:`pytest_runtest_teardown`
     can tell whether the test passed.
@@ -2206,19 +2887,26 @@ def pytest_runtest_teardown(item, nextitem):  # noqa: D401, ARG001 - pytest hook
     All failures degrade silently — capture is a best-effort optimization,
     not a correctness invariant. The heal flow still works without it.
     """
+    # Record passing-test witnesses for TBD promotion. Independent from
+    # storage-state capture: runs even when workspace_dir is unset (the
+    # cache file may live elsewhere), and runs even after one test has
+    # already captured storage state (we want every passing test to vote).
+    rep_call = getattr(item, "rep_call", None)
+    test_passed = (
+        rep_call is None or getattr(rep_call, "passed", False) is True
+    )
+    if test_passed:
+        _record_passing_witnesses(item.nodeid)
+    else:
+        _test_resolutions.pop(item.nodeid, None)
+
     global _storage_state_captured
     if _storage_state_captured:
         return
     workspace_dir = os.environ.get("WORCA_T_WORKSPACE_DIR")
     if not workspace_dir:
         return
-    # Only capture on a passing test. The pytest report status of the
-    # most-recent call phase lives on the item via stash; older pytest
-    # versions used ``item.rep_call`` (set by user conftest). Be defensive
-    # — when status can't be determined, skip rather than capture from a
-    # potentially-broken context.
-    rep_call = getattr(item, "rep_call", None)
-    if rep_call is not None and getattr(rep_call, "passed", False) is False:
+    if not test_passed:
         return
     # Get the test's context fixture. Different SUTs may rename the
     # fixture (e.g. "playwright_context", "browser_context"); we try the

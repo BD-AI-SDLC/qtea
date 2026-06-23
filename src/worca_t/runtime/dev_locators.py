@@ -30,7 +30,16 @@ ENV_VAR = "WORCA_T_DEV_LOCATORS"
 
 @dataclass(frozen=True)
 class DevLocator:
-    """One dev-supplied entry. Mirrors the schema's locators[].* shape."""
+    """One dev-supplied entry. Mirrors the schema's locators[].* shape.
+
+    ``payload`` is the structured form for role/text/label/placeholder/test_id
+    locators (introduced after the run-20260621 regression where the LLM
+    cached `link "Go to Gemini Enterprise"` as a CSS string). When ``payload``
+    is set, the runtime calls ``page.get_by_role(...)`` etc. at action time
+    instead of ``page.locator(selector)``. ``selector`` is still required
+    (carried for telemetry / back-compat readers) but is not used at action
+    time when ``payload`` is present.
+    """
 
     constant_name: str
     selector: str
@@ -38,6 +47,7 @@ class DevLocator:
     intent: str | None = None
     page_url: str | None = None
     notes: str | None = None
+    payload: dict | None = None
 
     def as_dict(self) -> dict:
         return {
@@ -47,6 +57,7 @@ class DevLocator:
             "intent": self.intent,
             "page_url": self.page_url,
             "notes": self.notes,
+            "payload": self.payload,
         }
 
 
@@ -119,6 +130,14 @@ def load_dev_locators(
         warnings.append(f"dev-locators file at {path} has no top-level `locators` object")
         return {}, path, warnings
 
+    # Lazy import — keeps this module importable inside the vendored runtime
+    # where `worca_t` isn't on sys.path. Validation falls back to the local
+    # `_is_xpath` + presence checks when the import fails.
+    try:
+        from worca_t.jit_resolver import validate_selector_payload as _validate
+    except Exception:
+        _validate = None  # type: ignore[assignment]
+
     out: dict[str, DevLocator] = {}
     for name, entry in locators_block.items():
         if not isinstance(entry, dict):
@@ -134,6 +153,20 @@ def load_dev_locators(
                 f" ({selector!r}); rejected per locator-priority gate"
             )
             continue
+        payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else None
+        # Validate up-front so a malformed dev-locators file fails at run-start,
+        # not silently at test time when a fuzzy-match accidentally lands on
+        # the bad entry. The string-form path catches Playwright debug syntax
+        # (`link "..."`), unbalanced brackets, and the same injection markers
+        # that `is_unsafe_selector` blocks.
+        if _validate is not None:
+            ok, why = _validate(payload, selector)
+            if not ok:
+                warnings.append(
+                    f"dev-locators[{name}] rejected by validate_selector_payload"
+                    f" ({why}); skipping"
+                )
+                continue
         out[name] = DevLocator(
             constant_name=name,
             selector=selector.strip(),
@@ -141,5 +174,6 @@ def load_dev_locators(
             intent=entry.get("intent") if isinstance(entry.get("intent"), str) else None,
             page_url=entry.get("page_url") if isinstance(entry.get("page_url"), str) else None,
             notes=entry.get("notes") if isinstance(entry.get("notes"), str) else None,
+            payload=payload,
         )
     return out, path, warnings

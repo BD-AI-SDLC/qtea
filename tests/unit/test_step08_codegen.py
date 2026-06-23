@@ -16,7 +16,18 @@ from pathlib import Path
 from worca_t.checkpoints import RunState
 from worca_t.pipeline import PipelineOptions
 from worca_t.steps.base import StepContext
-from worca_t.steps.s08_codegen import CodegenStep, _strip_code_fences
+from worca_t.runtime.dev_locators import DevLocator
+from worca_t.steps.s08_codegen import (
+    CodegenStep,
+    _LocatorTask,
+    _detect_init_placement,
+    _filter_index_to_worca,
+    _framework_mismatch_message,
+    _match_dev_locator,
+    _parse_test_command_head,
+    _strip_code_fences,
+    _write_tbd_locators,
+)
 from worca_t.workspace import create_workspace
 
 from ._fake_anthropic import disable_vertex_env, install_fake_anthropic
@@ -544,6 +555,7 @@ from pages.login_page import LoginPage
 def test_b5_login(page):
     login_page = LoginPage(page)
     login_page.click_login()
+    assert page is not None
 '''
 
 _B5_TEST_MISSING_METHOD = '''\
@@ -555,6 +567,7 @@ from pages.login_page import LoginPage
 def test_b5_login(page):
     login_page = LoginPage(page)
     login_page.click_save()
+    assert page is not None
 '''
 
 
@@ -861,3 +874,242 @@ async def test_step08_b5_autopatch_crash_returns_clean_step_result(
     assert recon["mismatches"], (
         "Pre-crash mismatches must persist in reconcile-result.json for triage"
     )
+
+
+# ---------------------------------------------------------------------------
+# Dev-locator matching
+# ---------------------------------------------------------------------------
+
+
+def test_match_dev_locator_exact_key():
+    dev = {"MY_BUTTON": DevLocator(constant_name="MY_BUTTON", selector="#btn")}
+    task = _LocatorTask(constant_name="MY_BUTTON", intent="click button", owning_page="Home")
+    assert _match_dev_locator(task, dev) is not None
+    assert _match_dev_locator(task, dev).selector == "#btn"
+
+
+def test_match_dev_locator_intent_fallback():
+    dev = {"OTHER": DevLocator(constant_name="OTHER", selector="#btn", intent="click button")}
+    task = _LocatorTask(constant_name="MY_BUTTON", intent="Click Button", owning_page="Home")
+    hit = _match_dev_locator(task, dev)
+    assert hit is not None
+    assert hit.selector == "#btn"
+
+
+def test_match_dev_locator_no_match():
+    dev = {"OTHER": DevLocator(constant_name="OTHER", selector="#btn", intent="submit form")}
+    task = _LocatorTask(constant_name="MY_BUTTON", intent="click button", owning_page="Home")
+    assert _match_dev_locator(task, dev) is None
+
+
+def test_match_dev_locator_empty():
+    task = _LocatorTask(constant_name="MY_BUTTON", intent="click", owning_page="Home")
+    assert _match_dev_locator(task, {}) is None
+    assert _match_dev_locator(task, None) is None
+
+
+# ---------------------------------------------------------------------------
+# Instance-attribute placement detection
+# ---------------------------------------------------------------------------
+
+
+_LOCATORS_WITH_INIT = '''\
+class ChatPageLocators:
+    DEFAULT_X = "[data-testid='x']"
+
+    def __init__(self):
+        self.PROMPT_FIELD = "[data-testid='PromptInput']"
+        self.SEND_BUTTON = "[data-testid='Submit']"
+
+    def reset(self):
+        self.__init__()
+'''.strip().splitlines()
+
+
+_LOCATORS_CLASS_LEVEL = '''\
+class LoginLocators:
+    LOGIN_BUTTON = "#login"
+    PASSWORD_INPUT = "#password"
+'''.strip().splitlines()
+
+
+def test_detect_init_placement_with_self_attrs():
+    use_self, indent, idx = _detect_init_placement(_LOCATORS_WITH_INIT)
+    assert use_self is True
+    assert indent == "        "
+    assert idx > 0
+
+
+def test_detect_init_placement_class_level():
+    use_self, indent, idx = _detect_init_placement(_LOCATORS_CLASS_LEVEL)
+    assert use_self is False
+
+
+# ---------------------------------------------------------------------------
+# _write_tbd_locators with dev-locators + instance placement
+# ---------------------------------------------------------------------------
+
+
+def test_write_tbd_locators_dev_match(tmp_path: Path):
+    loc_file = tmp_path / "locators.py"
+    loc_file.write_text(
+        'class Loc:\n    EXISTING = "#e"\n',
+        encoding="utf-8",
+    )
+    dev = {"NEW_BTN": DevLocator(constant_name="NEW_BTN", selector="[data-testid='btn']")}
+    tasks = [_LocatorTask(
+        constant_name="NEW_BTN",
+        intent="new button",
+        owning_page="Page",
+        locator_file=str(loc_file.relative_to(tmp_path)),
+    )]
+    count = _write_tbd_locators(tasks, tmp_path, "python", dev_locators=dev)
+    assert count == 1
+    content = loc_file.read_text(encoding="utf-8")
+    assert "[data-testid='btn']" in content
+    assert "tbd(" not in content
+
+
+def test_write_tbd_locators_no_dev_match(tmp_path: Path):
+    loc_file = tmp_path / "locators.py"
+    loc_file.write_text(
+        'class Loc:\n    EXISTING = "#e"\n',
+        encoding="utf-8",
+    )
+    tasks = [_LocatorTask(
+        constant_name="NEW_BTN",
+        intent="new button",
+        owning_page="Page",
+        locator_file=str(loc_file.relative_to(tmp_path)),
+    )]
+    count = _write_tbd_locators(tasks, tmp_path, "python", dev_locators={})
+    assert count == 1
+    content = loc_file.read_text(encoding="utf-8")
+    assert 'tbd("new button")' in content
+
+
+def test_write_tbd_locators_instance_placement(tmp_path: Path):
+    loc_file = tmp_path / "locators.py"
+    loc_file.write_text(
+        'from tests.worca_t_runtime import tbd\n'
+        '\n'
+        'class ChatLocators:\n'
+        '    def __init__(self):\n'
+        '        self.FIELD_A = "[data-testid=\'a\']"\n'
+        '        self.FIELD_B = "[data-testid=\'b\']"\n'
+        '\n'
+        '    def reset(self):\n'
+        '        self.__init__()\n',
+        encoding="utf-8",
+    )
+    tasks = [_LocatorTask(
+        constant_name="NEW_FIELD",
+        intent="new input field",
+        owning_page="Chat",
+        locator_file=str(loc_file.relative_to(tmp_path)),
+    )]
+    count = _write_tbd_locators(tasks, tmp_path, "python")
+    assert count == 1
+    content = loc_file.read_text(encoding="utf-8")
+    assert 'self.NEW_FIELD = tbd("new input field")' in content
+    for line in content.splitlines():
+        if "NEW_FIELD" in line:
+            assert "self." in line, f"must use self. prefix: {line}"
+            break
+
+
+# ---------------------------------------------------------------------------
+# _filter_index_to_worca with include parameter
+# ---------------------------------------------------------------------------
+
+
+def test_filter_index_include_non_worca(tmp_path: Path):
+    from worca_t.test_indexer import IndexResult, SupportFileEntry, TBDMarker
+
+    idx = IndexResult(
+        framework="pytest",
+        test_root=str(tmp_path),
+        files=["worca_test.py", "chat_page_locators.py"],
+        tests=[],
+        violations=[],
+        support_files=[
+            SupportFileEntry(
+                name="chat_page_locators",
+                file="chat_page_locators.py",
+                kind="locators",
+                tbd_markers=[TBDMarker(line=10, raw="tbd(x)", context="...", description="x")],
+            ),
+        ],
+    )
+    # Without include: non-worca support file is dropped
+    filtered = _filter_index_to_worca(idx, tmp_path)
+    assert len(filtered.support_files) == 0
+    assert len(filtered.files) == 1
+
+    # With include: non-worca support file is kept
+    inc = {(tmp_path / "chat_page_locators.py").resolve()}
+    filtered2 = _filter_index_to_worca(idx, tmp_path, include=inc)
+    assert len(filtered2.support_files) == 1
+    assert len(filtered2.files) == 2
+
+
+# ---------------------------------------------------------------------------
+# Framework ↔ test-command consistency check (Change 2)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_test_command_head_strips_wrappers():
+    assert _parse_test_command_head("uv run pytest -x") == "pytest"
+    assert _parse_test_command_head("poetry run pytest tests/") == "pytest"
+    assert _parse_test_command_head("npx playwright test") == "playwright test"
+    assert _parse_test_command_head("npm run test") is None  # `test` script name; cannot classify
+    assert _parse_test_command_head("./mvnw test") == "mvnw"
+    assert _parse_test_command_head("./gradlew test") == "gradlew"
+    assert _parse_test_command_head("mvn test") == "mvn"
+    assert _parse_test_command_head("robot tests/") == "robot"
+    assert _parse_test_command_head("cypress run --headless") == "cypress run"
+    assert _parse_test_command_head("") is None
+    assert _parse_test_command_head(None) is None
+
+
+def test_framework_mismatch_message_consistent():
+    assert _framework_mismatch_message("pytest", "pytest") is None
+    assert _framework_mismatch_message("playwright-py", "pytest") is None
+    assert _framework_mismatch_message("playwright-ts", "playwright test") is None
+    assert _framework_mismatch_message("selenium-java", "mvn") is None
+
+
+def test_framework_mismatch_message_skips_when_unverifiable():
+    assert _framework_mismatch_message(None, "pytest") is None
+    assert _framework_mismatch_message("pytest", None) is None
+    # Unknown command head → skip (no false positive).
+    assert _framework_mismatch_message("pytest", "make") is None
+
+
+def test_framework_mismatch_message_detects_obvious_misdetection():
+    msg = _framework_mismatch_message("pytest", "playwright test")
+    assert msg is not None
+    assert "pytest" in msg and "playwright test" in msg
+    msg2 = _framework_mismatch_message("playwright-ts", "robot")
+    assert msg2 is not None
+
+
+async def test_step08_fails_fast_on_framework_mismatch(tmp_path: Path):
+    """Integration: when research.json says detected_stack=pytest but
+    commands.test runs `playwright test`, Step 8 must abort in pre-flight
+    rather than vendor the wrong runtime."""
+    ctx = _ctx(tmp_path, detected_stack="pytest")
+    # Overwrite research.json with a deliberately inconsistent command.
+    (ctx.workspace.step_dir(6) / "research.json").write_text(
+        json.dumps({
+            "title": "r", "sections": [], "detected_stack": "pytest",
+            "commands": {"test": "npx playwright test"},
+        }),
+        encoding="utf-8",
+    )
+
+    result = await CodegenStep().run(ctx)
+    assert not result.success
+    err = result.error or ""
+    assert "detected_stack" in err
+    assert "playwright test" in err or "playwright-ts" in err

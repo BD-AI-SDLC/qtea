@@ -44,6 +44,19 @@
             "minimum": 0,
             "maximum": 1
           },
+          "payload": {
+            "type": ["object", "null"],
+            "description": "Structured locator payload for role/text/label/placeholder/test_id strategies. When set, the runtime calls page.get_by_role(...) at action time; TBD promotion writes a role_locator(...) / text_locator(...) call into source. Null for CSS-string selectors (back-compat with pre-payload cache entries on disk). Validated by worca_t.jit_resolver.validate_selector_payload."
+          },
+          "passing_witnesses": {
+            "type": "array",
+            "description": "Pytest nodeids of tests that USED this resolution AND subsequently PASSED. TBD promotion requires at least one entry — a selector that has only been exercised by failing tests is never frozen into source. Populated by the runtime's pytest_runtest_logreport hook.",
+            "items": { "type": "string" }
+          },
+          "quarantined": {
+            "type": "boolean",
+            "description": "True when this dev-pool entry was used and then failed at action time. The original key is kept (dev-pool selector preserved); the LLM fallback is stored under `_shadow:<key>`. A dev-locator-drifted bug-candidate is emitted at Step 9 end."
+          },
           "candidates": {
             "type": "array",
             "description": "Ranked selector candidates from the LLM resolver (Tier 4). Index 0 mirrors the top-level selector/strategy/confidence. Index 1 is a fallback the retry proxy tries on TimeoutError before invalidating the cache. Absent for non-agent sources (dev/cached/heuristic/hitl/unresolvable).",

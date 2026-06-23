@@ -16,11 +16,13 @@ from worca_t.steps.s09_execute import (
     _attempt_state_path,
     _build_bug_candidates,
     _build_fixer_prompt,
+    _classify_failure,
     _compute_install_sig,
     _count_xpath_markers,
     _filter_command_for_tests,
     _lazy_probe_heal_mcp,
     _load_attempt_state,
+    _partition_failures,
     _patch_introduces_xpath,
     _run_dep_install,
     _save_attempt_state,
@@ -1421,3 +1423,188 @@ def test_install_sig_returns_none_when_profile_is_none(tmp_path):
     signature is None → install logic falls through naturally."""
     (tmp_path / "poetry.lock").write_text("x\n", encoding="utf-8")
     assert _compute_install_sig(tmp_path, None) is None
+
+
+# ---------------------------------------------------------------------------
+# Failure classifier (`_classify_failure` / `_partition_failures`)
+#
+# Test data lifted verbatim from run 20260621-213751-ee0fef
+# (`artifacts/step09/run-results.json`) so the classifier is anchored on
+# real Playwright + pytest output, not synthetic strings.
+# ---------------------------------------------------------------------------
+
+
+def _mk_entry(*, id_: str = "T-x", message: str = "", traceback: str = ""):
+    return TestRunEntry(
+        id=id_, name=id_.lstrip("T-"), file="t.py",
+        status="failed", message=message, traceback=traceback,
+    )
+
+
+def test_classify_locator_timeout_playwright_module_path():
+    """The canonical Playwright TimeoutError on Locator.get_attribute —
+    the exact shape that caused 4+ failures in run 20260621-213751-ee0fef."""
+    entry = _mk_entry(
+        message=(
+            "playwright._impl._errors.TimeoutError: Locator.get_attribute: "
+            "Timeout 60000ms exceeded.\nCall log:\n  - waiting for "
+            "locator(\"a[href*='vertexaisearch'] img\")"
+        ),
+    )
+    assert _classify_failure(entry) == "locator_timeout"
+
+
+def test_classify_locator_timeout_click():
+    entry = _mk_entry(
+        message="playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceeded.",
+    )
+    assert _classify_failure(entry) == "locator_timeout"
+
+
+def test_classify_locator_timeout_waiting_for_event():
+    """Timeout waiting for a page event (e.g. new tab on click). Different
+    surface form — no `Locator.` prefix — but still locator/interaction
+    driven and curable by heal."""
+    entry = _mk_entry(
+        message='Timeout 30000ms exceeded while waiting for event "page"',
+    )
+    assert _classify_failure(entry) == "locator_timeout"
+
+
+def test_classify_tbd_unresolvable():
+    """JIT runtime gave up after bundle exhaustion + LLM re-resolve.
+    Real example: tooltip-on-hover (not visible in initial AOM)."""
+    entry = _mk_entry(
+        message=(
+            "Failed: worca-t JIT runtime: could not resolve locator "
+            "'tooltip element shown on hover over Gemini Enterprise button'."
+        ),
+    )
+    assert _classify_failure(entry) == "tbd_unresolvable"
+
+
+def test_classify_fixture_missing():
+    entry = _mk_entry(
+        message="fixture 'snapshot' not found",
+    )
+    assert _classify_failure(entry) == "fixture_missing"
+
+
+def test_classify_import_error():
+    entry = _mk_entry(message="ModuleNotFoundError: No module named 'dotenv'")
+    assert _classify_failure(entry) == "import_error"
+
+
+def test_classify_wcag_violation():
+    entry = _mk_entry(
+        message=(
+            "AssertionError: Expected zero WCAG 2.1 AA violations, got 4: "
+            "['button-name', 'color-contrast', 'link-name', 'select-name']"
+        ),
+    )
+    assert _classify_failure(entry) == "wcag_violation"
+
+
+def test_classify_tti_budget():
+    entry = _mk_entry(
+        message="AssertionError: p95 TTI 330.6ms exceeds budget of 50ms",
+    )
+    assert _classify_failure(entry) == "tti_budget"
+
+
+def test_classify_dom_order():
+    entry = _mk_entry(
+        message=(
+            "AssertionError: Gemini button should appear before New Chat "
+            "in DOM order\nassert False is True"
+        ),
+    )
+    assert _classify_failure(entry) == "dom_order"
+
+
+def test_classify_assertion_value_falls_through_to_healable():
+    """Bare AssertionError without a real-bug signature — typically a
+    downstream symptom of locator drift (wrong element → wrong value).
+    Treated as healable so re-targeting the locator can fix it."""
+    entry = _mk_entry(message="AssertionError: assert None == 'noopener noreferrer'")
+    assert _classify_failure(entry) == "assertion_value"
+
+
+def test_classify_unknown_when_no_message():
+    """Defaults to ``unknown`` (which the partition treats as healable)
+    so a classifier gap never loses a fix opportunity."""
+    assert _classify_failure(_mk_entry()) == "unknown"
+
+
+def test_classify_unknown_when_no_pattern_matches():
+    entry = _mk_entry(message="some weird non-pytest-shaped output")
+    assert _classify_failure(entry) == "unknown"
+
+
+def test_classify_tti_pattern_does_not_match_settings_word():
+    """Regression: an earlier classifier matched `TTI` inside `seTTIngs`
+    in AOM dumps, falsely categorizing locator-timeout failures as
+    `tti_budget`. Word boundary requirement prevents this."""
+    entry = _mk_entry(
+        message=(
+            "AssertionError: Locator expected to be visible\n"
+            'Actual value: - button "Settings"\n- link "Go to Gemini Enterprise"\n'
+        ),
+    )
+    # Should classify as assertion_value (healable), not tti_budget.
+    assert _classify_failure(entry) == "assertion_value"
+
+
+def test_partition_splits_healable_from_real_bugs():
+    """The full 11-failure decomposition from run 20260621-213751-ee0fef
+    — 7 healable + 3 real bugs + 1 codegen bug (fixture_missing → real)."""
+    failing = [
+        _mk_entry(id_="T-1", message="playwright._impl._errors.TimeoutError: Locator.get_attribute: Timeout 60000ms exceeded."),
+        _mk_entry(id_="T-2", message="AssertionError: assert None == 'noopener noreferrer'"),
+        _mk_entry(id_="T-3", message="fixture 'snapshot' not found"),
+        _mk_entry(id_="T-4", message="playwright._impl._errors.TimeoutError: Locator.select_option: Timeout 60000ms exceeded."),
+        _mk_entry(id_="T-5", message="AssertionError: Locator expected to be visible"),
+        _mk_entry(id_="T-6", message="Failed: worca-t JIT runtime: could not resolve locator 'tooltip ...'"),
+        _mk_entry(id_="T-7", message="playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceeded."),
+        _mk_entry(id_="T-8", message="playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceeded."),
+        _mk_entry(id_="T-9", message="AssertionError: Expected zero WCAG 2.1 AA violations, got 4"),
+        _mk_entry(id_="T-10", message='Timeout 30000ms exceeded while waiting for event "page"'),
+        _mk_entry(id_="T-11", message="AssertionError: p95 TTI 330.6ms exceeds budget of 50ms"),
+        _mk_entry(id_="T-12", message="AssertionError: Gemini button should appear before New Chat in DOM order"),
+    ]
+    healable, real_bugs = _partition_failures(failing)
+    # Use sets so the assertion isn't sensitive to lexicographic ordering
+    # (e.g. "T-10" < "T-2" by string compare). The classifier itself
+    # doesn't promise order; the partition just preserves input order.
+    healable_ids = {e.id for e in healable}
+    real_bug_ids = {e.id for e, _ in real_bugs}
+    # 7 locator/timeout + assertion-value + tbd_unresolvable → healable
+    assert healable_ids == {"T-1", "T-2", "T-4", "T-5", "T-6", "T-7", "T-8", "T-10"}
+    # fixture-missing + WCAG + TTI + dom-order → real bugs
+    assert real_bug_ids == {"T-3", "T-9", "T-11", "T-12"}
+    # Each real-bug row carries its classifier label for the heal-log audit.
+    by_id = dict((e.id, cls) for e, cls in real_bugs)
+    assert by_id["T-3"] == "fixture_missing"
+    assert by_id["T-9"] == "wcag_violation"
+    assert by_id["T-11"] == "tti_budget"
+    assert by_id["T-12"] == "dom_order"
+
+
+def test_partition_heal_all_escape_hatch_skips_classifier(monkeypatch):
+    """WORCA_T_HEAL_ALL=1 short-circuits the classifier so the operator
+    can debug heal coverage when the classifier is suspected of false
+    exclusion."""
+    monkeypatch.setenv("WORCA_T_HEAL_ALL", "1")
+    failing = [
+        _mk_entry(id_="T-wcag", message="AssertionError: Expected zero WCAG 2.1 AA violations"),
+        _mk_entry(id_="T-tti", message="AssertionError: p95 TTI exceeds budget of 50ms"),
+    ]
+    healable, real_bugs = _partition_failures(failing)
+    assert [e.id for e in healable] == ["T-wcag", "T-tti"]
+    assert real_bugs == []
+
+
+def test_partition_empty_input_returns_empty_lists():
+    healable, real_bugs = _partition_failures([])
+    assert healable == []
+    assert real_bugs == []

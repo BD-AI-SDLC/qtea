@@ -177,6 +177,32 @@ def _reset_steps_from(state: RunState, from_step: int) -> None:
     state.finished_at = None
 
 
+def _kill_allure_for_workspace(ws: Workspace) -> None:
+    """Kill any allure server process whose command line references this workspace.
+
+    ``allure open`` spawns a detached Java/Jetty server that holds
+    ``allure-open.log`` open via stderr. On Windows the open file handle
+    blocks ``shutil.rmtree`` — we must terminate the process first.
+    The process may be named ``allure``, ``java``, or ``javaw`` depending
+    on the platform and allure distribution.
+    """
+    import psutil
+
+    ws_str = str(ws.root)
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            cmdline = proc.info.get("cmdline") or []
+            cmd_joined = " ".join(cmdline)
+            if "allure" not in cmd_joined:
+                continue
+            if ws_str in cmd_joined:
+                proc.terminate()
+                proc.wait(timeout=5)
+                _log.info("cleanup.allure_killed", pid=proc.pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+            pass
+
+
 def _cleanup_step_artifacts(ws: Workspace, from_step: int, console: Console | None = None) -> None:
     """Delete step-specific directories from from_step onward to ensure clean state.
 
@@ -250,6 +276,9 @@ def _cleanup_step_artifacts(ws: Workspace, from_step: int, console: Console | No
     if response not in ("", "y", "yes"):
         console.print("[yellow]cleanup:[/] cancelled by user")
         return
+
+    # Kill any allure server holding files open in this workspace.
+    _kill_allure_for_workspace(ws)
 
     # Perform cleanup
     deleted_count = 0
@@ -692,6 +721,12 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
             if record is not None:
                 console.print(f"   {_format_step_metrics_line(record)}")
             exit_code = 1
+            # Step 9 failures still have test results worth reporting.
+            # Let steps 10 (bug classification) and 11 (allure report)
+            # run so the operator gets a full report with findings.
+            if step_num == 9:
+                _after_step_status = True
+                continue
             break
 
         if step_num == 4 and not await review_step_4_strategy(ctx, result, console):

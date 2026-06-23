@@ -66,11 +66,19 @@ from worca_t.test_runner import (
 
 log = get_logger(__name__)
 
-# Cap on number of failing tests we'll attempt to self-heal in a single step run.
-_MAX_HEAL_TESTS = int(os.environ.get("WORCA_T_MAX_HEAL", "5"))
+# Cap on number of HEALABLE failing tests we'll attempt to self-heal in a
+# single step run. The cap exists as runaway-cost protection: each heal
+# invocation spawns a Playwright MCP browser and burns LLM tokens
+# (~$0.10-0.50 per heal). The default was 5 historically; bumped to 15 so
+# typical small suites (10-15 tests) where the LLM resolver hit a hard UI
+# (DSSF-style synthetic CSS classes, hover-only elements) fit inside the
+# cap. Tests are pre-filtered by ``_partition_failures`` so this counts
+# only locator/timeout class failures; WCAG / TTI / fixture-missing rows
+# are excluded from heal entirely and do NOT count against the cap.
+_MAX_HEAL_TESTS = int(os.environ.get("WORCA_T_MAX_HEAL", "15"))
 
 # Pytest -m selector that scopes Step 9 to ONLY the worca-t generated tests.
-# The codegen agent (`ui-test-automation.agent.md` rule 8) applies one of these
+# The codegen agent (`codegen-violation-fixer.agent.md` rule 8) applies one of these
 # markers to every generated test based on the planning phase. The vendored
 # `tests/worca_t_runtime.py` plugin registers them via `pytest_configure` so
 # strict-markers runs don't fail. Keep this list in sync with the agent prompt
@@ -184,6 +192,62 @@ def _patch_modifies_assertions(pre: bytes | None, post: bytes | None) -> bool:
     pre_counts = Counter(pre_assertions)
     post_counts = Counter(post_assertions)
     return any(post_counts.get(assertion, 0) < count for assertion, count in pre_counts.items())
+
+
+# ---------------------------------------------------------------------------
+# Anti-pattern gate — rejects heals that introduce exception-swallowing
+# ---------------------------------------------------------------------------
+
+_EMPTY_HANDLER_PATTERNS: tuple[_re_module.Pattern, ...] = (
+    # Python: except ...: pass / except: pass (single or multi-line)
+    _re_module.compile(
+        r"except\b[^:]*:\s*(?:#[^\n]*)?\n\s*pass\b",
+        _re_module.MULTILINE,
+    ),
+    # JS/TS: catch (...) { } or catch { } with empty/whitespace-only body
+    _re_module.compile(
+        r"catch\s*(?:\([^)]*\))?\s*\{\s*\}",
+    ),
+    # Java/C#: catch (...) { } with empty/whitespace-only body
+    _re_module.compile(
+        r"catch\s*\([^)]+\)\s*\{\s*\}",
+    ),
+)
+
+
+def _count_empty_handlers(source: str) -> int:
+    """Count exception handlers with empty/no-op bodies across stacks."""
+    return sum(len(p.findall(source)) for p in _EMPTY_HANDLER_PATTERNS)
+
+
+def _patch_has_anti_patterns(pre: bytes | None, post: bytes | None) -> list[str]:
+    """Return a list of anti-pattern violations INTRODUCED by the heal.
+
+    Only flags patterns that are NEW (post count > pre count) so
+    pre-existing SUT code doesn't trigger false positives.
+    Returns an empty list when clean."""
+    if post is None:
+        return []
+    try:
+        post_src = post.decode("utf-8", errors="replace")
+    except Exception:
+        return []
+    post_count = _count_empty_handlers(post_src)
+    if post_count == 0:
+        return []
+    pre_count = 0
+    if pre is not None:
+        try:
+            pre_src = pre.decode("utf-8", errors="replace")
+            pre_count = _count_empty_handlers(pre_src)
+        except Exception:
+            pass
+    if post_count > pre_count:
+        return [
+            f"exception swallowing: {post_count - pre_count} new empty "
+            f"exception handler(s) (except/catch with no-op body)"
+        ]
+    return []
 
 
 # File-shape predicates that heal is forbidden to touch. Mirrors the
@@ -1012,6 +1076,154 @@ def _prewarm_jit_cache_dev_pool(
     )
 
 
+# ---------------------------------------------------------------------------
+# Failure classification (used by the heal-gate to skip un-healable rows)
+# ---------------------------------------------------------------------------
+#
+# Run 20260621-213751-ee0fef hit the canonical recurring failure: 11/13 tests
+# failed, the heal-skip cap (`len(failing) > _MAX_HEAL_TESTS`) blocked the
+# entire heal flow, and TBD-promotion stayed blocked on `no_passing_witness`
+# — so the user saw 11 mixed failures with no recovery path. Decomposition
+# of the 11:
+#   - 7 locator/timeout issues (Playwright TimeoutError, action-mediated
+#     assertion-on-None) — heal can fix these via live MCP browser inspection
+#   - 3 real bugs (WCAG violations, TTI budget, DOM-order assertion) — heal
+#     cannot fix these; they are app-behaviour defects
+#   - 1 codegen bug (`fixture 'snapshot' not found`) — needs Step 8 retry,
+#     not heal
+#
+# The classifier below splits a `TestRunEntry` into one of:
+#   - locator_timeout    — Playwright TimeoutError on locator action
+#   - tbd_unresolvable   — JIT runtime exhausted bundle + LLM and gave up
+#   - assertion_value    — bare assertion mismatch (e.g. `assert None == 'x'`,
+#                          typically downstream of a locator finding the wrong
+#                          element); treated as healable because the cause is
+#                          usually upstream locator drift
+#   - wcag_violation     — axe-core / WCAG audit reported issues
+#   - tti_budget         — performance budget assertion
+#   - fixture_missing    — pytest fixture lookup failure (codegen drift)
+#   - import_error       — ModuleNotFoundError / ImportError at collection
+#   - dom_order          — order-sensitive DOM assertion (e.g. `is_above is True`)
+#   - unknown            — defaults to healable so we never lose a fix
+#                          opportunity to a classifier gap
+#
+# The classifier is a PURE FUNCTION over `entry.message` + `entry.traceback`
+# strings. No side effects, easy to unit-test. Anything classified as
+# locator_timeout / tbd_unresolvable / assertion_value / unknown counts
+# toward the heal queue; everything else flows directly to bug-candidates
+# as a "real bug" without consuming heal budget.
+#
+# Operator escape: set `WORCA_T_HEAL_ALL=1` to bypass the classifier and
+# heal every failure (useful for debugging the classifier itself).
+
+_FAILURE_CLASS_HEALABLE = frozenset({
+    "locator_timeout", "tbd_unresolvable", "assertion_value", "unknown",
+})
+
+_CLASSIFY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    # JIT runtime fail-fast — the bundle was exhausted, LLM re-resolve gave
+    # up. Heal with MCP can interact (hover/click) then snapshot to find the
+    # right selector for elements not visible in initial AOM.
+    ("tbd_unresolvable", re.compile(
+        r"worca-t JIT runtime: could not resolve locator", re.I,
+    )),
+    # Playwright TimeoutError on any Locator action (get_attribute, click,
+    # select_option, etc.). The runtime template's bundle-fallback already
+    # tried alternatives + re-resolved; reaching this stage means we need
+    # MCP-driven live inspection.
+    ("locator_timeout", re.compile(
+        r"playwright[\._]+_impl[\._]+_errors\.TimeoutError"
+        r"|TimeoutError:\s*Locator\.",
+        re.I,
+    )),
+    ("locator_timeout", re.compile(
+        r"Timeout\s+\d+ms\s+exceeded.*while\s+waiting", re.I,
+    )),
+    # Pytest fixture lookup failure — codegen referenced a fixture that
+    # isn't available (e.g. pytest-snapshot not installed). Heal cannot
+    # fix this; needs a Step 8 codegen retry with a corrected test.
+    ("fixture_missing", re.compile(
+        r"fixture '[^']+' not found|fixture \".+?\" not found", re.I,
+    )),
+    # Import errors at collection time. Heal scope forbids touching
+    # imports / fixtures / conftest. Word boundaries guard against false
+    # positives in AOM snapshots that might quote module names verbatim.
+    ("import_error", re.compile(
+        r"\bModuleNotFoundError\b|\bImportError\b|\bNo module named\b", re.I,
+    )),
+    # WCAG / accessibility audit. axe-core results are app behaviour;
+    # rewriting the test won't change the violation count.
+    ("wcag_violation", re.compile(
+        r"WCAG\s*[\d\.]+|wcag\d|axe-core|accessibility violation",
+        re.I,
+    )),
+    # Performance budget. A heal pass can't make the SUT faster.
+    # `\bTTI\b` requires word boundaries — bare `TTI` matched inside
+    # words like "settings" (seTTIngs) and false-flagged any test whose
+    # AOM dump contained UI text with that substring.
+    ("tti_budget", re.compile(
+        r"\bTTI\b|exceeds budget of \d+ms|p9[05] (?:latency|tti|response)",
+        re.I,
+    )),
+    # Order-sensitive DOM assertion (typically `is_above`, `is_before`).
+    # These are app-behaviour assertions — heal cannot reorder the DOM.
+    ("dom_order", re.compile(
+        r"(?:appear\s+(?:before|above)|DOM\s+order|is_above|is_before)",
+        re.I,
+    )),
+    # Bare assertion mismatch — usually a downstream symptom of locator
+    # drift (wrong element found → wrong value). Treat as healable: if
+    # heal can re-target the locator, the assertion will pass.
+    ("assertion_value", re.compile(
+        r"^\s*AssertionError|assert\s+\S+\s*(?:==|is|!=)",
+        re.I | re.MULTILINE,
+    )),
+)
+
+
+def _classify_failure(entry: TestRunEntry) -> str:
+    """Return one of the classes above based on entry.message + entry.traceback.
+
+    First matching pattern wins. Order matters — more-specific patterns
+    (e.g. `worca-t JIT runtime`) come before more-general ones (e.g. bare
+    AssertionError). Returns ``"unknown"`` when nothing matches; the heal
+    gate treats unknown as healable so a classifier gap never blocks a
+    fix opportunity.
+    """
+    haystack = "\n".join(filter(None, (entry.message, entry.traceback)))
+    if not haystack:
+        return "unknown"
+    for label, pat in _CLASSIFY_PATTERNS:
+        if pat.search(haystack):
+            return label
+    return "unknown"
+
+
+def _partition_failures(
+    failing: list[TestRunEntry],
+) -> tuple[list[TestRunEntry], list[tuple[TestRunEntry, str]]]:
+    """Split ``failing`` into (healable, real_bugs).
+
+    ``real_bugs`` carries (entry, class_label) so the caller can record
+    the rationale in heal-log.jsonl without re-classifying.
+
+    Operator escape: ``WORCA_T_HEAL_ALL=1`` returns ``(failing, [])`` —
+    skips classification and heals everything. Use when the classifier
+    itself is suspected of false-positively excluding a real heal target.
+    """
+    if os.environ.get("WORCA_T_HEAL_ALL") == "1":
+        return list(failing), []
+    healable: list[TestRunEntry] = []
+    real_bugs: list[tuple[TestRunEntry, str]] = []
+    for entry in failing:
+        cls = _classify_failure(entry)
+        if cls in _FAILURE_CLASS_HEALABLE:
+            healable.append(entry)
+        else:
+            real_bugs.append((entry, cls))
+    return healable, real_bugs
+
+
 def _build_bug_candidates(failing: list[TestRunEntry]) -> dict:
     now = datetime.now(UTC).isoformat()
     out = {"candidates": []}
@@ -1230,32 +1442,176 @@ def _append_resolved_to_dev_locators(
         log.warning("step09.hitl_dev_locators_write_failed", error=str(e))
 
 
-def _promote_resolved_tbds(sut_root: Path, cache_path: Path) -> list[str]:
-    """Replace tbd("intent") sentinels with their resolved selectors in-place.
+def _format_promoted_substitution(payload: dict | None, selector: str | None) -> str | None:
+    """Render a cache entry as the Python expression to substitute for `tbd(...)`.
 
-    Reads locator-cache.json, scans the SUT source tree for remaining tbd()
-    patterns, and replaces any whose intent has a cached selector.  Returns
-    SUT-relative paths of files that were modified.
+    Returns the substitution string (a `json.dumps`'d CSS string OR a call
+    like `role_locator("link", name="...")`), or None when the entry has no
+    representable form. None means "leave the tbd() in place" — the caller
+    emits a promotion-blocked bug-candidate.
+
+    For structured payloads, we emit calls to the runtime helpers
+    (`role_locator`, `text_locator`, …) defined in
+    ``src/worca_t/_resources/runtime/worca_t_runtime.py.tpl``. The
+    codegen-pom-extender ensures the runtime import is already present in
+    the POM file (`from tests.worca_t_runtime import tbd`); the new
+    helpers live in the same module, so we may need to extend that import.
+    """
+    if isinstance(payload, dict):
+        kind = payload.get("kind")
+        if kind == "css":
+            sel = payload.get("selector") or selector
+            if not sel:
+                return None
+            return json.dumps(sel)
+        if kind == "role":
+            role = payload.get("role")
+            if not role:
+                return None
+            parts = [f"role_locator({json.dumps(role)}"]
+            if payload.get("name"):
+                parts.append(f", name={json.dumps(payload['name'])}")
+            if payload.get("exact") is True:
+                parts.append(", exact=True")
+            parts.append(")")
+            return "".join(parts)
+        if kind in ("text", "label", "placeholder"):
+            text = payload.get("text")
+            if not text:
+                return None
+            fn = f"{kind}_locator"
+            parts = [f"{fn}({json.dumps(text)}"]
+            if payload.get("exact") is True:
+                parts.append(", exact=True")
+            parts.append(")")
+            return "".join(parts)
+        if kind == "test_id":
+            value = payload.get("value")
+            if not value:
+                return None
+            return f"test_id_locator({json.dumps(value)})"
+        return None
+    # No payload — fall back to the legacy CSS-string path.
+    if not selector:
+        return None
+    return json.dumps(selector)
+
+
+def _ensure_runtime_imports(text: str, needed_names: set[str]) -> str:
+    """Extend `from tests.worca_t_runtime import …` to include `needed_names`.
+
+    No-op when no such import line exists (caller's POM doesn't follow the
+    convention; promotion still works for CSS-string substitutions because
+    those don't need extra symbols).
     """
     import re as _re
 
-    from worca_t.jit_resolver import is_unsafe_selector
+    if not needed_names:
+        return text
+    pat = _re.compile(
+        r"^(from\s+tests\.worca_t_runtime\s+import\s+)([^\n]+)$",
+        _re.MULTILINE,
+    )
+    m = pat.search(text)
+    if not m:
+        return text
+    existing = {n.strip() for n in m.group(2).split(",") if n.strip()}
+    missing = needed_names - existing
+    if not missing:
+        return text
+    new_imports = ", ".join(sorted(existing | needed_names))
+    return text[:m.start()] + m.group(1) + new_imports + text[m.end():]
+
+
+def _promote_resolved_tbds(
+    sut_root: Path, cache_path: Path,
+) -> tuple[list[str], list[dict]]:
+    """Replace tbd("intent") sentinels with their resolved selectors in-place.
+
+    Returns ``(modified_files, blocked_candidates)``:
+      - ``modified_files`` — SUT-relative paths of files actually rewritten.
+      - ``blocked_candidates`` — bug-candidate dicts for entries the promoter
+        REFUSED to substitute (no passing witness OR fails validation OR
+        unrepresentable payload). The caller appends these to bug-candidates.json.
+
+    Gating (the safety net added after the run-20260621 regression):
+      1. ``passing_witnesses`` must be non-empty — the selector has been used
+         by at least one test that PASSED in this attempt. Selectors that
+         only failing tests touched never reach SUT source.
+      2. ``validate_selector_payload(payload, selector)`` must return ok —
+         catches Playwright debug-print syntax (`link "..."`), unbalanced
+         brackets, injection markers, and structurally-malformed payloads.
+      3. ``_format_promoted_substitution`` must yield a valid Python
+         expression for the substitution. Structured payloads emit
+         `role_locator(...)` / `text_locator(...)` / etc.; the runtime
+         import line is extended to include the needed helpers.
+    """
+    import re as _re
+
+    from worca_t.jit_resolver import validate_selector_payload
     from worca_t.tbd_scanner import scan_tbd_intents
 
+    blocked: list[dict] = []
     if not cache_path.exists():
-        return []
+        return [], blocked
     try:
         data = json.loads(cache_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
-        return []
+        return [], blocked
 
-    intent_to_selector: dict[str, str] = {
-        e["intent"]: e["selector"]
-        for e in (data.get("entries") or [])
-        if e.get("selector") and e.get("intent") and e.get("source", "none") != "none"
-    }
-    if not intent_to_selector:
-        return []
+    intent_to_entry: dict[str, dict] = {}
+    for e in (data.get("entries") or []):
+        intent = e.get("intent")
+        if not intent:
+            continue
+        if e.get("source", "none") == "none":
+            continue
+        # Gate 1: passing-test witness required. The cache file may carry
+        # entries with no witnesses yet (resolved + used in a failing test);
+        # those stay as tbd() this round but may earn witnesses on a later run.
+        witnesses = e.get("passing_witnesses")
+        if not isinstance(witnesses, list) or not witnesses:
+            blocked.append({
+                "id": f"BC-promotion-blocked-{e.get('constant_name', 'unknown')}",
+                "kind": "promotion-blocked",
+                "reason": "no_passing_witness",
+                "intent": intent,
+                "constant_name": e.get("constant_name"),
+                "cached_selector": e.get("selector"),
+                "cached_payload": e.get("payload"),
+                "remediation": (
+                    "No passing test has used this resolution yet. The "
+                    "selector stays as tbd() so the JIT runtime keeps "
+                    "resolving it. Add a test that exercises it OR fix the "
+                    "test that triggered the resolution."
+                ),
+            })
+            continue
+        # Gate 2: structural validation.
+        payload = e.get("payload") if isinstance(e.get("payload"), dict) else None
+        ok, why = validate_selector_payload(payload, e.get("selector"))
+        if not ok:
+            blocked.append({
+                "id": f"BC-promotion-blocked-{e.get('constant_name', 'unknown')}",
+                "kind": "promotion-blocked",
+                "reason": "invalid_selector_form",
+                "intent": intent,
+                "constant_name": e.get("constant_name"),
+                "cached_selector": e.get("selector"),
+                "cached_payload": payload,
+                "validation_reason": why,
+                "remediation": (
+                    "The cached selector failed validate_selector_payload. "
+                    "Drop the bad cache entry (rm locator-cache.json) and "
+                    "re-run; the resolver will try again with the updated "
+                    "prompt that demands structured payloads."
+                ),
+            })
+            continue
+        intent_to_entry[intent] = e
+
+    if not intent_to_entry:
+        return [], blocked
 
     scan_roots = [p for p in (sut_root / d for d in ("src", "tests", "pages")) if p.is_dir()]
     if not scan_roots:
@@ -1264,40 +1620,127 @@ def _promote_resolved_tbds(sut_root: Path, cache_path: Path) -> list[str]:
 
     by_file: dict[Path, list] = {}
     for hit in hits:
-        if hit.intent in intent_to_selector:
+        if hit.intent in intent_to_entry:
             by_file.setdefault(hit.file, []).append(hit)
+
+    # Map runtime helper kinds to import names — added to the POM's
+    # `from tests.worca_t_runtime import ...` line when the substitution
+    # uses them. CSS / no-payload substitutions don't need any extra imports.
+    _KIND_TO_HELPER = {
+        "role": "role_locator",
+        "text": "text_locator",
+        "label": "label_locator",
+        "placeholder": "placeholder_locator",
+        "test_id": "test_id_locator",
+    }
 
     modified: list[str] = []
     for file_path, file_hits in by_file.items():
-        text = file_path.read_text(encoding="utf-8")
+        abs_path = (sut_root / file_path) if not file_path.is_absolute() else file_path
+        rel_str = str(file_path) if not file_path.is_absolute() else str(file_path.relative_to(sut_root))
+        text = abs_path.read_text(encoding="utf-8")
         new_text = text
+        helper_imports: set[str] = set()
         for hit in file_hits:
-            sel = intent_to_selector[hit.intent]
-            # Defense in depth: re-validate at substitution time. The cache
-            # lives on disk between resolver write and promoter read.
-            if is_unsafe_selector(sel):
-                log.warning(
-                    "step09.tbd_promote_unsafe_selector_skipped",
-                    intent=hit.intent,
-                    file=str(file_path.relative_to(sut_root)),
-                )
+            entry = intent_to_entry[hit.intent]
+            payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else None
+            substitution = _format_promoted_substitution(payload, entry.get("selector"))
+            if substitution is None:
+                blocked.append({
+                    "id": f"BC-promotion-blocked-{entry.get('constant_name', 'unknown')}",
+                    "kind": "promotion-blocked",
+                    "reason": "unrepresentable_payload",
+                    "intent": hit.intent,
+                    "constant_name": entry.get("constant_name"),
+                    "cached_selector": entry.get("selector"),
+                    "cached_payload": payload,
+                    "remediation": "Payload could not be rendered; investigate jit_resolver / cache state.",
+                })
                 continue
+            if isinstance(payload, dict):
+                helper = _KIND_TO_HELPER.get(payload.get("kind"))
+                if helper:
+                    helper_imports.add(helper)
             escaped = _re.escape(hit.intent)
-            # Lambda replacement (not f-string) so backslash sequences in
-            # `sel` are not interpreted as regex backreferences (\1, \g<name>).
-            # `json.dumps` produces a valid double-quoted string literal for
-            # Python / TS / Java with `"` and `\` properly escaped — prevents
-            # quote-break code injection regardless of selector content.
-            replacement = json.dumps(sel)
             new_text = _re.sub(
                 rf'tbd\((?P<q>["\']){escaped}(?P=q)\)',
-                lambda _m, _r=replacement: _r,
+                lambda _m, _r=substitution: _r,
                 new_text,
             )
+        # Add any new helper imports BEFORE writing back.
+        if helper_imports:
+            new_text = _ensure_runtime_imports(new_text, helper_imports)
         if new_text != text:
-            file_path.write_text(new_text, encoding="utf-8")
-            modified.append(str(file_path.relative_to(sut_root)))
-    return modified
+            abs_path.write_text(new_text, encoding="utf-8")
+            modified.append(rel_str)
+    return modified, blocked
+
+
+def _bug_candidates_for_dev_pool_drift(quarantine_log: Path) -> list[dict]:
+    """Read ``dev-pool-quarantine.jsonl`` and emit one bug-candidate per
+    dev-pool selector that failed at action time.
+
+    The JIT runtime writes one JSONL record per quarantine event. Each
+    candidate guides the user to update the dev-locators file OR let
+    worca-t re-resolve fresh (delete the entry from dev-locators.json).
+    """
+    if not quarantine_log.exists():
+        return []
+    try:
+        lines = quarantine_log.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        const = record.get("constant_name") or "unknown"
+        matched = record.get("matched_constant")
+        # Dedupe within a single run: many tests may hit the same drift.
+        key = f"{const}::{matched or ''}::{record.get('intent', '')}"
+        if key in seen:
+            continue
+        seen.add(key)
+        intent = record.get("intent") or ""
+        stale = record.get("stale_selector")
+        out.append({
+            "id": f"BC-dev-locator-drifted-{matched or const}",
+            "test_id": f"dev-locator-drifted:{matched or const}",
+            "title": (
+                f"Dev locator {(matched or const)!r} drifted at runtime"
+            ),
+            "file": record.get("test_file"),
+            "status": "error",
+            "kind": "dev-locator-drifted",
+            "message": (
+                f"Tier 1b dev-pool selector for intent {intent!r} "
+                f"({stale!r}) failed at action time on "
+                f"{record.get('page_url') or '(unknown URL)'}: "
+                f"{record.get('exception') or 'TimeoutError'}. "
+                f"The JIT runtime fell back to the LLM resolver under a "
+                f"shadow cache key; the dev-locators entry was NOT "
+                f"overwritten. Update the selector for "
+                f"{(matched or const)!r} in dev-locators.json, OR remove "
+                f"that entry so worca-t resolves fresh on the next run."
+            ),
+            "traceback": None,
+            "tc_refs": [],
+            "attachments": [],
+            "first_seen": record.get("ts"),
+            "constant_name": const,
+            "matched_constant": matched,
+            "intent": intent,
+            "page_url": record.get("page_url"),
+            "stale_selector": stale,
+            "pool_score": record.get("pool_score"),
+        })
+    return out
 
 
 def _bug_candidates_for_unresolvable_tbds(
@@ -1695,7 +2138,7 @@ class ExecuteStep(Step):
             pw_cmd = wrap_command(stack_profile, "playwright install chromium")
             log.info("step09.playwright_install", command=pw_cmd)
             rc, out, err, _dur = execute_command(
-                pw_cmd, cwd=ctx.workspace.sut, timeout_s=300,
+                pw_cmd, cwd=ctx.workspace.sut, timeout_s=400,
                 isolate_venv=bool(
                     (stack_profile.package_manager or "").lower()
                     in PYTHON_VENV_MANAGERS
@@ -2185,6 +2628,45 @@ class ExecuteStep(Step):
                     path=_storage_state_mod.mask_path(_storage_state_path),
                 )
 
+            # Partition failures by class. Only "healable" rows (locator
+            # timeouts, TBD unresolvable, assertion-on-locator-mediated
+            # values, unknown) enter the heal queue. Real bugs (WCAG, TTI,
+            # fixture-missing, import-error, dom-order) skip heal — they
+            # cannot be fixed by selector or interaction-pattern tweaks
+            # and would just burn LLM + MCP budget. They still surface to
+            # Step 10 via _build_bug_candidates (which derives from
+            # final_failing post-heal, so this partition does not hide
+            # them from the bug-candidates emission).
+            #
+            # Without this partition, run 20260621-213751-ee0fef hit the
+            # canonical recurring failure: 11/13 tests failed → heal-skip
+            # cap blocked the entire heal flow → no recovery → user saw
+            # 11 mixed failures with the cache holding wrong selectors.
+            if failing:
+                healable, real_bugs = _partition_failures(failing)
+                if real_bugs:
+                    _ts = datetime.now(UTC).isoformat()
+                    for entry, cls in real_bugs:
+                        with heal_log_path.open("a", encoding="utf-8") as fh:
+                            fh.write(json.dumps({
+                                "test_id": entry.id,
+                                "file": entry.file,
+                                "applied": False,
+                                "agent_success": False,
+                                "agent_error": (
+                                    f"skipped: classified as {cls!r} "
+                                    f"(real bug — not a heal target)"
+                                ),
+                                "ts": _ts,
+                            }, ensure_ascii=False) + "\n")
+                    log.info(
+                        "step09.heal_skip_real_bugs",
+                        count=len(real_bugs),
+                        classes=sorted({c for _, c in real_bugs}),
+                        healable_remaining=len(healable),
+                    )
+                failing = healable
+
             if failing and len(failing) <= _MAX_HEAL_TESTS:
                 # Lazy Playwright MCP probe — replaces the eager preflight
                 # so green runs skip the 5-15s warmup. We probe ONCE before
@@ -2268,6 +2750,7 @@ class ExecuteStep(Step):
                     "step09.heal_parallel_start",
                     failing_count=len(failing),
                     concurrency=_heal_concurrency,
+                    tests=[e.name for e in failing],
                 )
 
                 async def _do_one_heal(entry):
@@ -2322,6 +2805,12 @@ class ExecuteStep(Step):
                     # ``_heal_sem`` bounds the in-flight LLM calls so the
                     # parallel orchestration doesn't spin up more browser
                     # processes than the host can handle.
+                    log.info(
+                        "step09.heal_start",
+                        test_id=entry.id,
+                        test_name=entry.name,
+                        test_file=entry.file,
+                    )
                     async with _heal_sem:
                         agent_res = await run_agent(
                             fixer_agent,
@@ -2485,6 +2974,37 @@ class ExecuteStep(Step):
                             )
                             applied = False
 
+                    anti_pattern_rejected = False
+                    anti_pattern_violations: list[str] = []
+                    if applied:
+                        post_bytes_ap = (
+                            target_in_sut.read_bytes() if target_in_sut.exists() else None
+                        )
+                        anti_pattern_violations = _patch_has_anti_patterns(
+                            pre_bytes, post_bytes_ap,
+                        )
+                        if anti_pattern_violations:
+                            anti_pattern_rejected = True
+                            try:
+                                if pre_bytes is not None:
+                                    target_in_sut.write_bytes(pre_bytes)
+                                elif target_in_sut.exists():
+                                    target_in_sut.unlink()
+                            except OSError as e:
+                                log.warning(
+                                    "step09.anti_pattern_revert_failed",
+                                    test_id=entry.id,
+                                    file=entry.file,
+                                    error=str(e),
+                                )
+                            log.warning(
+                                "step09.heal_rejected_anti_pattern",
+                                test_id=entry.id,
+                                file=entry.file,
+                                violations=anti_pattern_violations,
+                            )
+                            applied = False
+
                     if applied:
                         patches_applied += 1
                         # Per-test commit so the human reviewer sees exactly which
@@ -2521,6 +3041,11 @@ class ExecuteStep(Step):
                             "rejected: heal modified assertions in generated "
                             "test (Step 9 assertion-immutability gate)"
                         )
+                    elif anti_pattern_rejected:
+                        summary_text = (
+                            f"rejected: heal introduced anti-pattern — "
+                            f"{'; '.join(anti_pattern_violations)}"
+                        )
                     else:
                         summary_text = "no usable patch produced"
                     self_heal_meta[entry.id] = {
@@ -2542,6 +3067,8 @@ class ExecuteStep(Step):
                         heal_entry["rejected"] = "xpath"
                     if assertion_rejected:
                         heal_entry["rejected"] = "assertion_modified"
+                    if anti_pattern_rejected:
+                        heal_entry["rejected"] = "anti_pattern"
                     if scope_violation:
                         heal_entry["rejected"] = "scope_violation"
                         heal_entry["reverted_files"] = scope_reverted
@@ -2691,13 +3218,19 @@ class ExecuteStep(Step):
             # TBD promotion: any tbd("intent") sentinels whose intent now has a
             # cached selector get replaced in-place in the SUT source files and
             # committed, so the code is self-sufficient without the JIT plugin.
-            _promoted = _promote_resolved_tbds(
+            _promoted, _promotion_blocked = _promote_resolved_tbds(
                 ctx.workspace.sut,
                 jit_cache_dir / "locator-cache.json",
             )
             if _promoted:
                 log.info("step09.tbd_promoted", count=len(_promoted), files=_promoted)
                 commit_step(ctx.workspace.sut, 9, self.name, "tbd-promotion")
+            if _promotion_blocked:
+                log.info(
+                    "step09.tbd_promotion_blocked",
+                    count=len(_promotion_blocked),
+                    reasons=sorted({b["reason"] for b in _promotion_blocked}),
+                )
 
             # HITL escalation pass. The JIT runtime drops `hitl-pending-*.json`
             # files in the cache dir whenever it could not resolve a TBD.
@@ -2721,6 +3254,22 @@ class ExecuteStep(Step):
                     hitl_remaining, dev_locators_path=hitl_dev_locators_path,
                 )
             )
+            # Promotion gate emits structured candidates for entries that
+            # had a cached resolution but couldn't be safely frozen into
+            # source (no passing-test witness, malformed selector, or
+            # unrepresentable payload). Surface them so reviewers see what
+            # the JIT runtime is still chewing on between runs.
+            if _promotion_blocked:
+                bug_payload["candidates"].extend(_promotion_blocked)
+            # Dev-pool drift candidates: one per dev-locators entry whose
+            # selector failed at action time this run. The JIT runtime
+            # quarantined them and stored an LLM fallback under a shadow
+            # cache key; the user owns updating the dev file.
+            _drift_candidates = _bug_candidates_for_dev_pool_drift(
+                jit_cache_dir / "dev-pool-quarantine.jsonl",
+            )
+            if _drift_candidates:
+                bug_payload["candidates"].extend(_drift_candidates)
             bug_path = out_dir / "bug-candidates.json"
             bug_path.write_text(
                 json.dumps(bug_payload, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -2831,14 +3380,30 @@ class ExecuteStep(Step):
             if final_failing and not any_passed:
                 first_entry = final_failing[0]
                 msg_snippet = (first_entry.message or "").strip()[:300]
+                error_counts: dict[str, int] = {}
+                for r in first.results:
+                    error_counts[r.status] = error_counts.get(r.status, 0) + 1
+                status_breakdown = ", ".join(
+                    f"{v} {k}" for k, v in sorted(error_counts.items())
+                )
+                setup_failures = [
+                    r for r in first.results
+                    if r.message and "failed on setup" in r.message
+                ]
+                hint = ""
+                if setup_failures:
+                    hint = (
+                        " Likely cause: shared fixture/setup failure blocking "
+                        "all tests — check conftest.py and fixture code."
+                    )
                 return StepResult(
                     success=False,
                     status="failed",
                     outputs=[run_results_path, bug_path],
                     error=(
                         f"all {len(first.results)} test(s) errored with zero "
-                        f"passing — no assertion was evaluated. First error: "
-                        f"{msg_snippet}"
+                        f"passing ({status_breakdown}) — no assertion was "
+                        f"evaluated.{hint} First error: {msg_snippet}"
                     ),
                     notes=notes,
                 )

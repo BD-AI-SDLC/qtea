@@ -363,6 +363,55 @@ def test_dedup_keeps_clarification_when_ac_not_covered_by_any_blocker():
     assert "aria-label" in surviving_clar.prompt_text
 
 
+def test_dedup_merges_clarification_referencing_block_id_style():
+    """Agents follow the table's `BLOCK-001` ID convention when writing
+    inline cross-references — `see BLOCK-006` rather than `see blocker #6`.
+    The xref regex must accept both."""
+    md = """\
+# Spec
+
+## Blockers
+
+| ID | Question | Description | Severity | Affected ACs |
+|----|----------|-------------|----------|--------------|
+| BLOCK-001 | What is the exact URL? | URL undefined. | high | — |
+| BLOCK-002 | Which browsers are supported? | Browser matrix undefined. | medium | — |
+
+## Acceptance Criteria
+
+- [ ] **AC-PERF-1:** Page loads in [CLARIFICATION NEEDED: exact URL — see BLOCK-001]. `[AUTOMATABLE]`
+- [ ] **AC-COMPAT-1:** Works on [CLARIFICATION NEEDED: browser matrix — see BLOCK-002]. `[AUTOMATABLE]`
+"""
+    qs = extract_questions(md)
+    # Both inline CLARs reference blockers by `BLOCK-NNN` and must be
+    # dropped by Pass 1. Only the two blockers survive.
+    assert len(qs) == 2
+    assert all(q.kind == "blocker" for q in qs)
+
+
+def test_dedup_merges_blocker_and_inline_clarification_by_composite_ac_id():
+    """Pass 2 must recognise composite AC IDs (e.g. `AC-A11Y-1`, `AC-COMPAT-1`)
+    so a blocker covering them subsumes inline CLARs on those bullets."""
+    md = """\
+# Spec
+
+## Blockers
+
+| ID | Question | Description | Severity | Affected ACs |
+|----|----------|-------------|----------|--------------|
+| BLOCK-001 | What aria-label should the button expose? | undefined | high | AC-A11Y-1 |
+| BLOCK-002 | Which browser matrix? | undefined | medium | AC-COMPAT-1 |
+
+## Acceptance Criteria
+
+- [ ] **AC-A11Y-1:** Screen reader announces [CLARIFICATION NEEDED: exact aria-label]. `[MANUAL ONLY]`
+- [ ] **AC-COMPAT-1:** Renders on [CLARIFICATION NEEDED: browser matrix]. `[AUTOMATABLE]`
+"""
+    qs = extract_questions(md)
+    assert len(qs) == 2
+    assert all(q.kind == "blocker" for q in qs)
+
+
 def test_extract_blockers_prefers_description_column():
     """When both 'Blocker' and 'Description' columns exist, use Description."""
     md = """\

@@ -52,6 +52,7 @@ The full step-by-step procedure (stack catalogs, regex signals, universal fallba
        entry_method: <file:Class.method-or-file:func>
        credentials_env_vars: [<ENV_VAR>, <ENV_VAR>]
        fixture_entry: <file:func>
+     custom_test_id_attribute: <data-testid|data-test|data-cy|data-qa|null>
    ```
 
    Emit one such block per module. The pipeline parses these deterministically (no LLM in the parser) and merges them into the existing inventory with **deterministic values winning** where both exist — your LLM augmentation only fills gaps. Partial blocks are valid; empty arrays are valid.

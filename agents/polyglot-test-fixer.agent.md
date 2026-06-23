@@ -67,6 +67,14 @@ These paths are off-limits — touching ANY of them reverts the patch and marks 
 
 If the failure root cause is in a forbidden file (e.g. missing pytest fixture, broken `conftest`), do NOT edit — abort the heal with the literal token `OUT_OF_SCOPE: <category>` (e.g. `OUT_OF_SCOPE: fixture-defect`) so the orchestrator surfaces it to Step 10 for bug classification instead of silently rewriting test infrastructure.
 
+**NEVER work around a forbidden-file defect.** If the traceback shows the failure originates in a setup/teardown hook, shared fixture, test configuration, or business logic that is outside your edit scope — you MUST NOT:
+- Wrap the failing call in try/catch/except in the generated test
+- Add fallback/retry logic that masks the setup error
+- Duplicate or shadow the existing fixture/hook inline with modifications
+- Swallow exceptions to let the test continue past a broken setup
+
+Instead, emit `OUT_OF_SCOPE: <category>` (e.g. `fixture-defect`, `config-defect`, `infra-defect`) and include a one-line diagnostic: which file, which line, what call failed, and what the likely fix is. This diagnostic flows to Step 10 for bug classification and reaches the operator in the report.
+
 ## MCP Channel + per-stack source capture preference
 
 **Playwright MCP** (`@playwright/mcp@latest --headless`, server name

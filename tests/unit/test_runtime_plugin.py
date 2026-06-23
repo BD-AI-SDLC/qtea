@@ -87,6 +87,95 @@ def test_is_sentinel_rejects_normal_selectors(runtime):
 
 
 # ---------------------------------------------------------------------------
+# Resolved-sentinel factories (role_locator / text_locator / ...)
+# ---------------------------------------------------------------------------
+
+
+def test_role_locator_round_trip(runtime):
+    s = runtime.role_locator("link", name="Go to Gemini Enterprise")
+    # Recognized by is_resolved_sentinel, not is_sentinel (the latter is for
+    # unresolved tbd(...) markers only).
+    assert runtime.is_resolved_sentinel(s)
+    assert not runtime.is_sentinel(s)
+    payload = runtime.parse_resolved_sentinel(s)
+    assert payload == {
+        "kind": "role", "role": "link", "name": "Go to Gemini Enterprise",
+    }
+
+
+def test_role_locator_without_name(runtime):
+    s = runtime.role_locator("button")
+    payload = runtime.parse_resolved_sentinel(s)
+    assert payload == {"kind": "role", "role": "button"}
+
+
+def test_role_locator_with_exact(runtime):
+    s = runtime.role_locator("tab", name="Settings", exact=True)
+    payload = runtime.parse_resolved_sentinel(s)
+    assert payload == {"kind": "role", "role": "tab", "name": "Settings", "exact": True}
+
+
+def test_role_locator_rejects_empty_inputs(runtime):
+    with pytest.raises(ValueError):
+        runtime.role_locator("")
+    with pytest.raises(ValueError):
+        runtime.role_locator("link", name="")
+
+
+def test_text_label_placeholder_locators(runtime):
+    assert runtime.parse_resolved_sentinel(runtime.text_locator("Submit")) == {
+        "kind": "text", "text": "Submit",
+    }
+    assert runtime.parse_resolved_sentinel(runtime.label_locator("Email")) == {
+        "kind": "label", "text": "Email",
+    }
+    assert runtime.parse_resolved_sentinel(runtime.placeholder_locator("Search")) == {
+        "kind": "placeholder", "text": "Search",
+    }
+    assert runtime.parse_resolved_sentinel(
+        runtime.text_locator("Hello", exact=True)
+    ) == {"kind": "text", "text": "Hello", "exact": True}
+
+
+def test_test_id_locator(runtime):
+    s = runtime.test_id_locator("submit-button")
+    assert runtime.parse_resolved_sentinel(s) == {
+        "kind": "test_id", "value": "submit-button",
+    }
+
+
+def test_resolved_sentinel_dispatches_via_apply_resolution(runtime):
+    """The locator wrapper must route resolved sentinels directly to
+    scope.get_by_role(...) etc. — skipping the resolver tier ladder."""
+    captured: list[tuple[str, dict]] = []
+
+    class FakePage:
+        # Stand-ins for Playwright getters; record what was called with what.
+        def get_by_role(self, role, **kw):
+            captured.append(("role", {"role": role, **kw}))
+            return ("locator-for-role", role, kw)
+        def locator(self, sel, *a, **kw):
+            captured.append(("locator", {"selector": sel}))
+            return ("locator-for-css", sel)
+        # Mark as a Page receiver for `_resolve_page_from_receiver`.
+        @property
+        def main_frame(self): return None
+
+    page = FakePage()
+    # Stand in for the wrapped original `Page.locator` — same as page.locator above.
+    wrapped = runtime._wrap_locator_method(FakePage.locator, "page")
+    result = wrapped(page, runtime.role_locator("link", name="Gemini"))
+    # The role getter was called, NOT the CSS locator path.
+    assert ("role", {"role": "link", "name": "Gemini"}) in captured
+    assert result == ("locator-for-role", "link", {"name": "Gemini"})
+    # A plain string still goes through the CSS path.
+    captured.clear()
+    plain = wrapped(page, "#submit")
+    assert ("locator", {"selector": "#submit"}) in captured
+    assert plain == ("locator-for-css", "#submit")
+
+
+# ---------------------------------------------------------------------------
 # _is_playwright_timeout — best-effort detector
 # ---------------------------------------------------------------------------
 
@@ -186,7 +275,7 @@ def test_retrying_locator_invalidates_cache_and_retries_on_timeout(runtime, tmp_
     # invariant the retry proxy depends on).
     captured: dict = {}
 
-    def _fake_resolve(p, sentinel, *, skip_dev=False, skip_cache=False, skip_heuristic=False):
+    def _fake_resolve(p, sentinel, *, skip_dev=False, skip_cache=False, skip_heuristic=False, skip_pool=False):
         captured["skip_dev"] = skip_dev
         captured["skip_cache"] = skip_cache
         return runtime._Resolution(
@@ -232,7 +321,7 @@ def test_retrying_locator_retry_skip_dev_false_when_source_is_cached(runtime, tm
 
     captured: dict = {}
 
-    def _fake_resolve(p, sentinel, *, skip_dev=False, skip_cache=False, skip_heuristic=False):
+    def _fake_resolve(p, sentinel, *, skip_dev=False, skip_cache=False, skip_heuristic=False, skip_pool=False):
         captured["skip_dev"] = skip_dev
         return runtime._Resolution(
             selector="#fresh", source="agent",
@@ -464,7 +553,7 @@ def test_retrying_locator_falls_through_to_llm_when_all_candidates_exhausted(run
         # 1st rebuild = fallback candidate; 2nd rebuild = LLM-resolved selector.
         return fallback_real if rebuild_calls["n"] == 1 else llm_resolved_real
 
-    def _fake_resolve(p, sentinel, *, skip_dev=False, skip_cache=False, skip_heuristic=False):
+    def _fake_resolve(p, sentinel, *, skip_dev=False, skip_cache=False, skip_heuristic=False, skip_pool=False):
         call_log.append("llm-resolve-called")
         assert skip_cache is True  # the existing invariant
         return runtime._Resolution(
@@ -505,7 +594,7 @@ def test_retrying_locator_without_bundle_unchanged_behavior(runtime, tmp_path, m
     real = SimpleNamespace(click=_click)
     fresh = SimpleNamespace(click=lambda timeout=None: "ok")
 
-    def _fake_resolve(p, sentinel, *, skip_dev=False, skip_cache=False, skip_heuristic=False):
+    def _fake_resolve(p, sentinel, *, skip_dev=False, skip_cache=False, skip_heuristic=False, skip_pool=False):
         call_log.append("llm")
         return runtime._Resolution(
             selector="#fresh", source="agent",
@@ -790,9 +879,9 @@ def test_parse_aria_snapshot_heuristic_finds_signin_button(runtime):
 
 
 def test_snapshot_page_prefers_aria_snapshot_with_mode_ai(runtime):
-    """``_snapshot_page`` should try ``aria_snapshot(mode="ai")`` first
-    (LLM-optimized, Playwright 1.59+). The legacy ``page.accessibility``
-    path must NOT be invoked."""
+    """``_snapshot_page`` should try ``aria_snapshot(mode="ai", boxes=True)``
+    first (richest kwarg-set, Playwright 1.60+). The legacy
+    ``page.accessibility`` path must NOT be invoked."""
 
     class _FakeBodyLocator:
         def __init__(self):
@@ -821,14 +910,14 @@ def test_snapshot_page_prefers_aria_snapshot_with_mode_ai(runtime):
     assert text == '- button "OK"'
     assert tree["children"][0] == {"role": "button", "name": "OK", "children": []}
     assert page.legacy_called is False
-    # mode="ai" attempted on the first call.
-    assert page.body.calls == [{"mode": "ai"}]
+    # Richest rung (v1.60+: mode="ai" + boxes=True) attempted first.
+    assert page.body.calls == [{"mode": "ai", "boxes": True}]
 
 
 def test_snapshot_page_falls_back_when_mode_kwarg_unsupported(runtime):
     """Older Playwright (1.40-1.58) doesn't know the ``mode`` kwarg and
-    raises ``TypeError``. The wrapper must retry with no kwargs and the
-    snapshot capture must still succeed."""
+    raises ``TypeError``. The wrapper must descend the ladder until a
+    rung succeeds — boxes rung → mode rung → no-kwargs rung."""
 
     class _FakeBodyLocator:
         def __init__(self):
@@ -851,8 +940,14 @@ def test_snapshot_page_falls_back_when_mode_kwarg_unsupported(runtime):
     text, tree = runtime._snapshot_page(page)
     assert text == '- link "Help"'
     assert tree["children"][0]["role"] == "link"
-    # Both attempts were made — mode="ai" first, then no-mode fallback.
-    assert page.body.calls == [{"mode": "ai"}, {}]
+    # All three rungs attempted on the first call before the empty-kwargs
+    # rung wins. Capability cache will skip the failed rungs on subsequent
+    # calls (verified by test_snapshot_page_caches_capability_across_calls).
+    assert page.body.calls == [
+        {"mode": "ai", "boxes": True},
+        {"mode": "ai"},
+        {},
+    ]
 
 
 def test_snapshot_page_falls_back_to_legacy_accessibility(runtime):
@@ -894,6 +989,236 @@ def test_snapshot_page_returns_empty_on_total_failure(runtime):
     text, tree = runtime._snapshot_page(_FakePage())
     assert text == ""
     assert tree == {}
+
+
+def test_snapshot_page_prefers_boxes_when_supported(runtime):
+    """Playwright 1.60+ accepts ``boxes=True``. The ladder must select the
+    boxes rung first when it succeeds, and stay on it for subsequent calls.
+    Also asserts the capability cache was populated."""
+
+    class _FakeBodyLocator:
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        def aria_snapshot(self, **kwargs):
+            self.calls.append(kwargs)
+            return '- button "Submit" [box=10,20,80,30]'
+
+    class _FakePage:
+        def __init__(self):
+            self.body = _FakeBodyLocator()
+
+        def locator(self, selector):
+            return self.body
+
+    page = _FakePage()
+    runtime._snapshot_page(page)
+    assert page.body.calls == [{"mode": "ai", "boxes": True}]
+    assert runtime._AOM_CAPS["mode_ai"] is True
+    assert runtime._AOM_CAPS["boxes"] is True
+
+
+def test_snapshot_page_falls_back_when_boxes_kwarg_unsupported(runtime):
+    """Playwright 1.59 has ``mode="ai"`` but not ``boxes=True``. The ladder
+    must degrade to the mode-only rung and cache the failure so subsequent
+    calls skip the boxes attempt."""
+
+    class _FakeBodyLocator:
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        def aria_snapshot(self, **kwargs):
+            self.calls.append(kwargs)
+            if "boxes" in kwargs:
+                raise TypeError("unexpected keyword argument 'boxes'")
+            return '- button "Go"'
+
+    class _FakePage:
+        def __init__(self):
+            self.body = _FakeBodyLocator()
+
+        def locator(self, selector):
+            return self.body
+
+    page = _FakePage()
+    text, _ = runtime._snapshot_page(page)
+    assert text == '- button "Go"'
+    # First call: boxes rung tried, fails; mode-only rung wins.
+    assert page.body.calls == [{"mode": "ai", "boxes": True}, {"mode": "ai"}]
+    assert runtime._AOM_CAPS["boxes"] is False
+    assert runtime._AOM_CAPS["mode_ai"] is True
+
+
+def test_snapshot_page_caches_capability_across_calls(runtime):
+    """Once the capability cache records that ``boxes=True`` is unsupported,
+    subsequent calls must skip that rung entirely (no wasted TypeError
+    dance per sentinel resolution)."""
+
+    class _FakeBodyLocator:
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        def aria_snapshot(self, **kwargs):
+            self.calls.append(kwargs)
+            if "boxes" in kwargs:
+                raise TypeError("no boxes")
+            return '- link "X"'
+
+    class _FakePage:
+        def __init__(self):
+            self.body = _FakeBodyLocator()
+
+        def locator(self, selector):
+            return self.body
+
+    page = _FakePage()
+    runtime._snapshot_page(page)
+    runtime._snapshot_page(page)
+    runtime._snapshot_page(page)
+    # First call: 2 attempts (boxes fails, mode succeeds).
+    # Calls 2 and 3: cache says boxes unsupported → only mode-only rung.
+    assert page.body.calls == [
+        {"mode": "ai", "boxes": True},
+        {"mode": "ai"},
+        {"mode": "ai"},
+        {"mode": "ai"},
+    ]
+
+
+def test_snapshot_page_respects_aom_boxes_off_env(runtime, monkeypatch):
+    """``WORCA_T_AOM_BOXES=off`` skips the boxes rung entirely — useful
+    when token budget is tight and the user knows they don't need spatial
+    disambiguation."""
+
+    class _FakeBodyLocator:
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        def aria_snapshot(self, **kwargs):
+            self.calls.append(kwargs)
+            return '- button "X"'
+
+    class _FakePage:
+        def __init__(self):
+            self.body = _FakeBodyLocator()
+
+        def locator(self, selector):
+            return self.body
+
+    monkeypatch.setenv("WORCA_T_AOM_BOXES", "off")
+    page = _FakePage()
+    runtime._snapshot_page(page)
+    assert page.body.calls == [{"mode": "ai"}]
+
+
+def test_snapshot_page_threads_depth_env(runtime, monkeypatch):
+    """``WORCA_T_AOM_DEPTH=5`` passes ``depth=5`` through to aria_snapshot
+    on the mode-aware rungs."""
+
+    class _FakeBodyLocator:
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        def aria_snapshot(self, **kwargs):
+            self.calls.append(kwargs)
+            return '- button "X"'
+
+    class _FakePage:
+        def __init__(self):
+            self.body = _FakeBodyLocator()
+
+        def locator(self, selector):
+            return self.body
+
+    monkeypatch.setenv("WORCA_T_AOM_DEPTH", "5")
+    page = _FakePage()
+    runtime._snapshot_page(page)
+    assert page.body.calls == [{"mode": "ai", "boxes": True, "depth": 5}]
+
+
+def test_snapshot_page_legacy_disabled_via_env(runtime, monkeypatch):
+    """``WORCA_T_AOM_LEGACY_OK=0`` prevents the pre-1.40
+    ``accessibility.snapshot()`` fallback from running."""
+
+    legacy_called = []
+
+    class _FakePage:
+        def locator(self, selector):
+            raise RuntimeError("aria_snapshot broken")
+
+        @property
+        def accessibility(self):
+            legacy_called.append(True)
+            raise AssertionError("legacy must not be reached when LEGACY_OK=0")
+
+    monkeypatch.setenv("WORCA_T_AOM_LEGACY_OK", "0")
+    text, tree = runtime._snapshot_page(_FakePage())
+    assert text == ""
+    assert tree == {}
+    assert legacy_called == []
+
+
+def test_parse_aria_snapshot_strips_box_annotation(runtime):
+    """``[box=x,y,w,h]`` annotations (Playwright 1.60+) are stripped from
+    the element name and retained on the node as a coord tuple."""
+    yaml = '- button "Submit" [box=10,20,80,30]'
+    tree = runtime._parse_aria_snapshot_yaml(yaml)
+    node = tree["children"][0]
+    assert node["role"] == "button"
+    assert node["name"] == "Submit"
+    assert node["box"] == (10.0, 20.0, 80.0, 30.0)
+
+
+def test_parse_aria_snapshot_strips_ref_annotation(runtime):
+    """``[ref=eN]`` annotations (Playwright 1.59+ mode="ai") are stripped
+    entirely — ephemeral element refs not addressable by user code."""
+    yaml = '- link "Help" [ref=e7]'
+    tree = runtime._parse_aria_snapshot_yaml(yaml)
+    node = tree["children"][0]
+    assert node["role"] == "link"
+    assert node["name"] == "Help"
+    assert "box" not in node
+
+
+def test_parse_aria_snapshot_strips_box_and_ref_together(runtime):
+    """When both annotations are present on one line, both are stripped
+    and the box coords are retained."""
+    yaml = '- button "Continue" [ref=e3] [box=100,200,120,40]'
+    tree = runtime._parse_aria_snapshot_yaml(yaml)
+    node = tree["children"][0]
+    assert node["role"] == "button"
+    assert node["name"] == "Continue"
+    assert node["box"] == (100.0, 200.0, 120.0, 40.0)
+
+
+def test_heuristic_resolve_box_tiebreaker_picks_topmost(runtime):
+    """When two same-role+name candidates tie within
+    ``_HEURISTIC_TIE_GAP`` AND both have box coords, the tie-break
+    prefers the smaller-y (visually-higher) candidate."""
+    yaml = (
+        '- button "Sign in" [box=10,500,80,30]\n'  # bottom
+        '- button "Sign in" [box=10,50,80,30]'    # top — should win
+    )
+    tree = runtime._parse_aria_snapshot_yaml(yaml)
+    selector = runtime._heuristic_resolve("sign in button", tree)
+    # Without the tie-break, the duplicate match would return None; the
+    # box-based tie-break promotes the visually-higher candidate.
+    assert selector == 'role=button[name="Sign in"]'
+    nodes = [n for n in runtime._aom_walk(tree) if n.get("role") == "button"]
+    assert len(nodes) == 2
+
+
+def test_heuristic_resolve_no_box_tiebreak_when_only_one_has_box(runtime):
+    """Asymmetric box availability — one candidate has a box, the other
+    doesn't — must NOT trigger the tie-breaker (would bias arbitrarily).
+    The heuristic falls through to the LLM tier by returning None."""
+    yaml = (
+        '- button "Sign in" [box=10,50,80,30]\n'
+        '- button "Sign in"'
+    )
+    tree = runtime._parse_aria_snapshot_yaml(yaml)
+    selector = runtime._heuristic_resolve("sign in button", tree)
+    assert selector is None
 
 
 def test_resolve_page_from_receiver_detects_page_via_main_frame(runtime):

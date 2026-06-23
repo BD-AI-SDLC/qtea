@@ -56,3 +56,4 @@ Apply exactly one phase marker to every generated test, drawn from the test's ph
 - Pass rate > 98%, flakiness < 2%
 - Per-file cap: 200 lines.
 - No test mutates state that another test depends on.
+- **Never define inline locator strings** in test files. All locator constants are defined in the locator class (pre-written by the pipeline). Access them via the Page Object's `.locators` instance handle (e.g. `chat_page.locators.PROMPT_FIELD`) — NOT via the locator class directly. `ChatPageLocators.PROMPT_FIELD` fails type checking because most locators are defined as instance attributes in `__init__`, not class attributes; only the explicitly-declared `ClassVar` defaults (e.g. `DEFAULT_PROMPT_FIELD`) may be referenced via the class. Do not hardcode selector strings anywhere in the test file.

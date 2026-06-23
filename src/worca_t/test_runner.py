@@ -278,6 +278,8 @@ def _inject_xdist_override(
     ``parallelism == 0`` appends ``-n 0`` to run in-process (no worker
     subprocess).
     """
+    if re.search(r"(?:^|\s)-n(?:\s|=)", command):
+        return command
     n_flag = f"-n {parallelism}" if parallelism > 0 else "-n 0"
     return f"{command} {n_flag}"
 
@@ -1249,6 +1251,50 @@ def _detect_stale_venv_scripts(venv_dir: Path, env: dict[str, str]) -> bool:
         return False
 
 
+def _rmtree_robust(path: Path) -> None:
+    """``shutil.rmtree`` with Windows read-only + transient-lock handling.
+
+    Two failure modes are common when wiping a Python venv on Windows:
+
+      1. Read-only files (typical for pip-installed dist-info / RECORD
+         entries): handled inline via ``chmod(S_IWRITE) + retry`` in the
+         ``onerror`` callback, mirroring ``s06_research._rmtree_safe``.
+
+      2. ``.pyd`` extension modules still loaded by a subprocess that has
+         only just exited: Windows briefly keeps the DLL handle alive
+         after the process is gone (``[WinError 5] Access is denied``).
+         A short backoff-and-retry resolves it without escalating to the
+         caller. Three attempts at 0.3s / 0.8s / 1.6s cover the common
+         case (pytest worker shutting down). A persistent lock (IDE, AV
+         scanner) will still fail — the caller decides how to surface that.
+
+    Raises ``OSError`` on terminal failure so the caller can log + skip
+    the venv rebuild rather than continue with a half-deleted directory.
+    """
+    import stat
+    import time
+
+    def _on_error(func, target, _exc_info):
+        try:
+            Path(target).chmod(stat.S_IWRITE)
+            func(target)
+        except Exception:
+            # Re-raise so the outer retry loop catches transient locks.
+            raise
+
+    last_err: OSError | None = None
+    for attempt, delay in enumerate((0.3, 0.8, 1.6)):
+        try:
+            shutil.rmtree(path, onerror=_on_error)
+            return
+        except OSError as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(delay)
+    if last_err is not None:
+        raise last_err
+
+
 def prepare_sut(
     profile: StackProfile | None,
     *,
@@ -1336,7 +1382,7 @@ def prepare_sut(
                 hint="Scripts wrappers resolve to a different Python than venv/python — rebuilding",
             )
             try:
-                shutil.rmtree(venv_dir)
+                _rmtree_robust(venv_dir)
             except OSError as e:
                 log.warning("prepare_sut.stale_venv_remove_failed", error=str(e))
             else:

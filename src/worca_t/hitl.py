@@ -31,11 +31,11 @@ log = get_logger(__name__)
 _CLARIFICATION_RE = re.compile(r"\[CLARIFICATION\s+NEEDED:\s*([^\]]+)\]", re.IGNORECASE)
 _NOT_READY_RE = re.compile(r"\bNOT\s+READY\b", re.IGNORECASE)
 _XREF_BLOCKER_RE = re.compile(
-    r"\s*(?:—|--|–|-)\s*see\s+blocker\s+#?(\d+)", re.IGNORECASE
+    r"\s*(?:—|--|–|-)\s*see\s+(?:blocker\s+#?|block-)(\d+)", re.IGNORECASE
 )
 _BLOCKER_PREFIX = "How should we resolve this blocker: "
 _TC_ID_RE = re.compile(r"TC-[A-Z]+-\d+", re.IGNORECASE)
-_AC_ID_RE = re.compile(r"\bAC-\d+\b", re.IGNORECASE)
+_AC_ID_RE = re.compile(r"\bAC(?:-[A-Z0-9]+)+\b", re.IGNORECASE)
 
 # Text the user can type to mean "skip this — drop from output". Without
 # this, "i'm not sure" / "skip" / "n/a" are treated as literal answers and

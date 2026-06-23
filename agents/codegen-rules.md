@@ -1,20 +1,26 @@
 # Codegen Quality Rules (Shared Reference)
 
-> **Single source of truth** for all Step 8 codegen sub-agents (`codegen-pom-extender`, `codegen-test-writer`, `ui-test-automation` violation fix). This file is injected as input context by `s08_codegen.py` — do not duplicate these rules in individual agent files.
+> **Single source of truth** for all Step 8 codegen sub-agents (`codegen-pom-extender`, `codegen-test-writer`, `codegen-violation-fixer` violation fix). This file is injected as input context by `s08_codegen.py` — do not duplicate these rules in individual agent files.
 
 ---
 
 ## 1. Locator Priority (fixed, enforced)
 
-`id` > `data-testid` > `role` > `label` > `text` > `placeholder` > scoped CSS. **Never XPath.** Full ranking in `ui-test-automation.prompt.md` §4.
+`id` > `data-testid` > `role` > `label` > `text` > `placeholder` > scoped CSS. **Never XPath.** Full ranking in `codegen-violation-fixer.prompt.md` §4.
 
 ## 2. AOM Snapshot Only in Generated Test Code
 
-When generated test code inspects page state, it MUST use the accessibility tree (e.g. Playwright `page.accessibility.snapshot()` in Python, the equivalent in your target framework). **Never** raw-DOM dumps (`page.content()`, `driver.page_source`) inside tests — they waste tokens and ignore semantic structure.
+When generated test code inspects page state, it MUST use the accessibility tree (e.g. Playwright `Locator.aria_snapshot()` in Python, the equivalent in your target framework). **Never** raw-DOM dumps (`page.content()`, `driver.page_source`) inside tests — they waste tokens and ignore semantic structure.
+
+**Do not emit `boxes=True` or `mode="ai"` literals in generated test code.** Those kwargs (Playwright 1.60+ and 1.59+ respectively) are runtime-only affordances used by the JIT resolver. Generated tests target the 1.40+ floor and must call `aria_snapshot()` plain so they work on any supported Playwright version. The runtime's capability ladder handles richer kwargs internally and gracefully degrades.
 
 ## 3. TBD Locator Marker Convention
 
-Every unresolved locator placeholder MUST carry the locator's semantic intent so the downstream resolver knows what DOM element to find. **Four emission styles**, chosen by the active module's stack — pick exactly one branch based on `sut_inventory.json["modules"][active_module].language` + framework:
+Every **new** locator constant added by codegen MUST use `tbd("intent")` (or the stack-specific equivalent below). The codegen agent MUST NEVER hardcode a selector string — not from the AOM snapshot, not from the strategy, not from any other source. The JIT runtime resolves intents at test execution time against the live page. Hardcoding selectors bypasses the SUT's POM API compatibility layer (e.g. `wait_for_selector` vs `page.locator`) and the locator-priority gate.
+
+**Exception — dev-locator match:** When the pipeline pre-populates a locator constant with a dev-supplied selector (from `--dev-locators`), that value is authoritative and must not be overwritten with `tbd()`. The pipeline handles this substitution in Phase A2 — the agent never needs to read or reference the dev-locators file.
+
+**Four emission styles**, chosen by the active module's stack — pick exactly one branch based on `sut_inventory.json["modules"][active_module].language` + framework:
 
 **3a — Python + pytest + Playwright (JIT runtime path).** Import the worca-t runtime helper and use `tbd("intent")` in place of the bare `TBD_LOCATOR` literal. The Step 8 codegen step vendors a `tests/worca_t_runtime.py` plugin into the SUT; the helper produces a sentinel that the plugin intercepts at runtime via the live Playwright page. The plugin patches `Page.locator`, `Frame.locator`, AND `Locator.locator` on BOTH the sync (`playwright.sync_api`) AND async (`playwright.async_api`) API surfaces. **Mirror the SUT's existing Playwright API style** (sync vs async).
 
@@ -54,6 +60,7 @@ public final class LoginLocators {
 **Java-specific constraint:** declare `Page` and `Locator` via interface types, never concrete impl classes (the dynamic-proxy mechanism only works through interfaces).
 
 **3d — All other stacks (Selenium / Robot / Cypress / WebdriverIO / C# / etc.).** Emit the literal `TBD_LOCATOR` placeholder paired with an adjacent `TBD_INTENT: <one-line description>` comment on the line immediately above the marker. Polyglot comment styles:
+
 - Python (non-pytest+Playwright) / Ruby / shell / Robot: `# TBD_INTENT: <text>`
 - JS / TS / Java / C#: `// TBD_INTENT: <text>`
 
@@ -62,9 +69,10 @@ public final class LoginLocators {
 public static final String EMAIL_INPUT = "TBD_LOCATOR";
 ```
 
-**Heuristic-friendly intent style (saves LLM cost).** When you can name the element by its visible role + label, do so — e.g. `tbd("sign in button")` over `tbd("primary submit on the login form")`. The runtime's in-process heuristic resolves the former without an LLM call by walking the accessibility tree for an exact role+name match. When semantic context is genuinely needed for disambiguation, the longer form is correct.
+**Heuristic-friendly intent style (saves LLM cost).** When you can name the element by its visible role + label, do so — e.g. `tbd("sign in button")` over `tbd("primary submit on the login form")`. The runtime's in-process heuristic resolves the former without an LLM call by walking the accessibility tree for an exact role+name match. When semantic context is genuinely needed for disambiguation, the longer form is correct. **Spatial qualifiers help when two same-role+name elements coexist** (e.g. `tbd("top sign in button")`, `tbd("header search button")`) — on Playwright 1.60+, the runtime captures bounding boxes and breaks ties by visual position, and the LLM resolver tier is prompted to honor those spatial hints.
 
 **TBD sentinel strings are NOT raw selectors.** A `tbd("…")` return value is an opaque sentinel (`__WORCA_T_TBD__::<intent>`). It only becomes a real selector when the framework's locator API resolves it — `page.locator(<sentinel>)` for Playwright, `driver.find_element(<sentinel>)` for Selenium, etc. NEVER pass a TBD sentinel into:
+
 - `page.evaluate("(selector) => document.querySelector(selector)", self.locators.X)`
 - `browser.executeScript("return document.querySelector(arguments[0])", self.locators.X)`
 - `cy.window().then(win => win.document.querySelector(self.locators.X))`
@@ -125,6 +133,27 @@ The active module's inventory record is provided to you as context — inlined i
 - Prefix every generated filename with `worca_` to avoid collisions. **Test file naming:** `worca_<feature>_test.py` (start with `worca_`, then the feature, end with `_test.py`). Page objects and locators: `worca_<feature>_page.py` / `worca_<feature>_locators.py`. **Never** `worca_test_*.py`.
 - **NEVER modify existing SUT test files.** worca-t always writes TDD tests from scratch into new `worca_*_test.py` files. Existing test files (e.g. `test_chat_page.py`, `test_login.py`) belong to the SUT team and must not be touched. The "reuse" principle applies to page objects, locators, helpers, and fixtures — not to test files. If you find yourself about to add a `def test_*` function to an existing file, stop: create a new `worca_<feature>_test.py` instead.
 
+### Prefer POM/BasePage helper methods over raw `page.*` / `driver.*` calls
+
+When the active module's POM already wraps a common Playwright/Selenium/framework action in a helper method, **always call that helper instead of the raw framework API**. The POM layer encapsulates retry logic, wait strategies, timeout defaults, and error handling that a direct `page.goto()` or `driver.find_element()` bypasses.
+
+**Common examples (inspect the SUT's `BasePage` / base POM before writing):**
+
+| Raw framework call | Prefer POM helper (if it exists) |
+| --- | --- |
+| `page.goto(url); page.wait_for_load_state("networkidle")` | `chat_page.open_url(url)` |
+| `page.locator(selector).click()` | `chat_page.click_element(selector)` |
+| `page.locator(selector).fill(text)` | `chat_page.enter_text(selector, text)` |
+| `driver.find_element(By.ID, "x").click()` | `login_page.click(locator_constant)` |
+
+**How to check:** Before writing any `page.goto`, `page.locator(...).click()`, `page.locator(...).fill()`, `driver.find_element`, or other low-level navigation/interaction call in a test, grep the active module's base page object (often `base_page.py`, `BasePage.java`, `base-page.ts`) for methods like `open_url`, `click_element`, `enter_text`, `navigate_to`, `hover_on_element`, `is_element_visible`. If a matching helper exists, use it — the test inherits the POM's hardened wait/retry behavior and stays maintainable when the SUT team refactors the base layer.
+
+**When raw calls are acceptable:**
+
+- The POM genuinely lacks a helper for this action AND the strategy does not prescribe extending the POM (write the raw call in the test, note the gap in an `[ASSUMPTION]` comment).
+- The action is POM-internal (inside a new POM method you're writing) and you're implementing the primitive that the test will call — raw framework API is correct here.
+- The test is exercising framework edge-case behavior (e.g. testing that a `page.goto` with `wait_until="commit"` differs from `"networkidle"`) where the POM abstraction would hide what's under test.
+
 ## 8. DOM Attribute Diagnostics for POM Methods (Python + pytest + Playwright)
 
 Any POM method whose sole purpose is to **read a DOM attribute** (i.e. it calls `.get_attribute("attr_name")` and returns the result) MUST capture the element's opening HTML tag as an Allure attachment immediately before the `return`. This makes the raw attribute value visible in the Allure report without the noise of the full page source.
@@ -132,27 +161,48 @@ Any POM method whose sole purpose is to **read a DOM attribute** (i.e. it calls 
 **Pattern — always split into a named locator variable first:**
 
 ```python
-import allure  # top of file, alongside other imports
+import contextlib  # top of file, alongside other imports
+import allure      # top of file, alongside other imports
 
-def get_gemini_button_rel_attribute(self) -> str:
+def get_gemini_button_rel_attribute(self) -> str | None:
     loc = self.get_locator(self.locators.GEMINI_ENTERPRISE_LINK)
-    try:
+    with contextlib.suppress(Exception):
         allure.attach(
             loc.evaluate("el => el.outerHTML.split('>')[0] + '>'"),
             name="element-html",
             attachment_type=allure.attachment_type.TEXT,
         )
-    except Exception:
-        pass
     return loc.get_attribute("rel")
 ```
 
-Rules:
+Rules (Python + pytest + Playwright):
+
 - Extract the locator into a local variable `loc` before both the attachment and the `return` — never inline `self.get_locator(...)` twice.
-- Wrap in `try/except Exception: pass` so a missing `allure` package or an element-not-found error never breaks the test.
+- Wrap the attachment in `with contextlib.suppress(Exception):` so a missing `allure` package or an element-not-found error never breaks the test. **Never** use `try: ... except Exception: pass` — the codegen quality gate flags empty exception handlers as the `empty-handler` violation and fails Step 8. The `contextlib.suppress` form is shorter, expresses intent better, and is what every linter expects.
+- The signature returns `str | None` because `Locator.get_attribute(...)` returns `str | None` — declaring `-> str` triggers the Phase B.6 type-checker (see "Respect Playwright optional-return signatures" in `codegen-pom-extender.agent.md`).
 - The JavaScript expression `el.outerHTML.split('>')[0] + '>'` returns only the **opening tag** (e.g. `<a rel="noopener noreferrer" href="...">`) — one line, all attributes, no inner content.
 - Skip this rule for methods that: return `inner_text()`, `text_content()`, `is_visible()`, `count()`, or any non-attribute value — it only applies to `.get_attribute()` calls.
-- Skip on non-pytest stacks (Selenium, Cypress, etc.) — those lack the Playwright `evaluate` bridge.
+- Skip on Selenium, Cypress, WebdriverIO, and Robot stacks — those lack a synchronous `evaluate()` bridge to the element handle.
+
+**TypeScript / JavaScript + Playwright** — use the same diagnostic pattern via `allure-playwright`:
+
+```typescript
+import * as allure from "allure-playwright";  // or: import { allure } from "allure-playwright";
+
+async getGeminiButtonRelAttribute(): Promise<string | null> {
+    const loc = this.page.locator(this.locators.GEMINI_ENTERPRISE_LINK);
+    await loc.evaluate(el => el.outerHTML.split(">")[0] + ">")
+        .then(tag => allure.attachment("element-html", tag, { contentType: "text/plain" }))
+        .catch(() => undefined);  // suppress — missing allure or element-not-found must not fail the test
+    return loc.getAttribute("rel");
+}
+```
+
+TS/JS rules:
+
+- Use `.catch(() => undefined)` (not an empty `catch` block) to silence attachment errors without masking real failures.
+- Return type is `Promise<string | null>` — `Locator.getAttribute()` returns `string | null` in TS; never widen to `Promise<string>`.
+- `allure-playwright` is a peer dep of the SUT's test setup; if the SUT does not have it installed, omit the attachment rather than adding the dependency.
 
 ## 9. Worca-t Attribution Markers (pytest stacks only)
 
@@ -165,6 +215,8 @@ import pytest
 def test_should_open_chat_when_landing_page_loads(chat_page):
     ...
 ```
+
+**Opt-out marker `@pytest.mark.worca_setup`** — apply ONLY to tests that legitimately perform setup-only work (state-mutation under a fixture, smoke probes whose verification lives inside a fixture, etc.). The Step 8 `zero-assertions` gate skips functions carrying this marker, but every use is audited; the rule is "almost never needed — if you're tempted, add an assertion instead."
 
 ## 10. Network Egress Restrictions
 

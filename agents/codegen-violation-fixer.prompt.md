@@ -1,8 +1,8 @@
-# UI Test Automation Specialist — Reference Data
+# Codegen Violation Fixer — Reference Data
 
-On-demand lookup tables, code templates, locator strategy, production examples, and worked scenarios for the `ui-test-automation.agent.md`. The agent reads specific sections of this file via the Read tool when it needs framework-specific detail — it is NOT loaded into the system prompt.
+On-demand lookup tables, code templates, locator strategy, production examples, and worked scenarios for the `codegen-violation-fixer.agent.md`. The agent reads specific sections of this file via the Read tool when it needs framework-specific detail — it is NOT loaded into the system prompt.
 
-Persona, mission, non-negotiable rules, and the high-level workflow (including the stack-resolution reading procedure) live in `ui-test-automation.agent.md`.
+Persona, mission, non-negotiable rules, and the high-level workflow (including the stack-resolution reading procedure) live in `codegen-violation-fixer.agent.md`.
 
 ---
 
@@ -105,7 +105,7 @@ Use the catalog in `agents/polyglot-test-researcher.prompt.md` §2 as the canoni
 
 ## §4 — Locator Strategy (Strict Priority)
 
-Authoritative order — must match `ui-test-automation.agent.md` rule 1, `docs/qa-orchestrator.instructions.md` §6, and `CLAUDE.md`. Keep these in sync; any change here must be mirrored in all three.
+Authoritative order — must match `codegen-violation-fixer.agent.md` rule 1, `docs/qa-orchestrator.instructions.md` §6, and `CLAUDE.md`. Keep these in sync; any change here must be mirrored in all three.
 
 When defining elements, use the **first available** option from this list:
 
@@ -270,7 +270,7 @@ All scenarios assume the normal worca-t pipeline path: `./sut_inventory.json` is
 → Generate `Worca<Feature>Test.java` under `src/test/java/`. Use TestNG `@Test` annotations and `@FindBy` page-object pattern. Reuse any existing `*Page.java` from `sut_inventory.existing_page_objects`.
 
 **Scenario C (`active_module` null or `modules` empty — rare):** Step 6 hard-failed and operator pushed through anyway.
-→ The fallback language/framework/pattern prompt is presented by the agent (see `ui-test-automation.agent.md` workflow). **WAIT** for explicit selection. Do NOT scan the SUT root yourself.
+→ The fallback language/framework/pattern prompt is presented by the agent (see `codegen-violation-fixer.agent.md` workflow). **WAIT** for explicit selection. Do NOT scan the SUT root yourself.
 
 **Scenario D (User explicitly overrides):** User states "Generate Python pytest tests" in the task prompt even though `sut_inventory.json["modules"][active]` says TypeScript.
 → Trust the explicit override but document it: top-of-file comment `# Stack: python+pytest (user override; sut_inventory.json detected typescript)`. This is rare and intentional.

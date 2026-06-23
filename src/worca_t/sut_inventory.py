@@ -176,6 +176,7 @@ class ModuleInventory:
     existing_fixtures: list[Fixture] = field(default_factory=list)
     existing_locators: list[LocatorClass] = field(default_factory=list)
     auth_flow: AuthFlow = field(default_factory=AuthFlow)
+    custom_test_id_attribute: str | None = None
     source: str = "deterministic"  # "deterministic" | "llm_augmented" | "llm_only"
 
     def as_dict(self) -> dict[str, Any]:
@@ -1478,6 +1479,44 @@ def detect_src_directory_layout(
     )
 
 
+_PW_CONFIG_EXTS = ("ts", "mts", "cts", "js", "mjs", "cjs")
+_TESTID_ATTR_PW_RE = re.compile(r"testIdAttribute\s*:\s*['\"]([^'\"]+)['\"]")
+_TESTID_ATTR_PY_RE = re.compile(r"set_test_id_attribute\s*\(\s*['\"]([^'\"]+)['\"]")
+
+
+def detect_custom_test_id_attribute(module_root: Path) -> str | None:
+    """Detect a non-default test-id attribute configured in the SUT.
+
+    Returns the attribute name (e.g. ``"data-test"``) when the SUT explicitly
+    overrides Playwright's default ``data-testid``, or ``None`` when the
+    default is in effect.
+    """
+    for ext in _PW_CONFIG_EXTS:
+        cfg = module_root / f"playwright.config.{ext}"
+        if not cfg.is_file():
+            continue
+        try:
+            text = cfg.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        m = _TESTID_ATTR_PW_RE.search(text)
+        if m:
+            val = m.group(1).strip()
+            return val if val != "data-testid" else None
+
+    for src in iter_python_files(module_root, contains_hint=b"set_test_id_attribute"):
+        try:
+            text = src.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        m = _TESTID_ATTR_PY_RE.search(text)
+        if m:
+            val = m.group(1).strip()
+            return val if val != "data-testid" else None
+
+    return None
+
+
 def detect_module_inventory(sut_root: Path, module_rel: str) -> ModuleInventory:
     """Run Tier 1 (Python AST) + Tier 2 (TS regex) detection on one module."""
     module_root = sut_root / module_rel
@@ -1508,6 +1547,7 @@ def detect_module_inventory(sut_root: Path, module_rel: str) -> ModuleInventory:
     src_layout = detect_src_directory_layout(
         module_root, page_objects=pages, helpers=helpers, language=language,
     )
+    custom_test_id = detect_custom_test_id_attribute(module_root)
 
     name = "sut" if module_rel == "." else Path(module_rel).name
     source = (
@@ -1528,6 +1568,7 @@ def detect_module_inventory(sut_root: Path, module_rel: str) -> ModuleInventory:
         existing_fixtures=fixtures,
         existing_locators=locators,
         auth_flow=auth,
+        custom_test_id_attribute=custom_test_id,
         source=source,
     )
 
@@ -1783,6 +1824,8 @@ def merge_llm_inventory(
         out.language = str(llm["language"])
     if not out.package_manager and llm.get("package_manager"):
         out.package_manager = str(llm["package_manager"])
+    if not out.custom_test_id_attribute and llm.get("custom_test_id_attribute"):
+        out.custom_test_id_attribute = str(llm["custom_test_id_attribute"])
 
     # Layout: fill nulls only.
     layout_llm = llm.get("test_directory_layout") or {}
