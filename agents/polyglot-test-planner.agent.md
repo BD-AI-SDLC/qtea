@@ -156,7 +156,7 @@ Instead:
 
 **`## Coverage Notes` placement.** H2 heading at ROOT level of `plan.md`
 (not inside any `## Phase N` section — the Python parser at
-`src/worca_t/steps/s03_plan.py` only walks `^Phase \d+:` headings and will
+`src/qtea/steps/s03_plan.py` only walks `^Phase \d+:` headings and will
 silently ignore Coverage Notes at root, which is what we want).
 
 **Preservation across iterations.** Once Coverage Notes exists in a

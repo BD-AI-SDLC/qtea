@@ -5,11 +5,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from worca_t.checkpoints import RunState
-from worca_t.pipeline import PipelineOptions
-from worca_t.steps.base import StepContext
-from worca_t.steps.s01_intake import IntakeStep
-from worca_t.workspace import create_workspace
+from qtea.checkpoints import RunState
+from qtea.pipeline import PipelineOptions
+from qtea.steps.base import StepContext
+from qtea.steps.s01_intake import IntakeStep
+from qtea.workspace import create_workspace
 
 from ._fake_anthropic import install_fake_anthropic
 
@@ -100,7 +100,7 @@ async def test_intake_url_passthrough(tmp_path: Path, monkeypatch):
 
     # Patch the downloader at the module boundary instead of mocking httpx.
     monkeypatch.setattr(
-        "worca_t.steps.s01_intake._download_text",
+        "qtea.steps.s01_intake._download_text",
         lambda _url: "# Remote\n\nDISTINCTIVE_URL_MARKER\n",
     )
 
@@ -129,7 +129,7 @@ async def test_intake_jira_via_rest_shorthand(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("JIRA_API_TOKEN", "tok")
 
     monkeypatch.setattr(
-        "worca_t.steps.s01_intake.fetch_issue",
+        "qtea.steps.s01_intake.fetch_issue",
         lambda base_url, ticket_id: _fake_jira_payload(),
     )
     install_fake_anthropic(monkeypatch, text=_AGENT_SPEC_MD)
@@ -160,7 +160,7 @@ async def test_intake_jira_via_rest_url_form(tmp_path: Path, monkeypatch):
         captured_args["ticket_id"] = ticket_id
         return _fake_jira_payload()
 
-    monkeypatch.setattr("worca_t.steps.s01_intake.fetch_issue", _fake_fetch)
+    monkeypatch.setattr("qtea.steps.s01_intake.fetch_issue", _fake_fetch)
     install_fake_anthropic(monkeypatch, text=_AGENT_SPEC_MD)
 
     ctx = _ctx(tmp_path, "https://bosch-pt.atlassian.net/browse/MEAS-5490")
@@ -181,7 +181,7 @@ async def test_intake_jira_via_rest_dc_url(tmp_path: Path, monkeypatch):
         captured_args["base_url"] = base_url
         return _fake_jira_payload()
 
-    monkeypatch.setattr("worca_t.steps.s01_intake.fetch_issue", _fake_fetch)
+    monkeypatch.setattr("qtea.steps.s01_intake.fetch_issue", _fake_fetch)
     install_fake_anthropic(monkeypatch, text=_AGENT_SPEC_MD)
 
     ctx = _ctx(tmp_path, "https://rb-tracker.bosch.com/tracker01/browse/DXFAA-14642")
@@ -202,7 +202,7 @@ async def test_intake_jira_inlines_payload_with_shape_a_header(
     payload = _fake_jira_payload()
     payload["fields"]["summary"] = "PAYLOAD_INLINE_MARKER_XYZ"
     monkeypatch.setattr(
-        "worca_t.steps.s01_intake.fetch_issue",
+        "qtea.steps.s01_intake.fetch_issue",
         lambda base_url, ticket_id: payload,
     )
 
@@ -245,13 +245,13 @@ async def test_intake_jira_empty_ticket_fails(tmp_path: Path):
 
 async def test_intake_jira_fetch_failure_propagates(tmp_path: Path, monkeypatch):
     """A JiraFetchError (auth / 404 / network) is surfaced as step failure."""
-    from worca_t.jira_client import JiraFetchError
+    from qtea.jira_client import JiraFetchError
     monkeypatch.setenv("JIRA_BASE_URL", "https://x.atlassian.net")
 
     def _raise(*_a, **_kw):
         raise JiraFetchError("token expired", status_code=401)
 
-    monkeypatch.setattr("worca_t.steps.s01_intake.fetch_issue", _raise)
+    monkeypatch.setattr("qtea.steps.s01_intake.fetch_issue", _raise)
 
     ctx = _ctx(tmp_path, "jira:PROJ-1")
     result = await IntakeStep().run(ctx)
@@ -265,7 +265,7 @@ async def test_intake_agent_no_output_fails(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("JIRA_EMAIL", "u@b.com")
     monkeypatch.setenv("JIRA_API_TOKEN", "tok")
     monkeypatch.setattr(
-        "worca_t.steps.s01_intake.fetch_issue",
+        "qtea.steps.s01_intake.fetch_issue",
         lambda *_a, **_kw: _fake_jira_payload(),
     )
     install_fake_anthropic(monkeypatch, text="")
@@ -283,7 +283,7 @@ async def test_intake_url_download_failure_propagates(tmp_path: Path, monkeypatc
     def _raise(_url):
         raise _httpx.ConnectError("connection refused")
 
-    monkeypatch.setattr("worca_t.steps.s01_intake._download_text", _raise)
+    monkeypatch.setattr("qtea.steps.s01_intake._download_text", _raise)
     # Tripwire: agent must NOT be called when download fails.
     install_fake_anthropic(monkeypatch, text="should not appear")
 

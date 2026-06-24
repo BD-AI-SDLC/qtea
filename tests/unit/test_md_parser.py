@@ -1,6 +1,6 @@
 """Tests for the markdown parser used by spec/plan/strategy/research projections."""
 
-from worca_t.md_parser import (
+from qtea.md_parser import (
     extract_bullets,
     extract_tables,
     parse_markdown,

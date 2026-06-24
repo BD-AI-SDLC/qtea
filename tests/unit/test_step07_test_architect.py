@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from worca_t.checkpoints import RunState
-from worca_t.pipeline import PipelineOptions
-from worca_t.steps.base import StepContext
-from worca_t.steps.s07_test_architect import (
+from qtea.checkpoints import RunState
+from qtea.pipeline import PipelineOptions
+from qtea.steps.base import StepContext
+from qtea.steps.s07_test_architect import (
     TestArchitectStep,
     _active_module_dict,
     _approved_dirs,
@@ -18,7 +18,7 @@ from worca_t.steps.s07_test_architect import (
     _render_plan_markdown,
     _validate_plan_against_inventory,
 )
-from worca_t.workspace import create_workspace
+from qtea.workspace import create_workspace
 
 from ._fake_anthropic import (
     disable_vertex_env,
@@ -97,9 +97,9 @@ def test_approved_dirs_pulls_from_test_and_src_layouts():
 
 def test_path_under_approved_handles_separators_and_dot_prefix():
     approved = {"tests/e2e", "src/pages"}
-    assert _path_under_approved("tests/e2e/worca_login_test.py", approved)
-    assert _path_under_approved("./src/pages/worca_login_page.py", approved)
-    assert _path_under_approved("tests\\e2e\\worca_e2e_test.py", approved)
+    assert _path_under_approved("tests/e2e/qtea_login_test.py", approved)
+    assert _path_under_approved("./src/pages/qtea_login_page.py", approved)
+    assert _path_under_approved("tests\\e2e\\qtea_e2e_test.py", approved)
     assert not _path_under_approved("garden/of_evil.py", approved)
 
 
@@ -119,8 +119,8 @@ def test_validate_plan_rejects_unknown_reuse_reference():
         "active_module": "x",
         "test_cases": [{
             "id": "TC-LOGIN-1",
-            "test_file_target": "tests/worca_login_test.py",
-            "test_functions": [{"name": "test_login", "markers": ["worca_smoke"]}],
+            "test_file_target": "tests/qtea_login_test.py",
+            "test_functions": [{"name": "test_login", "markers": ["qtea_smoke"]}],
             "fixtures": [{"name": "phantom", "source": "reuse", "from": "tests/conftest.py:phantom"}],
         }],
     }
@@ -136,11 +136,11 @@ def test_validate_plan_rejects_bad_marker():
         "test_cases": [{
             "id": "TC-1",
             "test_file_target": "tests/x.py",
-            "test_functions": [{"name": "test_x", "markers": ["worca_wrong"]}],
+            "test_functions": [{"name": "test_x", "markers": ["qtea_wrong"]}],
         }],
     }
     violations = _validate_plan_against_inventory(plan, am)
-    assert any("worca_wrong" in v for v in violations)
+    assert any("qtea_wrong" in v for v in violations)
 
 
 def test_validate_plan_rejects_oversize_intent():
@@ -195,8 +195,8 @@ def test_validate_plan_passes_on_well_formed_plan():
         "active_module": "x",
         "test_cases": [{
             "id": "TC-LOGIN-1",
-            "test_file_target": "tests/worca_login_test.py",
-            "test_functions": [{"name": "test_login", "markers": ["worca_smoke"], "uses_fixtures": ["auth"]}],
+            "test_file_target": "tests/qtea_login_test.py",
+            "test_functions": [{"name": "test_login", "markers": ["qtea_smoke"], "uses_fixtures": ["auth"]}],
             "fixtures": [{
                 "name": "auth", "source": "reuse",
                 "from": "tests/conftest.py:auth",
@@ -228,7 +228,7 @@ def test_validate_plan_rejects_missing_reuse_justification():
         "test_cases": [{
             "id": "TC-1",
             "test_file_target": "tests/x.py",
-            "test_functions": [{"name": "test_x", "markers": ["worca_smoke"]}],
+            "test_functions": [{"name": "test_x", "markers": ["qtea_smoke"]}],
             "fixtures": [{
                 "name": "auth", "source": "reuse",
                 "from": "tests/conftest.py:auth",
@@ -254,7 +254,7 @@ def test_validate_plan_rejects_whitespace_reuse_justification():
         "test_cases": [{
             "id": "TC-1",
             "test_file_target": "tests/x.py",
-            "test_functions": [{"name": "test_x", "markers": ["worca_smoke"]}],
+            "test_functions": [{"name": "test_x", "markers": ["qtea_smoke"]}],
             "page_objects": [{
                 "name": "LoginPage", "source": "reuse",
                 "from": "src/pages/login.py",
@@ -282,7 +282,7 @@ def test_validate_plan_rejects_locator_reuse_missing_justification():
         "test_cases": [{
             "id": "TC-1",
             "test_file_target": "tests/x.py",
-            "test_functions": [{"name": "test_x", "markers": ["worca_smoke"]}],
+            "test_functions": [{"name": "test_x", "markers": ["qtea_smoke"]}],
             "locators": [{
                 "name": "EMAIL_INPUT", "owning_page": "LoginPage",
                 "source": "reuse",
@@ -388,7 +388,7 @@ def test_inline_reuse_sources_respects_env_budget(tmp_path: Path, monkeypatch):
         "path": ".",
         "existing_page_objects": [{"name": "Big", "file": "src/big.py"}],
     }
-    monkeypatch.setenv("WORCA_T_REUSE_SOURCE_BUDGET", "100")
+    monkeypatch.setenv("QTEA_REUSE_SOURCE_BUDGET", "100")
     sources, skipped = _inline_reuse_sources(am, sut)
     assert sources == {}
     assert skipped == ["src/big.py"]
@@ -402,7 +402,7 @@ def test_validate_plan_helper_reuse_requires_justification_and_from():
         "test_cases": [{
             "id": "TC-1",
             "test_file_target": "tests/x.py",
-            "test_functions": [{"name": "test_x", "markers": ["worca_smoke"]}],
+            "test_functions": [{"name": "test_x", "markers": ["qtea_smoke"]}],
             "helpers": [{"name": "wait_for", "source": "reuse"}],
         }],
     }
@@ -426,7 +426,7 @@ def _am_with_auth(fixture_entry="tests/conftest.py:chat_page"):
 def _plan_with_create_fixture(yields="ChatPage", depends_on=None):
     fix = {
         "name": "mobile_chat_page", "source": "create",
-        "at": "tests/fixtures/worca_fixtures.py",
+        "at": "tests/fixtures/qtea_fixtures.py",
     }
     if yields is not None:
         fix["yields"] = yields
@@ -438,7 +438,7 @@ def _plan_with_create_fixture(yields="ChatPage", depends_on=None):
         "test_cases": [{
             "id": "TC-1",
             "test_file_target": "tests/x.py",
-            "test_functions": [{"name": "test_x", "markers": ["worca_smoke"]}],
+            "test_functions": [{"name": "test_x", "markers": ["qtea_smoke"]}],
             "fixtures": [fix],
         }],
     }
@@ -490,10 +490,10 @@ _GOOD_PLAN = {
     "test_cases": [{
         "id": "TC-LOGIN-1",
         "title": "User can log in",
-        "test_file_target": "tests/worca_login_test.py",
+        "test_file_target": "tests/qtea_login_test.py",
         "test_functions": [{
             "name": "test_login_with_valid_credentials",
-            "markers": ["worca_smoke"],
+            "markers": ["qtea_smoke"],
             "uses_fixtures": ["auth"],
         }],
         "fixtures": [{
@@ -753,7 +753,7 @@ async def test_step07_rejects_phase_gate_violation(
         "test_cases": [{
             "id": "TC-1",
             "test_file_target": "tests/x.py",
-            "test_functions": [{"name": "test_x", "markers": ["worca_smoke"]}],
+            "test_functions": [{"name": "test_x", "markers": ["qtea_smoke"]}],
             "fixtures": [{
                 "name": "phantom", "source": "reuse",
                 "from": "tests/conftest.py:phantom",
@@ -780,7 +780,7 @@ def test_render_plan_markdown_includes_test_cases_and_sources():
     assert "frontend" in md
     assert "TC-LOGIN-1" in md
     assert "User can log in" in md
-    assert "tests/worca_login_test.py" in md
+    assert "tests/qtea_login_test.py" in md
     # Reuse + create_tbd lines render with their source semantics.
     assert "reuse from" in md
     assert "create_tbd" in md

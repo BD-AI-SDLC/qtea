@@ -20,11 +20,11 @@ import json
 from pathlib import Path
 
 from tests.unit._fake_anthropic import install_fake_anthropic
-from worca_t.checkpoints import RunState
-from worca_t.pipeline import PipelineOptions
-from worca_t.steps.base import StepContext
-from worca_t.steps.s04_strategy import StrategyStep
-from worca_t.workspace import create_workspace
+from qtea.checkpoints import RunState
+from qtea.pipeline import PipelineOptions
+from qtea.steps.base import StepContext
+from qtea.steps.s04_strategy import StrategyStep
+from qtea.workspace import create_workspace
 
 # ---------- canned markdown fixtures ----------
 
@@ -149,8 +149,8 @@ def _ctx(tmp_path: Path) -> StepContext:
 
 def _seed_upstream(ctx: StepContext) -> None:
     """Populate Step 2 + Step 3 artifacts (md + json) that Step 4 reads."""
-    from worca_t.steps.s02_refine import _project_to_json
-    from worca_t.steps.s03_plan import _project_plan
+    from qtea.steps.s02_refine import _project_to_json
+    from qtea.steps.s03_plan import _project_plan
 
     step2 = ctx.workspace.step_dir(2)
     (step2 / "refined-spec.md").write_text(_REFINED_MD, encoding="utf-8")
@@ -171,7 +171,7 @@ def _seed_upstream(ctx: StepContext) -> None:
 async def test_step4_gate_off_preserves_existing_behavior(
     tmp_path: Path, monkeypatch,
 ):
-    monkeypatch.delenv("WORCA_T_COVERAGE_AUDIT", raising=False)
+    monkeypatch.delenv("QTEA_COVERAGE_AUDIT", raising=False)
     ctx = _ctx(tmp_path)
     _seed_upstream(ctx)
     install_fake_anthropic(monkeypatch, text=_STRATEGY_DROPS_PLAN_002)
@@ -188,7 +188,7 @@ async def test_step4_gate_off_preserves_existing_behavior(
 async def test_step4_clean_strategy_emits_traceability_matrix(
     tmp_path: Path, monkeypatch,
 ):
-    monkeypatch.setenv("WORCA_T_COVERAGE_AUDIT", "1")
+    monkeypatch.setenv("QTEA_COVERAGE_AUDIT", "1")
     ctx = _ctx(tmp_path)
     _seed_upstream(ctx)
     install_fake_anthropic(monkeypatch, text=_STRATEGY_CLEAN)
@@ -213,7 +213,7 @@ async def test_step4_clean_strategy_emits_traceability_matrix(
 async def test_step4_orphan_plan_tc_triggers_audit_failure(
     tmp_path: Path, monkeypatch,
 ):
-    monkeypatch.setenv("WORCA_T_COVERAGE_AUDIT", "1")
+    monkeypatch.setenv("QTEA_COVERAGE_AUDIT", "1")
     ctx = _ctx(tmp_path)
     _seed_upstream(ctx)
     install_fake_anthropic(monkeypatch, text=_STRATEGY_DROPS_PLAN_002)
@@ -233,7 +233,7 @@ async def test_step4_accepted_risk_coverage_note_suppresses_orphan(
 ):
     """Plan TC dropped + Coverage Notes accepted_risk entry → matrix records
     `dropped_accepted_risk` and audit passes."""
-    monkeypatch.setenv("WORCA_T_COVERAGE_AUDIT", "1")
+    monkeypatch.setenv("QTEA_COVERAGE_AUDIT", "1")
     ctx = _ctx(tmp_path)
     _seed_upstream(ctx)
     install_fake_anthropic(monkeypatch, text=_STRATEGY_ACCEPTS_RISK_FOR_PLAN_002)
@@ -250,7 +250,7 @@ async def test_step4_accepted_risk_coverage_note_suppresses_orphan(
 async def test_step4_cross_priority_consolidation_triggers_audit_failure(
     tmp_path: Path, monkeypatch,
 ):
-    monkeypatch.setenv("WORCA_T_COVERAGE_AUDIT", "1")
+    monkeypatch.setenv("QTEA_COVERAGE_AUDIT", "1")
     ctx = _ctx(tmp_path)
     _seed_upstream(ctx)
     install_fake_anthropic(monkeypatch, text=_STRATEGY_CROSS_PRIORITY_MERGE)
@@ -270,7 +270,7 @@ async def test_step4_cross_priority_consolidation_triggers_audit_failure(
 async def test_step4_audit_log_consumed_on_retry_and_succeeds(
     tmp_path: Path, monkeypatch,
 ):
-    monkeypatch.setenv("WORCA_T_COVERAGE_AUDIT", "1")
+    monkeypatch.setenv("QTEA_COVERAGE_AUDIT", "1")
     captured: list[dict] = []
     install_fake_anthropic(
         monkeypatch,
@@ -306,7 +306,7 @@ async def test_step4_audit_log_consumed_on_retry_and_succeeds(
 async def test_step4_two_consecutive_audit_failures_hard_fail(
     tmp_path: Path, monkeypatch,
 ):
-    monkeypatch.setenv("WORCA_T_COVERAGE_AUDIT", "1")
+    monkeypatch.setenv("QTEA_COVERAGE_AUDIT", "1")
     install_fake_anthropic(
         monkeypatch,
         texts=[_STRATEGY_DROPS_PLAN_002, _STRATEGY_DROPS_PLAN_002],

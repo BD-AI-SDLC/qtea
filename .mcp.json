@@ -2,7 +2,7 @@
   "mcpServers": {
     "playwright": {
       "command": "npx",
-      "args": ["-y", "@playwright/mcp@latest", "--headless", "${WORCA_T_MCP_USER_DATA_DIR_ARG}", "${WORCA_T_STORAGE_STATE_ARG}"]
+      "args": ["-y", "@playwright/mcp@latest", "--headless", "${QTEA_MCP_USER_DATA_DIR_ARG}", "${QTEA_STORAGE_STATE_ARG}"]
     },
     "context7": {
       "type": "http",

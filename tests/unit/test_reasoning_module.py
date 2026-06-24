@@ -1,4 +1,4 @@
-"""Tests for :mod:`worca_t.llm.reasoning`.
+"""Tests for :mod:`qtea.llm.reasoning`.
 
 Covers the direct-SDK transport in isolation — no step files involved.
 The reasoning module is exercised by the soon-to-be-migrated step
@@ -21,11 +21,11 @@ from tests.unit._fake_anthropic import (
     enable_vertex_env,
     install_fake_anthropic,
 )
-from worca_t.llm.reasoning import (
+from qtea.llm.reasoning import (
     call_reasoning_llm,
     reset_vertex_structured_outputs_warning_latch,
 )
-from worca_t.metrics import CURRENT_STEP_METRICS, StepMetricsAccumulator
+from qtea.metrics import CURRENT_STEP_METRICS, StepMetricsAccumulator
 
 
 @pytest.fixture(autouse=True)
@@ -247,7 +247,7 @@ async def test_vertex_structured_outputs_warning_fires_once_per_run(
     agent = _write_agent_file(tmp_path)
     schema = {"type": "object", "properties": {"x": {"type": "string"}}}
 
-    with caplog.at_level(logging.WARNING, logger="worca_t.llm.reasoning"):
+    with caplog.at_level(logging.WARNING, logger="qtea.llm.reasoning"):
         for _ in range(3):
             await call_reasoning_llm(
                 agent_path=agent,
@@ -270,7 +270,7 @@ async def test_vertex_structured_outputs_warning_fires_once_per_run(
 async def test_vertex_structured_outputs_warning_resets_between_runs(
     tmp_path, monkeypatch, caplog
 ):
-    """After the explicit reset (simulating a fresh process / `worca-t run`),
+    """After the explicit reset (simulating a fresh process / `qtea run`),
     the banner fires again on the next call."""
     import logging
 
@@ -279,7 +279,7 @@ async def test_vertex_structured_outputs_warning_resets_between_runs(
     agent = _write_agent_file(tmp_path)
     schema = {"type": "object"}
 
-    with caplog.at_level(logging.WARNING, logger="worca_t.llm.reasoning"):
+    with caplog.at_level(logging.WARNING, logger="qtea.llm.reasoning"):
         await call_reasoning_llm(
             agent_path=agent, workdir=tmp_path / "wd",
             user_prompt="x", output_schema=schema, model="claude-sonnet-4-6",
@@ -453,7 +453,7 @@ async def test_missing_agent_file_raises(tmp_path):
 
 async def test_no_model_resolved_raises(tmp_path, monkeypatch):
     # Force model_for_agent() to return None and don't pass model=
-    monkeypatch.setattr("worca_t.llm.reasoning.model_for_agent", lambda _: None)
+    monkeypatch.setattr("qtea.llm.reasoning.model_for_agent", lambda _: None)
     install_fake_anthropic(monkeypatch, text="ok")
     agent = _write_agent_file(tmp_path)
 
@@ -589,7 +589,7 @@ async def test_cost_zero_for_unknown_model(tmp_path, monkeypatch):
     agent = _write_agent_file(tmp_path)
 
     # Force model_for_agent + override model to a non-Anthropic-family id.
-    monkeypatch.setattr("worca_t.llm.reasoning.model_for_agent", lambda _: "gpt-9-future")
+    monkeypatch.setattr("qtea.llm.reasoning.model_for_agent", lambda _: "gpt-9-future")
     result = await call_reasoning_llm(
         agent_path=agent,
         workdir=tmp_path / "wd",

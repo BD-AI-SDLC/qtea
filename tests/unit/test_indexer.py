@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from worca_t.test_indexer import (
+from qtea.test_indexer import (
     blocking_violations,
     index_tests,
     resolve_framework,
@@ -342,7 +342,7 @@ def test_zero_assertions_opt_out_marker_respected(tmp_path: Path):
     (tmp_path / "test_setup.py").write_text(
         """import pytest
 
-@pytest.mark.worca_setup
+@pytest.mark.qtea_setup
 def test_seed_state(page):
     page.goto("/admin")
     page.click("#seed")
@@ -588,50 +588,50 @@ def test_index_as_dict_matches_schema_shape(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Regression: indexer must see `worca_`-prefixed test files (Layer B convention).
+# Regression: indexer must see `qtea_`-prefixed test files (Layer B convention).
 # ---------------------------------------------------------------------------
 
 
-def test_indexer_finds_worca_prefixed_pytest_files(tmp_path: Path):
-    """Step 7 codegen prefixes every generated test file with `worca_`
-    (e.g. `worca_test_login.py`) to avoid colliding with the SUT's own tests.
-    Without explicit `worca_test_*.py` globs, the indexer reports tests=0 for
+def test_indexer_finds_qtea_prefixed_pytest_files(tmp_path: Path):
+    """Step 7 codegen prefixes every generated test file with `qtea_`
+    (e.g. `qteaest_login.py`) to avoid colliding with the SUT's own tests.
+    Without explicit `qteaest_*.py` globs, the indexer reports tests=0 for
     the actual test file and Step 8 misses every TBD marker.
     """
     smoke = tmp_path / "smoke"
     smoke.mkdir()
-    (smoke / "worca_test_login.py").write_text(
+    (smoke / "qteaest_login.py").write_text(
         "def test_should_login_when_valid_creds():\n    pass\n",
         encoding="utf-8",
     )
     result = index_tests(tmp_path, framework="playwright-py")
     assert len(result.tests) == 1
-    assert any("worca_test_login.py" in f for f in result.files)
+    assert any("qteaest_login.py" in f for f in result.files)
     assert result.tests[0].name.startswith("test_should_login")
 
 
-def test_indexer_finds_worca_prefixed_playwright_ts_files(tmp_path: Path):
+def test_indexer_finds_qtea_prefixed_playwright_ts_files(tmp_path: Path):
     pages = tmp_path / "tests"
     pages.mkdir()
-    (pages / "worca_login.spec.ts").write_text(
+    (pages / "qtea_login.spec.ts").write_text(
         """test('should login', async ({page}) => {\n  await page.getByRole('button').click();\n});\n""",
         encoding="utf-8",
     )
     result = index_tests(tmp_path, framework="playwright-ts")
     assert len(result.tests) == 1
-    assert any("worca_login.spec.ts" in f for f in result.files)
+    assert any("qtea_login.spec.ts" in f for f in result.files)
 
 
-def test_indexer_still_finds_standard_test_files_alongside_worca(tmp_path: Path):
-    """Adding worca_ globs must NOT exclude standard test_ files."""
+def test_indexer_still_finds_standard_test_files_alongside_qtea(tmp_path: Path):
+    """Adding qtea_ globs must NOT exclude standard test_ files."""
     smoke = tmp_path / "smoke"
     smoke.mkdir()
     (smoke / "test_native.py").write_text("def test_a(): pass\n", encoding="utf-8")
-    (smoke / "worca_test_added.py").write_text("def test_b(): pass\n", encoding="utf-8")
+    (smoke / "qteaest_added.py").write_text("def test_b(): pass\n", encoding="utf-8")
     result = index_tests(tmp_path, framework="playwright-py")
     files = " ".join(result.files)
     assert "test_native.py" in files
-    assert "worca_test_added.py" in files
+    assert "qteaest_added.py" in files
     assert len(result.tests) == 2
 
 
@@ -644,7 +644,7 @@ def test_indexer_attaches_tbd_intent_python_comment(tmp_path: Path):
     """A `# TBD_INTENT: <text>` comment above a TBD_LOCATOR marker is
     captured as the marker's `description`. Also: the surrounding test
     function name lands on `test_function`."""
-    f = tmp_path / "worca_test_login.py"
+    f = tmp_path / "qteaest_login.py"
     f.write_text(
         """\
 def test_login_with_valid_credentials(page):
@@ -665,7 +665,7 @@ def test_login_with_valid_credentials(page):
 
 def test_indexer_attaches_tbd_intent_js_comment(tmp_path: Path):
     """JS/TS `// TBD_INTENT: <text>` comment style is also recognized."""
-    f = tmp_path / "worca_login.spec.ts"
+    f = tmp_path / "qtea_login.spec.ts"
     f.write_text(
         """\
 test('should login', async ({ page }) => {
@@ -685,7 +685,7 @@ test('should login', async ({ page }) => {
 def test_indexer_legacy_marker_without_intent_has_null_description(tmp_path: Path):
     """A TBD marker with no adjacent TBD_INTENT comment leaves `description`
     as None — older runs degrade gracefully, no schema breakage."""
-    f = tmp_path / "worca_test_legacy.py"
+    f = tmp_path / "qteaest_legacy.py"
     f.write_text(
         """\
 def test_legacy(page):
@@ -703,7 +703,7 @@ def test_indexer_tbd_intent_search_window_is_narrow(tmp_path: Path):
     """An intent comment 5 lines away from the marker is NOT attached —
     the search window is ±2 lines so far-away comments don't bleed into
     unrelated markers."""
-    f = tmp_path / "worca_test_far.py"
+    f = tmp_path / "qteaest_far.py"
     f.write_text(
         """\
 def test_far(page):
@@ -723,7 +723,7 @@ def test_far(page):
 
 def test_indexer_tbd_intent_persists_through_as_dict(tmp_path: Path):
     """The new fields round-trip through the serialised output."""
-    f = tmp_path / "worca_test_serialize.py"
+    f = tmp_path / "qteaest_serialize.py"
     f.write_text(
         """\
 def test_serialize(page):
@@ -751,9 +751,9 @@ def test_indexer_recognizes_tbd_call_in_support_file(tmp_path: Path):
     The indexer extracts intent directly from the call argument."""
     pages = tmp_path / "pages" / "locators"
     pages.mkdir(parents=True)
-    (pages / "worca_login_locators.py").write_text(
+    (pages / "qtea_login_locators.py").write_text(
         """\
-from tests.worca_t_runtime import tbd
+from tests.qtea_runtime import tbd
 
 class LoginLocators:
     LOGIN_BUTTON = tbd("primary submit button on the login form")
@@ -778,9 +778,9 @@ def test_indexer_mixed_tbd_styles_no_double_count(tmp_path: Path):
     `TBD_LOCATOR` markers should index each marker exactly once."""
     pages = tmp_path / "pages" / "locators"
     pages.mkdir(parents=True)
-    (pages / "worca_mixed_locators.py").write_text(
+    (pages / "qtea_mixed_locators.py").write_text(
         """\
-from tests.worca_t_runtime import tbd
+from tests.qtea_runtime import tbd
 
 class MixedLocators:
     NEW_STYLE = tbd("new style locator")
@@ -801,9 +801,9 @@ def test_indexer_tbd_call_with_empty_intent_is_skipped(tmp_path: Path):
     test time; the indexer also drops it to avoid producing empty markers."""
     pages = tmp_path / "pages" / "locators"
     pages.mkdir(parents=True)
-    (pages / "worca_empty_locators.py").write_text(
+    (pages / "qtea_empty_locators.py").write_text(
         """\
-from tests.worca_t_runtime import tbd
+from tests.qtea_runtime import tbd
 
 class EmptyLocators:
     BAD = tbd("")

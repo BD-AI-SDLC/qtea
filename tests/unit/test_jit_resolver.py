@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 import pytest
 
-from worca_t.jit_resolver import (
+from qtea.jit_resolver import (
     ResolutionResult,
     cache_key,
     is_xpath,
@@ -25,7 +25,7 @@ from worca_t.jit_resolver import (
     snapshot_hash,
     write_cache,
 )
-from worca_t.runtime.dev_locators import DevLocator
+from qtea.runtime.dev_locators import DevLocator
 
 # ---------------------------------------------------------------------------
 # Pure helpers
@@ -138,7 +138,7 @@ def test_resolve_one_cache_hit_skips_llm(tmp_path: Path):
         },
     )
     # Mock _call_anthropic so test fails if it's invoked.
-    with patch("worca_t.jit_resolver._call_anthropic", side_effect=AssertionError("LLM called on cache hit")):
+    with patch("qtea.jit_resolver._call_anthropic", side_effect=AssertionError("LLM called on cache hit")):
         result = resolve_one(
             intent="submit button",
             snapshot_text='{"role":"button"}',
@@ -169,7 +169,7 @@ def test_resolve_one_llm_success_caches_and_returns_agent_source(tmp_path: Path)
     cache = tmp_path / "cache"
     cache.mkdir()
     with patch(
-        "worca_t.jit_resolver._call_anthropic",
+        "qtea.jit_resolver._call_anthropic",
         return_value=_fake_anthropic_response({
             "selector": "[data-testid='login-submit']",
             "strategy": "data-testid",
@@ -201,7 +201,7 @@ def test_resolve_one_llm_returns_xpath_treated_as_unresolvable(tmp_path: Path):
     cache = tmp_path / "cache"
     cache.mkdir()
     with patch(
-        "worca_t.jit_resolver._call_anthropic",
+        "qtea.jit_resolver._call_anthropic",
         return_value=_fake_anthropic_response({
             "selector": "//button[@id='login']",
             "strategy": "xpath",
@@ -225,7 +225,7 @@ def test_resolve_one_llm_returns_null_selector_unresolvable(tmp_path: Path):
     cache = tmp_path / "cache"
     cache.mkdir()
     with patch(
-        "worca_t.jit_resolver._call_anthropic",
+        "qtea.jit_resolver._call_anthropic",
         return_value=_fake_anthropic_response({
             "selector": None,
             "strategy": None,
@@ -250,9 +250,9 @@ def test_resolve_one_bounded_retry_on_api_failure(tmp_path: Path):
     cache = tmp_path / "cache"
     cache.mkdir()
     with patch(
-        "worca_t.jit_resolver._call_anthropic",
+        "qtea.jit_resolver._call_anthropic",
         side_effect=RuntimeError("connection reset"),
-    ), patch("worca_t.jit_resolver.time.sleep") as sleep_mock:
+    ), patch("qtea.jit_resolver.time.sleep") as sleep_mock:
         result = resolve_one(
             intent="submit button",
             snapshot_text="{}",
@@ -269,7 +269,7 @@ def test_resolve_one_no_cache_dir_still_works(tmp_path: Path):
     """When no cache_dir is supplied (e.g. test or one-off call), resolution
     still happens but the result isn't persisted."""
     with patch(
-        "worca_t.jit_resolver._call_anthropic",
+        "qtea.jit_resolver._call_anthropic",
         return_value=_fake_anthropic_response({
             "selector": "#x", "strategy": "id", "confidence": 0.9,
         }),
@@ -316,7 +316,7 @@ def test_resolve_one_parses_two_candidate_bundle(tmp_path: Path):
     cache = tmp_path / "cache"
     cache.mkdir()
     with patch(
-        "worca_t.jit_resolver._call_anthropic",
+        "qtea.jit_resolver._call_anthropic",
         return_value=_fake_anthropic_response({
             "candidates": [
                 {"selector": "[data-testid='login-submit']", "strategy": "data-testid", "confidence": 0.92, "reason": None},
@@ -354,7 +354,7 @@ def test_resolve_one_accepts_single_candidate_bundle(tmp_path: Path):
     cache = tmp_path / "cache"
     cache.mkdir()
     with patch(
-        "worca_t.jit_resolver._call_anthropic",
+        "qtea.jit_resolver._call_anthropic",
         return_value=_fake_anthropic_response({
             "candidates": [
                 {"selector": "#unique-id", "strategy": "id", "confidence": 0.95, "reason": None},
@@ -376,7 +376,7 @@ def test_resolve_one_drops_xpath_candidates_from_bundle(tmp_path: Path):
     cache = tmp_path / "cache"
     cache.mkdir()
     with patch(
-        "worca_t.jit_resolver._call_anthropic",
+        "qtea.jit_resolver._call_anthropic",
         return_value=_fake_anthropic_response({
             "candidates": [
                 {"selector": "[data-testid='go']", "strategy": "data-testid", "confidence": 0.9},
@@ -400,7 +400,7 @@ def test_resolve_one_falls_back_to_flat_shape_for_legacy_response(tmp_path: Path
     cache = tmp_path / "cache"
     cache.mkdir()
     with patch(
-        "worca_t.jit_resolver._call_anthropic",
+        "qtea.jit_resolver._call_anthropic",
         return_value=_fake_anthropic_response({
             "selector": "#legacy", "strategy": "id", "confidence": 0.8, "reason": None,
         }),
@@ -422,7 +422,7 @@ def test_resolve_one_empty_candidates_array_is_unresolvable(tmp_path: Path):
     cache = tmp_path / "cache"
     cache.mkdir()
     with patch(
-        "worca_t.jit_resolver._call_anthropic",
+        "qtea.jit_resolver._call_anthropic",
         return_value=_fake_anthropic_response({
             "candidates": [],
             "reason": "no button with name 'Sign in' present",
@@ -486,7 +486,7 @@ def test_resolve_one_cache_hit_surfaces_bundle(tmp_path: Path):
             },
         },
     )
-    with patch("worca_t.jit_resolver._call_anthropic", side_effect=AssertionError("LLM called on cache hit")):
+    with patch("qtea.jit_resolver._call_anthropic", side_effect=AssertionError("LLM called on cache hit")):
         result = resolve_one(
             intent="go button",
             snapshot_text="{}",
@@ -512,7 +512,7 @@ def test_parse_response_tolerates_leading_prose():
     the model emits a leading newline, whitespace, or a stray token before
     the opening brace. Without the assistant-prefill nudge this is the
     safety net against rare format slips."""
-    from worca_t.jit_resolver import _parse_response
+    from qtea.jit_resolver import _parse_response
 
     payload = '{"candidates": [{"selector": "#x", "strategy": "id", "confidence": 0.9}]}'
     for prefix in ("", "\n", "  ", "```json\n", "Here is the JSON:\n"):
@@ -525,7 +525,7 @@ def test_call_anthropic_messages_end_with_user_role(tmp_path: Path):
     The `messages` list sent to the Anthropic SDK must end with a user-role
     message — never assistant — so the same call works on both native
     Anthropic and Vertex backends."""
-    from worca_t.jit_resolver import _call_anthropic
+    from qtea.jit_resolver import _call_anthropic
 
     captured: dict = {}
 
@@ -549,7 +549,7 @@ def test_call_anthropic_messages_end_with_user_role(tmp_path: Path):
     class _FakeClient:
         messages = _FakeMessages()
 
-    with patch("worca_t.config.use_vertex_backend", return_value=False), \
+    with patch("qtea.config.use_vertex_backend", return_value=False), \
          patch("anthropic.Anthropic", return_value=_FakeClient()):
         body, _ = _call_anthropic("sys", "user", model="claude-sonnet-4-6")
 

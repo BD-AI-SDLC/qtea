@@ -1,4 +1,4 @@
-# Getting Started with worca-t
+# Getting Started with qtea
 
 > End-to-end guide: from installation to your first fully autonomous QA run.
 
@@ -12,19 +12,19 @@
 | npx | Yes | `npx --version` | Bundled with Node.js (install nodejs.org) |
 | Allure CLI | Optional | `allure --version` | `npm install -g allure-commandline` |
 
-## 1. Install worca-t
+## 1. Install qtea
 
 ```bash
-uv tool install /path/to/worca-t
-worca-t --help
+uv tool install /path/to/qtea
+qtea --help
 ```
 
 Or for development:
 
 ```bash
-cd /path/to/worca-t
+cd /path/to/qtea
 uv sync
-uv run worca-t --help
+uv run qtea --help
 ```
 
 ## 2. Configure environment
@@ -58,7 +58,7 @@ and Xray credentials are optional — steps 1 and 5 auto-adapt.
 
 ### Prompt caching (BMF sticky sessions) — IMPORTANT, set this first
 
-> **Set `ANTHROPIC_CUSTOM_HEADERS` as a USER environment variable before running worca-t.** Single most impactful one-time setup. Without the BMF sticky-session header the relay does not honour `cache_control` — caching becomes a net **cost loss** (25% creation surcharge, zero read-side payback). With it, worca-t auto-enables caching on every step; no `--cache` flag needed.
+> **Set `ANTHROPIC_CUSTOM_HEADERS` as a USER environment variable before running qtea.** Single most impactful one-time setup. Without the BMF sticky-session header the relay does not honour `cache_control` — caching becomes a net **cost loss** (25% creation surcharge, zero read-side payback). With it, qtea auto-enables caching on every step; no `--cache` flag needed.
 
 Pick **one** BMF replica (`01` or `02`) and stick with the same value across runs for cache locality:
 
@@ -85,7 +85,7 @@ Alternatively, pass a custom env file at runtime (the file can live
 anywhere on disk — it does not need to be inside the SUT):
 
 ```bash
-worca-t run --spec ./spec.md --sut ./app --env-file /path/to/.env.prod
+qtea run --spec ./spec.md --sut ./app --env-file /path/to/.env.prod
 ```
 
 ### SUT environment variables (interactive resolution)
@@ -103,7 +103,7 @@ A key is **required** when it appears in `.env.example` or matches `*BASE_URL*`,
 CI / non-interactive: pass `--no-hitl` to skip prompts entirely (assumes vars are pre-set by the pipeline):
 
 ```bash
-worca-t run --spec ./spec.md --sut ./app --no-hitl
+qtea run --spec ./spec.md --sut ./app --no-hitl
 ```
 
 ### Remote SUT (git URL)
@@ -111,16 +111,16 @@ worca-t run --spec ./spec.md --sut ./app --no-hitl
 `--sut` accepts git URLs from any major hosting provider (shallow-cloned `--depth=1` into the workspace):
 
 ```bash
-worca-t run --spec ./spec.md --sut https://github.com/org/app.git                     # GitHub / GitLab / Bitbucket
-worca-t run --spec ./spec.md --sut https://org@dev.azure.com/org/project/_git/repo    # Azure DevOps (HTTPS)
-worca-t run --spec ./spec.md --sut git@ssh.dev.azure.com:v3/org/project/repo          # Azure DevOps (SSH)
+qtea run --spec ./spec.md --sut https://github.com/org/app.git                     # GitHub / GitLab / Bitbucket
+qtea run --spec ./spec.md --sut https://org@dev.azure.com/org/project/_git/repo    # Azure DevOps (HTTPS)
+qtea run --spec ./spec.md --sut git@ssh.dev.azure.com:v3/org/project/repo          # Azure DevOps (SSH)
 ```
 
 `.env` files are gitignored so won't be cloned — use `--env-file` or the interactive prompt for missing values.
 
 ### Azure DevOps Variable Groups
 
-In an Azure DevOps pipeline (or any env with REST access), worca-t can pull SUT env vars directly from a Variable Group. Set these:
+In an Azure DevOps pipeline (or any env with REST access), qtea can pull SUT env vars directly from a Variable Group. Set these:
 
 | Env Var | Purpose |
 | --- | --- |
@@ -139,7 +139,7 @@ variables:
   - { name: AZDO_VARIABLE_GROUP, value: my-qa-variables }
   - { name: AZDO_PAT,            value: $(System.AccessToken) }  # or a secret-bound PAT
 steps:
-  - script: worca-t run --spec jira:PROJ-123 --sut $(SUT_REPO_URL) --no-hitl
+  - script: qtea run --spec jira:PROJ-123 --sut $(SUT_REPO_URL) --no-hitl
 ```
 
 **Note:** Variables marked **secret** in Azure DevOps cannot be retrieved via REST (API returns `null`) — set them in the pipeline definition or use `--env-file`.
@@ -147,7 +147,7 @@ steps:
 ## 3. Validate your setup
 
 ```bash
-worca-t doctor
+qtea doctor
 ```
 
 Expected output: all checks `OK` or `INFO`. Fix any `FAIL` items before
@@ -155,7 +155,7 @@ proceeding. Common issues:
 
 | Check | Fix |
 | --- | --- |
-| claude CLI: FAIL | Install Claude Code CLI or set `WORCA_T_CLAUDE_BIN=claude` |
+| claude CLI: FAIL | Install Claude Code CLI or set `QTEA_CLAUDE_BIN=claude` |
 | npx: FAIL | Install Node.js (includes npx) |
 | ANTHROPIC_API_KEY: WARN | Add it to your `.env` file |
 | proxy: INFO | Safe to ignore if you're not behind a corporate proxy |
@@ -192,19 +192,19 @@ Save as `feature-spec.md`.
 **With a local spec and local SUT:**
 
 ```bash
-worca-t run --spec ./feature-spec.md --sut ./path-to-your-app
+qtea run --spec ./feature-spec.md --sut ./path-to-your-app
 ```
 
 **With a Jira ticket and a Git repo:**
 
 ```bash
-worca-t run --spec jira:PROJ-123 --sut https://github.com/org/app.git
+qtea run --spec jira:PROJ-123 --sut https://github.com/org/app.git
 ```
 
 **With an Azure DevOps repo and a separate env file:**
 
 ```bash
-worca-t run --spec jira:PROJ-123 \
+qtea run --spec jira:PROJ-123 \
   --sut https://org@dev.azure.com/org/project/_git/repo \
   --env-file ./qa.env
 ```
@@ -212,13 +212,13 @@ worca-t run --spec jira:PROJ-123 \
 **With the report opening automatically:**
 
 ```bash
-worca-t run --spec ./feature-spec.md --sut ./app --open-report
+qtea run --spec ./feature-spec.md --sut ./app --open-report
 ```
 
 The pipeline runs all 11 steps. You'll see console output like:
 
 ```text
-workspace .worca-t/20260523-143012-a1b2c3
+workspace .qtea/20260523-143012-a1b2c3
 run_id    20260523-143012-a1b2c3
 >>> step 1 intake
 step 1 ok  -> 2 outputs
@@ -253,20 +253,20 @@ All `run` flags:
 | `--no-hitl` | false | Disable interactive prompts (CI mode) |
 | `--cache / --no-cache` | auto | Prompt caching: auto-enabled when BMF sticky-session header is detected, disabled otherwise. `--cache` forces on, `--no-cache` forces off |
 | `--dev-locators PATH` | — | Dev-supplied locator file for JIT resolution (highest-priority Tier 1) |
-| `--storage-state PATH` | — | Playwright `storageState.json` injected into the Step 9 heal-agent's Playwright MCP browser so it skips the 10-30 s auth-replay per heal call. Resolution priority: this flag > `WORCA_T_STORAGE_STATE` > `<sut>/.worca-t/storage-state.json` (from `worca-t auth-capture`) > `<workspace>/storage-state.json` (auto-captured by the runtime on first passing test of the current run). |
+| `--storage-state PATH` | — | Playwright `storageState.json` injected into the Step 9 heal-agent's Playwright MCP browser so it skips the 10-30 s auth-replay per heal call. Resolution priority: this flag > `QTEA_STORAGE_STATE` > `<sut>/.qtea/storage-state.json` (from `qtea auth-capture`) > `<workspace>/storage-state.json` (auto-captured by the runtime on first passing test of the current run). |
 | `--no-cleanup` | false | Keep step artifacts when using `--from-step` (default cleans target step onward) |
-| `-w / --workspace PATH` | `~/.worca-t` | Override the workspace base directory |
+| `-w / --workspace PATH` | `~/.qtea` | Override the workspace base directory |
 
 ## 6. List and inspect workspaces
 
 ```bash
-worca-t list
+qtea list
 ```
 
-Shows all workspaces under `~/.worca-t`, newest first:
+Shows all workspaces under `~/.qtea`, newest first:
 
 ```text
- Workspaces under /home/you/.worca-t
+ Workspaces under /home/you/.qtea
  run-id                    status    last  steps  started              spec
  20260523-143012-a1b2c3   finished  11    11     2026-05-23 14:30:12  feature-spec.md
  20260522-091500-b3c4d5   failed    7     7      2026-05-22 09:15:00  jira-PROJ-123
@@ -284,15 +284,15 @@ List flags:
 Use the `run-id` column with `--run-id` to resume a specific run:
 
 ```bash
-worca-t run --spec ./spec.md --sut ./app --run-id 20260522-091500-b3c4d5
+qtea run --spec ./spec.md --sut ./app --run-id 20260522-091500-b3c4d5
 ```
 
 ## 7. Find your results
 
-All artifacts are under `.worca-t/<run-id>/artifacts/`:
+All artifacts are under `.qtea/<run-id>/artifacts/`:
 
 ```text
-.worca-t/<run-id>/
+.qtea/<run-id>/
 ├── artifacts/
 │   ├── step01/   spec.md, jira-spec.md
 │   ├── step02/   refined-spec.md, refined-spec.json
@@ -313,7 +313,7 @@ All artifacts are under `.worca-t/<run-id>/artifacts/`:
 
 ```bash
 # Built-in HTML (always generated)
-open .worca-t/<run-id>/artifacts/step11/index.html
+open .qtea/<run-id>/artifacts/step11/index.html
 
 # Or use the --open-report flag to auto-open at end of run
 ```
@@ -322,25 +322,25 @@ open .worca-t/<run-id>/artifacts/step11/index.html
 
 ```bash
 # Re-run only the report (after editing bug classifications)
-worca-t run --spec ./spec.md --sut ./app --only-step 11
+qtea run --spec ./spec.md --sut ./app --only-step 11
 
 # Resume after a failure — pipeline auto-resumes from the last completed step
-worca-t run --spec ./spec.md --sut ./app
+qtea run --spec ./spec.md --sut ./app
 
 # Force a clean re-run (ignore checkpoints)
-worca-t run --spec ./spec.md --sut ./app --force
+qtea run --spec ./spec.md --sut ./app --force
 
 # Re-run from a specific step
-worca-t run --spec ./spec.md --sut ./app --from-step 7
+qtea run --spec ./spec.md --sut ./app --from-step 7
 
 # Debug a failing step — verbose debug agent from step 1
-worca-t run --spec ./spec.md --sut ./app --debug
+qtea run --spec ./spec.md --sut ./app --debug
 
 # Fix proposal when a step fails twice (suggestions only — never auto-edits)
-worca-t run --spec ./spec.md --sut ./app --fix
+qtea run --spec ./spec.md --sut ./app --fix
 ```
 
-Debug artifacts land in `.worca-t/<run-id>/debug/`.
+Debug artifacts land in `.qtea/<run-id>/debug/`.
 
 ### Review gates (interactive)
 
@@ -357,34 +357,34 @@ Edits made via the `[f]` option are fed back to the agent for a revision pass be
 ### Skip Xray upload (or enforce it)
 
 ```bash
-worca-t run --spec ./spec.md --sut ./app                # default: step 5 auto-skips when JIRA_XRAY creds are unset
-worca-t run --spec ./spec.md --sut ./app --strict-xray  # enforce: fail the pipeline if Xray upload doesn't succeed
+qtea run --spec ./spec.md --sut ./app                # default: step 5 auto-skips when JIRA_XRAY creds are unset
+qtea run --spec ./spec.md --sut ./app --strict-xray  # enforce: fail the pipeline if Xray upload doesn't succeed
 ```
 
 ### Storage-state reuse (skip auth in Step 9 self-heal)
 
 Step 9's self-heal Playwright MCP browser runs in a separate process from the test runner, so it inherits no cookies and would otherwise replay sign-in per heal call (10-30 s). Two ways to avoid that:
 
-**When do you need `auth-capture`?** When your SUT sits behind a login that can't be automated inline — MFA (Okta push, hardware key, TOTP), SSO/SAML redirects, or CAPTCHA-protected pages. You run it once interactively, complete the challenge manually in the headed browser, and worca-t saves the session for all subsequent runs. If your SUT uses standard username/password auth that tests can replay on their own, you don't need it — the auto-capture default below handles that.
+**When do you need `auth-capture`?** When your SUT sits behind a login that can't be automated inline — MFA (Okta push, hardware key, TOTP), SSO/SAML redirects, or CAPTCHA-protected pages. You run it once interactively, complete the challenge manually in the headed browser, and qtea saves the session for all subsequent runs. If your SUT uses standard username/password auth that tests can replay on their own, you don't need it — the auto-capture default below handles that.
 
 **Auto-capture (default, no setup):** the vendored pytest runtime captures `context.storage_state()` on the first passing test, writes `<workspace>/storage-state.json`, and Step 9 injects `--storage-state=<path>` into Playwright MCP. Works whenever tests can authenticate on their own (no MFA / captcha).
 
 **One-shot capture (for MFA / SSO / captcha):**
 
 ```bash
-worca-t auth-capture --sut ./path-to-your-app   # interactive headed browser — user completes MFA/SSO once.
-                                                # Output: <sut>/.worca-t/storage-state.json (convention path).
-worca-t run --spec ./feature-spec.md --sut ./path-to-your-app   # subsequent runs reuse it automatically.
+qtea auth-capture --sut ./path-to-your-app   # interactive headed browser — user completes MFA/SSO once.
+                                                # Output: <sut>/.qtea/storage-state.json (convention path).
+qtea run --spec ./feature-spec.md --sut ./path-to-your-app   # subsequent runs reuse it automatically.
 ```
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
-| `--sut PATH` | required | SUT root with `.worca-t/sut_inventory.json` from a prior `worca-t run` Step 6 |
-| `--output / -o PATH` | `<sut>/.worca-t/storage-state.json` | Output path |
+| `--sut PATH` | required | SUT root with `.qtea/sut_inventory.json` from a prior `qtea run` Step 6 |
+| `--output / -o PATH` | `<sut>/.qtea/storage-state.json` | Output path |
 | `--headed / --headless` | headed | Keep headed for interactive MFA |
 | `--timeout N` | 600 | Subprocess timeout (seconds) |
 
-**Explicit override:** pass `--storage-state PATH` to `worca-t run` to force a specific file. **`auth-capture` supports Python and Node.js (JS/TS) Playwright SUTs.** Java / .NET / Selenium / Cypress / Robot SUTs raise `NotImplementedError` — produce a Playwright-format `storageState.json` manually and pass it via `--storage-state`.
+**Explicit override:** pass `--storage-state PATH` to `qtea run` to force a specific file. **`auth-capture` supports Python and Node.js (JS/TS) Playwright SUTs.** Java / .NET / Selenium / Cypress / Robot SUTs raise `NotImplementedError` — produce a Playwright-format `storageState.json` manually and pass it via `--storage-state`.
 
 ## 9. The 11 steps explained
 
@@ -415,33 +415,33 @@ worca-t run --spec ./feature-spec.md --sut ./path-to-your-app   # subsequent run
                         # (not needed with --report allure / both — those auto-open)
 ```
 
-## Developing worca-t locally
+## Developing qtea locally
 
 The installed wheel holds **two kinds of frozen content** that don't auto-update on source edits:
 
 | Edited content | How to pick it up |
 | --- | --- |
-| Markdown resources: `agents/`, `templates/`, `schemas/`, `skills/`, `examples/`, `CLAUDE.md`, `.mcp.json` | Set `WORCA_T_RESOURCE_ROOT=<repo-root>` — runner reads from there instead of the frozen `_resources/` snapshot. **No reinstall needed.** |
-| Python code: `src/worca_t/**.py` | Reinstall the tool **or** run the dev venv binary (editable install). The env var does **not** help — Python imports come from site-packages. |
+| Markdown resources: `agents/`, `templates/`, `schemas/`, `skills/`, `examples/`, `CLAUDE.md`, `.mcp.json` | Set `QTEA_RESOURCE_ROOT=<repo-root>` — runner reads from there instead of the frozen `_resources/` snapshot. **No reinstall needed.** |
+| Python code: `src/qtea/**.py` | Reinstall the tool **or** run the dev venv binary (editable install). The env var does **not** help — Python imports come from site-packages. |
 
 ```bash
 # A) Resource-root env var (markdown only):
-export WORCA_T_RESOURCE_ROOT=/path/to/worca-t       # bash / zsh
-$Env:WORCA_T_RESOURCE_ROOT = "C:\path\to\worca-t"   # PowerShell
-set WORCA_T_RESOURCE_ROOT=C:\path\to\worca-t        # cmd
+export QTEA_RESOURCE_ROOT=/path/to/qtea       # bash / zsh
+$Env:QTEA_RESOURCE_ROOT = "C:\path\to\qtea"   # PowerShell
+set QTEA_RESOURCE_ROOT=C:\path\to\qtea        # cmd
 
 # B) Reinstall the tool (covers both markdown + Python):
-uv tool install --reinstall --force /path/to/worca-t
+uv tool install --reinstall --force /path/to/qtea
 
-# C) Dev venv binary (editable; pair with WORCA_T_RESOURCE_ROOT for markdown):
-/path/to/worca-t/.venv/bin/worca-t run ...                       # Unix
-C:\path\to\worca-t\.venv\Scripts\worca-t.exe run ...             # Windows
+# C) Dev venv binary (editable; pair with QTEA_RESOURCE_ROOT for markdown):
+/path/to/qtea/.venv/bin/qtea run ...                       # Unix
+C:\path\to\qtea\.venv\Scripts\qtea.exe run ...             # Windows
 ```
 
-CI / non-interactive: pass `--no-hitl` to `worca-t run`.
+CI / non-interactive: pass `--no-hitl` to `qtea run`.
 
 ## Next steps
 
 - See `docs/qa-orchestrator.instructions.md` for the full operator reference
 - See `CHANGELOG.md` for version history
-- Run `worca-t doctor` any time to diagnose environment issues
+- Run `qtea doctor` any time to diagnose environment issues

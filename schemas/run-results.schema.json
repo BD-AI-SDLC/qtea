@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://worca-t/schemas/run-results.schema.json",
+  "$id": "https://qtea/schemas/run-results.schema.json",
   "title": "RunResults",
   "type": "object",
   "required": ["framework", "command", "started_at", "finished_at", "results"],

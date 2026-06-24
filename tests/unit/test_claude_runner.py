@@ -8,15 +8,15 @@ from pathlib import Path
 
 import pytest
 
-from worca_t.claude_runner import (
+from qtea.claude_runner import (
     _agent_key,
     _force_cleanup,
     _is_model_unavailable,
     _stage_inputs,
     run_agent,
 )
-from worca_t.config import get_model_chain
-from worca_t.metrics import CURRENT_STEP_METRICS, StepMetricsAccumulator
+from qtea.config import get_model_chain
+from qtea.metrics import CURRENT_STEP_METRICS, StepMetricsAccumulator
 
 from ._fake_claude import install_fake_query
 
@@ -67,7 +67,7 @@ def test_agent_result_carries_mcp_servers_failed():
     """Regression: AgentResult must expose `mcp_servers_failed` so Step 8 can
     fail-fast when Playwright MCP didn't start (otherwise the agent aborts
     silently and the user gets confusing 'warned, 0 resolutions' output)."""
-    from worca_t.claude_runner import AgentResult
+    from qtea.claude_runner import AgentResult
 
     r = AgentResult(
         success=True, exit_code=0, duration_s=0.0,
@@ -78,7 +78,7 @@ def test_agent_result_carries_mcp_servers_failed():
 
 
 def test_agent_result_mcp_servers_failed_defaults_empty():
-    from worca_t.claude_runner import AgentResult
+    from qtea.claude_runner import AgentResult
 
     r = AgentResult(
         success=True, exit_code=0, duration_s=0.0,
@@ -219,7 +219,7 @@ async def test_run_agent_timeout(tmp_path: Path, monkeypatch):
 
 async def test_run_agent_missing_binary(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("PATH", str(tmp_path))  # no claude on PATH
-    monkeypatch.setenv("WORCA_T_CLAUDE_BIN", "definitely-not-claude-xyz")
+    monkeypatch.setenv("QTEA_CLAUDE_BIN", "definitely-not-claude-xyz")
     agent = tmp_path / "a.agent.md"; agent.write_text("x", encoding="utf-8")
     mcp = tmp_path / ".mcp.json"; mcp.write_text("{}", encoding="utf-8")
 
@@ -548,10 +548,10 @@ async def test_run_agent_timeout_preserves_partial_metrics(tmp_path: Path, monke
         await _asyncio.sleep(3600)
 
     monkeypatch.setattr(
-        "worca_t.claude_runner.shutil.which",
+        "qtea.claude_runner.shutil.which",
         lambda *_a, **_kw: "/fake/claude",
     )
-    monkeypatch.setattr("worca_t.claude_runner.query", _slow_query)
+    monkeypatch.setattr("qtea.claude_runner.query", _slow_query)
 
     agent = tmp_path / "a.agent.md"; agent.write_text("x", encoding="utf-8")
     mcp = tmp_path / ".mcp.json"; mcp.write_text("{}", encoding="utf-8")
@@ -593,7 +593,7 @@ async def test_force_cleanup_is_bounded_by_grace_s(tmp_path: Path, monkeypatch):
         def children(self, recursive=True):
             return []
     monkeypatch.setattr(
-        "worca_t.claude_runner.psutil.Process",
+        "qtea.claude_runner.psutil.Process",
         lambda pid: FakeMe(),
     )
 
@@ -636,11 +636,11 @@ async def test_force_cleanup_spares_pre_existing_children(tmp_path: Path, monkey
 
     all_children = [FakeProc(101), FakeProc(102), FakeProc(103)]
     monkeypatch.setattr(
-        "worca_t.claude_runner.psutil.Process",
+        "qtea.claude_runner.psutil.Process",
         lambda pid: FakeMe(all_children),
     )
     monkeypatch.setattr(
-        "worca_t.claude_runner.psutil.wait_procs",
+        "qtea.claude_runner.psutil.wait_procs",
         lambda procs, timeout=None: (procs, []),
     )
 
@@ -710,10 +710,10 @@ async def test_run_agent_falls_back_on_model_unavailable(tmp_path: Path, monkeyp
         yield rmsg
 
     monkeypatch.setattr(
-        "worca_t.claude_runner.shutil.which",
+        "qtea.claude_runner.shutil.which",
         lambda *_a, **_kw: "/fake/claude",
     )
-    monkeypatch.setattr("worca_t.claude_runner.query", _query_with_fallback)
+    monkeypatch.setattr("qtea.claude_runner.query", _query_with_fallback)
 
     agent = tmp_path / "a.agent.md"
     agent.write_text("x", encoding="utf-8")
@@ -752,10 +752,10 @@ async def test_run_agent_no_fallback_on_non_model_error(tmp_path: Path, monkeypa
         yield  # unreachable -- make this an async generator
 
     monkeypatch.setattr(
-        "worca_t.claude_runner.shutil.which",
+        "qtea.claude_runner.shutil.which",
         lambda *_a, **_kw: "/fake/claude",
     )
-    monkeypatch.setattr("worca_t.claude_runner.query", _query_that_fails)
+    monkeypatch.setattr("qtea.claude_runner.query", _query_that_fails)
 
     agent = tmp_path / "a.agent.md"
     agent.write_text("x", encoding="utf-8")

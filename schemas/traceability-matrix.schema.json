@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://worca-t/schemas/traceability-matrix.schema.json",
+  "$id": "https://qtea/schemas/traceability-matrix.schema.json",
   "title": "TraceabilityMatrix",
   "type": "object",
   "required": ["requirement_id", "entries", "summary"],

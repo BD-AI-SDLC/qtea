@@ -7,15 +7,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from worca_t.checkpoints import RunState
-from worca_t.pipeline import PipelineOptions
-from worca_t.report.allure_writer import generate_allure_html, write_allure_results
-from worca_t.report.data_builder import RunReport, _compute_summary, build_report, to_dict
-from worca_t.report.html_renderer import render_html
-from worca_t.schemas import is_valid
-from worca_t.steps.base import StepContext
-from worca_t.steps.s11_report import ReportStep
-from worca_t.workspace import create_workspace
+from qtea.checkpoints import RunState
+from qtea.pipeline import PipelineOptions
+from qtea.report.allure_writer import generate_allure_html, write_allure_results
+from qtea.report.data_builder import RunReport, _compute_summary, build_report, to_dict
+from qtea.report.html_renderer import render_html
+from qtea.schemas import is_valid
+from qtea.steps.base import StepContext
+from qtea.steps.s11_report import ReportStep
+from qtea.workspace import create_workspace
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -283,7 +283,7 @@ def test_render_html_bug_card_with_empty_dict_attachments():
 
 
 def test_normalize_bug_attachments_dict_form():
-    from worca_t.report.html_renderer import _normalize_bug_attachments
+    from qtea.report.html_renderer import _normalize_bug_attachments
     out = _normalize_bug_attachments({
         "screenshots": ["a.png"],
         "traces": ["b.zip"],
@@ -294,7 +294,7 @@ def test_normalize_bug_attachments_dict_form():
 
 
 def test_normalize_bug_attachments_list_form():
-    from worca_t.report.html_renderer import _normalize_bug_attachments
+    from qtea.report.html_renderer import _normalize_bug_attachments
     out = _normalize_bug_attachments([
         {"path": "a.png", "type": "screenshot"},
         "bare-path.zip",
@@ -304,7 +304,7 @@ def test_normalize_bug_attachments_list_form():
 
 
 def test_normalize_bug_attachments_empty_and_none():
-    from worca_t.report.html_renderer import _normalize_bug_attachments
+    from qtea.report.html_renderer import _normalize_bug_attachments
     assert _normalize_bug_attachments(None) == []
     assert _normalize_bug_attachments({}) == []
     assert _normalize_bug_attachments([]) == []
@@ -436,7 +436,7 @@ async def test_step11_report_auto_builtin_always(tmp_path: Path, monkeypatch):
 async def test_step11_open_report_flag(tmp_path: Path):
     ctx = _ctx(tmp_path, open_report=True)
     _seed(ctx, results=_sample_results())
-    with patch("worca_t.steps.s11_report.webbrowser.open") as mock_open:
+    with patch("qtea.steps.s11_report.webbrowser.open") as mock_open:
         result = await ReportStep().run(ctx)
         assert result.success
         assert mock_open.called

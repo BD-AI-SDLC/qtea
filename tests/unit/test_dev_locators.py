@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from worca_t.runtime.dev_locators import (
+from qtea.runtime.dev_locators import (
     DevLocator,
     discover_path,
     load_dev_locators,
@@ -26,10 +26,10 @@ def _write_dev_file(path: Path, locators: dict) -> None:
 
 
 def test_discover_path_cli_flag_wins(tmp_path: Path, monkeypatch):
-    monkeypatch.delenv("WORCA_T_DEV_LOCATORS", raising=False)
+    monkeypatch.delenv("QTEA_DEV_LOCATORS", raising=False)
     sut = tmp_path / "sut"
     cli_file = tmp_path / "from-cli.json"
-    convention = sut / ".worca-t" / "dev-locators.json"
+    convention = sut / ".qtea" / "dev-locators.json"
     _write_dev_file(cli_file, {"X": {"selector": "#cli"}})
     _write_dev_file(convention, {"X": {"selector": "#convention"}})
 
@@ -40,19 +40,19 @@ def test_discover_path_cli_flag_wins(tmp_path: Path, monkeypatch):
 def test_discover_path_env_var_used_when_no_cli(tmp_path: Path, monkeypatch):
     sut = tmp_path / "sut"
     env_file = tmp_path / "from-env.json"
-    convention = sut / ".worca-t" / "dev-locators.json"
+    convention = sut / ".qtea" / "dev-locators.json"
     _write_dev_file(env_file, {"X": {"selector": "#env"}})
     _write_dev_file(convention, {"X": {"selector": "#convention"}})
-    monkeypatch.setenv("WORCA_T_DEV_LOCATORS", str(env_file))
+    monkeypatch.setenv("QTEA_DEV_LOCATORS", str(env_file))
 
     found = discover_path(cli_path=None, sut_root=sut)
     assert found == env_file
 
 
 def test_discover_path_convention_used_when_no_cli_or_env(tmp_path: Path, monkeypatch):
-    monkeypatch.delenv("WORCA_T_DEV_LOCATORS", raising=False)
+    monkeypatch.delenv("QTEA_DEV_LOCATORS", raising=False)
     sut = tmp_path / "sut"
-    convention = sut / ".worca-t" / "dev-locators.json"
+    convention = sut / ".qtea" / "dev-locators.json"
     _write_dev_file(convention, {"X": {"selector": "#convention"}})
 
     found = discover_path(cli_path=None, sut_root=sut)
@@ -60,7 +60,7 @@ def test_discover_path_convention_used_when_no_cli_or_env(tmp_path: Path, monkey
 
 
 def test_discover_path_returns_none_when_no_file(tmp_path: Path, monkeypatch):
-    monkeypatch.delenv("WORCA_T_DEV_LOCATORS", raising=False)
+    monkeypatch.delenv("QTEA_DEV_LOCATORS", raising=False)
     assert discover_path(cli_path=None, sut_root=tmp_path) is None
 
 
@@ -68,7 +68,7 @@ def test_discover_path_cli_path_not_existing_falls_through_to_env(tmp_path: Path
     """A non-existent CLI path doesn't short-circuit; env wins next."""
     env_file = tmp_path / "from-env.json"
     _write_dev_file(env_file, {"X": {"selector": "#env"}})
-    monkeypatch.setenv("WORCA_T_DEV_LOCATORS", str(env_file))
+    monkeypatch.setenv("QTEA_DEV_LOCATORS", str(env_file))
 
     found = discover_path(cli_path=tmp_path / "does-not-exist.json", sut_root=None)
     assert found == env_file
@@ -80,9 +80,9 @@ def test_discover_path_cli_path_not_existing_falls_through_to_env(tmp_path: Path
 
 
 def test_load_dev_locators_returns_dev_locator_objects(tmp_path: Path, monkeypatch):
-    monkeypatch.delenv("WORCA_T_DEV_LOCATORS", raising=False)
+    monkeypatch.delenv("QTEA_DEV_LOCATORS", raising=False)
     sut = tmp_path / "sut"
-    _write_dev_file(sut / ".worca-t" / "dev-locators.json", {
+    _write_dev_file(sut / ".qtea" / "dev-locators.json", {
         "LOGIN_BUTTON": {
             "selector": "[data-testid='login']",
             "strategy": "data-testid",
@@ -108,9 +108,9 @@ def test_load_dev_locators_returns_dev_locator_objects(tmp_path: Path, monkeypat
 
 
 def test_load_dev_locators_filters_xpath(tmp_path: Path, monkeypatch):
-    monkeypatch.delenv("WORCA_T_DEV_LOCATORS", raising=False)
+    monkeypatch.delenv("QTEA_DEV_LOCATORS", raising=False)
     sut = tmp_path / "sut"
-    _write_dev_file(sut / ".worca-t" / "dev-locators.json", {
+    _write_dev_file(sut / ".qtea" / "dev-locators.json", {
         "GOOD": {"selector": "#login"},
         "BAD_XPATH": {"selector": "//button[@id='login']"},
         "BAD_XPATH_PREFIX": {"selector": "xpath=//div"},
@@ -122,9 +122,9 @@ def test_load_dev_locators_filters_xpath(tmp_path: Path, monkeypatch):
 
 
 def test_load_dev_locators_skips_entries_without_selector(tmp_path: Path, monkeypatch):
-    monkeypatch.delenv("WORCA_T_DEV_LOCATORS", raising=False)
+    monkeypatch.delenv("QTEA_DEV_LOCATORS", raising=False)
     sut = tmp_path / "sut"
-    _write_dev_file(sut / ".worca-t" / "dev-locators.json", {
+    _write_dev_file(sut / ".qtea" / "dev-locators.json", {
         "GOOD": {"selector": "#x"},
         "NO_SELECTOR": {"intent": "foo"},
         "EMPTY_SELECTOR": {"selector": "   "},
@@ -137,9 +137,9 @@ def test_load_dev_locators_skips_entries_without_selector(tmp_path: Path, monkey
 
 
 def test_load_dev_locators_malformed_json_returns_empty_with_warning(tmp_path: Path, monkeypatch):
-    monkeypatch.delenv("WORCA_T_DEV_LOCATORS", raising=False)
+    monkeypatch.delenv("QTEA_DEV_LOCATORS", raising=False)
     sut = tmp_path / "sut"
-    bad = sut / ".worca-t" / "dev-locators.json"
+    bad = sut / ".qtea" / "dev-locators.json"
     bad.parent.mkdir(parents=True, exist_ok=True)
     bad.write_text("not json{", encoding="utf-8")
     locs, path, warnings = load_dev_locators(sut_root=sut)
@@ -150,7 +150,7 @@ def test_load_dev_locators_malformed_json_returns_empty_with_warning(tmp_path: P
 
 
 def test_load_dev_locators_no_file_no_warning(tmp_path: Path, monkeypatch):
-    monkeypatch.delenv("WORCA_T_DEV_LOCATORS", raising=False)
+    monkeypatch.delenv("QTEA_DEV_LOCATORS", raising=False)
     locs, path, warnings = load_dev_locators(sut_root=tmp_path)
     assert locs == {}
     assert path is None
@@ -158,9 +158,9 @@ def test_load_dev_locators_no_file_no_warning(tmp_path: Path, monkeypatch):
 
 
 def test_load_dev_locators_top_level_locators_missing(tmp_path: Path, monkeypatch):
-    monkeypatch.delenv("WORCA_T_DEV_LOCATORS", raising=False)
+    monkeypatch.delenv("QTEA_DEV_LOCATORS", raising=False)
     sut = tmp_path / "sut"
-    bad = sut / ".worca-t" / "dev-locators.json"
+    bad = sut / ".qtea" / "dev-locators.json"
     bad.parent.mkdir(parents=True, exist_ok=True)
     bad.write_text(json.dumps({"version": "1.0"}), encoding="utf-8")  # no `locators` key
     locs, _, warnings = load_dev_locators(sut_root=sut)

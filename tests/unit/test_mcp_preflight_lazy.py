@@ -22,13 +22,13 @@ from unittest.mock import patch
 
 import pytest
 
-from worca_t.mcp_manager import McpServer
-from worca_t.pipeline import (
+from qtea.mcp_manager import McpServer
+from qtea.pipeline import (
     PipelineOptions,
     _mcp_preflight_for_step,
     run_pipeline,
 )
-from worca_t.steps.base import Step, StepContext, StepResult
+from qtea.steps.base import Step, StepContext, StepResult
 
 
 class _NoMcpStep(Step):
@@ -67,8 +67,8 @@ def test_preflight_skipped_when_step_declares_no_mcp(_console):
     opts = PipelineOptions(workspace_base=Path())
     step = _NoMcpStep()
 
-    with patch("worca_t.mcp_manager.load_mcp_config") as load_mock, \
-         patch("worca_t.mcp_manager.probe_server") as probe_mock:
+    with patch("qtea.mcp_manager.load_mcp_config") as load_mock, \
+         patch("qtea.mcp_manager.probe_server") as probe_mock:
         result = _mcp_preflight_for_step(step, opts=opts, console=_console)
 
     assert result is True
@@ -97,8 +97,8 @@ def test_preflight_probes_only_declared_servers(_console):
                 break
         return True, "spawned ok"
 
-    with patch("worca_t.mcp_manager.load_mcp_config", return_value=fake_config), \
-         patch("worca_t.mcp_manager.probe_server", side_effect=_fake_probe):
+    with patch("qtea.mcp_manager.load_mcp_config", return_value=fake_config), \
+         patch("qtea.mcp_manager.probe_server", side_effect=_fake_probe):
         result = _mcp_preflight_for_step(step, opts=opts, console=_console)
 
     assert result is True
@@ -113,8 +113,8 @@ def test_preflight_fails_when_required_server_missing_from_config(_console):
     step = _PlaywrightStep()
 
     with patch(
-        "worca_t.mcp_manager.load_mcp_config", return_value={},
-    ), patch("worca_t.mcp_manager.probe_server") as probe_mock:
+        "qtea.mcp_manager.load_mcp_config", return_value={},
+    ), patch("qtea.mcp_manager.probe_server") as probe_mock:
         result = _mcp_preflight_for_step(step, opts=opts, console=_console)
 
     assert result is False
@@ -128,9 +128,9 @@ def test_preflight_fails_fast_on_probe_failure_in_non_tty(_console):
     fake_config = {"playwright": McpServer(name="x", command="echo", args=[], env={})}
 
     with patch(
-        "worca_t.mcp_manager.load_mcp_config", return_value=fake_config,
+        "qtea.mcp_manager.load_mcp_config", return_value=fake_config,
     ), patch(
-        "worca_t.mcp_manager.probe_server", return_value=(False, "spawn error"),
+        "qtea.mcp_manager.probe_server", return_value=(False, "spawn error"),
     ):
         result = _mcp_preflight_for_step(step, opts=opts, console=_console)
 
@@ -150,14 +150,14 @@ async def test_pipeline_no_preflight_when_no_step_uses_mcp(
     call_log: list[str] = []
 
     monkeypatch.setattr(
-        "worca_t.pipeline.STEP_REGISTRY", {1: _NoMcpStep()},
+        "qtea.pipeline.STEP_REGISTRY", {1: _NoMcpStep()},
     )
     monkeypatch.setattr(
-        "worca_t.mcp_manager.load_mcp_config",
+        "qtea.mcp_manager.load_mcp_config",
         lambda path=None: call_log.append("load") or {},
     )
     monkeypatch.setattr(
-        "worca_t.mcp_manager.probe_server",
+        "qtea.mcp_manager.probe_server",
         lambda *a, **k: call_log.append("probe") or (True, "ok"),
     )
 
@@ -180,11 +180,11 @@ async def test_pipeline_preflights_only_when_required_step_runs(
     call_log: list[tuple[str, int | None]] = []
 
     monkeypatch.setattr(
-        "worca_t.pipeline.STEP_REGISTRY",
+        "qtea.pipeline.STEP_REGISTRY",
         {1: _NoMcpStep(), 2: _PlaywrightStep()},
     )
     monkeypatch.setattr(
-        "worca_t.mcp_manager.load_mcp_config",
+        "qtea.mcp_manager.load_mcp_config",
         lambda path=None: (
             call_log.append(("load", None))
             or {"playwright": McpServer(name="x", command="echo", args=[], env={})}
@@ -195,7 +195,7 @@ async def test_pipeline_preflights_only_when_required_step_runs(
         call_log.append(("probe", None))
         return True, "ok"
 
-    monkeypatch.setattr("worca_t.mcp_manager.probe_server", _probe)
+    monkeypatch.setattr("qtea.mcp_manager.probe_server", _probe)
 
     opts = PipelineOptions(
         spec="x", sut=".", workspace_base=tmp_path / ".ws",
@@ -226,7 +226,7 @@ def test_execute_step_probes_playwright_lazily_not_via_preflight():
     The class still owns the server name as `_LAZY_MCP_SERVER` so the
     lazy probe knows which server to start.
     """
-    from worca_t.steps.s09_execute import ExecuteStep
+    from qtea.steps.s09_execute import ExecuteStep
     step = ExecuteStep()
     assert step.mcp_servers_required == frozenset(), (
         "Step 9 must use the lazy probe path (mcp_servers_required = "
@@ -240,12 +240,12 @@ def test_execute_step_probes_playwright_lazily_not_via_preflight():
 def test_other_steps_declare_no_mcp_requirement():
     """Sanity: only Step 9 currently uses MCP. If this fails, audit whether
     the newly-added step actually needs MCP at runtime."""
-    from worca_t.steps.s01_intake import IntakeStep
-    from worca_t.steps.s02_refine import RefineStep
-    from worca_t.steps.s06_research import ResearchStep
-    from worca_t.steps.s08_codegen import CodegenStep
-    from worca_t.steps.s10_bug_classifier import BugClassifierStep
-    from worca_t.steps.s11_report import ReportStep
+    from qtea.steps.s01_intake import IntakeStep
+    from qtea.steps.s02_refine import RefineStep
+    from qtea.steps.s06_research import ResearchStep
+    from qtea.steps.s08_codegen import CodegenStep
+    from qtea.steps.s10_bug_classifier import BugClassifierStep
+    from qtea.steps.s11_report import ReportStep
 
     for cls in (
         IntakeStep, RefineStep, ResearchStep,

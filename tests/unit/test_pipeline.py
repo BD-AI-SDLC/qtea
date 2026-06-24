@@ -6,21 +6,21 @@ from pathlib import Path
 
 import pytest
 
-from worca_t.checkpoints import RunState, save_state
-from worca_t.pipeline import PipelineOptions, _select_workspace, run_pipeline
-from worca_t.steps.base import Step, StepContext, StepResult
-from worca_t.workspace import create_workspace
+from qtea.checkpoints import RunState, save_state
+from qtea.pipeline import PipelineOptions, _select_workspace, run_pipeline
+from qtea.steps.base import Step, StepContext, StepResult
+from qtea.workspace import create_workspace
 
 
 @pytest.fixture(autouse=True)
 def _skip_mcp_preflight(monkeypatch):
     """Tests in this file don't exercise MCPs; stub the preflight to a no-op."""
-    monkeypatch.setattr("worca_t.mcp_manager.load_mcp_config", lambda path=None: {})
+    monkeypatch.setattr("qtea.mcp_manager.load_mcp_config", lambda path=None: {})
 
 
 async def test_run_pipeline_completes_with_no_steps(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(
-        "worca_t.pipeline.STEP_REGISTRY", {},
+        "qtea.pipeline.STEP_REGISTRY", {},
     )
     opts = PipelineOptions(
         spec="x", sut=".", workspace_base=tmp_path / ".ws",
@@ -41,7 +41,7 @@ async def test_run_pipeline_runs_only_step(tmp_path: Path, monkeypatch):
             call_log.append(self.number)
             return StepResult(success=True, status="completed", outputs=[])
 
-    monkeypatch.setattr("worca_t.pipeline.STEP_REGISTRY", {1: _TrackStep()})
+    monkeypatch.setattr("qtea.pipeline.STEP_REGISTRY", {1: _TrackStep()})
     opts = PipelineOptions(
         spec="x", sut=".", workspace_base=tmp_path / ".ws",
         only_step=1,
@@ -60,7 +60,7 @@ async def test_run_pipeline_stops_on_failure(tmp_path: Path, monkeypatch):
         async def run(self, ctx: StepContext) -> StepResult:
             return StepResult(success=False, status="failed", outputs=[], error="boom")
 
-    monkeypatch.setattr("worca_t.pipeline.STEP_REGISTRY", {1: _FailStep()})
+    monkeypatch.setattr("qtea.pipeline.STEP_REGISTRY", {1: _FailStep()})
     opts = PipelineOptions(
         spec="x", sut=".", workspace_base=tmp_path / ".ws",
         only_step=1,
@@ -117,7 +117,7 @@ def test_select_workspace_from_step_without_run_id_raises(tmp_path: Path):
 
 async def test_resume_recovers_spec_and_sut_from_state(tmp_path: Path, monkeypatch):
     """On --run-id, missing --spec/--sut should fall back to state.json."""
-    monkeypatch.setattr("worca_t.pipeline.STEP_REGISTRY", {})
+    monkeypatch.setattr("qtea.pipeline.STEP_REGISTRY", {})
 
     spec_file = tmp_path / "prior-spec.md"
     spec_file.write_text("# prior")
@@ -130,9 +130,9 @@ async def test_resume_recovers_spec_and_sut_from_state(tmp_path: Path, monkeypat
     def _fake_materialize(src, dest, run_id):
         dest.mkdir(parents=True, exist_ok=True)
         (dest / ".git").mkdir(exist_ok=True)
-    monkeypatch.setattr("worca_t.steps.s06_research._materialize_sut", _fake_materialize)
-    monkeypatch.setattr("worca_t._sut_git.current_branch", lambda root: "stub")
-    monkeypatch.setattr("worca_t._sut_git.branch_name", lambda rid: "stub")
+    monkeypatch.setattr("qtea.steps.s06_research._materialize_sut", _fake_materialize)
+    monkeypatch.setattr("qtea._sut_git.current_branch", lambda root: "stub")
+    monkeypatch.setattr("qtea._sut_git.branch_name", lambda rid: "stub")
     save_state(
         RunState(
             run_id=ws_prior.run_id,
@@ -152,7 +152,7 @@ async def test_resume_recovers_spec_and_sut_from_state(tmp_path: Path, monkeypat
 
 async def test_fresh_run_without_spec_or_sut_fails(tmp_path: Path, monkeypatch):
     """A fresh run (no --run-id) with no --spec/--sut must error, not crash."""
-    monkeypatch.setattr("worca_t.pipeline.STEP_REGISTRY", {})
+    monkeypatch.setattr("qtea.pipeline.STEP_REGISTRY", {})
 
     opts = PipelineOptions(workspace_base=tmp_path / ".ws")
     rc = await run_pipeline(opts)
@@ -171,7 +171,7 @@ async def test_run_pipeline_debug_sets_extras(tmp_path: Path, monkeypatch):
             captured_ctx["debug_live"] = ctx.extras.get("debug_live")
             return StepResult(success=True, status="completed", outputs=[])
 
-    monkeypatch.setattr("worca_t.pipeline.STEP_REGISTRY", {1: _CaptureStep()})
+    monkeypatch.setattr("qtea.pipeline.STEP_REGISTRY", {1: _CaptureStep()})
     opts = PipelineOptions(
         spec="x", sut=".", workspace_base=tmp_path / ".ws",
         only_step=1, debug=True,
@@ -186,7 +186,7 @@ async def test_cache_default_none_without_sticky_disables(tmp_path: Path, monkey
     import os
     monkeypatch.delenv("DISABLE_PROMPT_CACHING", raising=False)
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
-    monkeypatch.setattr("worca_t.pipeline.STEP_REGISTRY", {})
+    monkeypatch.setattr("qtea.pipeline.STEP_REGISTRY", {})
 
     opts = PipelineOptions(spec="x", sut=".", workspace_base=tmp_path / ".ws")
     assert opts.cache is None  # tri-state default
@@ -203,7 +203,7 @@ async def test_cache_default_none_with_sticky_enables(tmp_path: Path, monkeypatc
     monkeypatch.setenv(
         "ANTHROPIC_CUSTOM_HEADERS", "x-bmf-sticky-session-instance: 01"
     )
-    monkeypatch.setattr("worca_t.pipeline.STEP_REGISTRY", {})
+    monkeypatch.setattr("qtea.pipeline.STEP_REGISTRY", {})
 
     opts = PipelineOptions(spec="x", sut=".", workspace_base=tmp_path / ".ws")
     await run_pipeline(opts)
@@ -218,7 +218,7 @@ async def test_cache_explicit_false_overrides_sticky(tmp_path: Path, monkeypatch
     monkeypatch.setenv(
         "ANTHROPIC_CUSTOM_HEADERS", "x-bmf-sticky-session-instance: 02"
     )
-    monkeypatch.setattr("worca_t.pipeline.STEP_REGISTRY", {})
+    monkeypatch.setattr("qtea.pipeline.STEP_REGISTRY", {})
 
     opts = PipelineOptions(
         spec="x", sut=".", workspace_base=tmp_path / ".ws", cache=False,
@@ -233,7 +233,7 @@ async def test_cache_flag_on_clears_disable_env(tmp_path: Path, monkeypatch):
     restored for this run."""
     import os
     monkeypatch.setenv("DISABLE_PROMPT_CACHING", "1")
-    monkeypatch.setattr("worca_t.pipeline.STEP_REGISTRY", {})
+    monkeypatch.setattr("qtea.pipeline.STEP_REGISTRY", {})
 
     opts = PipelineOptions(
         spec="x", sut=".", workspace_base=tmp_path / ".ws", cache=True,
@@ -251,7 +251,7 @@ def test_claude_runner_forwards_disable_prompt_caching():
     # Read the forwarded_env construction block source-level — it lives
     # inside run_agent and only runs end-to-end. The deterministic check:
     # the cache vars must be in the explicit forward list. Find them.
-    from worca_t import claude_runner
+    from qtea import claude_runner
     src = (Path(claude_runner.__file__)).read_text(encoding="utf-8")
     assert '"DISABLE_PROMPT_CACHING"' in src
     assert '"DISABLE_PROMPT_CACHING_OPUS"' in src
@@ -260,7 +260,7 @@ def test_claude_runner_forwards_disable_prompt_caching():
 
 
 def test_parse_custom_headers(monkeypatch):
-    from worca_t.config import _parse_custom_headers
+    from qtea.config import _parse_custom_headers
 
     monkeypatch.setenv(
         "ANTHROPIC_CUSTOM_HEADERS",
@@ -270,14 +270,14 @@ def test_parse_custom_headers(monkeypatch):
 
 
 def test_parse_custom_headers_empty(monkeypatch):
-    from worca_t.config import _parse_custom_headers
+    from qtea.config import _parse_custom_headers
 
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
     assert _parse_custom_headers() == {}
 
 
 def test_auth_kwargs_include_custom_headers(monkeypatch):
-    from worca_t.config import anthropic_auth_kwargs
+    from qtea.config import anthropic_auth_kwargs
 
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
@@ -293,7 +293,7 @@ def test_auth_kwargs_include_custom_headers(monkeypatch):
 
 
 def test_auth_kwargs_no_custom_headers(monkeypatch):
-    from worca_t.config import anthropic_auth_kwargs
+    from qtea.config import anthropic_auth_kwargs
 
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")

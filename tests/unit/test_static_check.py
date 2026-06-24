@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from worca_t.static_check import (
+from qtea.static_check import (
     StaticCheckResult,
     TYPE_ERROR_RULE,
     _filter_to_scope,
@@ -28,8 +28,8 @@ from worca_t.static_check import (
     format_for_fixer,
     run_static_check,
 )
-from worca_t.steps.s08_codegen import _run_phase_b6
-from worca_t.test_indexer import Violation
+from qtea.steps.s08_codegen import _run_phase_b6
+from qtea.test_indexer import Violation
 
 
 # ---------------------------------------------------------------------------
@@ -74,9 +74,9 @@ def test_pyright_json_parser_keeps_only_errors(tmp_path: Path):
 
 def test_tsc_text_parser_extracts_file_line_code(tmp_path: Path):
     sut = tmp_path
-    (sut / "tests" / "worca_foo.test.ts").parent.mkdir(parents=True, exist_ok=True)
-    (sut / "tests" / "worca_foo.test.ts").write_text("", encoding="utf-8")
-    abs_file = str(sut / "tests" / "worca_foo.test.ts")
+    (sut / "tests" / "qtea_foo.test.ts").parent.mkdir(parents=True, exist_ok=True)
+    (sut / "tests" / "qtea_foo.test.ts").write_text("", encoding="utf-8")
+    abs_file = str(sut / "tests" / "qtea_foo.test.ts")
     stdout = "\n".join([
         f"{abs_file}(12,5): error TS2339: Property 'FOO' does not exist on type 'Bar'.",
         "irrelevant noise line",
@@ -98,22 +98,22 @@ def test_scope_filter_splits_in_and_out(tmp_path: Path):
     sut = tmp_path
     tests_dir = sut / "tests"
     tests_dir.mkdir()
-    in_file = tests_dir / "worca_foo_test.py"
+    in_file = tests_dir / "qtea_foo_test.py"
     app_file = sut / "src" / "app" / "foo.py"
     app_file.parent.mkdir(parents=True)
     in_file.write_text("", encoding="utf-8")
     app_file.write_text("", encoding="utf-8")
 
     violations = [
-        Violation(rule=TYPE_ERROR_RULE, file="tests/worca_foo_test.py",
+        Violation(rule=TYPE_ERROR_RULE, file="tests/qtea_foo_test.py",
                   line=3, snippet="boom", severity="error"),
         Violation(rule=TYPE_ERROR_RULE, file="src/app/foo.py",
                   line=99, snippet="user code", severity="error"),
     ]
-    worca_touched = {in_file}
-    in_scope, out_of_scope = _filter_to_scope(violations, worca_touched, sut)
+    qteaouched = {in_file}
+    in_scope, out_of_scope = _filter_to_scope(violations, qteaouched, sut)
     assert len(in_scope) == 1
-    assert in_scope[0].file == "tests/worca_foo_test.py"
+    assert in_scope[0].file == "tests/qtea_foo_test.py"
     assert in_scope[0].severity == "error"
     assert len(out_of_scope) == 1
     assert out_of_scope[0].severity == "out_of_scope"
@@ -132,7 +132,7 @@ def test_run_static_check_autoinstalls_missing_pyright(tmp_path: Path, monkeypat
         "[tool.poetry]\nname = 'fake'\nversion = '0'\n", encoding="utf-8"
     )
     (sut / "poetry.lock").write_text("", encoding="utf-8")
-    test_file = sut / "tests" / "worca_login_test.py"
+    test_file = sut / "tests" / "qtea_login_test.py"
     test_file.parent.mkdir(parents=True)
     test_file.write_text("", encoding="utf-8")
 
@@ -149,21 +149,21 @@ def test_run_static_check_autoinstalls_missing_pyright(tmp_path: Path, monkeypat
         # The real checker call — return a clean run.
         return 0, _make_pyright_payload([]), "", 0.2
 
-    monkeypatch.setattr("worca_t.static_check.execute_command", fake_execute)
+    monkeypatch.setattr("qtea.static_check.execute_command", fake_execute)
     # _tool_available falls back to shutil.which when wrapper_prefix is None.
     # Force it through the wrapped-probe path by ensuring detect_stack_profile
     # returns a profile with a wrapper_prefix.
-    from worca_t.static_check import StackProfile
+    from qtea.static_check import StackProfile
 
     def fake_detect(_):
         return StackProfile(
             language="python", package_manager="poetry",
             wrapper_prefix="poetry run", venv_path=".venv",
         )
-    monkeypatch.setattr("worca_t.static_check.detect_stack_profile", fake_detect)
+    monkeypatch.setattr("qtea.static_check.detect_stack_profile", fake_detect)
 
     result = run_static_check(
-        sut, framework="pytest", worca_touched={test_file}, timeout_s=30,
+        sut, framework="pytest", qteaouched={test_file}, timeout_s=30,
     )
     assert result.ran is True
     assert result.in_scope_errors == 0
@@ -187,13 +187,13 @@ async def test_phase_b6_happy_path_no_violations(tmp_path: Path, monkeypatch):
         autofix_attempted=False, post_fix_errors=0,
     )
     monkeypatch.setattr(
-        "worca_t.steps.s08_codegen.run_static_check", lambda *a, **kw: clean,
+        "qtea.steps.s08_codegen.run_static_check", lambda *a, **kw: clean,
     )
     fix_agent_call = AsyncMock()
-    monkeypatch.setattr("worca_t.steps.s08_codegen.run_agent", fix_agent_call)
+    monkeypatch.setattr("qtea.steps.s08_codegen.run_agent", fix_agent_call)
 
     result = await _run_phase_b6(
-        sut_root=sut, framework="pytest", worca_touched=set(),
+        sut_root=sut, framework="pytest", qteaouched=set(),
         agents_root=tmp_path / "agents", workdir=tmp_path / "wd",
         timeout_s=300,
     )
@@ -213,9 +213,9 @@ async def test_phase_b6_one_retry_then_escalates(tmp_path: Path, monkeypatch):
         duration_s=0.2, exit_code=1, in_scope_errors=2, out_of_scope_errors=0,
         autofix_attempted=False, post_fix_errors=0,
         violations=[
-            Violation(rule=TYPE_ERROR_RULE, file="tests/worca_foo.py",
+            Violation(rule=TYPE_ERROR_RULE, file="tests/qtea_foo.py",
                       line=3, snippet="boom1", severity="error"),
-            Violation(rule=TYPE_ERROR_RULE, file="tests/worca_foo.py",
+            Violation(rule=TYPE_ERROR_RULE, file="tests/qtea_foo.py",
                       line=7, snippet="boom2", severity="error"),
         ],
     )
@@ -231,12 +231,12 @@ async def test_phase_b6_one_retry_then_escalates(tmp_path: Path, monkeypatch):
         call_count["n"] += 1
         return initial if call_count["n"] == 1 else after_fix
 
-    monkeypatch.setattr("worca_t.steps.s08_codegen.run_static_check", fake_run)
+    monkeypatch.setattr("qtea.steps.s08_codegen.run_static_check", fake_run)
     fix_agent_call = AsyncMock()
-    monkeypatch.setattr("worca_t.steps.s08_codegen.run_agent", fix_agent_call)
+    monkeypatch.setattr("qtea.steps.s08_codegen.run_agent", fix_agent_call)
 
     result = await _run_phase_b6(
-        sut_root=sut, framework="pytest", worca_touched=set(),
+        sut_root=sut, framework="pytest", qteaouched=set(),
         agents_root=tmp_path / "agents", workdir=tmp_path / "wd",
         timeout_s=300,
     )
@@ -249,13 +249,13 @@ async def test_phase_b6_one_retry_then_escalates(tmp_path: Path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_phase_b6_skipped_when_env_set(tmp_path: Path, monkeypatch):
-    """WORCA_T_SKIP_STATIC_CHECK=1 -> phase short-circuits, no checker call."""
-    monkeypatch.setenv("WORCA_T_SKIP_STATIC_CHECK", "1")
+    """QTEA_SKIP_STATIC_CHECK=1 -> phase short-circuits, no checker call."""
+    monkeypatch.setenv("QTEA_SKIP_STATIC_CHECK", "1")
     run_call = AsyncMock()
-    monkeypatch.setattr("worca_t.steps.s08_codegen.run_static_check", run_call)
+    monkeypatch.setattr("qtea.steps.s08_codegen.run_static_check", run_call)
 
     result = await _run_phase_b6(
-        sut_root=tmp_path, framework="pytest", worca_touched=set(),
+        sut_root=tmp_path, framework="pytest", qteaouched=set(),
         agents_root=tmp_path / "agents", workdir=tmp_path / "wd",
         timeout_s=300,
     )
@@ -266,14 +266,14 @@ async def test_phase_b6_skipped_when_env_set(tmp_path: Path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_phase_b6_skipped_by_flag(tmp_path: Path, monkeypatch):
-    """--no-static-check sets WORCA_T_NO_STATIC_CHECK=1 -> short-circuit."""
-    monkeypatch.delenv("WORCA_T_SKIP_STATIC_CHECK", raising=False)
-    monkeypatch.setenv("WORCA_T_NO_STATIC_CHECK", "1")
+    """--no-static-check sets QTEA_NO_STATIC_CHECK=1 -> short-circuit."""
+    monkeypatch.delenv("QTEA_SKIP_STATIC_CHECK", raising=False)
+    monkeypatch.setenv("QTEA_NO_STATIC_CHECK", "1")
     run_call = AsyncMock()
-    monkeypatch.setattr("worca_t.steps.s08_codegen.run_static_check", run_call)
+    monkeypatch.setattr("qtea.steps.s08_codegen.run_static_check", run_call)
 
     result = await _run_phase_b6(
-        sut_root=tmp_path, framework="pytest", worca_touched=set(),
+        sut_root=tmp_path, framework="pytest", qteaouched=set(),
         agents_root=tmp_path / "agents", workdir=tmp_path / "wd",
         timeout_s=300,
     )
@@ -291,7 +291,7 @@ def test_dispatch_covers_python_typescript_and_javascript():
     """Regression guard for the JS-coverage extension: dispatch must include
     at least one pure-JS stack (playwright-js) alongside TS-capable stacks,
     so jest/mocha/cypress projects targeting .js test files are gated too."""
-    from worca_t.static_check import _DISPATCH
+    from qtea.static_check import _DISPATCH
 
     py_stacks = {"pytest", "playwright-py", "selenium-py"}
     js_ts_stacks = {"playwright-ts", "playwright-js", "jest", "vitest",

@@ -7,10 +7,10 @@ import shutil
 import sys
 from pathlib import Path
 
-from worca_t.checkpoints import RunState
-from worca_t.pipeline import PipelineOptions
-from worca_t.steps.base import StepContext
-from worca_t.steps.s09_execute import (
+from qtea.checkpoints import RunState
+from qtea.pipeline import PipelineOptions
+from qtea.steps.base import StepContext
+from qtea.steps.s09_execute import (
     ExecuteStep,
     _apply_fixer_outputs,
     _attempt_state_path,
@@ -27,8 +27,8 @@ from worca_t.steps.s09_execute import (
     _run_dep_install,
     _save_attempt_state,
 )
-from worca_t.test_runner import TestRunEntry
-from worca_t.workspace import create_workspace
+from qtea.test_runner import TestRunEntry
+from qtea.workspace import create_workspace
 
 from ._fake_claude import install_fake_query
 from ._sut_setup import seed_sut
@@ -108,7 +108,7 @@ def test_run_dep_install_poetry_noop_treated_as_failure(tmp_path, monkeypatch):
     def fake_run(argv, **kwargs):
         return sp.CompletedProcess(argv, returncode=0, stdout=poetry_noop_stdout, stderr="")
 
-    monkeypatch.setattr("worca_t.steps.s09_execute.subprocess.run", fake_run)
+    monkeypatch.setattr("qtea.steps.s09_execute.subprocess.run", fake_run)
     install_log = tmp_path / "install.log"
     ok, summary = _run_dep_install("poetry", "pydantic_settings", tmp_path, install_log)
     assert ok is False
@@ -134,7 +134,7 @@ def test_run_dep_install_poetry_real_install_succeeds(tmp_path, monkeypatch):
             stderr="",
         )
 
-    monkeypatch.setattr("worca_t.steps.s09_execute.subprocess.run", fake_run)
+    monkeypatch.setattr("qtea.steps.s09_execute.subprocess.run", fake_run)
     ok, summary = _run_dep_install(
         "poetry", "pytest-asyncio", tmp_path, tmp_path / "install.log"
     )
@@ -144,7 +144,7 @@ def test_run_dep_install_poetry_real_install_succeeds(tmp_path, monkeypatch):
 
 def test_run_dep_install_passes_isolate_venv_for_poetry(tmp_path, monkeypatch):
     """The subprocess env handed to poetry must NOT inherit VIRTUAL_ENV —
-    otherwise poetry reuses worca-t's parent venv as the SUT's venv (the
+    otherwise poetry reuses qtea's parent venv as the SUT's venv (the
     original bug that motivated `isolate_venv`)."""
     import subprocess as sp
 
@@ -154,8 +154,8 @@ def test_run_dep_install_passes_isolate_venv_for_poetry(tmp_path, monkeypatch):
         captured_env.update(kwargs.get("env") or {})
         return sp.CompletedProcess(argv, returncode=0, stdout="installed", stderr="")
 
-    monkeypatch.setenv("VIRTUAL_ENV", "/worca-t/.venv")
-    monkeypatch.setattr("worca_t.steps.s09_execute.subprocess.run", fake_run)
+    monkeypatch.setenv("VIRTUAL_ENV", "/qtea/.venv")
+    monkeypatch.setattr("qtea.steps.s09_execute.subprocess.run", fake_run)
     _run_dep_install("poetry", "pkg", tmp_path, tmp_path / "log")
     assert "VIRTUAL_ENV" not in captured_env
 
@@ -163,12 +163,12 @@ def test_run_dep_install_passes_isolate_venv_for_poetry(tmp_path, monkeypatch):
 def test_run_dep_install_pip_uses_venv_pip_from_profile(tmp_path, monkeypatch):
     """pip auto-install must target the SUT's own .venv (via venv_bin from
     the profile), NOT bare `pip` from PATH. Without the path prefix the
-    install would land in worca-t's parent venv when VIRTUAL_ENV leaks
+    install would land in qtea's parent venv when VIRTUAL_ENV leaks
     (defeating the install) or in the system Python when it doesn't
     (polluting the host)."""
     import subprocess as sp
 
-    from worca_t.stack_profile import StackProfile
+    from qtea.stack_profile import StackProfile
 
     captured_argv = []
 
@@ -176,7 +176,7 @@ def test_run_dep_install_pip_uses_venv_pip_from_profile(tmp_path, monkeypatch):
         captured_argv.extend(argv)
         return sp.CompletedProcess(argv, returncode=0, stdout="installed", stderr="")
 
-    monkeypatch.setattr("worca_t.steps.s09_execute.subprocess.run", fake_run)
+    monkeypatch.setattr("qtea.steps.s09_execute.subprocess.run", fake_run)
     profile = StackProfile(
         language="python", package_manager="pip", wrapper_prefix=".venv/bin",
     )
@@ -196,7 +196,7 @@ def test_run_dep_install_pip_without_profile_refuses(tmp_path, monkeypatch):
     def fake_run(argv, **kwargs):
         return sp.CompletedProcess(argv, returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr("worca_t.steps.s09_execute.subprocess.run", fake_run)
+    monkeypatch.setattr("qtea.steps.s09_execute.subprocess.run", fake_run)
     ok, summary = _run_dep_install("pip", "requests", tmp_path, tmp_path / "log")
     assert ok is False
     assert "pip auto-install requires" in summary
@@ -207,8 +207,8 @@ def test_run_dep_install_isolates_for_all_python_venv_managers(tmp_path, monkeyp
     poetry — all four must strip the parent venv from the subprocess env."""
     import subprocess as sp
 
-    monkeypatch.setenv("VIRTUAL_ENV", "/worca-t/.venv")
-    monkeypatch.setattr("worca_t.steps.s09_execute.subprocess.run", lambda argv, **kw:
+    monkeypatch.setenv("VIRTUAL_ENV", "/qtea/.venv")
+    monkeypatch.setattr("qtea.steps.s09_execute.subprocess.run", lambda argv, **kw:
         (kw.setdefault("_seen", kw.get("env", {})),
          sp.CompletedProcess(argv, 0, "installed", ""))[1])
 
@@ -219,7 +219,7 @@ def test_run_dep_install_isolates_for_all_python_venv_managers(tmp_path, monkeyp
             captured.update(kwargs.get("env") or {})
             return sp.CompletedProcess(argv, returncode=0, stdout="installed", stderr="")
 
-        monkeypatch.setattr("worca_t.steps.s09_execute.subprocess.run", fake_run)
+        monkeypatch.setattr("qtea.steps.s09_execute.subprocess.run", fake_run)
         _run_dep_install(pm, "x", tmp_path, tmp_path / f"log-{pm}")
         assert "VIRTUAL_ENV" not in captured, f"{pm} did not strip VIRTUAL_ENV"
 
@@ -239,7 +239,7 @@ def test_run_dep_install_keeps_virtualenv_for_node_managers(tmp_path, monkeypatc
             captured.update(kwargs.get("env") or {})
             return sp.CompletedProcess(argv, returncode=0, stdout="added 1 package", stderr="")
 
-        monkeypatch.setattr("worca_t.steps.s09_execute.subprocess.run", fake_run)
+        monkeypatch.setattr("qtea.steps.s09_execute.subprocess.run", fake_run)
         ok, _ = _run_dep_install(pm, "lodash", tmp_path, tmp_path / f"log-{pm}")
         assert ok is True
         assert captured.get("VIRTUAL_ENV") == "/some/venv", (
@@ -252,7 +252,7 @@ def test_build_fixer_prompt_includes_required_fields():
         id="T-x", name="logs in", file="tests/login.spec.ts", status="failed",
         message="locator missing", traceback="long\ntb",
     )
-    prompt = _build_fixer_prompt(entry, Path("/sut/worca-tests"))
+    prompt = _build_fixer_prompt(entry, Path("/sut/qteaests"))
     assert "T-x" in prompt
     assert "tests/login.spec.ts" in prompt
     assert "locator missing" in prompt
@@ -278,7 +278,7 @@ def test_build_fixer_prompt_uses_fully_qualified_mcp_tool_names():
         message="locator missing", traceback="tb",
     )
     prompt = _build_fixer_prompt(
-        entry, Path("/sut/worca-tests"), sut_base_url="http://app.example",
+        entry, Path("/sut/qteaests"), sut_base_url="http://app.example",
     )
     assert "mcp__playwright__browser_navigate" in prompt, (
         "Step 9 heal prompt must reference Playwright MCP tools by their "
@@ -307,7 +307,7 @@ def test_build_bug_candidates_shape():
 
 
 def test_apply_fixer_outputs_copies_file(tmp_path: Path):
-    sut_tests = tmp_path / "sut" / "worca-tests"
+    sut_tests = tmp_path / "sut" / "qteaests"
     sut_tests.mkdir(parents=True)
     (sut_tests / "login.spec.ts").write_text("OLD\n", encoding="utf-8")
     wd = tmp_path / "heal"
@@ -320,7 +320,7 @@ def test_apply_fixer_outputs_copies_file(tmp_path: Path):
 
 
 def test_apply_fixer_outputs_handles_basename_fallback(tmp_path: Path):
-    sut_tests = tmp_path / "sut" / "worca-tests"
+    sut_tests = tmp_path / "sut" / "qteaests"
     sut_tests.mkdir(parents=True)
     (sut_tests / "login.spec.ts").write_text("OLD\n", encoding="utf-8")
     wd = tmp_path / "heal"
@@ -372,11 +372,11 @@ def _make_fake_pytest(
     junit_xml: str,
     exit_code: int,
 ) -> str:
-    """Write a python script that pretends to be pytest: writes worca-junit.xml
+    """Write a python script that pretends to be pytest: writes qtea-junit.xml
     into its CWD then exits with the given code. Returns a command string."""
     body = (
         "import sys, os\n"
-        f"open(os.path.join(os.getcwd(), 'worca-junit.xml'), 'w', encoding='utf-8').write({junit_xml!r})\n"
+        f"open(os.path.join(os.getcwd(), 'qtea-junit.xml'), 'w', encoding='utf-8').write({junit_xml!r})\n"
         f"sys.exit({exit_code})\n"
     )
     script_path.write_text(body, encoding="utf-8")
@@ -397,7 +397,7 @@ def _make_flaky_pytest(script_path: Path, marker_path: Path) -> str:
         "else:\n"
         f"    junit = {_JUNIT_RERUN_PASS!r}\n"
         "    code = 0\n"
-        "open(os.path.join(os.getcwd(), 'worca-junit.xml'), 'w', encoding='utf-8').write(junit)\n"
+        "open(os.path.join(os.getcwd(), 'qtea-junit.xml'), 'w', encoding='utf-8').write(junit)\n"
         "sys.exit(code)\n"
     )
     script_path.write_text(body, encoding="utf-8")
@@ -408,7 +408,7 @@ def _ctx(tmp_path: Path, *, seed_sut_repo: bool = True) -> StepContext:
     ws = create_workspace(tmp_path / ".ws")
     if seed_sut_repo:
         # Step 8 now requires `<workspace>/sut/` to be a git repo on the
-        # worca-t branch — pipeline.py + _materialize_sut do this in
+        # qtea branch — pipeline.py + _materialize_sut do this in
         # production. seed_sut() mirrors that end-state for tests.
         seed_sut(ws)
     state = RunState(run_id=ws.run_id, workspace=str(ws.root), spec_source="x", sut_source=".")
@@ -491,7 +491,7 @@ async def test_step09_failures_without_heal_yield_warned_and_bugs(tmp_path: Path
 
     # Stub the lazy MCP probe so the heal loop runs (no real `.mcp.json` in tests).
     monkeypatch.setattr(
-        "worca_t.steps.s09_execute._lazy_probe_heal_mcp",
+        "qtea.steps.s09_execute._lazy_probe_heal_mcp",
         lambda server, env=None: (True, "ok", 0.0),
     )
 
@@ -527,7 +527,7 @@ async def test_step09_self_heal_repairs_and_passes(tmp_path: Path, monkeypatch):
     # Stub the lazy MCP probe so the heal loop runs in unit tests (no real
     # `.mcp.json` / `npx` in the test environment).
     monkeypatch.setattr(
-        "worca_t.steps.s09_execute._lazy_probe_heal_mcp",
+        "qtea.steps.s09_execute._lazy_probe_heal_mcp",
         lambda server, env=None: (True, "ok", 0.0),
     )
 
@@ -740,7 +740,7 @@ def _make_dep_recovery_pytest(script_path: Path, marker_path: Path) -> str:
         "    sys.stderr.write(\"ImportError while loading conftest 'tests/conftest.py'.\\n\")\n"
         "    sys.stderr.write(\"E   ModuleNotFoundError: No module named 'allure'\\n\")\n"
         "    sys.exit(4)\n"
-        f"open(os.path.join(os.getcwd(), 'worca-junit.xml'), 'w', encoding='utf-8').write({_JUNIT_PASS!r})\n"
+        f"open(os.path.join(os.getcwd(), 'qtea-junit.xml'), 'w', encoding='utf-8').write({_JUNIT_PASS!r})\n"
         "sys.exit(0)\n"
     )
     script_path.write_text(body, encoding="utf-8")
@@ -766,7 +766,7 @@ async def test_step09_recovery_auto_installs_known_missing_dep(
         log_path.write_text(log_path.read_text(encoding="utf-8") if log_path.exists() else "", encoding="utf-8")
         return True, f"fake: {pm} add {pkg}"
 
-    monkeypatch.setattr("worca_t.steps.s09_execute._run_dep_install", fake_install)
+    monkeypatch.setattr("qtea.steps.s09_execute._run_dep_install", fake_install)
 
     result = await ExecuteStep().run(ctx)
     assert result.success, result.error
@@ -797,7 +797,7 @@ async def test_step09_no_auto_deps_flag_disables_recovery(
         install_calls.append(a)
         return True, "should not be called"
 
-    monkeypatch.setattr("worca_t.steps.s09_execute._run_dep_install", fake_install)
+    monkeypatch.setattr("qtea.steps.s09_execute._run_dep_install", fake_install)
 
     result = await ExecuteStep().run(ctx)
     assert not result.success
@@ -821,7 +821,7 @@ async def test_step09_install_failure_falls_through_to_heal_skip(
         call_count["n"] += 1
         return False, "fake install failure: 401 from registry"
 
-    monkeypatch.setattr("worca_t.steps.s09_execute._run_dep_install", failing_install)
+    monkeypatch.setattr("qtea.steps.s09_execute._run_dep_install", failing_install)
 
     result = await ExecuteStep().run(ctx)
     assert not result.success
@@ -854,11 +854,11 @@ async def test_step09_unknown_dep_non_tty_skips_install(
 
     install_calls: list = []
     monkeypatch.setattr(
-        "worca_t.steps.s09_execute._run_dep_install",
+        "qtea.steps.s09_execute._run_dep_install",
         lambda *a, **kw: (install_calls.append(a), (True, "x"))[1],
     )
     # Force non-TTY so the HITL branch is skipped without manual interaction.
-    monkeypatch.setattr("worca_t.steps.s09_execute.sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("qtea.steps.s09_execute.sys.stdin.isatty", lambda: False)
 
     result = await ExecuteStep().run(ctx)
     assert not result.success
@@ -920,7 +920,7 @@ async def test_step09_rejects_xpath_heal_and_reverts(tmp_path: Path, monkeypatch
 
     # Stub the lazy MCP probe so the heal loop runs (no real `.mcp.json` in tests).
     monkeypatch.setattr(
-        "worca_t.steps.s09_execute._lazy_probe_heal_mcp",
+        "qtea.steps.s09_execute._lazy_probe_heal_mcp",
         lambda server, env=None: (True, "ok", 0.0),
     )
 
@@ -947,7 +947,7 @@ async def test_step09_rejects_xpath_heal_and_reverts(tmp_path: Path, monkeypatch
     assert payload["self_heal"]["patches_rejected"] >= 1
 
     # No XPath survives anywhere in the resolved sut tests dir. The heal may
-    # have created `sut/worca-tests/a.py` from scratch; the gate's revert
+    # have created `sut/qteaests/a.py` from scratch; the gate's revert
     # deletes it. Walk every .py under sut and confirm the marker is gone.
     sut_root = ctx.workspace.sut
     for py in sut_root.rglob("*.py"):
@@ -1020,7 +1020,7 @@ def test_lazy_probe_returns_failure_when_mcp_json_missing(monkeypatch):
     def fake_load(path=None, env=None):
         raise FileNotFoundError(".mcp.json not found")
     monkeypatch.setattr(
-        "worca_t.mcp_manager.load_mcp_config", fake_load,
+        "qtea.mcp_manager.load_mcp_config", fake_load,
     )
     ok, detail, _warmup_s = _lazy_probe_heal_mcp("playwright")
     assert ok is False
@@ -1030,7 +1030,7 @@ def test_lazy_probe_returns_failure_when_mcp_json_missing(monkeypatch):
 def test_lazy_probe_returns_failure_when_server_not_declared(monkeypatch):
     """When the server name isn't declared in .mcp.json, fail cleanly."""
     monkeypatch.setattr(
-        "worca_t.mcp_manager.load_mcp_config", lambda env=None: {},
+        "qtea.mcp_manager.load_mcp_config", lambda env=None: {},
     )
     ok, detail, _warmup_s = _lazy_probe_heal_mcp("playwright")
     assert ok is False
@@ -1042,11 +1042,11 @@ def test_lazy_probe_returns_success_when_server_probes_ok(monkeypatch):
     """Happy path: server is declared + probes OK."""
     fake_server = object()
     monkeypatch.setattr(
-        "worca_t.mcp_manager.load_mcp_config",
+        "qtea.mcp_manager.load_mcp_config",
         lambda path=None, env=None: {"playwright": fake_server},
     )
     monkeypatch.setattr(
-        "worca_t.mcp_manager.probe_server",
+        "qtea.mcp_manager.probe_server",
         lambda srv, timeout_s=30.0: (True, "ok"),
     )
     ok, _detail, _warmup_s = _lazy_probe_heal_mcp("playwright")
@@ -1057,11 +1057,11 @@ def test_lazy_probe_returns_failure_when_probe_fails(monkeypatch):
     """Probe failure (e.g. npx missing, server crash) surfaces the detail."""
     fake_server = object()
     monkeypatch.setattr(
-        "worca_t.mcp_manager.load_mcp_config",
+        "qtea.mcp_manager.load_mcp_config",
         lambda path=None, env=None: {"playwright": fake_server},
     )
     monkeypatch.setattr(
-        "worca_t.mcp_manager.probe_server",
+        "qtea.mcp_manager.probe_server",
         lambda srv, timeout_s=30.0: (False, "npx not on PATH"),
     )
     ok, detail, _warmup_s = _lazy_probe_heal_mcp("playwright")
@@ -1085,17 +1085,17 @@ async def test_step09_skips_heal_when_mcp_probe_fails(tmp_path: Path, monkeypatc
         probe_calls.append(server_name)
         return False, "npx not on PATH", 0.0
 
-    monkeypatch.setattr("worca_t.steps.s09_execute._lazy_probe_heal_mcp", fake_probe)
+    monkeypatch.setattr("qtea.steps.s09_execute._lazy_probe_heal_mcp", fake_probe)
 
     # Fake claude — should NEVER be called when MCP probe fails.
     claude_calls: list = []
 
     async def fake_run_agent(*args, **kwargs):
         claude_calls.append((args, kwargs))
-        from worca_t.claude_runner import RunResult as _RR
+        from qtea.claude_runner import RunResult as _RR
         return _RR(success=False, error="should not run", workdir=kwargs.get("workdir"))
 
-    monkeypatch.setattr("worca_t.steps.s09_execute.run_agent", fake_run_agent)
+    monkeypatch.setattr("qtea.steps.s09_execute.run_agent", fake_run_agent)
 
     result = await ExecuteStep().run(ctx)
     # Step still completes (heal is best-effort). Real failures flow downstream.
@@ -1137,7 +1137,7 @@ async def test_step09_skips_probe_when_no_failing_tests(tmp_path: Path, monkeypa
         probe_calls.append(server_name)
         return True, "ok", 0.0
 
-    monkeypatch.setattr("worca_t.steps.s09_execute._lazy_probe_heal_mcp", fake_probe)
+    monkeypatch.setattr("qtea.steps.s09_execute._lazy_probe_heal_mcp", fake_probe)
 
     result = await ExecuteStep().run(ctx)
     assert result.success
@@ -1149,10 +1149,10 @@ async def test_step09_skips_probe_when_no_failing_tests(tmp_path: Path, monkeypa
 async def test_step09_skips_probe_when_no_llm_resolve_set(
     tmp_path: Path, monkeypatch,
 ):
-    """WORCA_T_NO_LLM_RESOLVE=1 short-circuits the heal loop BEFORE the
+    """QTEA_NO_LLM_RESOLVE=1 short-circuits the heal loop BEFORE the
     lazy probe. Verify the probe is skipped — symmetric with the env flag's
     "no LLM spend" contract (probing MCP also burns time/cache)."""
-    monkeypatch.setenv("WORCA_T_NO_LLM_RESOLVE", "1")
+    monkeypatch.setenv("QTEA_NO_LLM_RESOLVE", "1")
     ctx = _ctx(tmp_path)
     cmd = _make_fake_pytest(tmp_path / "pt.py", junit_xml=_JUNIT_FAIL, exit_code=1)
     _seed_minimal_inputs(ctx, command=cmd)
@@ -1163,7 +1163,7 @@ async def test_step09_skips_probe_when_no_llm_resolve_set(
         probe_calls.append(server_name)
         return True, "ok", 0.0
 
-    monkeypatch.setattr("worca_t.steps.s09_execute._lazy_probe_heal_mcp", fake_probe)
+    monkeypatch.setattr("qtea.steps.s09_execute._lazy_probe_heal_mcp", fake_probe)
 
     result = await ExecuteStep().run(ctx)
     # Tests failed but heal was disabled by the env flag.
@@ -1193,7 +1193,7 @@ async def test_step09_storage_state_arg_threaded_into_mcp_env_when_resolved(
 
     # Drop a storage-state file at the SUT convention path so the
     # 4-tier resolver picks it up.
-    storage_path = ctx.workspace.sut / ".worca-t" / "storage-state.json"
+    storage_path = ctx.workspace.sut / ".qtea" / "storage-state.json"
     storage_path.parent.mkdir(parents=True, exist_ok=True)
     storage_path.write_text('{"cookies":[],"origins":[]}', encoding="utf-8")
 
@@ -1206,13 +1206,13 @@ async def test_step09_storage_state_arg_threaded_into_mcp_env_when_resolved(
         return False, "stub", 0.0
 
     monkeypatch.setattr(
-        "worca_t.steps.s09_execute._lazy_probe_heal_mcp", fake_probe,
+        "qtea.steps.s09_execute._lazy_probe_heal_mcp", fake_probe,
     )
 
     await ExecuteStep().run(ctx)
 
     assert captured_env["env"] is not None
-    arg = captured_env["env"]["WORCA_T_STORAGE_STATE_ARG"]
+    arg = captured_env["env"]["QTEA_STORAGE_STATE_ARG"]
     assert arg.startswith("--storage-state=")
     assert "storage-state.json" in arg
 
@@ -1241,7 +1241,7 @@ async def test_step09_storage_state_arg_picked_up_after_same_run_auto_capture(
     # Wrap run_tests so it also writes the workspace storage-state.json
     # before returning — this is exactly what the runtime plugin does inside
     # the pytest subprocess on the first passing test.
-    from worca_t import test_runner as _tr_mod
+    from qtea import test_runner as _tr_mod
     real_run_tests = _tr_mod.run_tests
 
     def fake_run_tests(*args, **kwargs):
@@ -1254,7 +1254,7 @@ async def test_step09_storage_state_arg_picked_up_after_same_run_auto_capture(
         )
         return result
 
-    monkeypatch.setattr("worca_t.steps.s09_execute.run_tests", fake_run_tests)
+    monkeypatch.setattr("qtea.steps.s09_execute.run_tests", fake_run_tests)
 
     captured_env: dict[str, dict[str, str] | None] = {"env": None}
 
@@ -1263,7 +1263,7 @@ async def test_step09_storage_state_arg_picked_up_after_same_run_auto_capture(
         return False, "stub", 0.0
 
     monkeypatch.setattr(
-        "worca_t.steps.s09_execute._lazy_probe_heal_mcp", fake_probe,
+        "qtea.steps.s09_execute._lazy_probe_heal_mcp", fake_probe,
     )
 
     await ExecuteStep().run(ctx)
@@ -1273,7 +1273,7 @@ async def test_step09_storage_state_arg_picked_up_after_same_run_auto_capture(
     # MCP env at probe time carries the freshly-captured file's path
     # (this would be "" without the post-run re-resolve).
     assert captured_env["env"] is not None
-    arg = captured_env["env"]["WORCA_T_STORAGE_STATE_ARG"]
+    arg = captured_env["env"]["QTEA_STORAGE_STATE_ARG"]
     assert arg.startswith("--storage-state=")
     assert "storage-state.json" in arg
 
@@ -1288,7 +1288,7 @@ async def test_step09_storage_state_arg_empty_when_no_source(
     cmd = _make_fake_pytest(tmp_path / "pt.py", junit_xml=_JUNIT_FAIL, exit_code=1)
     _seed_minimal_inputs(ctx, command=cmd)
     # Make sure no env var leaks in.
-    monkeypatch.delenv("WORCA_T_STORAGE_STATE", raising=False)
+    monkeypatch.delenv("QTEA_STORAGE_STATE", raising=False)
 
     captured_env: dict[str, dict[str, str] | None] = {"env": None}
 
@@ -1297,13 +1297,13 @@ async def test_step09_storage_state_arg_empty_when_no_source(
         return False, "stub", 0.0
 
     monkeypatch.setattr(
-        "worca_t.steps.s09_execute._lazy_probe_heal_mcp", fake_probe,
+        "qtea.steps.s09_execute._lazy_probe_heal_mcp", fake_probe,
     )
 
     await ExecuteStep().run(ctx)
 
     assert captured_env["env"] is not None
-    assert captured_env["env"]["WORCA_T_STORAGE_STATE_ARG"] == ""
+    assert captured_env["env"]["QTEA_STORAGE_STATE_ARG"] == ""
 
 
 def test_build_fixer_prompt_includes_storage_state_directive_when_path_set(
@@ -1312,7 +1312,7 @@ def test_build_fixer_prompt_includes_storage_state_directive_when_path_set(
     """The heal prompt must surface the storage-state directive when a
     path is provided — agent skips the SUT's sign-in helper and goes
     direct to the failing page URL."""
-    storage_path = tmp_path / ".worca-t" / "storage-state.json"
+    storage_path = tmp_path / ".qtea" / "storage-state.json"
     storage_path.parent.mkdir(parents=True, exist_ok=True)
     storage_path.write_text('{"cookies":[],"origins":[]}', encoding="utf-8")
     entry = TestRunEntry(
@@ -1320,7 +1320,7 @@ def test_build_fixer_prompt_includes_storage_state_directive_when_path_set(
         message="locator missing", traceback="tb",
     )
     prompt = _build_fixer_prompt(
-        entry, Path("/sut/worca-tests"),
+        entry, Path("/sut/qteaests"),
         sut_base_url="http://app.example",
         storage_state_path=storage_path,
     )
@@ -1339,7 +1339,7 @@ def test_build_fixer_prompt_omits_storage_state_block_when_unset():
         message="locator missing", traceback="tb",
     )
     prompt = _build_fixer_prompt(
-        entry, Path("/sut/worca-tests"),
+        entry, Path("/sut/qteaests"),
         sut_base_url="http://app.example",
         storage_state_path=None,
     )
@@ -1363,7 +1363,7 @@ def test_build_fixer_prompt_includes_failure_class_assertion_value():
         traceback="AssertionError: assert None == 'true'",
     )
     prompt = _build_fixer_prompt(
-        entry, Path("/sut/worca-tests"),
+        entry, Path("/sut/qteaests"),
         failure_class="assertion_value",
     )
     assert "Failure class: `assertion_value`" in prompt
@@ -1381,7 +1381,7 @@ def test_build_fixer_prompt_includes_failure_class_locator_timeout():
         traceback="playwright._impl._errors.TimeoutError",
     )
     prompt = _build_fixer_prompt(
-        entry, Path("/sut/worca-tests"),
+        entry, Path("/sut/qteaests"),
         failure_class="locator_timeout",
     )
     assert "Failure class: `locator_timeout`" in prompt
@@ -1395,7 +1395,7 @@ def test_build_fixer_prompt_omits_failure_class_when_none():
         status="failed",
         message="locator missing", traceback="tb",
     )
-    prompt = _build_fixer_prompt(entry, Path("/sut/worca-tests"))
+    prompt = _build_fixer_prompt(entry, Path("/sut/qteaests"))
     assert "Failure class:" not in prompt
 
 
@@ -1527,7 +1527,7 @@ def test_classify_tbd_unresolvable():
     Real example: tooltip-on-hover (not visible in initial AOM)."""
     entry = _mk_entry(
         message=(
-            "Failed: worca-t JIT runtime: could not resolve locator "
+            "Failed: qtea JIT runtime: could not resolve locator "
             "'tooltip element shown on hover over Gemini Enterprise button'."
         ),
     )
@@ -1615,7 +1615,7 @@ def test_partition_splits_healable_from_real_bugs():
         _mk_entry(id_="T-3", message="fixture 'snapshot' not found"),
         _mk_entry(id_="T-4", message="playwright._impl._errors.TimeoutError: Locator.select_option: Timeout 60000ms exceeded."),
         _mk_entry(id_="T-5", message="AssertionError: Locator expected to be visible"),
-        _mk_entry(id_="T-6", message="Failed: worca-t JIT runtime: could not resolve locator 'tooltip ...'"),
+        _mk_entry(id_="T-6", message="Failed: qtea JIT runtime: could not resolve locator 'tooltip ...'"),
         _mk_entry(id_="T-7", message="playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceeded."),
         _mk_entry(id_="T-8", message="playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceeded."),
         _mk_entry(id_="T-9", message="AssertionError: Expected zero WCAG 2.1 AA violations, got 4"),
@@ -1642,10 +1642,10 @@ def test_partition_splits_healable_from_real_bugs():
 
 
 def test_partition_heal_all_escape_hatch_skips_classifier(monkeypatch):
-    """WORCA_T_HEAL_ALL=1 short-circuits the classifier so the operator
+    """QTEA_HEAL_ALL=1 short-circuits the classifier so the operator
     can debug heal coverage when the classifier is suspected of false
     exclusion."""
-    monkeypatch.setenv("WORCA_T_HEAL_ALL", "1")
+    monkeypatch.setenv("QTEA_HEAL_ALL", "1")
     failing = [
         _mk_entry(id_="T-wcag", message="AssertionError: Expected zero WCAG 2.1 AA violations"),
         _mk_entry(id_="T-tti", message="AssertionError: p95 TTI exceeds budget of 50ms"),

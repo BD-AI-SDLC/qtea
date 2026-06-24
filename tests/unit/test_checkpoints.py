@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from worca_t.checkpoints import (
+from qtea.checkpoints import (
     RunState,
     StepRecord,
     hash_paths,
@@ -14,9 +14,9 @@ from worca_t.checkpoints import (
     outputs_match,
     save_state,
 )
-from worca_t.pipeline import PipelineOptions, _select_steps
-from worca_t.steps.base import Step, StepContext, StepResult
-from worca_t.workspace import create_workspace
+from qtea.pipeline import PipelineOptions, _select_steps
+from qtea.steps.base import Step, StepContext, StepResult
+from qtea.workspace import create_workspace
 
 # ---------------------------------------------------------------------------
 # outputs_match unit tests

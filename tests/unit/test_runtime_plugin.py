@@ -1,4 +1,4 @@
-"""Tests for the vendored pytest runtime plugin (`worca_t_runtime.py.tpl`).
+"""Tests for the vendored pytest runtime plugin (`qtea_runtime.py.tpl`).
 
 The template ships as a `.py.tpl` file (not importable by name), so the
 test loads it via `importlib.util.spec_from_file_location` into a private
@@ -38,17 +38,17 @@ def _load_runtime():
 
     tpl = (
         Path(__file__).resolve().parents[2]
-        / "src" / "worca_t" / "_resources" / "runtime" / "worca_t_runtime.py.tpl"
+        / "src" / "qtea" / "_resources" / "runtime" / "qtea_runtime.py.tpl"
     )
-    loader = SourceFileLoader("worca_t_runtime_under_test", str(tpl))
-    spec = importlib.util.spec_from_loader("worca_t_runtime_under_test", loader)
+    loader = SourceFileLoader("qtea_runtime_under_test", str(tpl))
+    spec = importlib.util.spec_from_loader("qtea_runtime_under_test", loader)
     assert spec is not None
     mod = importlib.util.module_from_spec(spec)
-    sys.modules["worca_t_runtime_under_test"] = mod
+    sys.modules["qtea_runtime_under_test"] = mod
     try:
         loader.exec_module(mod)
     except Exception:
-        sys.modules.pop("worca_t_runtime_under_test", None)
+        sys.modules.pop("qtea_runtime_under_test", None)
         raise
     return mod
 
@@ -207,7 +207,7 @@ def _make_resolution(runtime, selector="#x", source="dev"):
         source=source,
         constant_name="LOGIN_BUTTON",
         intent="primary submit button",
-        test_file="tests/worca_login_test.py",
+        test_file="tests/qtea_login_test.py",
     )
 
 
@@ -253,7 +253,7 @@ def test_retrying_locator_invalidates_cache_and_retries_on_timeout(runtime, tmp_
     (skipping dev) → retries the same action with the new selector."""
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
-    monkeypatch.setenv("WORCA_T_CACHE_DIR", str(cache_dir))
+    monkeypatch.setenv("QTEA_CACHE_DIR", str(cache_dir))
 
     call_log: list[tuple[str, str]] = []
 
@@ -283,7 +283,7 @@ def test_retrying_locator_invalidates_cache_and_retries_on_timeout(runtime, tmp_
             source="agent",
             constant_name="LOGIN_BUTTON",
             intent="primary submit button",
-            test_file="tests/worca_login_test.py",
+            test_file="tests/qtea_login_test.py",
         )
 
     monkeypatch.setattr(runtime, "_resolve_sentinel", _fake_resolve)
@@ -311,7 +311,7 @@ def test_retrying_locator_retry_skip_dev_false_when_source_is_cached(runtime, tm
     retry should NOT skip dev — the dev file might still be valid for
     other constants, and on the constant-specific level the cache invalidation
     is what matters."""
-    monkeypatch.setenv("WORCA_T_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("QTEA_CACHE_DIR", str(tmp_path))
 
     def _click(timeout=None):
         raise _FakeTimeoutError()
@@ -419,7 +419,7 @@ def test_retrying_locator_does_not_retry_non_timeout_errors(runtime, monkeypatch
 
 
 def test_invalidate_cache_entry_removes_key(runtime, tmp_path, monkeypatch):
-    monkeypatch.setenv("WORCA_T_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("QTEA_CACHE_DIR", str(tmp_path))
     key = runtime._cache_key("tests/x.py", "LOGIN", "submit")
     cache_path = tmp_path / "locator-cache.json"
     cache_path.write_text(
@@ -435,7 +435,7 @@ def test_invalidate_cache_entry_removes_key(runtime, tmp_path, monkeypatch):
 
 
 def test_invalidate_cache_entry_missing_key_is_noop(runtime, tmp_path, monkeypatch):
-    monkeypatch.setenv("WORCA_T_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("QTEA_CACHE_DIR", str(tmp_path))
     # Cache file doesn't exist → safely returns.
     runtime._invalidate_cache_entry("LOGIN", "submit", "tests/x.py")
 
@@ -462,7 +462,7 @@ def _make_bundled_resolution(runtime, *, candidates, source="agent"):
 def test_retrying_locator_walks_fallback_candidate_on_timeout(runtime, tmp_path, monkeypatch):
     """Primary candidate times out → proxy tries fallback from the same
     bundle WITHOUT invalidating the cache or calling _resolve_sentinel."""
-    monkeypatch.setenv("WORCA_T_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("QTEA_CACHE_DIR", str(tmp_path))
     # Seed the cache so the promotion path has an entry to rewrite.
     key = runtime._cache_key("tests/test_go.py", "GO", "go button")
     cache_path = tmp_path / "locator-cache.json"
@@ -530,7 +530,7 @@ def test_retrying_locator_walks_fallback_candidate_on_timeout(runtime, tmp_path,
 def test_retrying_locator_falls_through_to_llm_when_all_candidates_exhausted(runtime, tmp_path, monkeypatch):
     """Primary AND fallback both time out → proxy invalidates cache and
     re-resolves via _resolve_sentinel (the existing path)."""
-    monkeypatch.setenv("WORCA_T_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("QTEA_CACHE_DIR", str(tmp_path))
 
     call_log: list[str] = []
 
@@ -583,7 +583,7 @@ def test_retrying_locator_without_bundle_unchanged_behavior(runtime, tmp_path, m
     """Resolution with no candidates field (cached non-LLM, dev, heuristic)
     behaves identically to the pre-bundle code path: TimeoutError → invalidate
     + LLM re-resolve immediately."""
-    monkeypatch.setenv("WORCA_T_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("QTEA_CACHE_DIR", str(tmp_path))
 
     call_log: list[str] = []
 
@@ -617,7 +617,7 @@ def test_retrying_locator_without_bundle_unchanged_behavior(runtime, tmp_path, m
 def test_promote_candidate_in_cache_rewrites_entry(runtime, tmp_path, monkeypatch):
     """The helper rewrites the cache entry so the working candidate becomes
     the sole entry. Verifies promotion semantics in isolation from the proxy."""
-    monkeypatch.setenv("WORCA_T_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("QTEA_CACHE_DIR", str(tmp_path))
     key = runtime._cache_key("tests/x.py", "GO", "go button")
     cache_path = tmp_path / "locator-cache.json"
     cache_path.write_text(
@@ -652,36 +652,36 @@ def test_promote_candidate_in_cache_rewrites_entry(runtime, tmp_path, monkeypatc
 
 
 def test_proxy_url_to_inject_returns_none_when_no_env(runtime, monkeypatch):
-    for key in ("WORCA_T_PROXY", "HTTPS_PROXY", "https_proxy",
-                "WORCA_T_DISABLE_PROXY_INJECT"):
+    for key in ("QTEA_PROXY", "HTTPS_PROXY", "https_proxy",
+                "QTEA_DISABLE_PROXY_INJECT"):
         monkeypatch.delenv(key, raising=False)
     assert runtime._proxy_url_to_inject() is None
 
 
 def test_proxy_url_to_inject_reads_https_proxy(runtime, monkeypatch):
-    for key in ("WORCA_T_PROXY", "WORCA_T_DISABLE_PROXY_INJECT"):
+    for key in ("QTEA_PROXY", "QTEA_DISABLE_PROXY_INJECT"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("HTTPS_PROXY", "http://localhost:3128")
     assert runtime._proxy_url_to_inject() == "http://localhost:3128"
 
 
-def test_proxy_url_to_inject_worca_env_wins_over_https_proxy(runtime, monkeypatch):
-    monkeypatch.delenv("WORCA_T_DISABLE_PROXY_INJECT", raising=False)
+def test_proxy_url_to_inject_qtea_env_wins_over_https_proxy(runtime, monkeypatch):
+    monkeypatch.delenv("QTEA_DISABLE_PROXY_INJECT", raising=False)
     monkeypatch.setenv("HTTPS_PROXY", "http://other:8080")
-    monkeypatch.setenv("WORCA_T_PROXY", "http://localhost:3128")
+    monkeypatch.setenv("QTEA_PROXY", "http://localhost:3128")
     assert runtime._proxy_url_to_inject() == "http://localhost:3128"
 
 
 def test_proxy_url_to_inject_disabled_via_env(runtime, monkeypatch):
-    """WORCA_T_DISABLE_PROXY_INJECT=1 wins even when HTTPS_PROXY is set."""
+    """QTEA_DISABLE_PROXY_INJECT=1 wins even when HTTPS_PROXY is set."""
     monkeypatch.setenv("HTTPS_PROXY", "http://localhost:3128")
-    monkeypatch.setenv("WORCA_T_DISABLE_PROXY_INJECT", "1")
+    monkeypatch.setenv("QTEA_DISABLE_PROXY_INJECT", "1")
     assert runtime._proxy_url_to_inject() is None
 
 
 def test_maybe_inject_proxy_kwarg_injects_when_absent(runtime, monkeypatch):
-    monkeypatch.delenv("WORCA_T_DISABLE_PROXY_INJECT", raising=False)
-    monkeypatch.delenv("WORCA_T_PROXY", raising=False)
+    monkeypatch.delenv("QTEA_DISABLE_PROXY_INJECT", raising=False)
+    monkeypatch.delenv("QTEA_PROXY", raising=False)
     monkeypatch.setenv("HTTPS_PROXY", "http://localhost:3128")
     out = runtime._maybe_inject_proxy_kwarg({"headless": True, "args": ["--no-sandbox"]})
     assert out["proxy"] == {"server": "http://localhost:3128"}
@@ -706,8 +706,8 @@ def test_maybe_inject_proxy_kwarg_respects_sut_proxy_none(runtime, monkeypatch):
 
 
 def test_maybe_inject_proxy_kwarg_noop_without_env(runtime, monkeypatch):
-    for key in ("WORCA_T_PROXY", "HTTPS_PROXY", "https_proxy",
-                "WORCA_T_DISABLE_PROXY_INJECT"):
+    for key in ("QTEA_PROXY", "HTTPS_PROXY", "https_proxy",
+                "QTEA_DISABLE_PROXY_INJECT"):
         monkeypatch.delenv(key, raising=False)
     out = runtime._maybe_inject_proxy_kwarg({"headless": True})
     assert "proxy" not in out
@@ -716,8 +716,8 @@ def test_maybe_inject_proxy_kwarg_noop_without_env(runtime, monkeypatch):
 def test_wrap_sync_launch_forwards_args_and_injects_proxy(runtime, monkeypatch):
     """End-to-end on a stub: the wrapper forwards self + positional + kwargs
     to the original after injecting proxy."""
-    monkeypatch.delenv("WORCA_T_DISABLE_PROXY_INJECT", raising=False)
-    monkeypatch.delenv("WORCA_T_PROXY", raising=False)
+    monkeypatch.delenv("QTEA_DISABLE_PROXY_INJECT", raising=False)
+    monkeypatch.delenv("QTEA_PROXY", raising=False)
     monkeypatch.setenv("HTTPS_PROXY", "http://localhost:3128")
 
     captured = {}
@@ -750,9 +750,9 @@ def test_wrap_sync_launch_preserves_wrapped_reference(runtime):
 
 
 def test_install_proxy_patch_skipped_when_disabled(runtime, monkeypatch):
-    """WORCA_T_DISABLE_PROXY_INJECT=1 means no patching happens — the
+    """QTEA_DISABLE_PROXY_INJECT=1 means no patching happens — the
     BrowserType originals are untouched and the registry stays empty."""
-    monkeypatch.setenv("WORCA_T_DISABLE_PROXY_INJECT", "1")
+    monkeypatch.setenv("QTEA_DISABLE_PROXY_INJECT", "1")
     monkeypatch.setenv("HTTPS_PROXY", "http://localhost:3128")
     # Ensure clean state.
     runtime._original_browsertype_methods.clear()
@@ -763,7 +763,7 @@ def test_install_proxy_patch_skipped_when_disabled(runtime, monkeypatch):
 def test_install_proxy_patch_idempotent(runtime, monkeypatch):
     """Calling install twice is a no-op the second time — we shouldn't
     re-wrap the wrapper. The registry's presence is the idempotency guard."""
-    monkeypatch.delenv("WORCA_T_DISABLE_PROXY_INJECT", raising=False)
+    monkeypatch.delenv("QTEA_DISABLE_PROXY_INJECT", raising=False)
     monkeypatch.setenv("HTTPS_PROXY", "http://localhost:3128")
     # Pre-seed the registry to simulate "already installed".
     runtime._original_browsertype_methods["sync.launch"] = lambda self: None
@@ -1086,7 +1086,7 @@ def test_snapshot_page_caches_capability_across_calls(runtime):
 
 
 def test_snapshot_page_respects_aom_boxes_off_env(runtime, monkeypatch):
-    """``WORCA_T_AOM_BOXES=off`` skips the boxes rung entirely — useful
+    """``QTEA_AOM_BOXES=off`` skips the boxes rung entirely — useful
     when token budget is tight and the user knows they don't need spatial
     disambiguation."""
 
@@ -1105,14 +1105,14 @@ def test_snapshot_page_respects_aom_boxes_off_env(runtime, monkeypatch):
         def locator(self, selector):
             return self.body
 
-    monkeypatch.setenv("WORCA_T_AOM_BOXES", "off")
+    monkeypatch.setenv("QTEA_AOM_BOXES", "off")
     page = _FakePage()
     runtime._snapshot_page(page)
     assert page.body.calls == [{"mode": "ai"}]
 
 
 def test_snapshot_page_threads_depth_env(runtime, monkeypatch):
-    """``WORCA_T_AOM_DEPTH=5`` passes ``depth=5`` through to aria_snapshot
+    """``QTEA_AOM_DEPTH=5`` passes ``depth=5`` through to aria_snapshot
     on the mode-aware rungs."""
 
     class _FakeBodyLocator:
@@ -1130,14 +1130,14 @@ def test_snapshot_page_threads_depth_env(runtime, monkeypatch):
         def locator(self, selector):
             return self.body
 
-    monkeypatch.setenv("WORCA_T_AOM_DEPTH", "5")
+    monkeypatch.setenv("QTEA_AOM_DEPTH", "5")
     page = _FakePage()
     runtime._snapshot_page(page)
     assert page.body.calls == [{"mode": "ai", "boxes": True, "depth": 5}]
 
 
 def test_snapshot_page_legacy_disabled_via_env(runtime, monkeypatch):
-    """``WORCA_T_AOM_LEGACY_OK=0`` prevents the pre-1.40
+    """``QTEA_AOM_LEGACY_OK=0`` prevents the pre-1.40
     ``accessibility.snapshot()`` fallback from running."""
 
     legacy_called = []
@@ -1151,7 +1151,7 @@ def test_snapshot_page_legacy_disabled_via_env(runtime, monkeypatch):
             legacy_called.append(True)
             raise AssertionError("legacy must not be reached when LEGACY_OK=0")
 
-    monkeypatch.setenv("WORCA_T_AOM_LEGACY_OK", "0")
+    monkeypatch.setenv("QTEA_AOM_LEGACY_OK", "0")
     text, tree = runtime._snapshot_page(_FakePage())
     assert text == ""
     assert tree == {}
@@ -1281,10 +1281,10 @@ class _FakeItem:
 
 
 def test_storage_state_auto_capture_on_first_passing_test(runtime, tmp_path, monkeypatch):
-    """When WORCA_T_WORKSPACE_DIR is set and a test passes with a `context`
+    """When QTEA_WORKSPACE_DIR is set and a test passes with a `context`
     fixture in scope, the runtime captures storage_state to the workspace
     file. Subsequent tests do NOT re-capture (single-capture-per-session)."""
-    monkeypatch.setenv("WORCA_T_WORKSPACE_DIR", str(tmp_path))
+    monkeypatch.setenv("QTEA_WORKSPACE_DIR", str(tmp_path))
     # Reset the module-level flag (fresh `runtime` fixture per test should
     # already give us False, but be explicit).
     runtime._storage_state_captured = False
@@ -1307,7 +1307,7 @@ def test_storage_state_auto_capture_skipped_on_failing_test(runtime, tmp_path, m
     """A FAILED test must not trigger capture — capturing from a context
     whose auth might have aborted mid-flow would persist a half-broken
     session."""
-    monkeypatch.setenv("WORCA_T_WORKSPACE_DIR", str(tmp_path))
+    monkeypatch.setenv("QTEA_WORKSPACE_DIR", str(tmp_path))
     runtime._storage_state_captured = False
 
     ctx = _FakeContext()
@@ -1319,9 +1319,9 @@ def test_storage_state_auto_capture_skipped_on_failing_test(runtime, tmp_path, m
 
 
 def test_storage_state_auto_capture_skipped_when_env_unset(runtime, tmp_path, monkeypatch):
-    """No WORCA_T_WORKSPACE_DIR → standalone pytest run, not under worca-t.
+    """No QTEA_WORKSPACE_DIR → standalone pytest run, not under qtea.
     Capture is a no-op (we don't want to scribble files in random cwds)."""
-    monkeypatch.delenv("WORCA_T_WORKSPACE_DIR", raising=False)
+    monkeypatch.delenv("QTEA_WORKSPACE_DIR", raising=False)
     runtime._storage_state_captured = False
 
     ctx = _FakeContext()
@@ -1333,7 +1333,7 @@ def test_storage_state_auto_capture_skipped_when_env_unset(runtime, tmp_path, mo
 
 def test_storage_state_auto_capture_no_context_fixture(runtime, tmp_path, monkeypatch):
     """SUT has no `context` fixture (non-Playwright stack) — skip silently."""
-    monkeypatch.setenv("WORCA_T_WORKSPACE_DIR", str(tmp_path))
+    monkeypatch.setenv("QTEA_WORKSPACE_DIR", str(tmp_path))
     runtime._storage_state_captured = False
 
     item = _FakeItem(funcargs={"something_else": object()}, passed=True)
@@ -1345,7 +1345,7 @@ def test_storage_state_auto_capture_no_context_fixture(runtime, tmp_path, monkey
 def test_storage_state_auto_capture_falls_back_to_funcarg_scan(runtime, tmp_path, monkeypatch):
     """When the fixture is renamed (not 'context'), scan funcargs for any
     value with a callable storage_state method."""
-    monkeypatch.setenv("WORCA_T_WORKSPACE_DIR", str(tmp_path))
+    monkeypatch.setenv("QTEA_WORKSPACE_DIR", str(tmp_path))
     runtime._storage_state_captured = False
 
     ctx = _FakeContext()
@@ -1358,7 +1358,7 @@ def test_storage_state_auto_capture_falls_back_to_funcarg_scan(runtime, tmp_path
 def test_storage_state_auto_capture_swallows_exceptions(runtime, tmp_path, monkeypatch):
     """A broken context.storage_state() must NOT crash the test session —
     capture is best-effort, failures degrade silently with a log warning."""
-    monkeypatch.setenv("WORCA_T_WORKSPACE_DIR", str(tmp_path))
+    monkeypatch.setenv("QTEA_WORKSPACE_DIR", str(tmp_path))
     runtime._storage_state_captured = False
 
     class _BrokenContext:

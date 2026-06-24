@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from worca_t.jit_resolver import (
+from qtea.jit_resolver import (
     _PAYLOAD_KINDS,
     parse_resolver_payload,
     validate_selector_payload,

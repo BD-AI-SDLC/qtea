@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://worca-t/schemas/static-check-result.schema.json",
+  "$id": "https://qtea/schemas/static-check-result.schema.json",
   "title": "StaticCheckResult",
-  "description": "Audit artifact for Phase B.6 of Step 8 codegen: native static-check gate. Runs the SUT stack's own type-checker (pyright for Python stacks; tsc for JS/TS stacks) against the worca-generated test files and their direct imports. Persisted to `artifacts/step08/static-check-result.json` on every run, including skipped cases (no checker for the stack, missing tool with no auto-install path, no in-scope files). Caller uses `in_scope_errors > 0` post-fixer to decide whether to fail Step 8.",
+  "description": "Audit artifact for Phase B.6 of Step 8 codegen: native static-check gate. Runs the SUT stack's own type-checker (pyright for Python stacks; tsc for JS/TS stacks) against the qtea-generated test files and their direct imports. Persisted to `artifacts/step08/static-check-result.json` on every run, including skipped cases (no checker for the stack, missing tool with no auto-install path, no in-scope files). Caller uses `in_scope_errors > 0` post-fixer to decide whether to fail Step 8.",
   "type": "object",
   "required": [
     "tool",
@@ -35,7 +35,7 @@
     },
     "skipped_reason": {
       "type": ["string", "null"],
-      "description": "Populated when `ran=false`. Common values: `\"no checker for framework=...\"` (stack outside v1 dispatch), `\"no auto-install path for package_manager=...\"` (tool absent and no install argv known), `\"no Python files in worca-touched set\"` / `\"no JS/TS files in worca-touched set\"` (post-filter scope is empty), `\"env_skip\"` (WORCA_T_SKIP_STATIC_CHECK=1), `\"flag_skip\"` (--no-static-check), `\"checker exit N: <stderr head>\"` (tool launched but emitted no parseable output). Null when `ran=true`."
+      "description": "Populated when `ran=false`. Common values: `\"no checker for framework=...\"` (stack outside v1 dispatch), `\"no auto-install path for package_manager=...\"` (tool absent and no install argv known), `\"no Python files in qteaouched set\"` / `\"no JS/TS files in qteaouched set\"` (post-filter scope is empty), `\"env_skip\"` (QTEA_SKIP_STATIC_CHECK=1), `\"flag_skip\"` (--no-static-check), `\"checker exit N: <stderr head>\"` (tool launched but emitted no parseable output). Null when `ran=true`."
     },
     "duration_s": {
       "type": "number",
@@ -49,12 +49,12 @@
     "in_scope_errors": {
       "type": "integer",
       "minimum": 0,
-      "description": "Count of error-severity violations whose file is in the worca-touched set after post-parse filtering. This is the count the caller uses to decide whether to invoke the fixer / fail the step."
+      "description": "Count of error-severity violations whose file is in the qteaouched set after post-parse filtering. This is the count the caller uses to decide whether to invoke the fixer / fail the step."
     },
     "out_of_scope_errors": {
       "type": "integer",
       "minimum": 0,
-      "description": "Count of error-severity violations the checker reported on files OUTSIDE the worca-touched set (e.g. transitively-imported user app source). Retained in `violations[]` with severity=\"out_of_scope\" for audit but never fed to the fixer."
+      "description": "Count of error-severity violations the checker reported on files OUTSIDE the qteaouched set (e.g. transitively-imported user app source). Retained in `violations[]` with severity=\"out_of_scope\" for audit but never fed to the fixer."
     },
     "autofix_attempted": {
       "type": "boolean",
@@ -95,7 +95,7 @@
           },
           "severity": {
             "type": "string",
-            "description": "`\"error\"` for in-scope rows; `\"out_of_scope\"` for rows whose file is outside the worca-touched set. The fixer only sees `\"error\"` rows. Warnings from the checker are dropped at parse time (they produce noise the fixer can't act on safely).",
+            "description": "`\"error\"` for in-scope rows; `\"out_of_scope\"` for rows whose file is outside the qteaouched set. The fixer only sees `\"error\"` rows. Warnings from the checker are dropped at parse time (they produce noise the fixer can't act on safely).",
             "enum": ["error", "out_of_scope"]
           }
         }

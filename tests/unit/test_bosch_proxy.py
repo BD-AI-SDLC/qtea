@@ -1,4 +1,4 @@
-"""Tests for :class:`worca_t.proxy.BoschProxyTransport`.
+"""Tests for :class:`qtea.proxy.BoschProxyTransport`.
 
 The PowerShell fallback path is Windows-only and cannot be exercised
 end-to-end in a portable test suite (Linux/macOS CI runs don't have
@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 
-from worca_t.proxy import (
+from qtea.proxy import (
     BoschProxyTransport,
     _build_ps_command,
     _parse_ps_response,
@@ -134,7 +134,7 @@ def test_non_407_passes_through_on_any_platform(monkeypatch):
     upstream = _fake_super_response(200, b'{"ok":1}')
 
     # Pretend we're on Windows so the platform check doesn't matter here.
-    monkeypatch.setattr("worca_t.proxy.sys.platform", "win32")
+    monkeypatch.setattr("qtea.proxy.sys.platform", "win32")
 
     transport = BoschProxyTransport()
     with patch.object(
@@ -153,7 +153,7 @@ def test_non_407_passes_through_on_any_platform(monkeypatch):
 def test_407_on_non_windows_passes_through(monkeypatch):
     """Non-Windows + 407 returns the 407 — no PowerShell available."""
     upstream = _fake_super_response(407, b"Proxy Auth Required")
-    monkeypatch.setattr("worca_t.proxy.sys.platform", "linux")
+    monkeypatch.setattr("qtea.proxy.sys.platform", "linux")
 
     transport = BoschProxyTransport()
     with patch.object(
@@ -174,7 +174,7 @@ def test_407_on_windows_invokes_powershell_fallback(monkeypatch):
     upstream = _fake_super_response(407, b"need auth")
     fallback_response = _fake_super_response(200, b'{"key":"X-1"}')
 
-    monkeypatch.setattr("worca_t.proxy.sys.platform", "win32")
+    monkeypatch.setattr("qtea.proxy.sys.platform", "win32")
 
     transport = BoschProxyTransport()
     with patch.object(
@@ -194,13 +194,13 @@ def test_407_on_windows_invokes_powershell_fallback(monkeypatch):
 
 def test_powershell_fallback_parses_subprocess_output(monkeypatch):
     """End-to-end of _powershell_fallback with mocked subprocess.run."""
-    monkeypatch.setattr("worca_t.proxy.sys.platform", "win32")
+    monkeypatch.setattr("qtea.proxy.sys.platform", "win32")
 
     mock_proc = MagicMock()
     mock_proc.stdout = "STATUS=200\n---BODY---\n{\"ok\":true}\n"
     mock_proc.stderr = ""
 
-    with patch("worca_t.proxy.subprocess.run", return_value=mock_proc):
+    with patch("qtea.proxy.subprocess.run", return_value=mock_proc):
         transport = BoschProxyTransport()
         result = transport._powershell_fallback(
             httpx.Request("GET", "https://x.atlassian.net/foo")
@@ -211,10 +211,10 @@ def test_powershell_fallback_parses_subprocess_output(monkeypatch):
 
 
 def test_powershell_fallback_missing_binary_returns_502(monkeypatch):
-    monkeypatch.setattr("worca_t.proxy.sys.platform", "win32")
+    monkeypatch.setattr("qtea.proxy.sys.platform", "win32")
 
     with patch(
-        "worca_t.proxy.subprocess.run",
+        "qtea.proxy.subprocess.run",
         side_effect=FileNotFoundError("powershell.exe not found"),
     ):
         transport = BoschProxyTransport()
@@ -227,11 +227,11 @@ def test_powershell_fallback_missing_binary_returns_502(monkeypatch):
 
 
 def test_powershell_fallback_timeout_returns_504(monkeypatch):
-    monkeypatch.setattr("worca_t.proxy.sys.platform", "win32")
+    monkeypatch.setattr("qtea.proxy.sys.platform", "win32")
 
     import subprocess as _sp
     with patch(
-        "worca_t.proxy.subprocess.run",
+        "qtea.proxy.subprocess.run",
         side_effect=_sp.TimeoutExpired(cmd="powershell", timeout=60),
     ):
         transport = BoschProxyTransport()
@@ -245,13 +245,13 @@ def test_powershell_fallback_timeout_returns_504(monkeypatch):
 
 def test_powershell_fallback_propagates_non_2xx_status(monkeypatch):
     """Auth still failing via PS (e.g. user has no NTLM creds) → propagate the status."""
-    monkeypatch.setattr("worca_t.proxy.sys.platform", "win32")
+    monkeypatch.setattr("qtea.proxy.sys.platform", "win32")
 
     mock_proc = MagicMock()
     mock_proc.stdout = "STATUS=401\n---BODY---\nstill unauthorized\n"
     mock_proc.stderr = ""
 
-    with patch("worca_t.proxy.subprocess.run", return_value=mock_proc):
+    with patch("qtea.proxy.subprocess.run", return_value=mock_proc):
         transport = BoschProxyTransport()
         result = transport._powershell_fallback(
             httpx.Request("GET", "https://x.atlassian.net/foo")

@@ -12,12 +12,12 @@ Use the value of `language` from `./sut_inventory.json` at `modules[active_modul
 
 | `language` value | Test file naming | Common framework |
 |---|---|---|
-| `python` | `test_*.py` (worca prefix: `worca_*_test.py`) | pytest + pytest-playwright OR selenium |
-| `typescript` | `*.spec.ts` (worca: `worca_*.spec.ts`) | Playwright OR Cypress OR WebdriverIO |
-| `javascript` | `*.spec.js` (worca: `worca_*.spec.js`) | same as TS |
-| `java` | `*Test.java` (worca: `Worca*Test.java`) | TestNG / JUnit + Selenium OR Playwright-Java |
-| `csharp` | `*Tests.cs` (worca: `Worca*Tests.cs`) | NUnit / xUnit + Playwright OR Selenium |
-| `robot` | `*.robot` (worca: `worca_*.robot`) | RF + Browser Library OR SeleniumLibrary |
+| `python` | `test_*.py` (qtea prefix: `qtea_*_test.py`) | pytest + pytest-playwright OR selenium |
+| `typescript` | `*.spec.ts` (qtea: `qtea_*.spec.ts`) | Playwright OR Cypress OR WebdriverIO |
+| `javascript` | `*.spec.js` (qtea: `qtea_*.spec.js`) | same as TS |
+| `java` | `*Test.java` (qtea: `Qtea*Test.java`) | TestNG / JUnit + Selenium OR Playwright-Java |
+| `csharp` | `*Tests.cs` (qtea: `Qtea*Tests.cs`) | NUnit / xUnit + Playwright OR Selenium |
+| `robot` | `*.robot` (qtea: `qtea_*.robot`) | RF + Browser Library OR SeleniumLibrary |
 
 Detailed per-framework patterns (imports, fixtures, test syntax): see `agents/polyglot-test-researcher.prompt.md` §2 — it's the canonical catalog, do not duplicate here.
 
@@ -39,12 +39,12 @@ Examples of "structural prefix" — all hypothetical, the rule applies whenever 
 
 ### When the signal fires, follow these three rules:
 
-1. **Reuse locator constants — never byte-duplicate.** If the existing locator class is the canonical owner and editable, append your new constants there. If you can't (or shouldn't) modify the SUT's file, create a thin `Worca<NewFeature>Locators` that **imports / subclasses the existing class** and only adds the genuinely new constants:
+1. **Reuse locator constants — never byte-duplicate.** If the existing locator class is the canonical owner and editable, append your new constants there. If you can't (or shouldn't) modify the SUT's file, create a thin `Qtea<NewFeature>Locators` that **imports / subclasses the existing class** and only adds the genuinely new constants:
    ```python
-   # in src/<pkg>/pages/locators/worca_<new_feature>_locators.py (new)
+   # in src/<pkg>/pages/locators/qtea_<new_feature>_locators.py (new)
    from .<existing>_locators import <Existing>Locators
 
-   class Worca<NewFeature>Locators(<Existing>Locators):
+   class Qtea<NewFeature>Locators(<Existing>Locators):
        """New: only adds <NewFeature>-specific constants; reuses everything in <Existing>Locators."""
        def __init__(self):
            super().__init__()
@@ -56,17 +56,17 @@ Examples of "structural prefix" — all hypothetical, the rule applies whenever 
 2. **Reuse page methods — extend or compose, don't fork.** When you need behavior the existing page already provides (collapse/expand, locale switch, navigation, modal open/close), call its method. If you must add new behavior, either subclass or compose:
    ```python
    # Subclass — when the new feature is a strict superset of the existing page's surface
-   class Worca<NewFeature>Page(<Existing>Page):
+   class Qtea<NewFeature>Page(<Existing>Page):
        """New: only adds <NewFeature>-specific actions; reuses every <Existing>Page method."""
        def <new_action>(self) -> None:
            self.click_on_element(self.locators.<NEW_CONSTANT>)
    ```
    ```python
    # Composition — when the new feature is a collaborator that operates on the existing page
-   class Worca<NewFeature>Page:
+   class Qtea<NewFeature>Page:
        def __init__(self, existing: <Existing>Page) -> None:
            self.existing = existing
-           self.locators = Worca<NewFeature>Locators()
+           self.locators = Qtea<NewFeature>Locators()
        def <new_action>(self) -> None:
            self.existing.click_on_element(self.locators.<NEW_CONSTANT>)
    ```
@@ -74,8 +74,8 @@ Examples of "structural prefix" — all hypothetical, the rule applies whenever 
 3. **Reuse the existing fixture chain.** Don't write a new `open()` that calls `page.goto(base_url)` if the SUT already has an authenticated fixture (`chat_setup`, `dashboard_setup`, whatever the SUT calls it) that lands you on the page. Compose your fixture from the existing one:
    ```python
    @pytest.fixture()
-   def <new_feature>_page(<existing>_page: <Existing>Page) -> Worca<NewFeature>Page:
-       return Worca<NewFeature>Page(<existing>_page)
+   def <new_feature>_page(<existing>_page: <Existing>Page) -> Qtea<NewFeature>Page:
+       return Qtea<NewFeature>Page(<existing>_page)
    ```
 
 ### When NOT to extend
@@ -261,13 +261,13 @@ export default defineConfig({
 
 ## §7 — Example Scenarios
 
-All scenarios assume the normal worca-t pipeline path: `./sut_inventory.json` is staged in your workdir by Step 7's orchestration code, and `modules[active_module]` holds the active module record.
+All scenarios assume the normal qtea pipeline path: `./sut_inventory.json` is staged in your workdir by Step 7's orchestration code, and `modules[active_module]` holds the active module record.
 
 **Scenario A (Python + Playwright):** `sut_inventory.json["modules"][active]` shows `language: "python"`, `package_manager: "poetry"`, and lists existing page objects under `pages/object/`.
-→ Generate `worca_<feature>_test.py` placed in `sut_inventory.modules[active].test_directory_layout.default_target` (e.g., `tests/regression/`). Import existing `SignInPage` / `<Feature>Page` from the SUT instead of redefining them. Use `pytest-playwright` synchronous fixtures. **Before creating a new `*Page` / `*Locators` class, run the §2 Owning-Page check** — if the SUT's existing locator constants share a `data-testid` prefix family with the selectors you'd write, extend the owning page object instead of forking.
+→ Generate `qtea_<feature>_test.py` placed in `sut_inventory.modules[active].test_directory_layout.default_target` (e.g., `tests/regression/`). Import existing `SignInPage` / `<Feature>Page` from the SUT instead of redefining them. Use `pytest-playwright` synchronous fixtures. **Before creating a new `*Page` / `*Locators` class, run the §2 Owning-Page check** — if the SUT's existing locator constants share a `data-testid` prefix family with the selectors you'd write, extend the owning page object instead of forking.
 
 **Scenario B (Java + Selenium):** `sut_inventory.json["modules"][active]` shows `language: "java"`, `package_manager: "maven"`.
-→ Generate `Worca<Feature>Test.java` under `src/test/java/`. Use TestNG `@Test` annotations and `@FindBy` page-object pattern. Reuse any existing `*Page.java` from `sut_inventory.existing_page_objects`.
+→ Generate `Qtea<Feature>Test.java` under `src/test/java/`. Use TestNG `@Test` annotations and `@FindBy` page-object pattern. Reuse any existing `*Page.java` from `sut_inventory.existing_page_objects`.
 
 **Scenario C (`active_module` null or `modules` empty — rare):** Step 6 hard-failed and operator pushed through anyway.
 → The fallback language/framework/pattern prompt is presented by the agent (see `codegen-violation-fixer.agent.md` workflow). **WAIT** for explicit selection. Do NOT scan the SUT root yourself.
@@ -276,4 +276,4 @@ All scenarios assume the normal worca-t pipeline path: `./sut_inventory.json` is
 → Trust the explicit override but document it: top-of-file comment `# Stack: python+pytest (user override; sut_inventory.json detected typescript)`. This is rare and intentional.
 
 **Scenario E (Robot Framework):** `sut_inventory.json["modules"][active]` shows `language: "robot"`, `existing_page_objects` may be empty (Tier 3 LLM-augmented from researcher).
-→ Generate `Tests/worca_<feature>.robot` and `Resources/<feature>_keywords.resource` using Browser Library locators (`id=`, `css=`, `role=`, `text=`). Reuse existing `*.resource` keywords listed in `sut_inventory.existing_helpers`.
+→ Generate `Tests/qtea_<feature>.robot` and `Resources/<feature>_keywords.resource` using Browser Library locators (`id=`, `css=`, `role=`, `text=`). Reuse existing `*.resource` keywords listed in `sut_inventory.existing_helpers`.

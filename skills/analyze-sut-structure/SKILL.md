@@ -72,14 +72,14 @@ For each test precondition, find an existing fixture or decide to create:
 
 | File Category | Inventory Field | Example |
 |---|---|---|
-| Test files | `test_directory_layout.default_target` | `tests/smoke/worca_<feature>_test.py` |
-| Page objects | `src_directory_layout.pages_object_dir` | `src/app/pages/object/worca_<feature>_page.py` |
-| Locators | `src_directory_layout.pages_locators_dir` | `src/app/pages/locators/worca_<feature>_locators.py` |
-| Helpers | `src_directory_layout.helpers_dir` | `src/app/helpers/worca_<feature>_helper.py` |
-| Fixtures | `test_directory_layout.base_dir` + `/fixtures/` | `tests/fixtures/worca_<feature>_fixture.py` |
-| Test data | `test_directory_layout.base_dir` + `/data/` | `tests/data/worca_<feature>_data.json` |
+| Test files | `test_directory_layout.default_target` | `tests/smoke/qtea_<feature>_test.py` |
+| Page objects | `src_directory_layout.pages_object_dir` | `src/app/pages/object/qtea_<feature>_page.py` |
+| Locators | `src_directory_layout.pages_locators_dir` | `src/app/pages/locators/qtea_<feature>_locators.py` |
+| Helpers | `src_directory_layout.helpers_dir` | `src/app/helpers/qtea_<feature>_helper.py` |
+| Fixtures | `test_directory_layout.base_dir` + `/fixtures/` | `tests/fixtures/qtea_<feature>_fixture.py` |
+| Test data | `test_directory_layout.base_dir` + `/data/` | `tests/data/qtea_<feature>_data.json` |
 
-All generated filenames must start with `worca_` (or `Worca` for Java classes) to prevent collisions with SUT files.
+All generated filenames must start with `qtea_` (or `Qtea` for Java classes) to prevent collisions with SUT files.
 
 ## Reuse-First Checklist
 

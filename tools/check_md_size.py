@@ -21,7 +21,7 @@ HARD_LIMIT = 500
 
 EXCLUDED_DIRS = frozenset({
     "agents", "skills", "candidate_agents",
-    ".venv", ".worca-t", "node_modules", "__pycache__",
+    ".venv", ".qtea", "node_modules", "__pycache__",
     ".git", ".github",
 })
 

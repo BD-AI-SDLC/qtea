@@ -1,11 +1,11 @@
-"""Tests for :mod:`worca_t.pricing` — cost estimator + family fallback."""
+"""Tests for :mod:`qtea.pricing` — cost estimator + family fallback."""
 
 from __future__ import annotations
 
 import pytest
 
-from worca_t.metrics import AgentMetrics
-from worca_t.pricing import (
+from qtea.metrics import AgentMetrics
+from qtea.pricing import (
     PRICING_BASIS,
     estimate_cost,
     estimate_cost_from_metrics,

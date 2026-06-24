@@ -9,10 +9,10 @@ Two layers:
 
 from __future__ import annotations
 
-from worca_t.schemas import is_valid
-from worca_t.steps.s02_refine import _project_to_json
-from worca_t.steps.s03_plan import _project_plan
-from worca_t.steps.s04_strategy import _project_strategy
+from qtea.schemas import is_valid
+from qtea.steps.s02_refine import _project_to_json
+from qtea.steps.s03_plan import _project_plan
+from qtea.steps.s04_strategy import _project_strategy
 
 # ---------- 1. Hand-crafted legacy artifacts validate ----------
 

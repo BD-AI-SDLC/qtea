@@ -14,7 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from worca_t.steps.s08_codegen import (
+from qtea.steps.s08_codegen import (
     _POM_EXTENDER_MAX_TOKENS_HARD_CAP,
     _POM_EXTENDER_MAX_TOKENS_OVERRIDE_KEY,
     _extend_poms,
@@ -76,7 +76,7 @@ def _patch_llm(
     mock = AsyncMock(
         return_value=_make_async_result(returns_text, stop_reason=stop_reason),
     )
-    from worca_t.steps import s08_codegen
+    from qtea.steps import s08_codegen
     monkeypatch.setattr(s08_codegen, "call_reasoning_llm", mock)
     return mock
 

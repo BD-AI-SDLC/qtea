@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from worca_t.metrics import (
+from qtea.metrics import (
     CURRENT_STEP_METRICS,
     AgentMetrics,
     StepMetricsAccumulator,

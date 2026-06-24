@@ -6,11 +6,11 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
-from worca_t.checkpoints import RunState
-from worca_t.pipeline import PipelineOptions
-from worca_t.schemas import is_valid
-from worca_t.steps.base import StepContext
-from worca_t.steps.s10_bug_classifier import (
+from qtea.checkpoints import RunState
+from qtea.pipeline import PipelineOptions
+from qtea.schemas import is_valid
+from qtea.steps.base import StepContext
+from qtea.steps.s10_bug_classifier import (
     BugClassifierStep,
     _agent_report_is_usable,
     _categorize_attachments,
@@ -19,7 +19,7 @@ from worca_t.steps.s10_bug_classifier import (
     _render_markdown,
     _synthesize,
 )
-from worca_t.workspace import create_workspace
+from qtea.workspace import create_workspace
 
 from ._fake_anthropic import disable_vertex_env, install_fake_anthropic
 

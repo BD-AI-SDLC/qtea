@@ -19,7 +19,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from worca_t.steps.s08_codegen import (
+from qtea.steps.s08_codegen import (
     _create_fixtures,
     _FixtureTask,
     _group_fixture_tasks_by_file,
@@ -28,13 +28,13 @@ from worca_t.steps.s08_codegen import (
 
 def _make_tasks() -> list[_FixtureTask]:
     return [
-        _FixtureTask(name="gemini_nav_locale_en", at="tests/fixtures/worca_nav.py"),
-        _FixtureTask(name="gemini_nav_locale_de", at="tests/fixtures/worca_nav.py"),
-        _FixtureTask(name="gtag_spy", at="tests/fixtures/worca_nav.py"),
-        _FixtureTask(name="gtag_removed", at="tests/fixtures/worca_nav.py"),
-        _FixtureTask(name="unauthenticated_context", at="tests/fixtures/worca_nav.py"),
-        _FixtureTask(name="mobile_viewport", at="tests/fixtures/worca_nav.py"),
-        _FixtureTask(name="shared_browser", at="tests/fixtures/worca_shared.py"),
+        _FixtureTask(name="gemini_nav_locale_en", at="tests/fixtures/qtea_nav.py"),
+        _FixtureTask(name="gemini_nav_locale_de", at="tests/fixtures/qtea_nav.py"),
+        _FixtureTask(name="gtag_spy", at="tests/fixtures/qtea_nav.py"),
+        _FixtureTask(name="gtag_removed", at="tests/fixtures/qtea_nav.py"),
+        _FixtureTask(name="unauthenticated_context", at="tests/fixtures/qtea_nav.py"),
+        _FixtureTask(name="mobile_viewport", at="tests/fixtures/qtea_nav.py"),
+        _FixtureTask(name="shared_browser", at="tests/fixtures/qtea_shared.py"),
     ]
 
 
@@ -42,12 +42,12 @@ def test_group_fixture_tasks_by_file_collates_correctly():
     tasks = _make_tasks()
     by_file = _group_fixture_tasks_by_file(tasks)
     assert set(by_file.keys()) == {
-        "tests/fixtures/worca_nav.py",
-        "tests/fixtures/worca_shared.py",
+        "tests/fixtures/qtea_nav.py",
+        "tests/fixtures/qtea_shared.py",
     }
-    assert len(by_file["tests/fixtures/worca_nav.py"]) == 6
-    assert len(by_file["tests/fixtures/worca_shared.py"]) == 1
-    nav_names = [t.name for t in by_file["tests/fixtures/worca_nav.py"]]
+    assert len(by_file["tests/fixtures/qtea_nav.py"]) == 6
+    assert len(by_file["tests/fixtures/qtea_shared.py"]) == 1
+    nav_names = [t.name for t in by_file["tests/fixtures/qtea_nav.py"]]
     assert "gemini_nav_locale_en" in nav_names
     assert "mobile_viewport" in nav_names
 
@@ -110,7 +110,7 @@ def test_create_fixtures_one_llm_call_per_file(tmp_path: Path, monkeypatch):
         return _StubResult(success=True, final_text=_all_fixtures_body(names))
 
     monkeypatch.setattr(
-        "worca_t.steps.s08_codegen.call_reasoning_llm", _stub,
+        "qtea.steps.s08_codegen.call_reasoning_llm", _stub,
     )
 
     results = asyncio.run(_create_fixtures(
@@ -126,8 +126,8 @@ def test_create_fixtures_one_llm_call_per_file(tmp_path: Path, monkeypatch):
         )
 
     # Both target files written to disk
-    nav_path = sut_root / "tests" / "fixtures" / "worca_nav.py"
-    shared_path = sut_root / "tests" / "fixtures" / "worca_shared.py"
+    nav_path = sut_root / "tests" / "fixtures" / "qtea_nav.py"
+    shared_path = sut_root / "tests" / "fixtures" / "qtea_shared.py"
     assert nav_path.is_file()
     assert shared_path.is_file()
 
@@ -167,7 +167,7 @@ def test_create_fixtures_reports_failure_when_agent_drops_a_name(
         return _StubResult(success=True, final_text=_all_fixtures_body(["alpha"]))
 
     monkeypatch.setattr(
-        "worca_t.steps.s08_codegen.call_reasoning_llm", _stub,
+        "qtea.steps.s08_codegen.call_reasoning_llm", _stub,
     )
 
     results = asyncio.run(_create_fixtures(
@@ -213,7 +213,7 @@ def test_create_fixtures_rolls_back_on_syntax_error(
         return _StubResult(success=True, final_text=broken_body)
 
     monkeypatch.setattr(
-        "worca_t.steps.s08_codegen.call_reasoning_llm", _stub,
+        "qtea.steps.s08_codegen.call_reasoning_llm", _stub,
     )
 
     results = asyncio.run(_create_fixtures(
@@ -251,7 +251,7 @@ def test_create_fixtures_restores_prior_content_on_syntax_error(
         )
 
     monkeypatch.setattr(
-        "worca_t.steps.s08_codegen.call_reasoning_llm", _stub,
+        "qtea.steps.s08_codegen.call_reasoning_llm", _stub,
     )
 
     results = asyncio.run(_create_fixtures(

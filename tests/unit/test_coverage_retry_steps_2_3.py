@@ -1,7 +1,7 @@
 """Retry-loop integration tests for the coverage audit on Steps 2 + 3.
 
 Verifies the PR 3 wiring:
-- audit fires after schema validation (only when WORCA_T_COVERAGE_AUDIT=1)
+- audit fires after schema validation (only when QTEA_COVERAGE_AUDIT=1)
 - a violation writes `audit-violations.log` and returns `status="failed"`
 - the next `run()` reads the log, prepends to the user prompt, deletes it,
   and succeeds when the agent emits a clean artifact
@@ -14,12 +14,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from tests.unit._fake_anthropic import install_fake_anthropic
-from worca_t.checkpoints import RunState
-from worca_t.pipeline import PipelineOptions
-from worca_t.steps.base import StepContext
-from worca_t.steps.s02_refine import RefineStep
-from worca_t.steps.s03_plan import PlanStep
-from worca_t.workspace import create_workspace
+from qtea.checkpoints import RunState
+from qtea.pipeline import PipelineOptions
+from qtea.steps.base import StepContext
+from qtea.steps.s02_refine import RefineStep
+from qtea.steps.s03_plan import PlanStep
+from qtea.workspace import create_workspace
 
 # ---------- canned markdown fixtures ----------
 
@@ -78,7 +78,7 @@ def _ctx(tmp_path: Path) -> StepContext:
 async def test_step2_passes_without_audit_when_gate_off(tmp_path: Path, monkeypatch):
     """Default (gate OFF) preserves existing behavior — broken markdown is
     accepted via the warned-only schema path."""
-    monkeypatch.delenv("WORCA_T_COVERAGE_AUDIT", raising=False)
+    monkeypatch.delenv("QTEA_COVERAGE_AUDIT", raising=False)
     install_fake_anthropic(monkeypatch, text=_REFINED_BROKEN)
     result = await RefineStep().run(_ctx(tmp_path))
     assert result.success, result.error
@@ -87,7 +87,7 @@ async def test_step2_passes_without_audit_when_gate_off(tmp_path: Path, monkeypa
 async def test_step2_audit_failure_writes_log_and_returns_failed(
     tmp_path: Path, monkeypatch,
 ):
-    monkeypatch.setenv("WORCA_T_COVERAGE_AUDIT", "1")
+    monkeypatch.setenv("QTEA_COVERAGE_AUDIT", "1")
     install_fake_anthropic(monkeypatch, text=_REFINED_BROKEN)
     ctx = _ctx(tmp_path)
     result = await RefineStep().run(ctx)
@@ -105,7 +105,7 @@ async def test_step2_audit_log_consumed_and_deleted_on_next_run(
 ):
     """The next `run()` reads the prior log, prepends it to the user prompt,
     deletes it, then succeeds when the agent emits a clean artifact."""
-    monkeypatch.setenv("WORCA_T_COVERAGE_AUDIT", "1")
+    monkeypatch.setenv("QTEA_COVERAGE_AUDIT", "1")
     captured: list[dict] = []
     install_fake_anthropic(
         monkeypatch,
@@ -142,7 +142,7 @@ async def test_step2_audit_log_consumed_and_deleted_on_next_run(
 async def test_step2_two_consecutive_audit_failures_hard_fail(
     tmp_path: Path, monkeypatch,
 ):
-    monkeypatch.setenv("WORCA_T_COVERAGE_AUDIT", "1")
+    monkeypatch.setenv("QTEA_COVERAGE_AUDIT", "1")
     install_fake_anthropic(monkeypatch, texts=[_REFINED_BROKEN, _REFINED_BROKEN])
     ctx = _ctx(tmp_path)
     r1 = await RefineStep().run(ctx)
@@ -167,7 +167,7 @@ async def _seed_refined_spec(ctx: StepContext, *, clean: bool = True) -> None:
     # Build the JSON projection the audit needs.
     import json
 
-    from worca_t.steps.s02_refine import _project_to_json
+    from qtea.steps.s02_refine import _project_to_json
     projection = _project_to_json(refined_md)
     (ctx.workspace.step_dir(2) / "refined-spec.json").write_text(
         json.dumps(projection, indent=2), encoding="utf-8",
@@ -175,7 +175,7 @@ async def _seed_refined_spec(ctx: StepContext, *, clean: bool = True) -> None:
 
 
 async def test_step3_passes_without_audit_when_gate_off(tmp_path: Path, monkeypatch):
-    monkeypatch.delenv("WORCA_T_COVERAGE_AUDIT", raising=False)
+    monkeypatch.delenv("QTEA_COVERAGE_AUDIT", raising=False)
     ctx = _ctx(tmp_path)
     await _seed_refined_spec(ctx, clean=True)
     install_fake_anthropic(monkeypatch, text=_PLAN_BROKEN)
@@ -186,7 +186,7 @@ async def test_step3_passes_without_audit_when_gate_off(tmp_path: Path, monkeypa
 async def test_step3_audit_failure_writes_log_and_returns_failed(
     tmp_path: Path, monkeypatch,
 ):
-    monkeypatch.setenv("WORCA_T_COVERAGE_AUDIT", "1")
+    monkeypatch.setenv("QTEA_COVERAGE_AUDIT", "1")
     ctx = _ctx(tmp_path)
     await _seed_refined_spec(ctx, clean=True)
     install_fake_anthropic(monkeypatch, text=_PLAN_BROKEN)
@@ -204,7 +204,7 @@ async def test_step3_audit_failure_writes_log_and_returns_failed(
 async def test_step3_audit_log_consumed_on_retry_and_succeeds(
     tmp_path: Path, monkeypatch,
 ):
-    monkeypatch.setenv("WORCA_T_COVERAGE_AUDIT", "1")
+    monkeypatch.setenv("QTEA_COVERAGE_AUDIT", "1")
     captured: list[dict] = []
     install_fake_anthropic(
         monkeypatch,
@@ -240,7 +240,7 @@ async def test_step3_audit_skipped_when_refined_spec_json_missing(
 ):
     """Defensive: if Step 2's JSON is missing (legacy workspace), the audit
     is skipped with a warning rather than crashing."""
-    monkeypatch.setenv("WORCA_T_COVERAGE_AUDIT", "1")
+    monkeypatch.setenv("QTEA_COVERAGE_AUDIT", "1")
     ctx = _ctx(tmp_path)
     (ctx.workspace.step_dir(2) / "refined-spec.md").write_text(
         _REFINED_CLEAN, encoding="utf-8",

@@ -13,22 +13,22 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from worca_t.checkpoints import RunState
-from worca_t.pipeline import PipelineOptions
-from worca_t.steps.base import StepContext
-from worca_t.runtime.dev_locators import DevLocator
-from worca_t.steps.s08_codegen import (
+from qtea.checkpoints import RunState
+from qtea.pipeline import PipelineOptions
+from qtea.steps.base import StepContext
+from qtea.runtime.dev_locators import DevLocator
+from qtea.steps.s08_codegen import (
     CodegenStep,
     _LocatorTask,
     _detect_init_placement,
-    _filter_index_to_worca,
+    _filter_index_to_qtea,
     _framework_mismatch_message,
     _match_dev_locator,
     _parse_test_command_head,
     _strip_code_fences,
     _write_tbd_locators,
 )
-from worca_t.workspace import create_workspace
+from qtea.workspace import create_workspace
 
 from ._fake_anthropic import disable_vertex_env, install_fake_anthropic
 from ._fake_claude import install_fake_query
@@ -56,7 +56,7 @@ test('xpath bad', async ({ page }) => {
 GOOD_PY_TEST = """\
 import pytest
 
-@pytest.mark.worca_smoke
+@pytest.mark.qtea_smoke
 def test_basic(page):
     assert True
 """
@@ -68,8 +68,8 @@ _MINIMAL_CODE_MOD_PLAN = {
     "framework": "playwright-test",
     "test_cases": [{
         "id": "TC-STUB",
-        "test_file_target": "tests/worca_login.spec.ts",
-        "test_functions": [{"name": "test_stub", "markers": ["worca_smoke"]}],
+        "test_file_target": "tests/qtea_login.spec.ts",
+        "test_functions": [{"name": "test_stub", "markers": ["qtea_smoke"]}],
         "fixtures": [],
         "page_objects": [],
         "locators": [],
@@ -130,7 +130,7 @@ async def test_step08_happy_path_indexes_and_validates(tmp_path: Path, monkeypat
 
     result = await CodegenStep().run(ctx)
     assert result.success, result.error
-    assert (ctx.workspace.sut / "tests" / "worca_login.spec.ts").exists()
+    assert (ctx.workspace.sut / "tests" / "qtea_login.spec.ts").exists()
     out = ctx.workspace.step_dir(8)
     assert not (out / "tests").exists()
     assert (out / "generated-files.json").exists()
@@ -166,8 +166,8 @@ async def test_step08_rejects_hard_wait_violation(tmp_path: Path, monkeypatch):
     plan = {**_MINIMAL_CODE_MOD_PLAN, "language": "python", "framework": "pytest"}
     plan["test_cases"] = [{
         "id": "TC-STUB",
-        "test_file_target": "tests/worca_bad_test.py",
-        "test_functions": [{"name": "test_x", "markers": ["worca_smoke"]}],
+        "test_file_target": "tests/qtea_bad_test.py",
+        "test_functions": [{"name": "test_x", "markers": ["qtea_smoke"]}],
         "fixtures": [], "page_objects": [], "locators": [],
     }]
     ctx = _ctx(tmp_path, detected_stack="pytest", plan_override=plan)
@@ -193,7 +193,7 @@ async def test_step08_empty_output_fails(tmp_path: Path, monkeypatch):
     result = await CodegenStep().run(ctx)
     assert not result.success
     err = result.error or ""
-    assert "worca" in err or "codegen" in err or "failed" in err
+    assert "qtea" in err or "codegen" in err or "failed" in err
 
 
 async def test_step08_zero_indexed_tests_fails(tmp_path: Path, monkeypatch):
@@ -203,15 +203,15 @@ async def test_step08_zero_indexed_tests_fails(tmp_path: Path, monkeypatch):
 
     result = await CodegenStep().run(ctx)
     assert not result.success
-    assert "0 worca_*-prefixed test functions" in (result.error or "")
+    assert "0 qtea_*-prefixed test functions" in (result.error or "")
 
 
 async def test_step08_uses_extension_fallback_when_no_stack(tmp_path: Path, monkeypatch):
     plan = {**_MINIMAL_CODE_MOD_PLAN, "language": "python", "framework": "pytest"}
     plan["test_cases"] = [{
         "id": "TC-STUB",
-        "test_file_target": "tests/worca_x_test.py",
-        "test_functions": [{"name": "test_basic", "markers": ["worca_smoke"]}],
+        "test_file_target": "tests/qtea_x_test.py",
+        "test_functions": [{"name": "test_basic", "markers": ["qtea_smoke"]}],
         "fixtures": [], "page_objects": [], "locators": [],
     }]
     ctx = _ctx(tmp_path, detected_stack=None, plan_override=plan)
@@ -331,7 +331,7 @@ async def test_step08_vendors_jit_runtime_before_codegen(tmp_path: Path, monkeyp
     """When `detected_stack` is set, the JIT runtime must be on disk BEFORE
     the reasoning calls run."""
     ctx = _ctx(tmp_path, detected_stack="playwright-ts")
-    expected_runtime = ctx.workspace.sut / "tests" / "worca-t-runtime.js"
+    expected_runtime = ctx.workspace.sut / "tests" / "qtea-runtime.js"
 
     runtime_present: dict[str, bool] = {}
 
@@ -360,7 +360,7 @@ async def test_step08_vendored_runtime_excluded_from_index(tmp_path: Path, monke
         (ctx.workspace.step_dir(8) / "tbd-index.json").read_text(encoding="utf-8")
     )
     indexed_paths = list(index["files"])
-    assert not any("worca-t-runtime" in p for p in indexed_paths), (
+    assert not any("qtea-runtime" in p for p in indexed_paths), (
         f"Pre-vendored runtime leaked into tbd-index: {indexed_paths}"
     )
     assert index["totals"]["files"] == 1
@@ -379,7 +379,7 @@ async def test_step08_vendored_runtime_included_in_manifest(tmp_path: Path, monk
     manifest = json.loads(
         (ctx.workspace.step_dir(8) / "generated-files.json").read_text(encoding="utf-8")
     )
-    assert any("worca-t-runtime" in f for f in manifest["files"]), (
+    assert any("qtea-runtime" in f for f in manifest["files"]), (
         f"Pre-vendored runtime missing from generated-files.json: {manifest['files']}"
     )
 
@@ -478,8 +478,8 @@ async def test_step08_strips_fences_from_generated_files(tmp_path: Path, monkeyp
     plan = {**_MINIMAL_CODE_MOD_PLAN, "language": "python", "framework": "pytest"}
     plan["test_cases"] = [{
         "id": "TC-STUB",
-        "test_file_target": "tests/worca_x_test.py",
-        "test_functions": [{"name": "test_basic", "markers": ["worca_smoke"]}],
+        "test_file_target": "tests/qtea_x_test.py",
+        "test_functions": [{"name": "test_basic", "markers": ["qtea_smoke"]}],
         "fixtures": [], "page_objects": [], "locators": [],
     }]
     ctx = _ctx(tmp_path, detected_stack="pytest", plan_override=plan)
@@ -488,7 +488,7 @@ async def test_step08_strips_fences_from_generated_files(tmp_path: Path, monkeyp
 
     result = await CodegenStep().run(ctx)
     assert result.success, result.error
-    written = (ctx.workspace.sut / "tests" / "worca_x_test.py").read_text(encoding="utf-8")
+    written = (ctx.workspace.sut / "tests" / "qtea_x_test.py").read_text(encoding="utf-8")
     assert not written.startswith("```"), (
         f"Markdown fences leaked into generated file: {written[:40]!r}"
     )
@@ -524,8 +524,8 @@ _B5_PLAN_WITH_POM: dict = {
     "framework": "pytest",
     "test_cases": [{
         "id": "TC-B5",
-        "test_file_target": "tests/worca_login_test.py",
-        "test_functions": [{"name": "test_b5_login", "markers": ["worca_smoke"]}],
+        "test_file_target": "tests/qtea_login_test.py",
+        "test_functions": [{"name": "test_b5_login", "markers": ["qtea_smoke"]}],
         "fixtures": [],
         "page_objects": [{
             "name": "LoginPage",
@@ -551,7 +551,7 @@ import pytest
 from pages.login_page import LoginPage
 
 
-@pytest.mark.worca_smoke
+@pytest.mark.qtea_smoke
 def test_b5_login(page):
     login_page = LoginPage(page)
     login_page.click_login()
@@ -563,7 +563,7 @@ import pytest
 from pages.login_page import LoginPage
 
 
-@pytest.mark.worca_smoke
+@pytest.mark.qtea_smoke
 def test_b5_login(page):
     login_page = LoginPage(page)
     login_page.click_save()
@@ -582,7 +582,7 @@ async def test_step08_b5_happy_path_no_mismatches(tmp_path: Path, monkeypatch):
     _seed_pom(ctx, "pages/login_page.py", _B5_POM_BASE)
 
     extend_calls: list[dict] = []
-    from worca_t.steps import s08_codegen as _s08
+    from qtea.steps import s08_codegen as _s08
 
     real_extend = _s08._extend_poms
 
@@ -620,7 +620,7 @@ async def test_step08_b5_autopatch_succeeds(tmp_path: Path, monkeypatch):
     )
     pom_path = _seed_pom(ctx, "pages/login_page.py", _B5_POM_BASE)
 
-    from worca_t.steps import s08_codegen as _s08
+    from qtea.steps import s08_codegen as _s08
 
     extend_invocations: list[int] = []
 
@@ -670,7 +670,7 @@ async def test_step08_b5_autopatch_still_fails(tmp_path: Path, monkeypatch):
     )
     _seed_pom(ctx, "pages/login_page.py", _B5_POM_BASE)
 
-    from worca_t.steps import s08_codegen as _s08
+    from qtea.steps import s08_codegen as _s08
 
     invocations: list[int] = []
 
@@ -693,7 +693,7 @@ async def test_step08_b5_autopatch_still_fails(tmp_path: Path, monkeypatch):
     )
     # Anchor: <test_file>:<line> calls <Pom>.<method>() — match the unresolved
     # call site so a human reading the failure knows what to fix.
-    assert "worca_login_test.py" in err and "click_save" in err, (
+    assert "qtea_login_test.py" in err and "click_save" in err, (
         f"Error must surface the unresolved call site anchor; got: {err!r}"
     )
 
@@ -723,7 +723,7 @@ async def test_step08_b5_skipped_for_unsupported_language(tmp_path: Path, monkey
     )
     _seed_pom(ctx, "pages/login_page.py", _B5_POM_BASE)
 
-    from worca_t.steps import s08_codegen as _s08
+    from qtea.steps import s08_codegen as _s08
 
     extend_invocations: list[int] = []
 
@@ -764,7 +764,7 @@ import pytest
 from pages.login_page import LoginPage
 
 
-@pytest.mark.worca_smoke
+@pytest.mark.qtea_smoke
 def test_b5_login(page):
     login_page = LoginPage(page)
     login_page.sumbit_form()
@@ -785,7 +785,7 @@ async def test_step08_b5_likely_typo_does_not_autopatch_and_fails_with_suggestio
     )
     _seed_pom(ctx, "pages/login_page.py", _B5_POM_WITH_SUBMIT)
 
-    from worca_t.steps import s08_codegen as _s08
+    from qtea.steps import s08_codegen as _s08
 
     extend_invocations: list[int] = []
 
@@ -837,7 +837,7 @@ async def test_step08_b5_autopatch_crash_returns_clean_step_result(
     )
     _seed_pom(ctx, "pages/login_page.py", _B5_POM_BASE)
 
-    from worca_t.steps import s08_codegen as _s08
+    from qtea.steps import s08_codegen as _s08
 
     extend_invocations: list[int] = []
 
@@ -991,7 +991,7 @@ def test_write_tbd_locators_no_dev_match(tmp_path: Path):
 def test_write_tbd_locators_instance_placement(tmp_path: Path):
     loc_file = tmp_path / "locators.py"
     loc_file.write_text(
-        'from tests.worca_t_runtime import tbd\n'
+        'from tests.qtea_runtime import tbd\n'
         '\n'
         'class ChatLocators:\n'
         '    def __init__(self):\n'
@@ -1019,17 +1019,17 @@ def test_write_tbd_locators_instance_placement(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# _filter_index_to_worca with include parameter
+# _filter_index_to_qtea with include parameter
 # ---------------------------------------------------------------------------
 
 
-def test_filter_index_include_non_worca(tmp_path: Path):
-    from worca_t.test_indexer import IndexResult, SupportFileEntry, TBDMarker
+def test_filter_index_include_non_qtea(tmp_path: Path):
+    from qtea.test_indexer import IndexResult, SupportFileEntry, TBDMarker
 
     idx = IndexResult(
         framework="pytest",
         test_root=str(tmp_path),
-        files=["worca_test.py", "chat_page_locators.py"],
+        files=["qteaest.py", "chat_page_locators.py"],
         tests=[],
         violations=[],
         support_files=[
@@ -1041,14 +1041,14 @@ def test_filter_index_include_non_worca(tmp_path: Path):
             ),
         ],
     )
-    # Without include: non-worca support file is dropped
-    filtered = _filter_index_to_worca(idx, tmp_path)
+    # Without include: non-qtea support file is dropped
+    filtered = _filter_index_to_qtea(idx, tmp_path)
     assert len(filtered.support_files) == 0
     assert len(filtered.files) == 1
 
-    # With include: non-worca support file is kept
+    # With include: non-qtea support file is kept
     inc = {(tmp_path / "chat_page_locators.py").resolve()}
-    filtered2 = _filter_index_to_worca(idx, tmp_path, include=inc)
+    filtered2 = _filter_index_to_qtea(idx, tmp_path, include=inc)
     assert len(filtered2.support_files) == 1
     assert len(filtered2.files) == 2
 

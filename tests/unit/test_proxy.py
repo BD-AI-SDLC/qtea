@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from worca_t.proxy import detected_proxies, mask_secrets, safe_subprocess_env, with_proxy_env
+from qtea.proxy import detected_proxies, mask_secrets, safe_subprocess_env, with_proxy_env
 
 
 def test_detected_proxies_returns_set_keys(monkeypatch):
@@ -55,17 +55,17 @@ def test_safe_subprocess_env_explicit_overrides_inherited_secret(monkeypatch):
 
 
 def test_safe_subprocess_env_isolate_venv_strips_virtualenv(monkeypatch):
-    """A worca-t process started from a venv (e.g. via `uv tool install
+    """A qtea process started from a venv (e.g. via `uv tool install
     --editable`) inherits VIRTUAL_ENV. When that env leaks into a poetry
-    subprocess, poetry happily reuses worca-t's venv as the SUT's venv
+    subprocess, poetry happily reuses qtea's venv as the SUT's venv
     whenever the Python versions agree — and then `poetry install` reports
     "in sync" while pytest fails on SUT-only imports. `isolate_venv=True`
     must strip VIRTUAL_ENV and POETRY_ACTIVE so poetry creates a fresh
     SUT-specific venv."""
-    monkeypatch.setenv("VIRTUAL_ENV", "/path/to/worca-t/.venv")
+    monkeypatch.setenv("VIRTUAL_ENV", "/path/to/qtea/.venv")
     monkeypatch.setenv("POETRY_ACTIVE", "1")
     env_leaked = safe_subprocess_env()
-    assert env_leaked.get("VIRTUAL_ENV") == "/path/to/worca-t/.venv"
+    assert env_leaked.get("VIRTUAL_ENV") == "/path/to/qtea/.venv"
     env_isolated = safe_subprocess_env(isolate_venv=True)
     assert "VIRTUAL_ENV" not in env_isolated
     assert "POETRY_ACTIVE" not in env_isolated

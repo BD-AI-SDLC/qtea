@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from worca_t.sut_inventory import (
+from qtea.sut_inventory import (
     Fixture,
     LocatorClass,
     LocatorConstant,

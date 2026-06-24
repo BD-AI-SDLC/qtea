@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from worca_t.stack_profile import (
+from qtea.stack_profile import (
     StackProfile,
     detect_stack_profile,
     wrap_command,

@@ -4,16 +4,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from worca_t.checkpoints import RunState, StepRecord, hash_paths, load_state, save_state
-from worca_t.config import (
+from qtea.checkpoints import RunState, StepRecord, hash_paths, load_state, save_state
+from qtea.config import (
     DEFAULT_STEP_TIMEOUTS,
     MAX_STEP_TIMEOUT_S,
     agent_model_map,
     model_for_agent,
     step_timeout,
 )
-from worca_t.proxy import mask_secrets, with_proxy_env
-from worca_t.workspace import create_workspace, generate_run_id
+from qtea.proxy import mask_secrets, with_proxy_env
+from qtea.workspace import create_workspace, generate_run_id
 
 
 def test_run_id_format():

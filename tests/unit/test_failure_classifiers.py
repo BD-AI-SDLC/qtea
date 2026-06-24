@@ -1,4 +1,4 @@
-"""Unit tests for worca_t.failure_classifiers.
+"""Unit tests for qtea.failure_classifiers.
 
 One test per category. Builds a synthetic `StepResult` with the matching
 error string, asserts the classification + any fix_hint produced.
@@ -6,13 +6,13 @@ error string, asserts the classification + any fix_hint produced.
 
 from __future__ import annotations
 
-from worca_t.failure_classifiers import (
+from qtea.failure_classifiers import (
     ClassificationResult,
     FailureCategory,
     classify_failure,
     is_recoverable_category,
 )
-from worca_t.steps.base import StepResult
+from qtea.steps.base import StepResult
 
 
 def _result(error: str | None) -> StepResult:
@@ -105,7 +105,7 @@ def test_classifies_schema_missing_required_field():
 # --- JSON unparseable ------------------------------------------------------
 
 
-def test_classifies_json_unparseable_via_worca_prefix():
+def test_classifies_json_unparseable_via_qtea_prefix():
     r = _result("plan JSON unparseable: Expecting value: line 1 column 1")
     c = classify_failure(r)
     assert c.category == FailureCategory.JSON_UNPARSEABLE
@@ -288,7 +288,7 @@ def test_schema_type_mismatch_is_case_insensitive():
 
 def test_classifies_correctly_when_error_spans_multiple_lines():
     """Realistic stack-trace-style error: validator output appears on a
-    line below worca's prefix. re.search (not re.match) must still find it."""
+    line below qtea's prefix. re.search (not re.match) must still find it."""
     err = (
         "plan failed schema validation:\n"
         "    Detail: 'short_string' is not of type 'array'\n"

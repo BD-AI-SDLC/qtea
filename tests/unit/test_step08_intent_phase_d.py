@@ -8,8 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from worca_t.review_gate import _replace_intent_at_line, review_step_8_intents
-from worca_t.steps.s08_codegen import _phase_d_score_intents
+from qtea.review_gate import _replace_intent_at_line, review_step_8_intents
+from qtea.steps.s08_codegen import _phase_d_score_intents
 
 from ._fake_anthropic import install_fake_anthropic
 
@@ -24,8 +24,8 @@ def _seed_locator_file(tmp_path: Path, intents: list[str]) -> Path:
     Each intent gets its own ALL_CAPS constant on a separate line so the
     scanner's line numbers are predictable.
     """
-    src = tmp_path / "worca_login_locators.py"
-    body = ["from tests.worca_t_runtime import tbd", ""]
+    src = tmp_path / "qtea_login_locators.py"
+    body = ["from tests.qtea_runtime import tbd", ""]
     for i, intent in enumerate(intents):
         body.append(f"L{i} = tbd(\"{intent}\")")
     src.write_text("\n".join(body) + "\n", encoding="utf-8")
@@ -45,8 +45,8 @@ def _agents_root_with_scorer(tmp_path: Path) -> Path:
 
 
 async def test_phase_d_skip_via_env(tmp_path: Path, monkeypatch):
-    """WORCA_T_SKIP_INTENT_SCORE=1 short-circuits with no LLM call."""
-    monkeypatch.setenv("WORCA_T_SKIP_INTENT_SCORE", "1")
+    """QTEA_SKIP_INTENT_SCORE=1 short-circuits with no LLM call."""
+    monkeypatch.setenv("QTEA_SKIP_INTENT_SCORE", "1")
     src = _seed_locator_file(tmp_path, ["sign in button"])
     out_dir = tmp_path / "out"
     out_dir.mkdir()
@@ -75,7 +75,7 @@ async def test_phase_d_skip_via_env(tmp_path: Path, monkeypatch):
 async def test_phase_d_no_intents_short_circuits(tmp_path: Path, monkeypatch):
     """When the source contains no TBD sentinels, Phase D is a no-op."""
     # Empty support file — no tbd() calls.
-    src = tmp_path / "worca_helpers.py"
+    src = tmp_path / "qtea_helpers.py"
     src.write_text("def util(): pass\n", encoding="utf-8")
     out_dir = tmp_path / "out"
     out_dir.mkdir()
@@ -101,19 +101,19 @@ async def test_phase_d_no_intents_short_circuits(tmp_path: Path, monkeypatch):
 
 
 async def test_phase_d_excludes_jit_runtime_files(tmp_path: Path, monkeypatch):
-    """JIT runtime files (e.g. worca_t_runtime.py) must be excluded from the
-    scan even when they appear in produced_in_sut via the worca_* rglob.
+    """JIT runtime files (e.g. qtea_runtime.py) must be excluded from the
+    scan even when they appear in produced_in_sut via the qtea_* rglob.
     The runtime template contains docstring examples with tbd() calls that
     would otherwise produce false-positive intent entries."""
     # Seed a real test file with one tbd() call.
-    real_test = tmp_path / "worca_login_test.py"
+    real_test = tmp_path / "qtea_login_test.py"
     real_test.write_text(
-        'from tests.worca_t_runtime import tbd\n'
+        'from tests.qtea_runtime import tbd\n'
         'SUBMIT = tbd("submit button on login form")\n',
         encoding="utf-8",
     )
     # Seed a JIT runtime file with docstring examples (mirrors the template).
-    jit_file = tmp_path / "worca_t_runtime.py"
+    jit_file = tmp_path / "qtea_runtime.py"
     jit_file.write_text(
         'def tbd(intent: str) -> str:\n'
         '    """Usage::\n'
@@ -122,7 +122,7 @@ async def test_phase_d_excludes_jit_runtime_files(tmp_path: Path, monkeypatch):
         '            LOGIN_BUTTON = tbd("primary submit button on the login form")\n'
         '            PASSWORD_INPUT = tbd("password input on the sign-in form")\n'
         '    """\n'
-        '    return f"__WORCA_T_TBD__::{intent}"\n',
+        '    return f"__QTEA_TBD__::{intent}"\n',
         encoding="utf-8",
     )
     out_dir = tmp_path / "out"
@@ -246,8 +246,8 @@ async def test_phase_d_warn_only_succeeds_with_stash(
 async def test_phase_d_fail_as_warn_env_downgrades(
     tmp_path: Path, monkeypatch,
 ):
-    """WORCA_T_INTENT_FAIL_AS_WARN=1 — FAIL no longer blocks; flows as WARN."""
-    monkeypatch.setenv("WORCA_T_INTENT_FAIL_AS_WARN", "1")
+    """QTEA_INTENT_FAIL_AS_WARN=1 — FAIL no longer blocks; flows as WARN."""
+    monkeypatch.setenv("QTEA_INTENT_FAIL_AS_WARN", "1")
     src = _seed_locator_file(tmp_path, ["#login"])
     out_dir = tmp_path / "out"
     out_dir.mkdir()

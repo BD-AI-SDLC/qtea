@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://worca-t/schemas/dev-locators.schema.json",
+  "$id": "https://qtea/schemas/dev-locators.schema.json",
   "title": "DevLocators",
-  "description": "Dev-team-supplied (or external-LLM-produced) mapping of selectors the JIT runtime consults BEFORE the LLM resolver. Two match modes: Tier 1a (exact key) — JSON keys equal worca-t's generated constant names (HITL-replay path). Tier 1b (intent pool) — entries carry an `intent` description and the runtime fuzzy-matches `tbd(...)` intents against the pool, so frontend devs can use arbitrary key names. Discovery precedence: --dev-locators flag > WORCA_T_DEV_LOCATORS env > `<workspace>/locator-cache/dev-locators.json` default. Selectors are verified at first use; mismatches fall through to the resolver.",
+  "description": "Dev-team-supplied (or external-LLM-produced) mapping of selectors the JIT runtime consults BEFORE the LLM resolver. Two match modes: Tier 1a (exact key) — JSON keys equal qtea's generated constant names (HITL-replay path). Tier 1b (intent pool) — entries carry an `intent` description and the runtime fuzzy-matches `tbd(...)` intents against the pool, so frontend devs can use arbitrary key names. Discovery precedence: --dev-locators flag > QTEA_DEV_LOCATORS env > `<workspace>/locator-cache/dev-locators.json` default. Selectors are verified at first use; mismatches fall through to the resolver.",
   "type": "object",
   "required": ["locators"],
   "additionalProperties": true,
@@ -13,7 +13,7 @@
     },
     "source": {
       "type": "string",
-      "description": "Free-text identifier of who produced this file (e.g. \"dev-team\", \"external-llm\", \"parent-worca\", \"manual\"). For traceability in the Step 10 report."
+      "description": "Free-text identifier of who produced this file (e.g. \"dev-team\", \"external-llm\", \"parent-qtea\", \"manual\"). For traceability in the Step 10 report."
     },
     "produced_at": { "type": "string", "format": "date-time" },
     "locators": {
@@ -35,7 +35,7 @@
             },
             "payload": {
               "type": ["object", "null"],
-              "description": "Structured locator payload for role/text/label/placeholder/test_id strategies. When set, the runtime uses page.get_by_role(...) etc. at action time instead of page.locator(string); TBD promotion writes a role_locator(...) call into source. Optional — when null, the runtime falls back to the `selector` string. Validated by worca_t.jit_resolver.validate_selector_payload at load time.",
+              "description": "Structured locator payload for role/text/label/placeholder/test_id strategies. When set, the runtime uses page.get_by_role(...) etc. at action time instead of page.locator(string); TBD promotion writes a role_locator(...) call into source. Optional — when null, the runtime falls back to the `selector` string. Validated by qtea.jit_resolver.validate_selector_payload at load time.",
               "properties": {
                 "kind": {
                   "type": "string",
@@ -56,7 +56,7 @@
             },
             "page_url": {
               "type": ["string", "null"],
-              "description": "URL or path of the page where this element lives. Optional but recommended for Tier 1b in multi-page apps with structurally similar elements (e.g. a Submit button on every form): when set and the current page differs, the entry's pool-match score is reduced by WORCA_T_DEV_POOL_PAGE_PENALTY (default 0.15, soft penalty — not a hard filter)."
+              "description": "URL or path of the page where this element lives. Optional but recommended for Tier 1b in multi-page apps with structurally similar elements (e.g. a Submit button on every form): when set and the current page differs, the entry's pool-match score is reduced by QTEA_DEV_POOL_PAGE_PENALTY (default 0.15, soft penalty — not a hard filter)."
             },
             "notes": {
               "type": ["string", "null"]

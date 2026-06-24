@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://worca-t/schemas/locator-cache.schema.json",
+  "$id": "https://qtea/schemas/locator-cache.schema.json",
   "title": "LocatorCache",
   "description": "Per-run cache of resolved TBD locators populated by the JIT runtime plugin during Step 8 test execution. Survives across `--from-step 8` re-runs. Each entry records how the selector was sourced (dev-supplied file vs cached vs LLM-resolved vs HITL) for downstream reporting and traceability.",
   "type": "object",
@@ -46,7 +46,7 @@
           },
           "payload": {
             "type": ["object", "null"],
-            "description": "Structured locator payload for role/text/label/placeholder/test_id strategies. When set, the runtime calls page.get_by_role(...) at action time; TBD promotion writes a role_locator(...) / text_locator(...) call into source. Null for CSS-string selectors (back-compat with pre-payload cache entries on disk). Validated by worca_t.jit_resolver.validate_selector_payload."
+            "description": "Structured locator payload for role/text/label/placeholder/test_id strategies. When set, the runtime calls page.get_by_role(...) at action time; TBD promotion writes a role_locator(...) / text_locator(...) call into source. Null for CSS-string selectors (back-compat with pre-payload cache entries on disk). Validated by qtea.jit_resolver.validate_selector_payload."
           },
           "passing_witnesses": {
             "type": "array",
@@ -83,7 +83,7 @@
           "source": {
             "type": "string",
             "enum": ["dev_verified", "dev_unverified", "cached", "agent", "hitl", "unresolvable"],
-            "description": "Where this entry came from. `dev_verified` = supplied by the dev file AND confirmed by Playwright count()>0 at first access. `dev_unverified` = present in dev file, not yet exercised at runtime. `cached` = hit on a previous run. `agent` = LLM-resolved via `worca-t resolve`. `hitl` = user-supplied via interactive prompt. `unresolvable` = resolver gave up after bounded retry."
+            "description": "Where this entry came from. `dev_verified` = supplied by the dev file AND confirmed by Playwright count()>0 at first access. `dev_unverified` = present in dev file, not yet exercised at runtime. `cached` = hit on a previous run. `agent` = LLM-resolved via `qtea resolve`. `hitl` = user-supplied via interactive prompt. `unresolvable` = resolver gave up after bounded retry."
           },
           "page_url": {
             "type": ["string", "null"],

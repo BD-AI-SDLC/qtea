@@ -8,7 +8,7 @@ prioritized bug reports. You do NOT debug or fix; you classify and report.
 - `run-results.json` - structured test execution results, screenshots/trace paths
 - `test-strategy.json` - test case definitions, expected behaviors, severity hints
 - `heal-log.jsonl` (optional) - self-heal attempts and outcomes
-- `generated-files.json` (optional) - the worca-t Step 8 commit manifest (list of files this run authored/modified). Used to distinguish `test-code-defect` from `environment` (see classification rules below).
+- `generated-files.json` (optional) - the qtea Step 8 commit manifest (list of files this run authored/modified). Used to distinguish `test-code-defect` from `environment` (see classification rules below).
 - `templates/bug-report-template.md` - canonical bug report structure
 - `examples/bug-classification-example.md` - worked example
 - `templates/edge-case-checklist.md` - taxonomy reference
@@ -61,7 +61,7 @@ prioritized bug reports. You do NOT debug or fix; you classify and report.
 - **Category**: pick the dominant axis from the enum above.
 - A test that **self-healed successfully** is NOT a bug; do not include it.
 - A test that **failed only on the first attempt and passed on the second without code change** -> category `flaky`, severity `minor`, priority `P2`.
-- **`test-code-defect` (worca-t's own output is broken).** If the failure is a Python `ImportError`, `SyntaxError`, undefined-name, or `@pytest.fixture` not found inside a file path that ALSO appears in `generated-files.json` (the Step 8 commit manifest), classify as `test-code-defect`, severity `major`, priority `P1`. Distinguishes worca-t's own codegen defects from SUT/infra failures. Examples that ARE test-code-defect: `cannot import name 'gemini_nav_locale_en' from 'tests.fixtures.worca_gemini_nav_fixtures'` when the fixtures file is in `generated-files.json`; a `NameError` in a generated `tests/smoke/worca_*.py`; a `pytest.fixture` decorator missing on a function the plan declared. Examples that are NOT (use `environment` instead): `ModuleNotFoundError: No module named 'playwright'` (missing dep), a worker OOM kill, a port-in-use error. When in doubt and `generated-files.json` IS provided, prefer `test-code-defect` over `environment` for ImportError-class failures whose offending file is in that manifest — `environment` is reserved for issues outside worca-t's authored code.
+- **`test-code-defect` (qtea's own output is broken).** If the failure is a Python `ImportError`, `SyntaxError`, undefined-name, or `@pytest.fixture` not found inside a file path that ALSO appears in `generated-files.json` (the Step 8 commit manifest), classify as `test-code-defect`, severity `major`, priority `P1`. Distinguishes qtea's own codegen defects from SUT/infra failures. Examples that ARE test-code-defect: `cannot import name 'gemini_nav_locale_en' from 'tests.fixtures.qtea_gemini_nav_fixtures'` when the fixtures file is in `generated-files.json`; a `NameError` in a generated `tests/smoke/qtea_*.py`; a `pytest.fixture` decorator missing on a function the plan declared. Examples that are NOT (use `environment` instead): `ModuleNotFoundError: No module named 'playwright'` (missing dep), a worker OOM kill, a port-in-use error. When in doubt and `generated-files.json` IS provided, prefer `test-code-defect` over `environment` for ImportError-class failures whose offending file is in that manifest — `environment` is reserved for issues outside qtea's authored code.
 
 - **Layer** (stack location — drives Jira routing and team assignment):
 
@@ -70,7 +70,7 @@ prioritized bug reports. You do NOT debug or fix; you classify and report.
 | `frontend` | Assertion fails on DOM attribute, text, label, visibility, CSS, layout, rendered HTML. Element found but value wrong. Element missing from rendered DOM. |
 | `backend` | HTTP 4xx/5xx in output. API response mismatch. Auth rejected server-side. DB constraint. Unexpected server redirect. |
 | `infrastructure` | `net::ERR_NAME_NOT_RESOLVED`, navigation `TimeoutError`, proxy error, browser crash (`Target closed`), `ECONNREFUSED`. |
-| `automation` | `ImportError`/`SyntaxError`/`NameError`/`AttributeError` in worca-generated files. Assertion provably wrong vs strategy. Missing `@pytest.fixture`. |
+| `automation` | `ImportError`/`SyntaxError`/`NameError`/`AttributeError` in qtea-generated files. Assertion provably wrong vs strategy. Missing `@pytest.fixture`. |
 
   Binding rules: `category=test-code-defect` → `layer` MUST be `automation`. `category=environment` → `layer` MUST be `infrastructure`. For all other categories, infer from the failure evidence.
 

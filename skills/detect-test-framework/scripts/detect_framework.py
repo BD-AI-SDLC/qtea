@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Detect test framework from manifest files, config files, and file patterns.
 
-Standalone script — no worca_t imports. Outputs JSON to stdout (or to a file
+Standalone script — no qtea imports. Outputs JSON to stdout (or to a file
 via --output). Follows the same conventions as
 skills/acquire-codebase-knowledge/scripts/scan.py.
 """

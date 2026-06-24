@@ -1,4 +1,4 @@
-"""Tests for `worca_t.coverage_audit` — the 3 audits + matrix generator
+"""Tests for `qtea.coverage_audit` — the 3 audits + matrix generator
 introduced in PR 2. Module is unused at this point in the roll-out; PR 3
 wires it into Steps 2/3 and PR 4 into Step 4.
 
@@ -8,7 +8,7 @@ adds value (clean cases are wrapped into the broader projections).
 
 from __future__ import annotations
 
-from worca_t.coverage_audit import (
+from qtea.coverage_audit import (
     _format_violations_for_agent,
     audit_plan,
     audit_refined_spec,
@@ -16,7 +16,7 @@ from worca_t.coverage_audit import (
     audit_traceability_matrix,
     build_traceability_matrix,
 )
-from worca_t.schemas import is_valid
+from qtea.schemas import is_valid
 
 # ---------- helpers ----------
 

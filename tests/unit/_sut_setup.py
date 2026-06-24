@@ -1,10 +1,10 @@
 """Shared SUT-seed helper for step tests.
 
 Steps 7, 8, and 9 now require `<workspace>/sut/` to be a git repo on the
-`worca-t/run-<id>` branch — pipeline.py materializes that in production
+`qtea/run-<id>` branch — pipeline.py materializes that in production
 via `_materialize_sut`. Tests don't go through the pipeline, so this
 helper mimics the same end state: a populated `ws.sut/` with `.git/`
-initialised and the worca-t branch checked out.
+initialised and the qtea branch checked out.
 
 Optional `inventory` arg writes a `sut_inventory.json` into
 `ws.step_dir(6)` so Step 7's pre-flight (which requires that file) passes.
@@ -22,7 +22,7 @@ from typing import Any
 
 from filelock import FileLock
 
-from worca_t._sut_git import ensure_git_repo_and_branch
+from qtea._sut_git import ensure_git_repo_and_branch
 
 # --- Session-scoped git template -------------------------------------------
 #
@@ -38,7 +38,7 @@ from worca_t._sut_git import ensure_git_repo_and_branch
 # instead build into a run-scoped *shared* directory guarded by a file lock:
 # the first worker to grab the lock builds it, every other worker reuses it.
 #
-# The template lives on branch `worca-t/run-template`; step tests assert on
+# The template lives on branch `qtea/run-template`; step tests assert on
 # run-results / disk state, never on the exact branch name (the git module's
 # own behaviour is covered separately by test_sut_branch.py, which keeps
 # exercising the real `ensure_git_repo_and_branch`).
@@ -58,7 +58,7 @@ def _git_template() -> Path:
     # Run-scoped key: shared across xdist workers of the SAME run, distinct
     # across separate invocations. Falls back to the pid for non-xdist runs.
     run_uid = os.environ.get("PYTEST_XDIST_TESTRUNUID") or f"pid{os.getpid()}"
-    shared = Path(tempfile.gettempdir()) / f"worca-t-sut-template-{run_uid}"
+    shared = Path(tempfile.gettempdir()) / f"qtea-sut-template-{run_uid}"
     # Marker lives OUTSIDE the template dir so it isn't copied into each SUT.
     ready = Path(str(shared) + ".ready")
 
@@ -88,7 +88,7 @@ def seed_sut(
     """Make `workspace.sut/` a git repo (copied from a session template).
 
     Mirrors the production end-state (`<workspace>/sut/` is a git repo with a
-    baseline commit and a worca-t branch checked out) by filesystem-copying a
+    baseline commit and a qtea branch checked out) by filesystem-copying a
     prebuilt template instead of re-running `git` per test.
 
     Parameters

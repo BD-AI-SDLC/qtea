@@ -1,17 +1,18 @@
-# worca-t
+# QTea
 
+> **Quality** **Testing** **environment** for **agentic** **AI**  
 > Fully autonomous QA SDLC orchestrator. Hybrid workflow consists of Python + LLM calls.  
 > It uses Python to run the pipeline deterministically, and spins up agents via direct SDK invocation (solely LLM prompt) or Claude Agent SDK (file management, MCP).
 
-`worca-t` turns a requirement (Jira ticket or local markdown spec) into a tested
+`qtea` turns a requirement (Jira ticket or local markdown spec) into a tested
 feature, executed tests, self-heal, classified bugs, and a polished report - in 11
 deterministic, checkpointed steps.
 
 ## Install
 clone the repo locally. then, to install it:
 ```bash
-uv tool install <path-to-worca-t>
-worca-t --help
+uv tool install <path-to-qtea>
+qtea --help
 ```
 
 Runs on Windows / Linux / macOS / CI from any shell.
@@ -19,8 +20,8 @@ Runs on Windows / Linux / macOS / CI from any shell.
 ## Quickstart
 
 ```bash
-worca-t doctor                     # validate environment
-worca-t run --spec ./feature.md --sut ./my-app
+qtea doctor                     # validate environment
+qtea run --spec ./feature.md --sut ./my-app
 ```
 
 ## The pipeline
@@ -54,15 +55,15 @@ Force one or the other: `--report allure`, `--report builtin`, `--report both`.
 ## Resume & debug
 
 ```bash
-worca-t list                               # show all workspaces (run-ids, status, last step)
-worca-t run --spec ./spec.md --sut ./app   # resumes from last checkpoint
-worca-t run --run-id <id> --spec ...       # resume a specific workspace by run-id
-worca-t run --from-step 6 --run-id ...       # skip steps 1-5
-worca-t run --only-step 11 --spec ...      # regenerate report only
-worca-t run --force --spec ...             # ignore all checkpoints
-worca-t run --debug --spec ...             # verbose debug agent from step 1
-worca-t run --fix --spec ...               # RCA + fix proposal on failure
-worca-t auth-capture --sut ./app           # one-shot Playwright storageState capture
+qtea list                               # show all workspaces (run-ids, status, last step)
+qtea run --spec ./spec.md --sut ./app   # resumes from last checkpoint
+qtea run --run-id <id> --spec ...       # resume a specific workspace by run-id
+qtea run --from-step 6 --run-id ...       # skip steps 1-5
+qtea run --only-step 11 --spec ...      # regenerate report only
+qtea run --force --spec ...             # ignore all checkpoints
+qtea run --debug --spec ...             # verbose debug agent from step 1
+qtea run --fix --spec ...               # RCA + fix proposal on failure
+qtea auth-capture --sut ./app           # one-shot Playwright storageState capture
                                            # (for MFA/SSO SUTs — lets Step 9's
                                            # heal agent skip auth-replay)
 ```
@@ -70,7 +71,7 @@ worca-t auth-capture --sut ./app           # one-shot Playwright storageState ca
 ## Limitations (v1)
 
 - **Single repo only.** `--sut` takes one path or one git URL. Multi-repo / monorepo workspaces and cross-repo dependencies are not currently supported — the SUT must be a single, self-contained repository the pipeline can clone and execute against.
-- **`worca-t auth-capture` supports Python and Node.js (JS/TS) Playwright SUTs.** Java / .NET / Selenium / Cypress / Robot SUTs that need pre-captured storage state (MFA / SSO) raise `NotImplementedError`. Same-run auto-capture (Step 9 default) still works on any Playwright stack.
+- **`qtea auth-capture` supports Python and Node.js (JS/TS) Playwright SUTs.** Java / .NET / Selenium / Cypress / Robot SUTs that need pre-captured storage state (MFA / SSO) raise `NotImplementedError`. Same-run auto-capture (Step 9 default) still works on any Playwright stack.
 
 ## Status
 

@@ -15,10 +15,10 @@ from pathlib import Path
 
 import pytest
 
-from worca_t.checkpoints import RunState
-from worca_t.pipeline import PipelineOptions
-from worca_t.steps.base import Step, StepContext, StepResult
-from worca_t.workspace import create_workspace
+from qtea.checkpoints import RunState
+from qtea.pipeline import PipelineOptions
+from qtea.steps.base import Step, StepContext, StepResult
+from qtea.workspace import create_workspace
 
 # --- Test scaffolding ------------------------------------------------------
 

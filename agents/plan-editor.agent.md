@@ -23,5 +23,5 @@ Apply the user's requested changes to the plan and return the **complete updated
    - Each test case requires `id` (pattern `TC-*`), `test_file_target`, and `test_functions` (non-empty)
    - `fixture.source` ∈ `{reuse, create}` — `reuse` needs `from`, `create` needs `at`
    - `locator.source` ∈ `{reuse, create_tbd}` — `create_tbd` needs `intent` (≤120 chars)
-   - Valid markers: `worca_smoke`, `worca_regression`, `worca_e2e`, `worca_exploratory`
+   - Valid markers: `qtea_smoke`, `qtea_regression`, `qtea_e2e`, `qtea_exploratory`
 4. **Return JSON only.** No prose, no markdown fences, no explanation. The response is consumed by `json.loads()` directly.
