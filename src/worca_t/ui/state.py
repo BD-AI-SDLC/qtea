@@ -1,0 +1,294 @@
+"""Central application state shared across all UI views and components."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable
+
+# ── Step definition table ────────────────────────────────────────────────────
+
+STEP_DEFINITIONS: list[tuple[int, str, str]] = [
+    (1, "Intake", "A"),
+    (2, "Spec Refinement", "A"),
+    (3, "Test Planning", "A"),
+    (4, "Test Strategy", "A"),
+    (5, "Xray Upload", "B"),
+    (6, "Repo Discovery", "B"),
+    (7, "Test Architect", "B"),
+    (8, "TDD Codegen", "B"),
+    (9, "Execute + Heal", "C"),
+    (10, "Bug Classification", "C"),
+    (11, "Report", "C"),
+]
+
+
+# ── Data classes ─────────────────────────────────────────────────────────────
+
+
+@dataclass
+class LogLine:
+    timestamp: str
+    level: str
+    event: str
+    message: str
+    fields: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class StepUIState:
+    number: int
+    name: str
+    phase: str
+    status: str = "pending"
+    started_at: float | None = None
+    elapsed_s: float = 0.0
+    attempts: int = 0
+    tokens_in: int = 0
+    tokens_out: int = 0
+    cache_read: int = 0
+    cache_write: int = 0
+    cost_usd: float = 0.0
+    sub_status: str | None = None
+    agent_calls: int = 0
+    agent_name: str | None = None
+    notes: str | None = None
+    error: str | None = None
+
+
+@dataclass
+class HitlRequest:
+    """A pending human-in-the-loop request from the pipeline."""
+
+    step: int
+    agent_label: str
+    questions: list[dict[str, Any]]
+    answers: dict[str, Any] = field(default_factory=dict)
+    completion_event: asyncio.Event | None = None
+
+
+@dataclass
+class ReviewGateRequest:
+    """A pending review gate (steps 4, 7, 8)."""
+
+    step: int
+    title: str
+    summary: str
+    completion_event: asyncio.Event | None = None
+    decision: str = ""  # "approve" | "edit" | "reject"
+    edit_instructions: str = ""
+    # Optional structured payload so the dialog can render a real Flet
+    # table/list instead of dumping a monospace ASCII summary. ``kind`` is
+    # one of: "strategy" (Step 4 test_cases), "plan" (Step 7 plan), or
+    # "intents" (Step 8 warnings). When ``data`` is None or ``kind`` is
+    # unknown, the dialog falls back to ``summary`` rendered in monospace.
+    data: Any = None
+    kind: str = ""
+
+
+# ── Preferences persistence ─────────────────────────────────────────────────
+
+_PREFS_FILE = Path.home() / ".worca-t" / ".ui-prefs.json"
+
+
+def _load_prefs() -> dict[str, Any]:
+    if _PREFS_FILE.exists():
+        try:
+            return json.loads(_PREFS_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _save_prefs(prefs: dict[str, Any]) -> None:
+    _PREFS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _PREFS_FILE.write_text(json.dumps(prefs, indent=2), encoding="utf-8")
+
+
+# ── Application state ────────────────────────────────────────────────────────
+
+
+@dataclass
+class AppState:
+    """Single source of truth for the entire UI."""
+
+    # ── Run configuration (populated from config_view form) ──────────────
+    spec: str = ""
+    sut: str = ""
+    headless: bool = True
+    debug: bool = False
+    fix: bool = False
+    parallel_run: int = 2
+    report: str = "auto"
+    cache: str = "auto"  # "auto" | "on" | "off"
+    log_level: str = "info"
+    skip_steps: set[int] = field(default_factory=set)
+    storage_state: str = ""
+    dev_locators: str = ""
+
+    # ── Resume from a prior workspace (UI mirror of CLI --run-id / --from-step) ──
+    # Empty string + None ⇒ fresh run. When ``resume_run_id`` is set, ``from_step``
+    # MUST also be set (and >= 1); the pipeline validator enforces "all prior steps
+    # completed or skipped" and aborts otherwise. Not persisted in prefs — these
+    # are per-run choices.
+    resume_run_id: str = ""
+    from_step: int | None = None
+
+    # ── Runtime state (updated by event_bridge) ──────────────────────────
+    run_status: str = "idle"  # idle | running | completed | failed
+    run_id: str | None = None
+    workspace_path: str | None = None
+    current_step: int | None = None
+    steps: dict[int, StepUIState] = field(default_factory=dict)
+    pipeline_started_at: float | None = None
+    total_cost: float = 0.0
+    total_tokens_in: int = 0
+    total_tokens_out: int = 0
+    total_cache_read: int = 0
+    total_cache_write: int = 0
+    total_agent_calls: int = 0
+    elapsed_s: float = 0.0
+    log_lines: list[LogLine] = field(default_factory=list)
+
+    # ── HITL ─────────────────────────────────────────────────────────────
+    pending_hitl: HitlRequest | None = None
+    pending_review_gate: ReviewGateRequest | None = None
+
+    # ── Results ──────────────────────────────────────────────────────────
+    exit_code: int | None = None
+    report_data: dict[str, Any] | None = None
+
+    # ── Pipeline worker control (set by app.py when the run starts; used
+    # by the Stop button to actually cancel the running pipeline rather
+    # than just flipping UI state) ──────────────────────────────────────
+    pipeline_loop: Any = None
+    pipeline_task: Any = None
+    cancel_requested: bool = False
+
+    # ── Stopwatch pause accounting (HITL waits should not count) ────────
+    paused_total_s: float = 0.0
+    pause_started_at: float | None = None
+
+    # ── Observer callbacks ───────────────────────────────────────────────
+    _listeners: list[Callable[[], None]] = field(
+        default_factory=list, repr=False,
+    )
+
+    # ── Methods ──────────────────────────────────────────────────────────
+
+    def init_steps(self) -> None:
+        self.steps = {
+            num: StepUIState(number=num, name=name, phase=phase)
+            for num, name, phase in STEP_DEFINITIONS
+        }
+
+    def reset_run(self) -> None:
+        self.run_status = "idle"
+        self.run_id = None
+        self.workspace_path = None
+        self.current_step = None
+        self.pipeline_started_at = None
+        self.total_cost = 0.0
+        self.total_tokens_in = 0
+        self.total_tokens_out = 0
+        self.total_cache_read = 0
+        self.total_cache_write = 0
+        self.total_agent_calls = 0
+        self.elapsed_s = 0.0
+        self.log_lines.clear()
+        self.pending_hitl = None
+        self.pending_review_gate = None
+        self.exit_code = None
+        self.report_data = None
+        self.pipeline_loop = None
+        self.pipeline_task = None
+        self.cancel_requested = False
+        self.paused_total_s = 0.0
+        self.pause_started_at = None
+        self.init_steps()
+
+    def recalculate_totals(self) -> None:
+        self.total_cost = sum(s.cost_usd for s in self.steps.values())
+        self.total_tokens_in = sum(s.tokens_in for s in self.steps.values())
+        self.total_tokens_out = sum(s.tokens_out for s in self.steps.values())
+        self.total_cache_read = sum(s.cache_read for s in self.steps.values())
+        self.total_cache_write = sum(s.cache_write for s in self.steps.values())
+        self.total_agent_calls = sum(s.agent_calls for s in self.steps.values())
+
+    def _active_seconds_from(self, started_at: float) -> float:
+        """Wall-clock seconds since ``started_at`` minus any paused windows."""
+        now = time.monotonic()
+        active = (now - started_at) - self.paused_total_s
+        if self.pause_started_at is not None:
+            active -= now - self.pause_started_at
+        return max(0.0, active)
+
+    def update_elapsed(self) -> None:
+        if self.pipeline_started_at is not None:
+            self.elapsed_s = self._active_seconds_from(self.pipeline_started_at)
+        # Update elapsed for the currently running step (also pause-aware).
+        if self.current_step and self.current_step in self.steps:
+            s = self.steps[self.current_step]
+            if s.started_at is not None and s.status == "in_progress":
+                s.elapsed_s = self._active_seconds_from(s.started_at)
+
+    def pause_clock(self) -> None:
+        """Mark the start of a paused window (e.g. a HITL wait)."""
+        if self.pause_started_at is None:
+            self.pause_started_at = time.monotonic()
+
+    def resume_clock(self) -> None:
+        """End the current paused window and roll its duration into the total."""
+        if self.pause_started_at is not None:
+            self.paused_total_s += time.monotonic() - self.pause_started_at
+            self.pause_started_at = None
+
+    def completed_step_count(self) -> int:
+        return sum(
+            1
+            for s in self.steps.values()
+            if s.status in ("completed", "skipped", "warned")
+        )
+
+    def subscribe(self, listener: Callable[[], None]) -> None:
+        self._listeners.append(listener)
+
+    def notify(self) -> None:
+        for cb in self._listeners:
+            cb()
+
+    def save_prefs(self) -> None:
+        _save_prefs(
+            {
+                "spec": self.spec,
+                "sut": self.sut,
+                "headless": self.headless,
+                "debug": self.debug,
+                "fix": self.fix,
+                "parallel_run": self.parallel_run,
+                "report": self.report,
+                "cache": self.cache,
+                "log_level": self.log_level,
+                "storage_state": self.storage_state,
+                "dev_locators": self.dev_locators,
+            }
+        )
+
+    def load_prefs(self) -> None:
+        prefs = _load_prefs()
+        if not prefs:
+            return
+        self.spec = prefs.get("spec", self.spec)
+        self.sut = prefs.get("sut", self.sut)
+        self.headless = prefs.get("headless", self.headless)
+        self.debug = prefs.get("debug", self.debug)
+        self.fix = prefs.get("fix", self.fix)
+        self.parallel_run = prefs.get("parallel_run", self.parallel_run)
+        self.report = prefs.get("report", self.report)
+        self.cache = prefs.get("cache", self.cache)
+        self.log_level = prefs.get("log_level", self.log_level)
+        self.storage_state = prefs.get("storage_state", self.storage_state)
+        self.dev_locators = prefs.get("dev_locators", self.dev_locators)

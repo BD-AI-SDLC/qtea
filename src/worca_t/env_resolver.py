@@ -348,8 +348,75 @@ class InteractivePromptStrategy(EnvStrategy):
         keys: list[str],
         already_resolved: dict[str, str],
     ) -> dict[str, str]:
-        if not keys or not sys.stdin.isatty():
+        if not keys:
             return {}
+
+        ui_mode = bool(os.environ.get("WORCA_T_UI_MODE"))
+        if not ui_mode and not sys.stdin.isatty():
+            return {}
+
+        # UI mode: route through the shared HITL bridge so the desktop
+        # dialog collects the values instead of stdout/stdin (which would
+        # otherwise hang the run with an unanswerable terminal prompt).
+        # ``hitl.prompt_user`` is already monkey-patched by HitlBridge in
+        # UI mode — we just need to package the env keys as Question
+        # objects and translate the responses back into env values.
+        if ui_mode:
+            from worca_t.hitl import (
+                RESOLUTION_ANSWERED,
+                Question,
+                prompt_user,
+            )
+
+            questions: list[Question] = []
+            for k in keys:
+                is_secret = bool(_SECRET_NAME_RE.search(k))
+                current = self._defaults.get(k, "")
+                if is_secret:
+                    state_str = (
+                        "secret found — leave blank to keep"
+                        if current
+                        else "secret not found — type to supply"
+                    )
+                    context = f"{state_str}"
+                else:
+                    context = (
+                        f"current: {current}"
+                        if current
+                        else "no default discovered"
+                    )
+                questions.append(
+                    Question(
+                        id=k,
+                        kind="env",
+                        prompt_text=k,
+                        context=context,
+                    )
+                )
+
+            if any(_SECRET_NAME_RE.search(k) for k in keys):
+                log.warning(
+                    "env_resolver.ui_secret_input_unmasked",
+                    note=(
+                        "Secret values typed in the UI dialog are not "
+                        "password-masked yet — prefer .env / process env "
+                        "for sensitive keys."
+                    ),
+                )
+
+            answers = prompt_user(questions, agent_label="env-resolver")
+            out: dict[str, str] = {}
+            for k in keys:
+                ans = answers.get(k)
+                if ans is None:
+                    continue
+                resolution, val = ans
+                if resolution != RESOLUTION_ANSWERED:
+                    continue
+                val = (val or "").strip()
+                if val:
+                    out[k] = val
+            return out
 
         from rich.console import Console
         from rich.panel import Panel
@@ -369,7 +436,7 @@ class InteractivePromptStrategy(EnvStrategy):
             )
         )
 
-        out: dict[str, str] = {}
+        out = {}
         for k in keys:
             is_secret = bool(_SECRET_NAME_RE.search(k))
             current = self._defaults.get(k, "")

@@ -1385,7 +1385,8 @@ def _hitl_resolve_unresolvable(
     """
     import sys
 
-    is_tty = sys.stdin is not None and sys.stdin.isatty()
+    import os
+    is_tty = (sys.stdin is not None and sys.stdin.isatty()) or os.environ.get("WORCA_T_UI_MODE")
     if not is_tty or no_hitl or not pendings:
         return [], pendings
 
@@ -2503,7 +2504,7 @@ class ExecuteStep(Step):
                     proceed = confidence == "known"
                     if confidence == "guessed":
                         interactive = (
-                            sys.stdin.isatty()
+                            (sys.stdin.isatty() or getattr(ctx.options, "ui_mode", False))
                             and not getattr(ctx.options, "no_hitl", False)
                             and not getattr(ctx.options, "yes", False)
                         )
@@ -2832,6 +2833,17 @@ class ExecuteStep(Step):
                     # ``_heal_sem`` bounds the in-flight LLM calls so the
                     # parallel orchestration doesn't spin up more browser
                     # processes than the host can handle.
+
+                    # Per-heal MCP env: each concurrent agent gets its own
+                    # Chromium user-data-dir so profile locks don't cause
+                    # "Browser is already in use" contention.
+                    _per_heal_mcp_env = {
+                        **_heal_mcp_env,
+                        "WORCA_T_MCP_USER_DATA_DIR_ARG": (
+                            f"--user-data-dir={heal_wd / 'playwright-mcp'}"
+                        ),
+                    }
+
                     _entry_class = _classify_failure(entry)
 
                     log.info(
@@ -2866,7 +2878,7 @@ class ExecuteStep(Step):
                             step=9,
                             max_turns=HEAL_AGENT_MAX_TURNS,
                             enable_mcp=True,
-                            mcp_env=_heal_mcp_env,
+                            mcp_env=_per_heal_mcp_env,
                         )
 
                     # Scope guard: revert any heal edits to files outside the

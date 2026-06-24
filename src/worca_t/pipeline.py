@@ -90,6 +90,8 @@ class PipelineOptions:
     # artifacts/stepNN/, and debug/step-NN-attempt* directories from the
     # target step onward).
     no_cleanup: bool = False
+    # Desktop UI mode — stdin is not a TTY but HITL should still be active.
+    ui_mode: bool = False
 
 
 def _build_registry() -> dict[int, Step]:
@@ -409,7 +411,7 @@ def _mcp_preflight_for_step(
             failed=[{"name": n, "error": m} for n, m in failed],
         )
 
-        if not sys.stdin.isatty() or opts.no_hitl or opts.yes:
+        if not (sys.stdin.isatty() or opts.ui_mode) or opts.no_hitl or opts.yes:
             console.print(
                 "[yellow]Non-interactive mode: fix MCP setup and re-run "
                 "(or omit --no-hitl / --yes to enable the retry prompt).[/yellow]"

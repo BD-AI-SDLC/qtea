@@ -1,0 +1,75 @@
+"""Brand colors, dark theme constants, and status styling."""
+
+from __future__ import annotations
+
+import flet as ft
+
+# ── Brand palette ────────────────────────────────────────────────────────────
+
+PRIMARY = "#6C63FF"
+SECONDARY = "#00BFA5"
+SURFACE = "#1E1E2E"
+BACKGROUND = "#121218"
+ON_SURFACE = "#E0E0E0"
+ON_SURFACE_DIM = "#9E9E9E"
+CARD_BG = "#252536"
+DIVIDER = "#2E2E42"
+
+# ── Phase colors ─────────────────────────────────────────────────────────────
+
+PHASE_COLORS: dict[str, str] = {
+    "A": "#7C4DFF",
+    "B": "#00BFA5",
+    "C": "#FF6E40",
+}
+
+PHASE_LABELS: dict[str, str] = {
+    "A": "Requirements",
+    "B": "Research & Codegen",
+    "C": "Execute & Report",
+}
+
+# ── Step status colors ───────────────────────────────────────────────────────
+
+STATUS_COLORS: dict[str, str] = {
+    "pending": "#616161",
+    "in_progress": "#00BFA5",
+    "completed": "#66BB6A",
+    "failed": "#FF5252",
+    "warned": "#FFB74D",
+    "skipped": "#757575",
+}
+
+STATUS_ICONS: dict[str, str] = {
+    "pending": ft.Icons.CIRCLE_OUTLINED,
+    "in_progress": ft.Icons.PLAY_CIRCLE_FILLED,
+    "completed": ft.Icons.CHECK_CIRCLE,
+    "failed": ft.Icons.ERROR,
+    "warned": ft.Icons.WARNING_ROUNDED,
+    "skipped": ft.Icons.SKIP_NEXT,
+}
+
+# ── Log level colors ─────────────────────────────────────────────────────────
+
+LOG_LEVEL_COLORS: dict[str, str] = {
+    "info": "#66BB6A",
+    "debug": "#9E9E9E",
+    "warning": "#FFB74D",
+    "error": "#FF5252",
+    "critical": "#FF1744",
+}
+
+# ── Theme factory ────────────────────────────────────────────────────────────
+
+
+def build_dark_theme() -> ft.Theme:
+    return ft.Theme(
+        color_scheme_seed=PRIMARY,
+        color_scheme=ft.ColorScheme(
+            primary=PRIMARY,
+            secondary=SECONDARY,
+            error="#FF5252",
+            surface=SURFACE,
+            on_surface=ON_SURFACE,
+        ),
+    )

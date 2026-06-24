@@ -36,13 +36,15 @@ dependencies = [
 
 [project.optional-dependencies]
 allure = ["allure-pytest>=2.13"]
+ui = ["flet>=0.28", "flet-desktop>=0.28"]
 
 [project.scripts]
 worca-t = "worca_t.cli:app"
+worca-t-ui = "worca_t.ui:launch"
 
 [project.urls]
-Homepage = "https://github.boschdevcloud.com/ETS1WZ/worca-t"
-Issues = "https://github.boschdevcloud.com/ETS1WZ/worca-t/issues"
+Homepage = "https://github.com/BD-AI-SDLC/worca-t"
+Issues = "https://github.com/BD-AI-SDLC/worca-t/issues"
 
 [build-system]
 requires = ["hatchling>=1.25"]

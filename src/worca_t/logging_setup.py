@@ -361,15 +361,20 @@ def configure_logging(
     handlers: list[logging.Handler] = []
 
     # Console handler: colored, human-readable.
-    use_colors = sys.stderr.isatty()
-    console_h = logging.StreamHandler(stream=sys.stderr)
-    console_h.setLevel(lvl)
-    console_h.setFormatter(
-        structlog.stdlib.ProcessorFormatter(
-            processors=_make_console_processors(use_colors),
+    # Skipped when WORCA_T_UI_MODE is set — the desktop UI owns the screen,
+    # so duplicating events into stderr is noise. (The JSONL audit trail is
+    # still written below.)
+    import os as _os
+    if not _os.environ.get("WORCA_T_UI_MODE"):
+        use_colors = sys.stderr.isatty()
+        console_h = logging.StreamHandler(stream=sys.stderr)
+        console_h.setLevel(lvl)
+        console_h.setFormatter(
+            structlog.stdlib.ProcessorFormatter(
+                processors=_make_console_processors(use_colors),
+            )
         )
-    )
-    handlers.append(console_h)
+        handlers.append(console_h)
 
     # JSONL file handler: machine-readable audit trail (unchanged behavior).
     if jsonl_path is not None:
@@ -389,6 +394,10 @@ def configure_logging(
 
     root = logging.getLogger()
     for h in list(root.handlers):
+        # Preserve handlers that have explicitly opted out of removal
+        # (e.g. the desktop-UI event bridge tagged with _worca_t_keep).
+        if getattr(h, "_worca_t_keep", False):
+            continue
         root.removeHandler(h)
     for h in handlers:
         root.addHandler(h)

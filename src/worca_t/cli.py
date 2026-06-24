@@ -49,6 +49,20 @@ def version() -> None:
     console.print(f"worca-t {__version__}")
 
 
+@app.command()
+def ui() -> None:
+    """Launch the desktop UI (requires worca-t[ui])."""
+    try:
+        from worca_t.ui import launch
+    except ImportError:
+        console.print(
+            "[red]Flet is not installed.[/red] "
+            "Install the UI extra: [bold]uv pip install -e '.\\[ui]'[/bold]"
+        )
+        raise typer.Exit(1)
+    launch()
+
+
 @app.command(name="list")
 def list_workspaces(
     workspace: Path | None = typer.Option(
