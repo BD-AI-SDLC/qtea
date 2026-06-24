@@ -789,7 +789,7 @@ async def run_agent(
             error=msg,
         )
 
-    # Build env: proxy + filtered Anthropic/WORCA keys, with Claude session
+    # Build env: proxy + filtered Anthropic/QTEA keys, with Claude session
     # keys stripped so the SDK doesn't think it's running nested.
     full_env = with_proxy_env()
     for key in CLAUDE_SESSION_KEYS:
@@ -797,7 +797,7 @@ async def run_agent(
     forwarded_env = {
         k: full_env[k]
         for k in full_env
-        if k.startswith(("WORCA_", "ANTHROPIC_", "HTTP", "HTTPS", "NO_PROXY"))
+        if k.startswith(("QTEA_", "ANTHROPIC_", "HTTP", "HTTPS", "NO_PROXY"))
     }
     # Claude Code's prompt-cache disable knobs (DISABLE_PROMPT_CACHING and
     # per-model DISABLE_PROMPT_CACHING_{OPUS,SONNET,HAIKU}) don't match the

@@ -18,6 +18,7 @@
 | Agent → model map | `src/qtea/agent_models.yaml` |
 | JSON schemas | `schemas/` |
 | JIT runtime (vendored into SUT for Playwright stacks) | `src/qtea/_resources/runtime/qtea_runtime.py.tpl` |
+| Desktop UI (Flet) | `src/qtea/ui/` — launched via `qtea ui` (requires `qtea[ui]` extra) |
 
 ---
 

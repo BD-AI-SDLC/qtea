@@ -19,11 +19,18 @@ uv tool install /path/to/qtea
 qtea --help
 ```
 
+To also install the desktop UI (Flet-based):
+
+```bash
+uv tool install '/path/to/qtea[ui]'
+qtea ui          # opens the configuration window
+```
+
 Or for development:
 
 ```bash
 cd /path/to/qtea
-uv sync
+uv sync --extra ui    # omit --extra ui if you don't need the desktop UI
 uv run qtea --help
 ```
 

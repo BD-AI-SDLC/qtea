@@ -82,10 +82,10 @@ _MAX_HEAL_TESTS = int(os.environ.get("QTEA_MAX_HEAL", "15"))
 # markers to every generated test based on the planning phase. The vendored
 # `tests/qtea_runtime.py` plugin registers them via `pytest_configure` so
 # strict-markers runs don't fail. Keep this list in sync with the agent prompt
-# and the runtime template's `_WORCA_PHASE_MARKERS`. Operator escape: set
+# and the runtime template's `_QTEA_PHASE_MARKERS`. Operator escape: set
 # `QTEA_PYTEST_MARKER` to override (e.g. `""` to disable marker scoping
 # and run the SUT's full native suite alongside qtea-generated tests).
-_WORCA_PYTEST_MARKER_FILTER = os.environ.get(
+_QTEA_PYTEST_MARKER_FILTER = os.environ.get(
     "QTEA_PYTEST_MARKER",
     "qtea_smoke or qtea_regression or qtea_e2e or qtea_exploratory",
 )
@@ -2328,7 +2328,7 @@ class ExecuteStep(Step):
                     detected=detected_cmd,
                     cwd=ctx.workspace.sut,
                     profile=stack_profile,
-                    marker_filter=_WORCA_PYTEST_MARKER_FILTER,
+                    marker_filter=_QTEA_PYTEST_MARKER_FILTER,
                 )
                 detected_cmd = _filter_command_for_tests(_base_cmd, _rerun_entries)
                 _retry_subset_count = len(_rerun_pairs)
@@ -2347,12 +2347,12 @@ class ExecuteStep(Step):
                 framework=framework,
                 cwd=str(ctx.workspace.sut),
                 detected_cmd=detected_cmd or "(none — will use framework default)",
-                marker_filter=_WORCA_PYTEST_MARKER_FILTER,
+                marker_filter=_QTEA_PYTEST_MARKER_FILTER,
                 parallelism=getattr(ctx.options, "parallelism", 0),
                 headless=getattr(ctx.options, "headless", True),
                 retry_subset_count=_retry_subset_count,
             )
-            _applied_marker_filter = _WORCA_PYTEST_MARKER_FILTER
+            _applied_marker_filter = _QTEA_PYTEST_MARKER_FILTER
             first = run_tests(
                 framework,
                 cwd=ctx.workspace.sut,
@@ -2564,7 +2564,7 @@ class ExecuteStep(Step):
                                 env_extra=runtime_env,
                                 profile=stack_profile,
                                 headless=getattr(ctx.options, "headless", True),
-                                marker_filter=_WORCA_PYTEST_MARKER_FILTER,
+                                marker_filter=_QTEA_PYTEST_MARKER_FILTER,
                                 parallelism=getattr(ctx.options, "parallelism", 0),
                             )
                             attempts = 2
@@ -3146,7 +3146,7 @@ class ExecuteStep(Step):
                         detected=detected_cmd,
                         cwd=ctx.workspace.sut,
                         profile=stack_profile,
-                        marker_filter=_WORCA_PYTEST_MARKER_FILTER,
+                        marker_filter=_QTEA_PYTEST_MARKER_FILTER,
                     )
                     narrowed_cmd = _filter_command_for_tests(base_cmd, failing)
                     _clean_sut_artifacts(ctx.workspace.sut)
@@ -3158,7 +3158,7 @@ class ExecuteStep(Step):
                         env_extra=runtime_env,
                         profile=stack_profile,
                         headless=getattr(ctx.options, "headless", True),
-                        marker_filter=_WORCA_PYTEST_MARKER_FILTER,
+                        marker_filter=_QTEA_PYTEST_MARKER_FILTER,
                         parallelism=getattr(ctx.options, "parallelism", 0),
                     )
                     attempts = 2

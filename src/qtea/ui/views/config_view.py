@@ -431,7 +431,7 @@ def build_config_view(
                                 controls=[
                                     ft.Icon(ft.Icons.ROCKET_LAUNCH, color=PRIMARY, size=32),
                                     ft.Text(
-                                        "qtea",
+                                        "QTea",
                                         size=28,
                                         weight=ft.FontWeight.BOLD,
                                         color=PRIMARY,
