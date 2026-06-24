@@ -1,4 +1,4 @@
-"""Tests for :mod:`worca_t.jira_client`.
+"""Tests for :mod:`qtea.jira_client`.
 
 Covers:
   * URL parsing (jira: shorthand, Cloud URL, DC URL with context path)
@@ -18,7 +18,7 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
-from worca_t.jira_client import (
+from qtea.jira_client import (
     JiraFetchError,
     _auth_headers,
     _profile,

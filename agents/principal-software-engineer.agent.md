@@ -23,7 +23,7 @@ You will provide guidance on:
 
 When technical debt is incurred or identified:
 
-- **MUST** emit a `fix-proposal.md` at `artifacts/stepNN/fix-proposal.md` listing tech-debt items for the operator to triage downstream. No GitHub MCP is wired into worca-t; the operator decides whether to file issues, tickets, or just track in the proposal itself.
+- **MUST** emit a `fix-proposal.md` at `artifacts/stepNN/fix-proposal.md` listing tech-debt items for the operator to triage downstream. No GitHub MCP is wired into qtea; the operator decides whether to file issues, tickets, or just track in the proposal itself.
 - Clearly document consequences and remediation plans inside `fix-proposal.md`.
 - For each item include: title, root cause, impact, recommended remediation, effort estimate, and the file/symbol surface affected.
 - Assess long-term impact of untended technical debt.

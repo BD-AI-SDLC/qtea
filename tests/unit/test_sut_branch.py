@@ -1,4 +1,4 @@
-"""End-to-end coverage for `_materialize_sut` + the worca-t isolation branch.
+"""End-to-end coverage for `_materialize_sut` + the qtea isolation branch.
 
 These tests use REAL git (not mocked) to verify the four materialization
 paths and exercise `ensure_git_repo_and_branch` end-to-end:
@@ -22,8 +22,8 @@ from pathlib import Path
 
 import pytest
 
-from worca_t._sut_git import branch_name, commit_step, current_branch, ensure_git_repo_and_branch
-from worca_t.steps.s06_research import _materialize_sut
+from qtea._sut_git import branch_name, commit_step, current_branch, ensure_git_repo_and_branch
+from qtea.steps.s06_research import _materialize_sut
 
 
 def _git_available() -> bool:
@@ -57,7 +57,7 @@ def _make_local_source(path: Path, *, with_git: bool) -> None:
 
 
 def test_materialize_local_non_git_creates_repo_and_branch(tmp_path: Path):
-    """Local-path source with no `.git/` → fresh repo + worca-t branch."""
+    """Local-path source with no `.git/` → fresh repo + qtea branch."""
     src = tmp_path / "src_sut"
     dst = tmp_path / "ws" / "sut"
     _make_local_source(src, with_git=False)
@@ -67,7 +67,7 @@ def test_materialize_local_non_git_creates_repo_and_branch(tmp_path: Path):
     assert (dst / ".git").is_dir(), "git init must run for non-git source"
     assert (dst / "src" / "app.py").exists(), "source files copied"
     branch = current_branch(dst)
-    assert branch == branch_name("abc123") == "worca-t/run-abc123"
+    assert branch == branch_name("abc123") == "qtea/run-abc123"
 
 
 def test_materialize_local_with_git_strips_history_and_branches(tmp_path: Path):
@@ -81,13 +81,13 @@ def test_materialize_local_with_git_strips_history_and_branches(tmp_path: Path):
     # Dst has its OWN .git (not a copy of src's — _materialize_sut uses
     # `ignore=ignore_patterns('.git')` to strip it, then ensure_* re-inits).
     assert (dst / ".git").is_dir()
-    # The dst's HEAD is the worca-t baseline commit, NOT src's "src baseline".
+    # The dst's HEAD is the qtea baseline commit, NOT src's "src baseline".
     log = subprocess.run(
         ["git", "-C", str(dst), "log", "--format=%s"],
         capture_output=True, text=True, check=True,
     ).stdout.strip().splitlines()
-    assert log == ["worca-t baseline"]
-    assert current_branch(dst) == "worca-t/run-def456"
+    assert log == ["qtea baseline"]
+    assert current_branch(dst) == "qtea/run-def456"
 
 
 def test_materialize_is_idempotent_on_resume(tmp_path: Path):
@@ -97,7 +97,7 @@ def test_materialize_is_idempotent_on_resume(tmp_path: Path):
     _make_local_source(src, with_git=False)
 
     _materialize_sut(str(src), dst, run_id="run-x")
-    # Make a worca-t step commit on the branch.
+    # Make a qtea step commit on the branch.
     (dst / "step7_artifact.py").write_text("pass\n", encoding="utf-8")
     sha1 = commit_step(dst, 7, "codegen", message_detail="1 file")
     assert sha1 is not None
@@ -105,7 +105,7 @@ def test_materialize_is_idempotent_on_resume(tmp_path: Path):
     # Re-materialize: should wipe + recreate. The previous step commit is
     # lost (expected — _materialize_sut always rmtree's `dst` first).
     _materialize_sut(str(src), dst, run_id="run-x")
-    assert current_branch(dst) == "worca-t/run-run-x"
+    assert current_branch(dst) == "qtea/run-run-x"
     # The artifact from the prior run is gone.
     assert not (dst / "step7_artifact.py").exists()
 
@@ -129,7 +129,7 @@ def test_ensure_git_repo_and_branch_idempotent_when_already_setup(tmp_path: Path
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     assert head1 == head2
-    assert current_branch(dst) == "worca-t/run-id1"
+    assert current_branch(dst) == "qtea/run-id1"
 
 
 def test_commit_step_records_sha_and_subject(tmp_path: Path):
@@ -140,8 +140,8 @@ def test_commit_step_records_sha_and_subject(tmp_path: Path):
     ensure_git_repo_and_branch(dst, "rid")
 
     # Add a "step output" and commit.
-    (dst / "tests" / "worca_x_test.py").parent.mkdir(parents=True, exist_ok=True)
-    (dst / "tests" / "worca_x_test.py").write_text("def test_x(): pass\n", encoding="utf-8")
+    (dst / "tests" / "qtea_x_test.py").parent.mkdir(parents=True, exist_ok=True)
+    (dst / "tests" / "qtea_x_test.py").write_text("def test_x(): pass\n", encoding="utf-8")
     sha = commit_step(dst, 7, "codegen", message_detail="1 file, 1 test")
 
     assert sha is not None and len(sha) >= 7
@@ -149,7 +149,7 @@ def test_commit_step_records_sha_and_subject(tmp_path: Path):
         ["git", "-C", str(dst), "log", "-1", "--format=%s"],
         capture_output=True, text=True, check=True,
     ).stdout.strip()
-    assert subject == "worca-t/step-07: codegen (1 file, 1 test)"
+    assert subject == "qtea/step-07: codegen (1 file, 1 test)"
 
 
 def test_commit_step_is_noop_on_clean_tree(tmp_path: Path):
@@ -167,4 +167,4 @@ def test_commit_step_is_noop_on_clean_tree(tmp_path: Path):
         ["git", "-C", str(dst), "log", "--format=%s"],
         capture_output=True, text=True, check=True,
     ).stdout.strip().splitlines()
-    assert log == ["worca-t baseline"]
+    assert log == ["qtea baseline"]

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://worca-t/schemas/research.schema.json",
+  "$id": "https://qtea/schemas/research.schema.json",
   "title": "ResearchProjection",
   "type": "object",
   "required": ["title", "sections"],
@@ -20,7 +20,7 @@
     },
     "stack_profile": {
       "type": ["object", "null"],
-      "description": "Deterministic SUT toolchain detection (package manager, wrapper, install/test/start commands). Populated by src/worca_t/stack_profile.py before the researcher agent runs.",
+      "description": "Deterministic SUT toolchain detection (package manager, wrapper, install/test/start commands). Populated by src/qtea/stack_profile.py before the researcher agent runs.",
       "properties": {
         "language": { "type": ["string", "null"] },
         "package_manager": { "type": ["string", "null"] },
@@ -37,7 +37,7 @@
     },
     "url_resolution": {
       "type": ["object", "null"],
-      "description": "Outcome of QA base-URL discovery (src/worca_t/url_resolver.py). The chosen `key` is the env var the SUT's auth/sign-in code consumes; `value` is non-null when a literal default was recoverable.",
+      "description": "Outcome of QA base-URL discovery (src/qtea/url_resolver.py). The chosen `key` is the env var the SUT's auth/sign-in code consumes; `value` is non-null when a literal default was recoverable.",
       "properties": {
         "key": { "type": ["string", "null"] },
         "value": { "type": ["string", "null"] },
@@ -50,7 +50,7 @@
     },
     "sut_inventory": {
       "type": ["object", "null"],
-      "description": "Language-agnostic, monorepo-aware introspection of the SUT(s). Produced by src/worca_t/sut_inventory.py (Python AST + TS regex deterministic tiers) and augmented from the researcher agent's `## SUT Inventory` YAML block for any language the deterministic tiers don't cover. Consumed by Steps 7/8/9 to integrate generated tests with the SUT's existing layout, page objects, helpers, fixtures, and auth flow rather than ignore them.",
+      "description": "Language-agnostic, monorepo-aware introspection of the SUT(s). Produced by src/qtea/sut_inventory.py (Python AST + TS regex deterministic tiers) and augmented from the researcher agent's `## SUT Inventory` YAML block for any language the deterministic tiers don't cover. Consumed by Steps 7/8/9 to integrate generated tests with the SUT's existing layout, page objects, helpers, fixtures, and auth flow rather than ignore them.",
       "properties": {
         "is_monorepo": { "type": "boolean" },
         "monorepo_signal": { "type": ["string", "null"] },

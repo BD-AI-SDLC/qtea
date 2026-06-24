@@ -1,4 +1,4 @@
-"""Shared pytest configuration for the worca-t test suite.
+"""Shared pytest configuration for the qtea test suite.
 
 Auto-tags the integration-style test modules — those whose tests spawn real
 ``git`` / subprocesses or do heavy filesystem work — with the ``integration``

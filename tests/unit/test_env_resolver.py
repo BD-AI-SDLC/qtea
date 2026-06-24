@@ -10,7 +10,7 @@ import pytest
 
 def test_azdo_url_encodes_special_chars():
     """org, project, and group with special characters must be percent-encoded."""
-    from worca_t.env_resolver import AzureDevOpsStrategy
+    from qtea.env_resolver import AzureDevOpsStrategy
 
     strategy = AzureDevOpsStrategy(
         org="my org",
@@ -48,7 +48,7 @@ def test_azdo_url_encodes_special_chars():
     "HOST", "ENDPOINT",
 ])
 def test_is_essential_key_recognises_runtime_creds_and_endpoints(key):
-    from worca_t.env_resolver import _is_essential_key
+    from qtea.env_resolver import _is_essential_key
     assert _is_essential_key(key), f"{key!r} should be essential"
 
 
@@ -58,7 +58,7 @@ def test_is_essential_key_recognises_runtime_creds_and_endpoints(key):
     "VIEWPORT_WIDTH", "DEVICE_SCALE",
 ])
 def test_is_essential_key_rejects_infrastructure_keys(key):
-    from worca_t.env_resolver import _is_essential_key
+    from qtea.env_resolver import _is_essential_key
     assert not _is_essential_key(key), f"{key!r} should not be essential"
 
 
@@ -72,8 +72,8 @@ def test_resolve_sut_env_prompts_only_for_essentials(tmp_path: Path, monkeypatch
     PASSWORD) and skip infrastructure keys (TIMEOUT, BROWSER_NAME) even
     when they're listed in .env.example.
     """
-    from worca_t import env_resolver
-    from worca_t.env_resolver import EnvResolverConfig, resolve_sut_env
+    from qtea import env_resolver
+    from qtea.env_resolver import EnvResolverConfig, resolve_sut_env
 
     (tmp_path / ".env.example").write_text(
         "BASE_URL=\nUSERNAME=\nPASSWORD=\nTIMEOUT=\nBROWSER_NAME=\n",
@@ -111,8 +111,8 @@ def test_resolve_sut_env_passes_discovered_value_as_default(tmp_path: Path, monk
     to the interactive strategy as the default so the user can confirm with
     Enter or override by typing.
     """
-    from worca_t import env_resolver
-    from worca_t.env_resolver import EnvResolverConfig, resolve_sut_env
+    from qtea import env_resolver
+    from qtea.env_resolver import EnvResolverConfig, resolve_sut_env
 
     (tmp_path / ".env").write_text("BASE_URL=https://staging.example.com\n", encoding="utf-8")
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
@@ -137,8 +137,8 @@ def test_resolve_sut_env_passes_discovered_value_as_default(tmp_path: Path, monk
 
 def test_resolve_sut_env_no_hitl_skips_interactive(tmp_path: Path, monkeypatch):
     """`--no-hitl` must suppress the interactive prompt even for essentials."""
-    from worca_t import env_resolver
-    from worca_t.env_resolver import EnvResolverConfig, resolve_sut_env
+    from qtea import env_resolver
+    from qtea.env_resolver import EnvResolverConfig, resolve_sut_env
 
     called = False
 
@@ -158,8 +158,8 @@ def test_resolve_sut_env_interactive_override_changes_source(tmp_path: Path, mon
     """If the user supplies a value through the prompt that differs from the
     silently-discovered one, the source should be relabelled 'interactive'.
     """
-    from worca_t import env_resolver
-    from worca_t.env_resolver import EnvResolverConfig, resolve_sut_env
+    from qtea import env_resolver
+    from qtea.env_resolver import EnvResolverConfig, resolve_sut_env
 
     (tmp_path / ".env").write_text("BASE_URL=https://old.example.com\n", encoding="utf-8")
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)

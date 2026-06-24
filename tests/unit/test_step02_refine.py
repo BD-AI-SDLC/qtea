@@ -5,11 +5,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from worca_t.checkpoints import RunState
-from worca_t.pipeline import PipelineOptions
-from worca_t.steps.base import StepContext
-from worca_t.steps.s02_refine import RefineStep, _project_to_json
-from worca_t.workspace import create_workspace
+from qtea.checkpoints import RunState
+from qtea.pipeline import PipelineOptions
+from qtea.steps.base import StepContext
+from qtea.steps.s02_refine import RefineStep, _project_to_json
+from qtea.workspace import create_workspace
 
 from ._fake_anthropic import (
     FakeResponse,
@@ -203,9 +203,9 @@ async def test_refine_step_hitl_loop_prompts_user_and_reruns(
 
     # Stub the user prompt so the test doesn't try to read stdin.
     # prompt_user returns dict[str, tuple[resolution, text]].
-    from worca_t.hitl import RESOLUTION_ANSWERED
+    from qtea.hitl import RESOLUTION_ANSWERED
     monkeypatch.setattr(
-        "worca_t.hitl.prompt_user",
+        "qtea.hitl.prompt_user",
         lambda questions, *, agent_label: {
             q.id: (RESOLUTION_ANSWERED, "use okta") for q in questions
         },
@@ -228,7 +228,7 @@ async def test_refine_step_no_hitl_flag_skips_prompt(tmp_path: Path, monkeypatch
     def fail(*_a, **_kw):  # pragma: no cover - must NOT be called
         raise AssertionError("prompt_user must not be called when --no-hitl is set")
 
-    monkeypatch.setattr("worca_t.hitl.prompt_user", fail)
+    monkeypatch.setattr("qtea.hitl.prompt_user", fail)
 
     ctx = _ctx(tmp_path)
     ctx.options.no_hitl = True
@@ -255,7 +255,7 @@ async def test_refine_step_skipped_question_is_not_reasked(
         prompt_calls["n"] += 1
         return {}  # user skips everything
 
-    monkeypatch.setattr("worca_t.hitl.prompt_user", stub_prompt)
+    monkeypatch.setattr("qtea.hitl.prompt_user", stub_prompt)
 
     ctx = _ctx(tmp_path)
     result = await RefineStep().run(ctx)

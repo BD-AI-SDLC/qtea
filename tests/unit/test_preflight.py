@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from worca_t.preflight import (
+from qtea.preflight import (
     _ast_parse_python_tests,
     _check_auth_fixture_missing,
     _check_fixture_graph,
@@ -50,7 +50,7 @@ Expected: count equals 1
 
 
 def test_ast_parse_clean_file_no_violation(tmp_path: Path):
-    rel = "tests/worca_clean_test.py"
+    rel = "tests/qtea_clean_test.py"
     (tmp_path / "tests").mkdir()
     (tmp_path / rel).write_text(
         "def test_clean():\n    assert True\n",
@@ -61,7 +61,7 @@ def test_ast_parse_clean_file_no_violation(tmp_path: Path):
 
 
 def test_ast_parse_syntax_error_flagged(tmp_path: Path):
-    rel = "tests/worca_broken_test.py"
+    rel = "tests/qtea_broken_test.py"
     (tmp_path / "tests").mkdir()
     (tmp_path / rel).write_text(
         "Looking at the plan, I need to write:\ndef test(): pass\n",
@@ -75,7 +75,7 @@ def test_ast_parse_syntax_error_flagged(tmp_path: Path):
 
 
 def test_ast_parse_skipped_on_non_python_framework(tmp_path: Path):
-    rel = "tests/worca_x.spec.ts"
+    rel = "tests/qtea_x.spec.ts"
     (tmp_path / "tests").mkdir()
     (tmp_path / rel).write_text("this is not valid python", encoding="utf-8")
     # Even though the file is invalid Python, TS-stack preflight ignores it.
@@ -160,7 +160,7 @@ def test_fixture_graph_self_loop_detected():
 def test_sentinel_constant_resolved_no_violation(tmp_path: Path):
     (tmp_path / "tests").mkdir()
     (tmp_path / "pages").mkdir()
-    (tmp_path / "tests" / "worca_login_test.py").write_text(
+    (tmp_path / "tests" / "qtea_login_test.py").write_text(
         "from pages.locators import LoginLocators\n"
         "def test_x(page):\n"
         "    page.locator(LoginLocators.LOGIN_BUTTON).click()\n",
@@ -180,7 +180,7 @@ def test_sentinel_constant_resolved_no_violation(tmp_path: Path):
     }
     violations = _check_sentinel_constants(
         tmp_path,
-        {"tests/worca_login_test.py"},
+        {"tests/qtea_login_test.py"},
         plan, None, "pytest",
     )
     assert violations == []
@@ -189,7 +189,7 @@ def test_sentinel_constant_resolved_no_violation(tmp_path: Path):
 def test_sentinel_constant_missing_flagged(tmp_path: Path):
     (tmp_path / "tests").mkdir()
     (tmp_path / "pages").mkdir()
-    (tmp_path / "tests" / "worca_login_test.py").write_text(
+    (tmp_path / "tests" / "qtea_login_test.py").write_text(
         "def test_x(page):\n"
         "    page.locator(LoginLocators.PASSWORD_FIELD).click()\n",
         encoding="utf-8",
@@ -208,7 +208,7 @@ def test_sentinel_constant_missing_flagged(tmp_path: Path):
     }
     violations = _check_sentinel_constants(
         tmp_path,
-        {"tests/worca_login_test.py"},
+        {"tests/qtea_login_test.py"},
         plan, None, "pytest",
     )
     assert len(violations) == 1
@@ -219,13 +219,13 @@ def test_sentinel_constant_missing_flagged(tmp_path: Path):
 def test_sentinel_constant_skipped_when_class_unknown(tmp_path: Path):
     """Unknown locator class → silent skip (no false positive)."""
     (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "worca_x_test.py").write_text(
+    (tmp_path / "tests" / "qtea_x_test.py").write_text(
         "def test_x(): UnknownThing.CONST  # noqa\n",
         encoding="utf-8",
     )
     violations = _check_sentinel_constants(
         tmp_path,
-        {"tests/worca_x_test.py"},
+        {"tests/qtea_x_test.py"},
         {}, None, "pytest",
     )
     assert violations == []
@@ -248,7 +248,7 @@ def test_strategy_parser_picks_navigation_tc():
 
 def test_href_when_navigates_flagged(tmp_path: Path):
     (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "worca_nav_test.py").write_text(
+    (tmp_path / "tests" / "qtea_nav_test.py").write_text(
         """from playwright.sync_api import expect
 
 # @tc TC-NAV-001
@@ -259,7 +259,7 @@ def test_link_destination(page):
         encoding="utf-8",
     )
     violations = _check_href_when_navigates(
-        tmp_path, {"tests/worca_nav_test.py"}, _NAV_STRATEGY, "pytest",
+        tmp_path, {"tests/qtea_nav_test.py"}, _NAV_STRATEGY, "pytest",
     )
     assert len(violations) == 1
     assert violations[0].rule == "href-when-navigates"
@@ -269,7 +269,7 @@ def test_link_destination(page):
 def test_href_when_navigates_not_flagged_for_count_tc(tmp_path: Path):
     """When the strategy says `count equals 1`, an href assertion is fine."""
     (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "worca_count_test.py").write_text(
+    (tmp_path / "tests" / "qtea_count_test.py").write_text(
         """from playwright.sync_api import expect
 
 # @tc TC-NOTNAV-001
@@ -280,7 +280,7 @@ def test_count(page):
         encoding="utf-8",
     )
     violations = _check_href_when_navigates(
-        tmp_path, {"tests/worca_count_test.py"}, _NAV_STRATEGY, "pytest",
+        tmp_path, {"tests/qtea_count_test.py"}, _NAV_STRATEGY, "pytest",
     )
     assert violations == []
 
@@ -299,7 +299,7 @@ def test_href_when_navigates_skipped_on_non_python(tmp_path: Path):
 
 def test_auth_fixture_missing_flagged_on_direct_omission(tmp_path: Path):
     (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "worca_dash_test.py").write_text(
+    (tmp_path / "tests" / "qtea_dash_test.py").write_text(
         """from pages.dashboard import DashboardPage
 
 def test_dashboard_loads(page):
@@ -310,7 +310,7 @@ def test_dashboard_loads(page):
     )
     violations = _check_auth_fixture_missing(
         tmp_path,
-        {"tests/worca_dash_test.py"},
+        {"tests/qtea_dash_test.py"},
         {}, _INVENTORY_WITH_AUTH, "pytest",
     )
     assert len(violations) == 1
@@ -321,7 +321,7 @@ def test_dashboard_loads(page):
 
 def test_auth_fixture_missing_satisfied_by_direct_param(tmp_path: Path):
     (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "worca_dash_test.py").write_text(
+    (tmp_path / "tests" / "qtea_dash_test.py").write_text(
         """from pages.dashboard import DashboardPage
 
 def test_dashboard_loads(authenticated_page):
@@ -332,7 +332,7 @@ def test_dashboard_loads(authenticated_page):
     )
     violations = _check_auth_fixture_missing(
         tmp_path,
-        {"tests/worca_dash_test.py"},
+        {"tests/qtea_dash_test.py"},
         {}, _INVENTORY_WITH_AUTH, "pytest",
     )
     assert violations == []
@@ -342,7 +342,7 @@ def test_auth_fixture_missing_satisfied_via_transitive_chain(tmp_path: Path):
     """Test consumes `dash_page` fixture, which the plan declares as
     depends_on=[authenticated_page] — auth is wired transitively."""
     (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "worca_dash_test.py").write_text(
+    (tmp_path / "tests" / "qtea_dash_test.py").write_text(
         """from pages.dashboard import DashboardPage
 
 def test_dashboard_loads(dash_page):
@@ -361,7 +361,7 @@ def test_dashboard_loads(dash_page):
     }
     violations = _check_auth_fixture_missing(
         tmp_path,
-        {"tests/worca_dash_test.py"},
+        {"tests/qtea_dash_test.py"},
         plan, _INVENTORY_WITH_AUTH, "pytest",
     )
     assert violations == []
@@ -370,7 +370,7 @@ def test_dashboard_loads(dash_page):
 def test_auth_fixture_missing_skipped_for_non_auth_poms(tmp_path: Path):
     """Test imports only generic-scope POMs → no auth requirement."""
     (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "worca_public_test.py").write_text(
+    (tmp_path / "tests" / "qtea_public_test.py").write_text(
         """from pages.public import PublicHomePage
 
 def test_home_loads(page):
@@ -381,7 +381,7 @@ def test_home_loads(page):
     )
     violations = _check_auth_fixture_missing(
         tmp_path,
-        {"tests/worca_public_test.py"},
+        {"tests/qtea_public_test.py"},
         {}, _INVENTORY_WITH_AUTH, "pytest",
     )
     assert violations == []
@@ -390,7 +390,7 @@ def test_home_loads(page):
 def test_auth_fixture_missing_silent_when_no_auth_flow(tmp_path: Path):
     """Inventory without auth_flow → skip the check entirely."""
     (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "worca_x_test.py").write_text(
+    (tmp_path / "tests" / "qtea_x_test.py").write_text(
         """def test_x(page):
     assert page is not None
 """,
@@ -398,7 +398,7 @@ def test_auth_fixture_missing_silent_when_no_auth_flow(tmp_path: Path):
     )
     violations = _check_auth_fixture_missing(
         tmp_path,
-        {"tests/worca_x_test.py"},
+        {"tests/qtea_x_test.py"},
         {}, {"modules": [{"name": "m"}]}, "pytest",
     )
     assert violations == []
@@ -411,7 +411,7 @@ def test_auth_fixture_missing_silent_when_no_auth_flow(tmp_path: Path):
 
 def test_missing_reuse_import_flagged(tmp_path: Path):
     (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "worca_login_test.py").write_text(
+    (tmp_path / "tests" / "qtea_login_test.py").write_text(
         """def test_login(page):
     # plan said reuse LoginPage from pages/login_page.py:LoginPage,
     # but the test forgot to import it.
@@ -421,7 +421,7 @@ def test_missing_reuse_import_flagged(tmp_path: Path):
     )
     plan = {
         "test_cases": [{
-            "test_file_target": "tests/worca_login_test.py",
+            "test_file_target": "tests/qtea_login_test.py",
             "page_objects": [{
                 "source": "reuse",
                 "from": "pages/login_page.py:LoginPage",
@@ -438,7 +438,7 @@ def test_missing_reuse_import_flagged(tmp_path: Path):
 
 def test_missing_reuse_import_satisfied(tmp_path: Path):
     (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "worca_login_test.py").write_text(
+    (tmp_path / "tests" / "qtea_login_test.py").write_text(
         """from pages.login_page import LoginPage
 
 def test_login(page):
@@ -449,7 +449,7 @@ def test_login(page):
     )
     plan = {
         "test_cases": [{
-            "test_file_target": "tests/worca_login_test.py",
+            "test_file_target": "tests/qtea_login_test.py",
             "page_objects": [{
                 "source": "reuse",
                 "from": "pages/login_page.py:LoginPage",
@@ -463,7 +463,7 @@ def test_login(page):
 
 def test_missing_reuse_import_alias_accepted(tmp_path: Path):
     (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "worca_login_test.py").write_text(
+    (tmp_path / "tests" / "qtea_login_test.py").write_text(
         """from pages.login_page import LoginPage as LP
 
 def test_login(page):
@@ -473,7 +473,7 @@ def test_login(page):
     )
     plan = {
         "test_cases": [{
-            "test_file_target": "tests/worca_login_test.py",
+            "test_file_target": "tests/qtea_login_test.py",
             "page_objects": [{
                 "source": "reuse",
                 "from": "pages/login_page.py:LoginPage",
@@ -491,7 +491,7 @@ def test_login(page):
 def test_missing_reuse_import_skips_fixtures(tmp_path: Path):
     """Fixtures aren't imported (pytest discovers by name) → skip the bucket."""
     (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "worca_x_test.py").write_text(
+    (tmp_path / "tests" / "qtea_x_test.py").write_text(
         """def test_x(authenticated_page):
     assert authenticated_page is not None
 """,
@@ -499,7 +499,7 @@ def test_missing_reuse_import_skips_fixtures(tmp_path: Path):
     )
     plan = {
         "test_cases": [{
-            "test_file_target": "tests/worca_x_test.py",
+            "test_file_target": "tests/qtea_x_test.py",
             "fixtures": [{
                 "source": "reuse",
                 "from": "tests/fixtures/auth.py:authenticated_page",
@@ -513,7 +513,7 @@ def test_missing_reuse_import_skips_fixtures(tmp_path: Path):
 
 def test_run_preflight_aggregates(tmp_path: Path):
     (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "worca_broken_test.py").write_text(
+    (tmp_path / "tests" / "qtea_broken_test.py").write_text(
         "Looking at:\ndef test_x(): pass\n",
         encoding="utf-8",
     )
@@ -527,7 +527,7 @@ def test_run_preflight_aggregates(tmp_path: Path):
     result = run_preflight(
         tmp_path,
         framework="pytest",
-        generated_files={"tests/worca_broken_test.py"},
+        generated_files={"tests/qtea_broken_test.py"},
         plan=plan,
         inventory=None,
     )

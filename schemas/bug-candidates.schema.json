@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://worca-t/schemas/bug-candidates.schema.json",
+  "$id": "https://qtea/schemas/bug-candidates.schema.json",
   "title": "BugCandidates",
   "type": "object",
   "required": ["candidates"],

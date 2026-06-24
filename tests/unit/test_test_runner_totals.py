@@ -8,7 +8,7 @@ case impossible to misread.
 
 from __future__ import annotations
 
-from worca_t.test_runner import RunResult, TestRunEntry
+from qtea.test_runner import RunResult, TestRunEntry
 
 
 def _entry(

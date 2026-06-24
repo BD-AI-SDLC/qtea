@@ -8,11 +8,11 @@ from unittest.mock import MagicMock
 
 import httpx
 
-from worca_t.checkpoints import RunState
-from worca_t.pipeline import PipelineOptions
-from worca_t.schemas import is_valid
-from worca_t.steps.base import StepContext
-from worca_t.steps.s05_xray import (
+from qtea.checkpoints import RunState
+from qtea.pipeline import PipelineOptions
+from qtea.schemas import is_valid
+from qtea.steps.base import StepContext
+from qtea.steps.s05_xray import (
     XrayClient,
     XrayUploadStep,
     _build_mappings,
@@ -20,7 +20,7 @@ from worca_t.steps.s05_xray import (
     _extract_project_key,
     _map_priority,
 )
-from worca_t.workspace import create_workspace
+from qtea.workspace import create_workspace
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from worca_t.steps.s09_execute import (
+from qtea.steps.s09_execute import (
     _extract_assertion_lines,
     _heal_allowlist_dirs,
     _heal_path_in_scope,
@@ -60,7 +60,7 @@ def test_heal_allowlist_dirs_empty_when_no_active_module():
 
 @pytest.mark.parametrize("path", [
     "tests/conftest.py",
-    "tests/fixtures/worca_nav.py",
+    "tests/fixtures/qtea_nav.py",
     "tests/fixtures/anything.py",
     "tests/smoke/test_login.py",
     "tests/smoke/login_test.py",
@@ -262,15 +262,15 @@ def test_scope_check_preserves_generated_test_file_edits(tmp_path: Path):
 
 
 def test_scope_check_skips_pre_heal_dirty_files(tmp_path: Path):
-    """Files already dirty before the heal (e.g. worca-junit.xml) are
+    """Files already dirty before the heal (e.g. qtea-junit.xml) are
     not flagged as scope violations."""
     sut = tmp_path / "sut"
     sut.mkdir()
     base_sha = _init_git(sut)
     allowlist = {"src/pkg/pages/object"}
 
-    # Simulate worca-junit.xml written by pytest BEFORE heal.
-    junit_xml = sut / "worca-junit.xml"
+    # Simulate qtea-junit.xml written by pytest BEFORE heal.
+    junit_xml = sut / "qtea-junit.xml"
     junit_xml.write_text("<xml/>", encoding="utf-8")
 
     # The heal agent also creates an out-of-scope file.
@@ -278,7 +278,7 @@ def test_scope_check_skips_pre_heal_dirty_files(tmp_path: Path):
     new_test.parent.mkdir(parents=True)
     new_test.write_text("def test_x(): pass\n", encoding="utf-8")
 
-    pre_heal_dirty = {"worca-junit.xml"}
+    pre_heal_dirty = {"qtea-junit.xml"}
 
     reverted = _heal_scope_check_and_revert(
         sut, base_sha, allowlist,
@@ -286,7 +286,7 @@ def test_scope_check_skips_pre_heal_dirty_files(tmp_path: Path):
     )
 
     assert "tests/smoke/test_new.py" in reverted
-    assert "worca-junit.xml" not in reverted
+    assert "qtea-junit.xml" not in reverted
     assert not new_test.exists()
     assert junit_xml.exists()
 

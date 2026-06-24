@@ -1,4 +1,4 @@
-"""Tests for :func:`worca_t.llm.reasoning.call_reasoning_llm_with_hitl`.
+"""Tests for :func:`qtea.llm.reasoning.call_reasoning_llm_with_hitl`.
 
 Covers the multi-turn HITL re-invoke pattern in isolation:
   * No-questions short-circuit (single iteration, no prompt)
@@ -23,7 +23,7 @@ from tests.unit._fake_anthropic import (
     FakeTextBlock,
     FakeUsage,
 )
-from worca_t.llm.reasoning import call_reasoning_llm_with_hitl
+from qtea.llm.reasoning import call_reasoning_llm_with_hitl
 
 
 def _write_agent_file(tmp_path: Path) -> Path:
@@ -138,9 +138,9 @@ async def test_one_round_resolution_prompts_user_and_reruns(tmp_path, monkeypatc
 
     # Stub the user prompt: answer every question with "use okta".
     # Note: prompt_user now returns dict[str, tuple[resolution, text]].
-    from worca_t.hitl import RESOLUTION_ANSWERED
+    from qtea.hitl import RESOLUTION_ANSWERED
     monkeypatch.setattr(
-        "worca_t.hitl.prompt_user",
+        "qtea.hitl.prompt_user",
         lambda qs, *, agent_label: {
             q.id: (RESOLUTION_ANSWERED, "use okta") for q in qs
         },
@@ -191,7 +191,7 @@ async def test_no_hitl_flag_returns_first_iteration(tmp_path, monkeypatch):
     def fail_prompt(*_a, **_kw):  # pragma: no cover - must NOT be called
         raise AssertionError("prompt_user must not be called with no_hitl=True")
 
-    monkeypatch.setattr("worca_t.hitl.prompt_user", fail_prompt)
+    monkeypatch.setattr("qtea.hitl.prompt_user", fail_prompt)
 
     result = await call_reasoning_llm_with_hitl(
         agent_path=_write_agent_file(tmp_path),
@@ -227,7 +227,7 @@ async def test_skipped_question_is_not_reasked(tmp_path, monkeypatch):
         prompt_calls["n"] += 1
         return {}  # user skips everything
 
-    monkeypatch.setattr("worca_t.hitl.prompt_user", stub_prompt)
+    monkeypatch.setattr("qtea.hitl.prompt_user", stub_prompt)
 
     result = await call_reasoning_llm_with_hitl(
         agent_path=_write_agent_file(tmp_path),
@@ -264,9 +264,9 @@ async def test_max_iterations_cap_terminates_loop(tmp_path, monkeypatch):
     scripted = _ScriptedAnthropic(responses=responses)
     scripted.install(monkeypatch)
 
-    from worca_t.hitl import RESOLUTION_ANSWERED
+    from qtea.hitl import RESOLUTION_ANSWERED
     monkeypatch.setattr(
-        "worca_t.hitl.prompt_user",
+        "qtea.hitl.prompt_user",
         lambda qs, *, agent_label: {
             q.id: (RESOLUTION_ANSWERED, f"answer-{q.id}") for q in qs
         },
@@ -304,7 +304,7 @@ async def test_failed_llm_call_returns_immediately(tmp_path, monkeypatch):
     def fail_prompt(*_a, **_kw):  # pragma: no cover - must NOT be called
         raise AssertionError("prompt_user must not be called when LLM returns empty")
 
-    monkeypatch.setattr("worca_t.hitl.prompt_user", fail_prompt)
+    monkeypatch.setattr("qtea.hitl.prompt_user", fail_prompt)
 
     result = await call_reasoning_llm_with_hitl(
         agent_path=_write_agent_file(tmp_path),
@@ -345,7 +345,7 @@ async def test_skip_produces_drop_directive_in_iteration_2_prompt(
 
     # User skips everything (returns empty dict).
     monkeypatch.setattr(
-        "worca_t.hitl.prompt_user", lambda qs, *, agent_label: {}
+        "qtea.hitl.prompt_user", lambda qs, *, agent_label: {}
     )
 
     await call_reasoning_llm_with_hitl(
@@ -382,9 +382,9 @@ async def test_scope_exclusion_passes_answer_through_with_exclusion_framing(
     scripted = _ScriptedAnthropic(responses=[_MD_WITH_QUESTION, _MD_RESOLVED])
     scripted.install(monkeypatch)
 
-    from worca_t.hitl import RESOLUTION_SCOPE_EXCLUSION
+    from qtea.hitl import RESOLUTION_SCOPE_EXCLUSION
     monkeypatch.setattr(
-        "worca_t.hitl.prompt_user",
+        "qtea.hitl.prompt_user",
         lambda qs, *, agent_label: {
             q.id: (RESOLUTION_SCOPE_EXCLUSION, "mobile isn't in scope") for q in qs
         },

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://worca-t/schemas/test-strategy.schema.json",
+  "$id": "https://qtea/schemas/test-strategy.schema.json",
   "title": "TestStrategy",
   "type": "object",
   "required": ["title", "test_cases"],

@@ -31,7 +31,7 @@ EXPECTED_URL = "https://example.com/path"
 EXPECTED_LABEL_EN = "Switch to Example"
 
 # Test functions
-@pytest.mark.worca_smoke
+@pytest.mark.qtea_smoke
 def test_should_<action>_when_<condition>(<fixture>):
     ...
     expect(loc).to_have_text(EXPECTED_LABEL_EN)
@@ -43,13 +43,13 @@ Prefer Playwright `expect()` for all assertions on Playwright objects (locators,
 
 ## Phase Markers
 
-Apply exactly one phase marker to every generated test, drawn from the test's phase in `plan.json` (one of `worca_smoke` / `worca_regression` / `worca_e2e` / `worca_exploratory`). Syntax is language-specific:
+Apply exactly one phase marker to every generated test, drawn from the test's phase in `plan.json` (one of `qtea_smoke` / `qtea_regression` / `qtea_e2e` / `qtea_exploratory`). Syntax is language-specific:
 
-- Python + pytest → `@pytest.mark.worca_smoke`
-- TS/JS + Playwright Test → `test('...', { tag: '@worca_smoke' }, async ({ page }) => { ... })`
-- TS/JS + Jest / Vitest → embed in the test name: `test('worca_smoke: should ...', ...)`
-- Java + JUnit5 → `@Tag("worca_smoke")`
-- Java + TestNG → `@Test(groups = "worca_smoke")`
+- Python + pytest → `@pytest.mark.qtea_smoke`
+- TS/JS + Playwright Test → `test('...', { tag: '@qtea_smoke' }, async ({ page }) => { ... })`
+- TS/JS + Jest / Vitest → embed in the test name: `test('qtea_smoke: should ...', ...)`
+- Java + JUnit5 → `@Tag("qtea_smoke")`
+- Java + TestNG → `@Test(groups = "qtea_smoke")`
 
 ## Quality Standards
 

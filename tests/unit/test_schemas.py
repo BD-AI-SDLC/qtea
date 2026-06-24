@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from worca_t import schemas
+from qtea import schemas
 
 
 def test_load_schema_returns_dict():

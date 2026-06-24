@@ -1154,7 +1154,7 @@ wheels = [
 ]
 
 [[package]]
-name = "worca-t"
+name = "qtea"
 version = "0.1.2"
 source = { editable = "." }
 dependencies = [

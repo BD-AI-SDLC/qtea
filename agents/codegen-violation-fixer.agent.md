@@ -34,7 +34,7 @@ Per-framework code templates, locator priority list, retry policy table, and pol
 - Do not create new files or delete existing ones.
 - Do not change test assertions or expected values.
 - Do not refactor code beyond what the violation fix requires.
-- Do not add comments like "fixed by worca-t" or "violation corrected".
+- Do not add comments like "fixed by qtea" or "violation corrected".
 - Do not search for or create the JIT runtime — it is already vendored.
 - **Do not silence the type checker** when fixing `type-error` violations — no `# type: ignore`, `# type: ignore[code]`, `# pyright: ignore`, `# pyright: ignore[code]`, `@ts-ignore`, `@ts-nocheck`, `@ts-expect-error`, `as any`, `as unknown as X`, or equivalent escape hatches. The point of the gate is to catch real bugs; silencing it defeats the gate.
 - **Do not silence the test** to make the checker quiet — no `pytest.skip(...)`, `@pytest.mark.skip`, `@pytest.mark.xfail`, `it.skip`, `it.only`, `describe.skip`, `test.todo`, `xit`, `xdescribe`, or equivalent. If you cannot fix a `type-error` cleanly, leave the file unchanged and let the gate escalate — the human review will surface the real issue.

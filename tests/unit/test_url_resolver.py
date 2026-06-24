@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from worca_t.url_resolver import (
+from qtea.url_resolver import (
     UrlResolution,
     _role_for_key,
     detect_qa_base_url,

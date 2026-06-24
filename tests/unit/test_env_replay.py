@@ -1,7 +1,7 @@
 """Regression tests for `replay_env_from_artifacts`.
 
 Step 6's `resolve_sut_env()` writes into `os.environ` in-process only. When
-the user re-runs `worca-t run --from-step 7+` in a new process, those writes
+the user re-runs `qtea run --from-step 7+` in a new process, those writes
 are gone — `SUT_BASE_URL` ends up unset and Step 8 aborts with
 `BASE_URL_UNRESOLVED`. `replay_env_from_artifacts` re-populates os.environ
 from the persisted Step 6 artifacts so re-runs work as expected.
@@ -16,8 +16,8 @@ from pathlib import Path
 
 import pytest
 
-from worca_t.steps.s06_research import replay_env_from_artifacts
-from worca_t.workspace import Workspace
+from qtea.steps.s06_research import replay_env_from_artifacts
+from qtea.workspace import Workspace
 
 
 @pytest.fixture

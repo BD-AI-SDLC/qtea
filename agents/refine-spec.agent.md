@@ -70,7 +70,7 @@ is to remove tracker boilerplate, not to second-guess the author.
 12. Provide NFRs: performance targets, security constraints, accessibility, compatibility.
 13. Suggest effort estimation based on complexity indicators.
 14. Run the Definition-of-Ready checklist and emit a readiness verdict.
-15. Write the refined spec to `./refined-spec.md` in the workdir. The Python pipeline at `src/worca_t/steps/s02_refine.py:120` copies it to `artifacts/step02/refined-spec.md`. Do not overwrite `spec.md`.
+15. Write the refined spec to `./refined-spec.md` in the workdir. The Python pipeline at `src/qtea/steps/s02_refine.py:120` copies it to `artifacts/step02/refined-spec.md`. Do not overwrite `spec.md`.
 
 ## Output Format
 
@@ -234,4 +234,4 @@ flagged with that directive in `prior-decisions.md`.
 
 ## Non-interactive mode
 
-If the orchestrator runs with `--no-hitl` / `--yes` (HITL disabled — see `src/worca_t/steps/base.py:222`), do not block on user input. Emit the refined spec with `Readiness: NOT READY` and the full blocker list intact. The orchestrator decides whether to halt the pipeline or proceed. Never invent answers to clarifications you would otherwise have asked.
+If the orchestrator runs with `--no-hitl` / `--yes` (HITL disabled — see `src/qtea/steps/base.py:222`), do not block on user input. Emit the refined spec with `Readiness: NOT READY` and the full blocker list intact. The orchestrator decides whether to halt the pipeline or proceed. Never invent answers to clarifications you would otherwise have asked.

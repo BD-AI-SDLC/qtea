@@ -5,17 +5,17 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from worca_t.checkpoints import RunState
-from worca_t.md_parser import parse_markdown
-from worca_t.pipeline import PipelineOptions
-from worca_t.steps.base import StepContext
-from worca_t.steps.s04_strategy import (
+from qtea.checkpoints import RunState
+from qtea.md_parser import parse_markdown
+from qtea.pipeline import PipelineOptions
+from qtea.steps.base import StepContext
+from qtea.steps.s04_strategy import (
     StrategyStep,
     _looks_like_test_case,
     _project_strategy,
     _project_test_case,
 )
-from worca_t.workspace import create_workspace
+from qtea.workspace import create_workspace
 
 from ._fake_anthropic import install_fake_anthropic
 

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://worca-t/schemas/refined-spec.schema.json",
+  "$id": "https://qtea/schemas/refined-spec.schema.json",
   "title": "RefinedSpec",
   "type": "object",
   "required": ["requirement_id", "title", "sections", "acceptance_criteria"],

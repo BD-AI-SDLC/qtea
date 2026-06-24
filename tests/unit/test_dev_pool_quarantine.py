@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from worca_t.steps.s09_execute import _bug_candidates_for_dev_pool_drift
+from qtea.steps.s09_execute import _bug_candidates_for_dev_pool_drift
 
 
 # ---------------------------------------------------------------------------
@@ -37,24 +37,24 @@ def _load_runtime():
     import sys
     tpl = (
         Path(__file__).resolve().parents[2]
-        / "src" / "worca_t" / "_resources" / "runtime" / "worca_t_runtime.py.tpl"
+        / "src" / "qtea" / "_resources" / "runtime" / "qtea_runtime.py.tpl"
     )
-    loader = SourceFileLoader("worca_t_runtime_quar_under_test", str(tpl))
-    spec = importlib.util.spec_from_loader("worca_t_runtime_quar_under_test", loader)
+    loader = SourceFileLoader("qtea_runtime_quar_under_test", str(tpl))
+    spec = importlib.util.spec_from_loader("qtea_runtime_quar_under_test", loader)
     assert spec is not None
     mod = importlib.util.module_from_spec(spec)
-    sys.modules["worca_t_runtime_quar_under_test"] = mod
+    sys.modules["qtea_runtime_quar_under_test"] = mod
     try:
         loader.exec_module(mod)
     except Exception:
-        sys.modules.pop("worca_t_runtime_quar_under_test", None)
+        sys.modules.pop("qtea_runtime_quar_under_test", None)
         raise
     return mod
 
 
 @pytest.fixture
 def runtime(monkeypatch, tmp_path):
-    monkeypatch.setenv("WORCA_T_CACHE_DIR", str(tmp_path / "locator-cache"))
+    monkeypatch.setenv("QTEA_CACHE_DIR", str(tmp_path / "locator-cache"))
     return _load_runtime()
 
 

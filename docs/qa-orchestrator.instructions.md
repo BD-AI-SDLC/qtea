@@ -1,15 +1,15 @@
 # QA Orchestrator - Step-by-Step Instructions
 
-> **Documentation only.** This file describes what `src/worca_t/pipeline.py` does — no Python code loads it at runtime. It is the canonical human/AI-facing specification of the orchestration contract; keep it in sync when the contract changes.
+> **Documentation only.** This file describes what `src/qtea/pipeline.py` does — no Python code loads it at runtime. It is the canonical human/AI-facing specification of the orchestration contract; keep it in sync when the contract changes.
 
 > HOW to execute what `docs/qa-orchestrator.agent.md` defines.
 > Read `CLAUDE.md` first -- it is the source of truth for pipeline structure,
 > agent-model map, MCP servers, and non-negotiable rules.
 >
 > **Single sources of truth** (this file points at them; never duplicate):
-> - Agent → model map: [`src/worca_t/agent_models.yaml`](../src/worca_t/agent_models.yaml)
+> - Agent → model map: [`src/qtea/agent_models.yaml`](../src/qtea/agent_models.yaml)
 > - MCP servers: [`.mcp.json`](../.mcp.json)
-> - Per-step timeouts: [`src/worca_t/config.py`](../src/worca_t/config.py)
+> - Per-step timeouts: [`src/qtea/config.py`](../src/qtea/config.py)
 > - Schemas: [`schemas/*.schema.json`](../schemas/)
 >
 > Model names and timeout numbers are deliberately omitted from the step
@@ -36,7 +36,7 @@ Two layers cooperate to run the pipeline:
 1. Generate a `run_id` (ISO-8601 timestamp or UUID).
 2. Create the workspace directory tree:
    ```
-   .worca-t/<run-id>/
+   .qtea/<run-id>/
      state.json          # checkpoint state (managed by checkpoints.py)
      run.log.jsonl       # structured log (structlog)
      debug/
@@ -50,7 +50,7 @@ Two layers cooperate to run the pipeline:
    first non-completed step. Verify output hashes of completed steps via
    `outputs_match()` -- if any hash mismatches, mark that step `pending`.
 6. **SUT preflight.** Materialize `--sut` into `<workspace>/sut/` (clone or
-   link) and put it on the worca-t isolation branch before any step runs.
+   link) and put it on the qtea isolation branch before any step runs.
 7. **MCP preflight.** Cold-start every server in `.mcp.json` via
    `mcp_manager.probe_server()`. On failure, prompt the user (TTY) to retry;
    non-TTY / `--no-hitl` / `--yes` fail fast with exit code 2. Side effect:
@@ -72,13 +72,13 @@ For each step in `_select_steps()` (respecting `--from-step`, `--only-step`, `--
 ### 2.2 Dispatch
 
 1. Look up the agent for this step in `CLAUDE.md` section 2.
-2. Look up the model for that agent in `src/worca_t/agent_models.yaml`.
+2. Look up the model for that agent in `src/qtea/agent_models.yaml`.
 3. Invoke the agent via `claude_runner.py` (`run_agent()`), which spawns the
    `claude` CLI with:
    - The model resolved from the agent-model map.
    - The curated input bundle (files listed in section 3 below).
    - MCP servers as configured in [`.mcp.json`](../.mcp.json).
-   - A per-step timeout cap from [`config.py`](../src/worca_t/config.py)
+   - A per-step timeout cap from [`config.py`](../src/qtea/config.py)
      (`step_timeout(N)`; the global cap is `MAX_STEP_TIMEOUT`).
 4. Stream agent progress. Write each event to `run.log.jsonl` with fields:
    `run_id`, `step`, `agent`, `attempt`, `correlation_id`, `timestamp`.
@@ -118,7 +118,7 @@ Attempt 1 fails  (steps/base.py MAX_ATTEMPTS=2)
 ```
 
 (Models for `debug`, `critical-thinking`, and `principal-software-engineer`
-live in `src/worca_t/agent_models.yaml`.)
+live in `src/qtea/agent_models.yaml`.)
 
 1. On first failure, increment `attempts` to 2, set `status: "in_progress"`.
 2. Re-invoke the same agent with the same inputs, but also co-run
@@ -147,7 +147,7 @@ live in `src/worca_t/agent_models.yaml`.)
 
 **Procedure:**
 1. If `--spec` starts with `jira:` or is a full `https://.../browse/KEY` URL,
-   fetch the issue via direct Jira REST (`worca_t.jira_client.fetch_issue` —
+   fetch the issue via direct Jira REST (`qtea.jira_client.fetch_issue` —
    the Atlassian MCP was retired in commit `a36dbbe`), slim the payload, and
    invoke `jira-to-ai-spec` with the JSON inlined under the `jira-issue.json`
    header. Output both `jira-spec.md` (provenance stub) and `spec.md` (the
@@ -169,12 +169,12 @@ live in `src/worca_t/agent_models.yaml`.)
 | Input | `artifacts/step01/spec.md` |
 | Output | `artifacts/step02/refined-spec.md`, `refined-spec.json` |
 | Schema | `schemas/refined-spec.schema.json` |
-| Transport | `worca_t.llm.reasoning.call_reasoning_llm_with_hitl` (direct Anthropic SDK, multi-turn HITL) |
+| Transport | `qtea.llm.reasoning.call_reasoning_llm_with_hitl` (direct Anthropic SDK, multi-turn HITL) |
 
 **HITL loop.** The transport extracts `[CLARIFICATION NEEDED]` tags,
 Blockers table rows, and Open Questions bullets from the agent's output
-via `worca_t.hitl.extract_questions`. Skipped items are deduped across
-iterations (see `worca_t.hitl._dedup`) so the user is never re-prompted
+via `qtea.hitl.extract_questions`. Skipped items are deduped across
+iterations (see `qtea.hitl._dedup`) so the user is never re-prompted
 for the same concern. Capped at `HITL_MAX_ITERATIONS` (3). Auto-skips
 when `--no-hitl` is set or stdin is not a TTY.
 
@@ -244,7 +244,7 @@ traceability backbone -- they propagate through every downstream artifact.
 | Schema | `schemas/research.schema.json` |
 
 **Procedure:**
-1. Clone `--sut` to `.worca-t/<run-id>/sut/`.
+1. Clone `--sut` to `.qtea/<run-id>/sut/`.
 2. Pass the `--sut` directory to `polyglot-test-researcher`.
 3. The agent discovers the test automation stack using 3-signal detection:
    dependency files + imports + config files.
@@ -283,13 +283,13 @@ JIT resolver respectively).
   directory (matches `test_directory_layout` / `src_directory_layout`).
 - Every `missing_methods` entry has a `signature`.
 - Every `create_tbd` locator has an `intent` of ≤120 chars.
-- Marker names match `worca_<phase>` convention exactly.
+- Marker names match `qtea_<phase>` convention exactly.
 - **Auth chaining:** when `auth_flow.fixture_entry` exists, any `source=create`
   fixture whose `yields` is a non-primitive type must include the auth fixture
   name in `depends_on`. Prevents generated fixtures from bypassing authentication.
 
 **Human review gate (post-step-7).** After the phase gate passes,
-`pipeline.py` invokes `review_step_7_plan` (`src/worca_t/review_gate.py`):
+`pipeline.py` invokes `review_step_7_plan` (`src/qtea/review_gate.py`):
 - Renders a table per test case: target file, function names + markers,
   fixtures (reuse vs create), page objects (reuse vs create + count of
   missing methods), locators (reuse vs create_tbd with intent). Footer
@@ -348,7 +348,7 @@ no separate locator-resolution step.
 
 | Field | Value |
 |---|---|
-| Agents | `polyglot-test-fixer` for self-heal (test execution itself is pure code via `worca_t.test_runner.run_tests`) |
+| Agents | `polyglot-test-fixer` for self-heal (test execution itself is pure code via `qtea.test_runner.run_tests`) |
 | Input | `artifacts/step08/tbd-index.json` (TBDs resolved), `--sut` path, `--parallelism N`, `--headless\|--headed` |
 | Output | `artifacts/step09/run-results.json`, screenshots, traces, `bugs/*.md` candidates, `locator-cache.json` (when JIT runtime ran) |
 | Schema | `schemas/run-results.schema.json` (+ `schemas/locator-cache.schema.json` for the JIT cache) |
@@ -356,25 +356,25 @@ no separate locator-resolution step.
 **JIT runtime (Playwright stacks — Python, TypeScript, JavaScript, Java).**
 For SUTs whose active module is a Playwright stack (Python+pytest, TS/JS+Playwright Test / Jest / Vitest, Java+JUnit5 / TestNG), Step 8 has vendored a per-language runtime into the SUT. Before launching the test command, Step 9:
 
-- Starts a parent-side `ResolverServer` (TCP loopback, per-run shared secret) and exports `WORCA_T_RESOLVER_PORT` + `WORCA_T_RESOLVER_TOKEN` into the test subprocess env.
-- Sets the rest of the `WORCA_T_*` env vars: `WORCA_T_CACHE_DIR`, `WORCA_T_RUN_ID`, `WORCA_T_RESOLVER_MODEL`, `WORCA_T_DEFAULT_TIMEOUT_MS`, optionally `WORCA_T_DEV_LOCATORS` (when `--dev-locators` or env is set), `WORCA_T_NO_LLM_RESOLVE=1` (when CI opts out of LLM spend).
+- Starts a parent-side `ResolverServer` (TCP loopback, per-run shared secret) and exports `QTEA_RESOLVER_PORT` + `QTEA_RESOLVER_TOKEN` into the test subprocess env.
+- Sets the rest of the `QTEA_*` env vars: `QTEA_CACHE_DIR`, `QTEA_RUN_ID`, `QTEA_RESOLVER_MODEL`, `QTEA_DEFAULT_TIMEOUT_MS`, optionally `QTEA_DEV_LOCATORS` (when `--dev-locators` or env is set), `QTEA_NO_LLM_RESOLVE=1` (when CI opts out of LLM spend).
 - **Strips `ANTHROPIC_API_KEY` from the subprocess env via `safe_subprocess_env`** — the key stays in the trusted parent process where `ResolverServer` makes the Anthropic API call. Leaked tokens from the SUT cannot exfiltrate the key.
 
 At test runtime, the vendored runtime intercepts sentinels — `tbd("intent")` (Python/TS/JS) or `Tbd.of("intent")` (Java) — and resolves them via the tier ladder defined in CLAUDE.md § JIT:
-1. Dev-supplied locator file (`<sut>/.worca-t/dev-locators.json` or `WORCA_T_DEV_LOCATORS`)
+1. Dev-supplied locator file (`<sut>/.qtea/dev-locators.json` or `QTEA_DEV_LOCATORS`)
 2. Runtime cache
 3. In-process AOM heuristic (`role + name` exact match, ≥0.9 confidence)
-4. ResolverServer over loopback TCP (preferred LLM path; legacy `worca-t resolve` subprocess is the fallback when `WORCA_T_RESOLVER_PORT` is unset)
+4. ResolverServer over loopback TCP (preferred LLM path; legacy `qtea resolve` subprocess is the fallback when `QTEA_RESOLVER_PORT` is unset)
 5. HITL prompt on TTY / `locator-unresolvable` bug-candidate entry for Step 10 on non-TTY
 
 Each returned `Locator` is wrapped in a retry proxy. On `TimeoutError`, the proxy walks any in-bundle fallback candidates first (zero LLM cost), then invalidates the failing cache entry, re-resolves via the LLM (skipping dev file + cache + heuristic), and replays the action once. If the retry also fails, the `TimeoutError` propagates and `polyglot-test-fixer` self-heal takes over. **Dev-pool quarantine:** when the stale resolution came from tier-1b, the proxy marks the cache entry `quarantined: true`, appends to `<workspace>/locator-cache/dev-pool-quarantine.jsonl`, re-resolves with `skip_pool=True`, and stores the LLM fallback under `_shadow:<key>` — preserving the dev-supplied selector. Step 9 emits a `dev-locator-drifted` bug-candidate per drift.
 
-Resolutions are cached to `<workspace>/locator-cache/locator-cache.json`; Step 9 copies it to `artifacts/step09/locator-cache.json`. HITL answers from Tier 5 prompts merge into `<sut>/.worca-t/dev-locators.json`. **TBD promotion gate:** after each attempt Step 9 freezes cache entries into SUT source via `_promote_resolved_tbds`, but ONLY when (a) `passing_witnesses` is non-empty (the runtime's teardown hook records nodeids of passing tests) AND (b) `validate_selector_payload` accepts. CSS payloads emit quoted strings; structured payloads (`role`/`text`/`label`/`placeholder`/`test_id`) emit `role_locator(...)` / `text_locator(...)` / etc. helper calls (the promoter extends the runtime import line). Blocked entries surface as `promotion-blocked` bug-candidates alongside `locator-unresolvable` and `dev-locator-drifted`.
+Resolutions are cached to `<workspace>/locator-cache/locator-cache.json`; Step 9 copies it to `artifacts/step09/locator-cache.json`. HITL answers from Tier 5 prompts merge into `<sut>/.qtea/dev-locators.json`. **TBD promotion gate:** after each attempt Step 9 freezes cache entries into SUT source via `_promote_resolved_tbds`, but ONLY when (a) `passing_witnesses` is non-empty (the runtime's teardown hook records nodeids of passing tests) AND (b) `validate_selector_payload` accepts. CSS payloads emit quoted strings; structured payloads (`role`/`text`/`label`/`placeholder`/`test_id`) emit `role_locator(...)` / `text_locator(...)` / etc. helper calls (the promoter extends the runtime import line). Blocked entries surface as `promotion-blocked` bug-candidates alongside `locator-unresolvable` and `dev-locator-drifted`.
 
-**Non-Playwright stacks (Selenium, Cypress, Robot, etc.):** JIT does not apply; `polyglot-test-fixer` heal mode handles `TBD_LOCATOR` markers on failure as the procedure below describes. `WORCA_T_NO_LLM_RESOLVE=1` disables both the runtime LLM tier AND the heal agent symmetrically — zero LLM spend in CI.
+**Non-Playwright stacks (Selenium, Cypress, Robot, etc.):** JIT does not apply; `polyglot-test-fixer` heal mode handles `TBD_LOCATOR` markers on failure as the procedure below describes. `QTEA_NO_LLM_RESOLVE=1` disables both the runtime LLM tier AND the heal agent symmetrically — zero LLM spend in CI.
 
 **Procedure (all stacks):**
-1. Run the test command via `worca_t.test_runner.run_tests` (pure code, no
+1. Run the test command via `qtea.test_runner.run_tests` (pure code, no
    agent). The command comes from `research.json.commands.test`, passed by
    `s09_execute.py:_detected_command()`. Falls back to a per-framework
    default only when `research.json` has no `commands.test`.
@@ -488,7 +488,7 @@ These are non-negotiable. Violations trigger step rejection and the retry/fix cy
 | No empty exception handlers | Step 8 | `empty-handler` in `violations[]` is a hard rejection. Mirrors the Step 9 heal-gate `_count_empty_handlers`; promoted from heal-only to codegen-side so write-time defects don't ship. |
 | Framework/command consistency | Step 8 pre-flight | `research.json.detected_stack` must be consistent with `research.json.commands.test` argv head; mismatch is a hard rejection before any agent runs. |
 | Semantic preflight | Step 8.5 | `preflight-error` rules: generated Python tests must `ast.parse`; plan fixture-graph must be acyclic with all `depends_on` resolving; every `LocatorClass.CONSTANT` referenced in tests must exist in the locator file. |
-| Assertion coverage | Step 8 | `zero-assertions` (Python+pytest): every `def test_*` must contain ≥1 assertion (`assert`, `expect(...)`, `pytest.raises`, `should`) unless tagged `@pytest.mark.worca_setup`. Hard rejection. |
+| Assertion coverage | Step 8 | `zero-assertions` (Python+pytest): every `def test_*` must contain ≥1 assertion (`assert`, `expect(...)`, `pytest.raises`, `should`) unless tagged `@pytest.mark.qtea_setup`. Hard rejection. |
 | Href vs. navigation | Step 8.5 | `href-when-navigates`: when the strategy's Expected Result says navigates/leads/points/redirects to a URL, generated tests must use click-then-`to_have_url(...)` not `to_have_attribute("href", ...)`. Hard rejection. |
 | Bare-assert advisory | Step 8 | `bare-assert-where-expect-available` (warning): `assert loc.text_content() == ...`, `assert loc.is_visible()`, `assert page.url == ...` surface as advisory warnings; promotion to hard-reject pending FP baseline. |
 | TC traceability | Step 8 | Every test must have `tc_refs` linking to `TC-*` IDs |

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://worca-t/schemas/xray-mapping.schema.json",
+  "$id": "https://qtea/schemas/xray-mapping.schema.json",
   "title": "XrayMapping",
   "type": "object",
   "required": ["status"],

@@ -2,7 +2,7 @@
 
 Parallel to :mod:`tests.unit._fake_claude` which mocks the Agent SDK
 subprocess. This one mocks ``anthropic.AsyncAnthropic`` so tests of
-:func:`worca_t.llm.reasoning.call_reasoning_llm` (and the step files
+:func:`qtea.llm.reasoning.call_reasoning_llm` (and the step files
 that call it) can supply canned responses without hitting a real API.
 
 Typical use::

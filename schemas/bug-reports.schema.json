@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://worca-t.dev/schemas/bug-reports.schema.json",
+  "$id": "https://qtea.dev/schemas/bug-reports.schema.json",
   "title": "Bug Reports",
   "type": "object",
   "required": ["run_id", "generated_at", "summary", "bugs"],
@@ -51,7 +51,7 @@
               "accessibility", "integration", "flaky", "environment",
               "test-code-defect"
             ],
-            "description": "Dominant failure axis. `test-code-defect` MUST be used when the failure is in test code that worca-t generated this run (collection ImportError, syntax error, undefined-symbol in fixtures/conftest, etc.) — distinct from `environment` which is for SUT infrastructure issues. Cross-reference `artifacts/step08/generated-files.json` to tell the two apart."
+            "description": "Dominant failure axis. `test-code-defect` MUST be used when the failure is in test code that qtea generated this run (collection ImportError, syntax error, undefined-symbol in fixtures/conftest, etc.) — distinct from `environment` which is for SUT infrastructure issues. Cross-reference `artifacts/step08/generated-files.json` to tell the two apart."
           },
           "component": { "type": "string" },
           "requirement_id": { "type": "string" },

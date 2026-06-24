@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://worca-t/schemas/code-modification-plan.schema.json",
+  "$id": "https://qtea/schemas/code-modification-plan.schema.json",
   "title": "CodeModificationPlan",
   "description": "Structural mapping from test-strategy.md test cases to the SUT's existing code. Produced by Step 7 (test-architect) and consumed by Step 8 (TDD codegen). Authoritative for placement decisions (which fixtures to reuse, where new POM methods go, what TBD intents to emit). The writer agent transpiles the plan into code; it does not redo placement reasoning.",
   "type": "object",
@@ -28,7 +28,7 @@
         "title": { "type": ["string", "null"] },
         "test_file_target": {
           "type": "string",
-          "description": "SUT-relative or absolute path where the worca-prefixed test file lands. Must match the active module's test_directory_layout convention."
+          "description": "SUT-relative or absolute path where the qtea-prefixed test file lands. Must match the active module's test_directory_layout convention."
         },
         "test_functions": {
           "type": "array",
@@ -63,7 +63,7 @@
           "type": "array",
           "items": {
             "type": "string",
-            "pattern": "^worca_(smoke|regression|e2e|exploratory)$"
+            "pattern": "^qtea_(smoke|regression|e2e|exploratory)$"
           }
         },
         "uses_fixtures": {

@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from worca_t.steps.s09_execute import (
+from qtea.steps.s09_execute import (
     _ensure_runtime_imports,
     _format_promoted_substitution,
     _promote_resolved_tbds,
@@ -83,21 +83,21 @@ def test_format_unknown_kind_returns_none():
 
 
 # ---------------------------------------------------------------------------
-# _ensure_runtime_imports: extend the `from tests.worca_t_runtime import …` line
+# _ensure_runtime_imports: extend the `from tests.qtea_runtime import …` line
 # ---------------------------------------------------------------------------
 
 
 def test_ensure_runtime_imports_adds_new_helpers():
     text = (
-        "from tests.worca_t_runtime import tbd\n"
+        "from tests.qtea_runtime import tbd\n"
         "from typing import ClassVar\n"
     )
     out = _ensure_runtime_imports(text, {"role_locator", "text_locator"})
-    assert "from tests.worca_t_runtime import role_locator, tbd, text_locator" in out
+    assert "from tests.qtea_runtime import role_locator, tbd, text_locator" in out
 
 
 def test_ensure_runtime_imports_is_noop_when_already_present():
-    text = "from tests.worca_t_runtime import tbd, role_locator\n"
+    text = "from tests.qtea_runtime import tbd, role_locator\n"
     out = _ensure_runtime_imports(text, {"role_locator"})
     assert out == text
 
@@ -134,7 +134,7 @@ def _write_cache(tmp_path: Path, entries: list[dict]) -> Path:
 
 def test_promote_witnessed_css_substitutes_string(tmp_path):
     pom = (
-        "from tests.worca_t_runtime import tbd\n"
+        "from tests.qtea_runtime import tbd\n"
         "class L:\n"
         "    def __init__(self):\n"
         "        self.X = tbd('login button')\n"
@@ -159,7 +159,7 @@ def test_promote_witnessed_css_substitutes_string(tmp_path):
 
 def test_promote_witnessed_role_emits_role_locator_call(tmp_path):
     pom = (
-        "from tests.worca_t_runtime import tbd\n"
+        "from tests.qtea_runtime import tbd\n"
         "class L:\n"
         "    def __init__(self):\n"
         "        self.GEMINI = tbd('Go to Gemini Enterprise side nav button')\n"
@@ -182,12 +182,12 @@ def test_promote_witnessed_role_emits_role_locator_call(tmp_path):
     text = (sut / "pages" / "locators" / "chat_page_locators.py").read_text(encoding="utf-8")
     assert 'role_locator("link", name="Go to Gemini Enterprise")' in text
     # The runtime import line gained `role_locator`.
-    assert "from tests.worca_t_runtime import role_locator, tbd" in text
+    assert "from tests.qtea_runtime import role_locator, tbd" in text
 
 
 def test_unwitnessed_entry_is_blocked(tmp_path):
     pom = (
-        "from tests.worca_t_runtime import tbd\n"
+        "from tests.qtea_runtime import tbd\n"
         "class L:\n"
         "    def __init__(self):\n"
         "        self.X = tbd('foo')\n"
@@ -217,7 +217,7 @@ def test_malformed_selector_is_blocked(tmp_path):
     debug-print syntax, not valid CSS. The validator catches it; the POM is
     left alone; a bug-candidate is emitted."""
     pom = (
-        "from tests.worca_t_runtime import tbd\n"
+        "from tests.qtea_runtime import tbd\n"
         "class L:\n"
         "    def __init__(self):\n"
         "        self.X = tbd('Gemini button')\n"
@@ -244,7 +244,7 @@ def test_malformed_selector_is_blocked(tmp_path):
 def test_mixed_witnessed_and_unwitnessed(tmp_path):
     """One entry promotes, the other is blocked — both reported correctly."""
     pom = (
-        "from tests.worca_t_runtime import tbd\n"
+        "from tests.qtea_runtime import tbd\n"
         "class L:\n"
         "    def __init__(self):\n"
         "        self.A = tbd('alpha')\n"

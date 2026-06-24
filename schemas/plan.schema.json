@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://worca-t/schemas/plan.schema.json",
+  "$id": "https://qtea/schemas/plan.schema.json",
   "title": "TestPlan",
   "type": "object",
   "required": ["title", "phases"],

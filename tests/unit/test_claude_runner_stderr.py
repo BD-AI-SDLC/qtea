@@ -3,7 +3,7 @@
 Background: the Claude Agent SDK's subprocess transport (`claude` CLI) is
 always launched with `--verbose`, but its stderr is only piped when the
 caller registers an `options.stderr` callback. Before this wiring,
-worca-t left the slot empty — discarding the underlying API error text
+qtea left the slot empty — discarding the underlying API error text
 behind every `api_retry` event and leaving us with `error: "unknown"` in
 post-mortems (run 20260603-205851-2d359f exemplified this: 8 retries
 emitted, none with a recoverable diagnostic).
@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from worca_t.claude_runner import run_agent
+from qtea.claude_runner import run_agent
 
 
 def _fake_agent_file(tmp_path: Path) -> Path:
@@ -35,7 +35,7 @@ async def test_stderr_callback_is_registered(tmp_path: Path, monkeypatch):
     from ._fake_claude import _make_message
 
     monkeypatch.setattr(
-        "worca_t.claude_runner.shutil.which",
+        "qtea.claude_runner.shutil.which",
         lambda *_a, **_kw: "/fake/claude",
     )
 
@@ -46,7 +46,7 @@ async def test_stderr_callback_is_registered(tmp_path: Path, monkeypatch):
         yield _make_message({"type": "result", "result": "ok",
                              "session_id": "sess-stderr"})
 
-    monkeypatch.setattr("worca_t.claude_runner.query", _fake_query)
+    monkeypatch.setattr("qtea.claude_runner.query", _fake_query)
 
     agent_path = _fake_agent_file(tmp_path)
     workdir = tmp_path / "wd"
@@ -73,7 +73,7 @@ async def test_stderr_callback_writes_lines_to_disk(tmp_path: Path, monkeypatch)
     from ._fake_claude import _make_message
 
     monkeypatch.setattr(
-        "worca_t.claude_runner.shutil.which",
+        "qtea.claude_runner.shutil.which",
         lambda *_a, **_kw: "/fake/claude",
     )
 
@@ -88,7 +88,7 @@ async def test_stderr_callback_writes_lines_to_disk(tmp_path: Path, monkeypatch)
         yield _make_message({"type": "result", "result": "ok",
                              "session_id": "sess-write"})
 
-    monkeypatch.setattr("worca_t.claude_runner.query", _fake_query)
+    monkeypatch.setattr("qtea.claude_runner.query", _fake_query)
 
     agent_path = _fake_agent_file(tmp_path)
     workdir = tmp_path / "wd"
@@ -122,7 +122,7 @@ async def test_stderr_callback_swallows_writes_after_file_closed(
     from ._fake_claude import _make_message
 
     monkeypatch.setattr(
-        "worca_t.claude_runner.shutil.which",
+        "qtea.claude_runner.shutil.which",
         lambda *_a, **_kw: "/fake/claude",
     )
 
@@ -133,7 +133,7 @@ async def test_stderr_callback_swallows_writes_after_file_closed(
         yield _make_message({"type": "result", "result": "ok",
                              "session_id": "sess-close"})
 
-    monkeypatch.setattr("worca_t.claude_runner.query", _fake_query)
+    monkeypatch.setattr("qtea.claude_runner.query", _fake_query)
 
     agent_path = _fake_agent_file(tmp_path)
     workdir = tmp_path / "wd"
@@ -177,7 +177,7 @@ async def test_runner_banner_appended_below_cli_stderr(tmp_path: Path, monkeypat
     """
 
     monkeypatch.setattr(
-        "worca_t.claude_runner.shutil.which",
+        "qtea.claude_runner.shutil.which",
         lambda *_a, **_kw: "/fake/claude",
     )
 
@@ -191,7 +191,7 @@ async def test_runner_banner_appended_below_cli_stderr(tmp_path: Path, monkeypat
         raise RuntimeError("upstream API failure")
         yield  # unreachable — keep generator shape
 
-    monkeypatch.setattr("worca_t.claude_runner.query", _fake_query)
+    monkeypatch.setattr("qtea.claude_runner.query", _fake_query)
 
     agent_path = _fake_agent_file(tmp_path)
     workdir = tmp_path / "wd"
@@ -212,7 +212,7 @@ async def test_runner_banner_appended_below_cli_stderr(tmp_path: Path, monkeypat
     # Runner banner still present (was dropped when CLI had written).
     assert "upstream API failure" in contents
     # Separator marks the boundary so post-mortems can tell them apart.
-    assert "--- worca-t runner ---" in contents
+    assert "--- qtea runner ---" in contents
     # CLI text comes BEFORE the separator (banner is the footer).
-    assert contents.index("socket hang up") < contents.index("--- worca-t runner ---")
-    assert contents.index("--- worca-t runner ---") < contents.index("upstream API failure")
+    assert contents.index("socket hang up") < contents.index("--- qtea runner ---")
+    assert contents.index("--- qtea runner ---") < contents.index("upstream API failure")

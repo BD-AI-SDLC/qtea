@@ -5,15 +5,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from worca_t.checkpoints import RunState
-from worca_t.pipeline import PipelineOptions
-from worca_t.steps.base import StepContext
-from worca_t.steps.s03_plan import (
+from qtea.checkpoints import RunState
+from qtea.pipeline import PipelineOptions
+from qtea.steps.base import StepContext
+from qtea.steps.s03_plan import (
     PlanStep,
     _extract_commands,
     _project_plan,
 )
-from worca_t.workspace import create_workspace
+from qtea.workspace import create_workspace
 
 from ._fake_anthropic import (
     FakeResponse,
@@ -249,9 +249,9 @@ async def test_plan_step_hitl_loop_prompts_user_and_reruns(
     calls = _install_scripted_anthropic(monkeypatch, [PLAN_MD_WITH_BLOCKERS, PLAN_MD])
 
     # prompt_user returns dict[str, tuple[resolution, text]].
-    from worca_t.hitl import RESOLUTION_ANSWERED
+    from qtea.hitl import RESOLUTION_ANSWERED
     monkeypatch.setattr(
-        "worca_t.hitl.prompt_user",
+        "qtea.hitl.prompt_user",
         lambda questions, *, agent_label: {
             q.id: (RESOLUTION_ANSWERED, "use mock IdP") for q in questions
         },

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://worca-t/schemas/tbd-index.schema.json",
+  "$id": "https://qtea/schemas/tbd-index.schema.json",
   "title": "TBDIndex",
   "description": "Index of files containing TBD markers after Step 7 codegen (and re-indexed after Step 8 patching). Separates actual test functions from support files (page objects, locators, helpers) that happen to carry TBDs.",
   "type": "object",

@@ -7,7 +7,7 @@ transport: reasoning
 
 # TBD Intent Scorer
 
-You receive a JSON list of UI-element intent strings emitted by the worca-t codegen step as `tbd("…")` / `Tbd.of("…")` sentinels. Each intent will be passed to the JIT locator resolver at test runtime to find a single DOM element on a live page via the accessibility object model (AOM).
+You receive a JSON list of UI-element intent strings emitted by the qtea codegen step as `tbd("…")` / `Tbd.of("…")` sentinels. Each intent will be passed to the JIT locator resolver at test runtime to find a single DOM element on a live page via the accessibility object model (AOM).
 
 Your job: judge whether each intent is specific and unambiguous enough that the resolver can reliably find the correct element. Return a verdict (PASS / WARN / FAIL) and a one-line rationale per intent.
 

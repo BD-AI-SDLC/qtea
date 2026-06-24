@@ -7,8 +7,8 @@ a test case. The fix adds a reserved-titles list and a body-marker check.
 
 from __future__ import annotations
 
-from worca_t.md_parser import Section
-from worca_t.steps.s04_strategy import _looks_like_test_case, _project_strategy
+from qtea.md_parser import Section
+from qtea.steps.s04_strategy import _looks_like_test_case, _project_strategy
 
 
 def _section(title: str, content: str = "", level: int = 2) -> Section:

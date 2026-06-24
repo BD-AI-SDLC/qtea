@@ -1,4 +1,4 @@
-"""Tests for the ``worca-t auth-capture`` Use case A capture path.
+"""Tests for the ``qtea auth-capture`` Use case A capture path.
 
 Mocks the SUT venv subprocess (no real Playwright spawn) and exercises
 the inventory-loading, wrapper-script generation, and error paths.
@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from worca_t.auth_capture import (
+from qtea.auth_capture import (
     DEFAULT_OUTPUT_REL,
     AuthFlowSpec,
     _active_module,
@@ -30,10 +30,10 @@ from worca_t.auth_capture import (
 
 
 def _make_sut_with_inventory(tmp_path: Path, inventory: dict) -> Path:
-    """Create a fake SUT with the canonical .worca-t/sut_inventory.json."""
+    """Create a fake SUT with the canonical .qtea/sut_inventory.json."""
     sut = tmp_path / "sut"
-    (sut / ".worca-t").mkdir(parents=True)
-    (sut / ".worca-t" / "sut_inventory.json").write_text(
+    (sut / ".qtea").mkdir(parents=True)
+    (sut / ".qtea" / "sut_inventory.json").write_text(
         json.dumps(inventory), encoding="utf-8",
     )
     return sut
@@ -176,7 +176,7 @@ def _seed_sut_for_capture(
 ) -> Path:
     """Materialize a fake SUT layout: inventory + venv stub + sign-in helper."""
     sut = tmp_path / "sut"
-    (sut / ".worca-t").mkdir(parents=True)
+    (sut / ".qtea").mkdir(parents=True)
     inventory = {
         "active_module": "frontend",
         "modules": [{
@@ -189,7 +189,7 @@ def _seed_sut_for_capture(
             },
         }],
     }
-    (sut / ".worca-t" / "sut_inventory.json").write_text(
+    (sut / ".qtea" / "sut_inventory.json").write_text(
         json.dumps(inventory), encoding="utf-8",
     )
     # Fake venv python (windows or posix layout — pick by current OS).
@@ -218,7 +218,7 @@ def test_cmd_auth_capture_writes_output_at_default_path(tmp_path, monkeypatch):
         expected_output.write_text('{"cookies":[],"origins":[]}', encoding="utf-8")
         return subprocess.CompletedProcess(argv, returncode=0, stdout="ok", stderr="")
 
-    monkeypatch.setattr("worca_t.auth_capture.subprocess.run", fake_run)
+    monkeypatch.setattr("qtea.auth_capture.subprocess.run", fake_run)
 
     out = cmd_auth_capture(sut=sut, output=None, headed=True)
     assert out.resolve() == expected_output.resolve()
@@ -234,7 +234,7 @@ def test_cmd_auth_capture_honors_explicit_output(tmp_path, monkeypatch):
         explicit.write_text('{}', encoding="utf-8")
         return subprocess.CompletedProcess(argv, returncode=0, stdout="ok", stderr="")
 
-    monkeypatch.setattr("worca_t.auth_capture.subprocess.run", fake_run)
+    monkeypatch.setattr("qtea.auth_capture.subprocess.run", fake_run)
 
     out = cmd_auth_capture(sut=sut, output=explicit, headed=True)
     assert out.resolve() == explicit.resolve()
@@ -262,7 +262,7 @@ def test_cmd_auth_capture_raises_when_subprocess_fails(tmp_path, monkeypatch):
             stderr="Traceback...\nE   ModuleNotFoundError: playwright",
         )
 
-    monkeypatch.setattr("worca_t.auth_capture.subprocess.run", fake_run)
+    monkeypatch.setattr("qtea.auth_capture.subprocess.run", fake_run)
     with pytest.raises(RuntimeError, match="exit code 2"):
         cmd_auth_capture(sut=sut)
 
@@ -275,7 +275,7 @@ def test_cmd_auth_capture_raises_when_no_file_written(tmp_path, monkeypatch):
     def fake_run(argv, **kwargs):
         return subprocess.CompletedProcess(argv, returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr("worca_t.auth_capture.subprocess.run", fake_run)
+    monkeypatch.setattr("qtea.auth_capture.subprocess.run", fake_run)
     with pytest.raises(RuntimeError, match="no file was written"):
         cmd_auth_capture(sut=sut)
 
@@ -290,7 +290,7 @@ def test_cmd_auth_capture_sets_owner_only_perms_on_posix(tmp_path, monkeypatch):
         expected.write_text('{}', encoding="utf-8")
         return subprocess.CompletedProcess(argv, returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr("worca_t.auth_capture.subprocess.run", fake_run)
+    monkeypatch.setattr("qtea.auth_capture.subprocess.run", fake_run)
 
     out = cmd_auth_capture(sut=sut)
     mode = out.stat().st_mode & 0o777

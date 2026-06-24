@@ -1,10 +1,10 @@
-"""Tests for worca_t.tbd_scanner."""
+"""Tests for qtea.tbd_scanner."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from worca_t.tbd_scanner import (
+from qtea.tbd_scanner import (
     detect_language,
     scan_file,
     scan_tbd_intents,
@@ -35,7 +35,7 @@ def test_detect_language_covers_supported_extensions():
 def test_python_assignment_form_captures_constant(tmp_path: Path):
     src = tmp_path / "locators.py"
     src.write_text(
-        "from tests.worca_t_runtime import tbd\n"
+        "from tests.qtea_runtime import tbd\n"
         "\n"
         "class LoginLocators:\n"
         "    LOGIN_BUTTON = tbd(\"sign in button\")\n"
@@ -98,7 +98,7 @@ def test_python_quoted_hash_in_intent_does_not_truncate(tmp_path: Path):
 def test_typescript_const_assignment(tmp_path: Path):
     src = tmp_path / "locators.ts"
     src.write_text(
-        "import { tbd } from \"./worca-t-runtime\";\n"
+        "import { tbd } from \"./qtea-runtime\";\n"
         "export const LOGIN_BUTTON = tbd(\"sign in button\");\n"
         "export const EMAIL = tbd(`username input`);\n",
         encoding="utf-8",
@@ -109,10 +109,10 @@ def test_typescript_const_assignment(tmp_path: Path):
     assert intents == {"sign in button", "username input"}
 
 
-def test_typescript_worca_prefixed_call(tmp_path: Path):
+def test_typescript_qtea_prefixed_call(tmp_path: Path):
     src = tmp_path / "page.ts"
     src.write_text(
-        "page.locator(worca.tbd(\"close button\")).click();\n",
+        "page.locator(qtea.tbd(\"close button\")).click();\n",
         encoding="utf-8",
     )
     results = scan_file(src)
@@ -158,7 +158,7 @@ def test_java_static_final_captures_constant(tmp_path: Path):
     src = tmp_path / "LoginLocators.java"
     src.write_text(
         "package com.example;\n"
-        "import com.worca.runtime.Tbd;\n"
+        "import com.qtea.runtime.Tbd;\n"
         "import org.openqa.selenium.By;\n"
         "\n"
         "public class LoginLocators {\n"
@@ -273,19 +273,19 @@ def test_scan_handles_unreadable_file_gracefully(tmp_path: Path):
 
 def test_scan_finds_files_under_hidden_prefixed_ancestor(tmp_path: Path):
     """Regression: when the scan root lives under a hidden-prefixed
-    parent (e.g. worca-t workspaces at ``~/.worca-t/<run>/sut``), the
+    parent (e.g. qtea workspaces at ``~/.qtea/<run>/sut``), the
     hidden-dir filter MUST NOT match the parent and skip every file.
     Previously this silently disabled TBD promotion across every run.
     """
-    # Build  ``<tmp>/.worca-t/run-abc/sut/src/locators.py`` —
-    # the path contains a ``.worca-t`` ancestor that the filter would
+    # Build  ``<tmp>/.qtea/run-abc/sut/src/locators.py`` —
+    # the path contains a ``.qtea`` ancestor that the filter would
     # historically reject.
-    hidden_root = tmp_path / ".worca-t" / "run-abc" / "sut"
+    hidden_root = tmp_path / ".qtea" / "run-abc" / "sut"
     (hidden_root / "src").mkdir(parents=True)
     (hidden_root / "src" / "locators.py").write_text(
         'BUTTON = tbd("primary submit button")\n', encoding="utf-8",
     )
-    # Scan the SUT root that itself sits beneath ``.worca-t/``.
+    # Scan the SUT root that itself sits beneath ``.qtea/``.
     results = scan_tbd_intents([hidden_root], sut_root=hidden_root)
     assert len(results) == 1
     assert results[0].intent == "primary submit button"

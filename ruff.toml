@@ -1,7 +1,7 @@
 line-length = 100
 target-version = "py311"
 src = ["src"]
-extend-exclude = ["candidate_agents", ".worca-t", ".venv"]
+extend-exclude = ["candidate_agents", ".qtea", ".venv"]
 
 [lint]
 select = ["E", "F", "I", "B", "UP", "S", "RUF", "SIM", "PL", "C4", "PTH"]
@@ -18,5 +18,5 @@ ignore = [
 
 [lint.per-file-ignores]
 "tests/**/*.py" = ["S", "PLR", "B", "E501", "E702", "SIM105", "PLW2901", "RUF005"]
-"src/worca_t/report/html_renderer.py" = ["E501"]
-"src/worca_t/cli.py" = ["B008", "E501"]
+"src/qtea/report/html_renderer.py" = ["E501"]
+"src/qtea/cli.py" = ["B008", "E501"]

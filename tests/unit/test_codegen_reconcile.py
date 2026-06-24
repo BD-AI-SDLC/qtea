@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from worca_t.codegen_reconcile import (
+from qtea.codegen_reconcile import (
     FixtureMismatch,
     Mismatch,
     fixture_mismatches_to_fixture_tasks,
@@ -393,7 +393,7 @@ def test_mismatches_to_pom_tasks_reuses_existing_pom_task_metadata(tmp_path: Pat
     # preserve its `source` / `from_path` / `at_path` / locator wiring so
     # `_extend_poms` re-runs against the same physical POM file with the
     # same locator imports.
-    from worca_t.steps.s08_codegen import _PomTask
+    from qtea.steps.s08_codegen import _PomTask
 
     pom_rel = "pages/login_page.py"
     test_rel = "tests/test_x.py"
@@ -441,7 +441,7 @@ def test_mismatches_to_pom_tasks_reuses_existing_pom_task_metadata(tmp_path: Pat
 
 
 def test_mismatch_as_dict_carries_required_fields():
-    from worca_t.codegen_reconcile import CallSite
+    from qtea.codegen_reconcile import CallSite
 
     cs = CallSite(
         test_file="tests/t.py", line=42, obj_name="login_page",
@@ -470,7 +470,7 @@ def test_mismatch_as_dict_carries_required_fields():
 
 def _reconcile_python_pair(tmp_path: Path, pom_src: str, test_src: str):
     pom_rel = "pages/login_page.py"
-    test_rel = "tests/worca_x_test.py"
+    test_rel = "tests/qtea_x_test.py"
     _touch(tmp_path / pom_rel, pom_src)
     _touch(tmp_path / test_rel, test_src)
     return reconcile_codegen(
@@ -486,7 +486,7 @@ def _reconcile_js_pair(
     language: str = "typescript", ext: str = "ts",
 ):
     pom_rel = f"pages/login_page.{ext}"
-    test_rel = f"tests/worca_x_test.{ext}"
+    test_rel = f"tests/qtea_x_test.{ext}"
     _touch(tmp_path / pom_rel, pom_src)
     _touch(tmp_path / test_rel, test_src)
     return reconcile_codegen(
@@ -651,7 +651,7 @@ def test_playwright_page_fixture_not_resolved_to_pom_named_page(tmp_path: Path):
     """A POM literally named `Page` must not capture every `page.click()` in tests."""
     # POM happens to be named Page (uncommon but legal — e.g. a base class).
     pom_rel = "pages/base.py"
-    test_rel = "tests/worca_x_test.py"
+    test_rel = "tests/qtea_x_test.py"
     _touch(
         tmp_path / pom_rel,
         "class Page:\n    def open(self):\n        pass\n",
@@ -678,10 +678,10 @@ def test_playwright_page_fixture_not_resolved_to_pom_named_page(tmp_path: Path):
 def test_mismatches_to_pom_tasks_uses_manifest_when_no_original_task(tmp_path: Path):
     """When the test calls a POM not in the original plan, the synthesised
     task must still pick up locator_file / locator_class from the manifest."""
-    from worca_t.codegen_reconcile import CallSite
+    from qtea.codegen_reconcile import CallSite
 
     cs = CallSite(
-        test_file="tests/worca_x_test.py", line=10, obj_name="dashboard_page",
+        test_file="tests/qtea_x_test.py", line=10, obj_name="dashboard_page",
         method_name="open", arity=0, kw_names=[],
         snippet="dashboard_page.open()",
     )
@@ -785,10 +785,10 @@ def test_typo_ambiguous_tie_falls_through_to_method_not_found(tmp_path: Path):
 def test_likely_typo_excluded_from_autopatch_tasks(tmp_path: Path):
     """`mismatches_to_pom_tasks` must NEVER synthesise a patch for a typo —
     otherwise a stub for `sumbit_form` would be added, masking the test bug."""
-    from worca_t.codegen_reconcile import CallSite
+    from qtea.codegen_reconcile import CallSite
 
     cs = CallSite(
-        test_file="tests/worca_x_test.py", line=10,
+        test_file="tests/qtea_x_test.py", line=10,
         obj_name="login_page", method_name="sumbit_form",
         arity=0, kw_names=[], snippet="login_page.sumbit_form()",
     )
@@ -808,7 +808,7 @@ def test_likely_typo_excluded_from_autopatch_tasks(tmp_path: Path):
 
 
 def _make_orig_task():
-    from worca_t.steps.s08_codegen import _PomTask
+    from qtea.steps.s08_codegen import _PomTask
     return _PomTask(
         pom_name="LoginPage", pom_file="pages/login_page.py",
         source="reuse", from_path="pages/login_page.py",
@@ -820,7 +820,7 @@ def _make_orig_task():
 def test_parse_error_call_site_line_is_at_least_one(tmp_path: Path):
     """parse_error mismatches must satisfy schema's `line >= 1` constraint."""
     pom_rel = "pages/login_page.py"
-    test_rel = "tests/worca_broken_test.py"
+    test_rel = "tests/qtea_broken_test.py"
     _touch(tmp_path / pom_rel, "class LoginPage:\n    def x(self):\n        pass\n")
     _touch(tmp_path / test_rel, "def test_x(:\n    invalid syntax\n")  # SyntaxError
     recon = reconcile_codegen(
@@ -884,7 +884,7 @@ def _plan_with_create_fixtures(file_rel: str, names: list[str]) -> dict:
 
 
 def test_reconcile_fixtures_no_mismatches_when_all_present(tmp_path: Path):
-    file_rel = "tests/fixtures/worca_nav.py"
+    file_rel = "tests/fixtures/qtea_nav.py"
     _touch(tmp_path / file_rel, _FIX_FILE_TWO_DEFINED)
     plan = _plan_with_create_fixtures(
         file_rel, ["gemini_nav_locale_en", "mobile_viewport"],
@@ -896,7 +896,7 @@ def test_reconcile_fixtures_no_mismatches_when_all_present(tmp_path: Path):
 
 def test_reconcile_fixtures_symbol_missing_when_file_lacks_def(tmp_path: Path):
     """The Phase A4 race condition reproducer: 1 fixture survived, 5 declared."""
-    file_rel = "tests/fixtures/worca_nav.py"
+    file_rel = "tests/fixtures/qtea_nav.py"
     _touch(tmp_path / file_rel, _FIX_FILE_ONLY_MOBILE)
     plan = _plan_with_create_fixtures(
         file_rel,

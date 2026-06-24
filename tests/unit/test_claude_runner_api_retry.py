@@ -10,7 +10,7 @@ The circuit breaker added in response:
 - Counts consecutive `api_retry` SystemMessages with NO intervening
   AssistantMessage / ResultMessage / UserMessage.
 - When the counter hits the active threshold (default 8; env-overridable
-  via `WORCA_T_API_RETRY_THRESHOLD` in `[1, 10]`), raises `_ApiRetryStorm`
+  via `QTEA_API_RETRY_THRESHOLD` in `[1, 10]`), raises `_ApiRetryStorm`
   which `run_agent` translates into a failed AgentResult with a clear,
   actionable error message.
 - Each `api_retry` is also logged at WARNING level so an in-progress
@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from worca_t.claude_runner import (
+from qtea.claude_runner import (
     _API_RETRY_STORM_THRESHOLD_DEFAULT,
     _api_retry_storm_threshold,
     run_agent,
@@ -68,34 +68,34 @@ def _retry_event(attempt: int, session_id: str) -> dict:
 
 
 def test_api_retry_threshold_default(monkeypatch):
-    monkeypatch.delenv("WORCA_T_API_RETRY_THRESHOLD", raising=False)
+    monkeypatch.delenv("QTEA_API_RETRY_THRESHOLD", raising=False)
     assert _api_retry_storm_threshold() == _API_RETRY_STORM_THRESHOLD_DEFAULT == 8
 
 
 def test_api_retry_threshold_env_override(monkeypatch):
-    monkeypatch.setenv("WORCA_T_API_RETRY_THRESHOLD", "7")
+    monkeypatch.setenv("QTEA_API_RETRY_THRESHOLD", "7")
     assert _api_retry_storm_threshold() == 7
 
 
 def test_api_retry_threshold_env_invalid_falls_back_to_default(monkeypatch, caplog):
-    monkeypatch.setenv("WORCA_T_API_RETRY_THRESHOLD", "not-a-number")
+    monkeypatch.setenv("QTEA_API_RETRY_THRESHOLD", "not-a-number")
     assert _api_retry_storm_threshold() == _API_RETRY_STORM_THRESHOLD_DEFAULT
 
 
 def test_api_retry_threshold_env_out_of_range_falls_back(monkeypatch):
     # SDK gives up at 10 by default; anything above is unreachable.
-    monkeypatch.setenv("WORCA_T_API_RETRY_THRESHOLD", "99")
+    monkeypatch.setenv("QTEA_API_RETRY_THRESHOLD", "99")
     assert _api_retry_storm_threshold() == _API_RETRY_STORM_THRESHOLD_DEFAULT
     # Zero / negative is a misconfiguration (effectively "no SDK retries
     # tolerated" — the SDK always retries once before the first event).
-    monkeypatch.setenv("WORCA_T_API_RETRY_THRESHOLD", "0")
+    monkeypatch.setenv("QTEA_API_RETRY_THRESHOLD", "0")
     assert _api_retry_storm_threshold() == _API_RETRY_STORM_THRESHOLD_DEFAULT
-    monkeypatch.setenv("WORCA_T_API_RETRY_THRESHOLD", "-1")
+    monkeypatch.setenv("QTEA_API_RETRY_THRESHOLD", "-1")
     assert _api_retry_storm_threshold() == _API_RETRY_STORM_THRESHOLD_DEFAULT
 
 
 def test_api_retry_threshold_env_empty_falls_back(monkeypatch):
-    monkeypatch.setenv("WORCA_T_API_RETRY_THRESHOLD", "")
+    monkeypatch.setenv("QTEA_API_RETRY_THRESHOLD", "")
     assert _api_retry_storm_threshold() == _API_RETRY_STORM_THRESHOLD_DEFAULT
 
 
@@ -111,9 +111,9 @@ async def test_api_retry_storm_aborts_at_default_threshold(tmp_path: Path, monke
     retry); 8 is the first that trips the breaker."""
     from ._fake_claude import _make_message
 
-    monkeypatch.delenv("WORCA_T_API_RETRY_THRESHOLD", raising=False)
+    monkeypatch.delenv("QTEA_API_RETRY_THRESHOLD", raising=False)
     monkeypatch.setattr(
-        "worca_t.claude_runner.shutil.which",
+        "qtea.claude_runner.shutil.which",
         lambda *_a, **_kw: "/fake/claude",
     )
 
@@ -139,7 +139,7 @@ async def test_api_retry_storm_aborts_at_default_threshold(tmp_path: Path, monke
         for spec in storm:
             yield _make_message(spec)
 
-    monkeypatch.setattr("worca_t.claude_runner.query", _fake_query)
+    monkeypatch.setattr("qtea.claude_runner.query", _fake_query)
 
     agent_path = _fake_agent_file(tmp_path)
     workdir = tmp_path / "wd"
@@ -170,9 +170,9 @@ async def test_api_retry_below_threshold_does_not_abort(tmp_path: Path, monkeypa
     sacrificing real progress to a transient flake)."""
     from ._fake_claude import _make_message
 
-    monkeypatch.delenv("WORCA_T_API_RETRY_THRESHOLD", raising=False)
+    monkeypatch.delenv("QTEA_API_RETRY_THRESHOLD", raising=False)
     monkeypatch.setattr(
-        "worca_t.claude_runner.shutil.which",
+        "qtea.claude_runner.shutil.which",
         lambda *_a, **_kw: "/fake/claude",
     )
 
@@ -196,7 +196,7 @@ async def test_api_retry_below_threshold_does_not_abort(tmp_path: Path, monkeypa
         for spec in messages:
             yield _make_message(spec)
 
-    monkeypatch.setattr("worca_t.claude_runner.query", _fake_query)
+    monkeypatch.setattr("qtea.claude_runner.query", _fake_query)
 
     agent_path = _fake_agent_file(tmp_path)
     workdir = tmp_path / "wd"
@@ -224,9 +224,9 @@ async def test_api_retry_counter_resets_on_progress(tmp_path: Path, monkeypatch)
     the new threshold)."""
     from ._fake_claude import _make_message
 
-    monkeypatch.delenv("WORCA_T_API_RETRY_THRESHOLD", raising=False)
+    monkeypatch.delenv("QTEA_API_RETRY_THRESHOLD", raising=False)
     monkeypatch.setattr(
-        "worca_t.claude_runner.shutil.which",
+        "qtea.claude_runner.shutil.which",
         lambda *_a, **_kw: "/fake/claude",
     )
 
@@ -252,7 +252,7 @@ async def test_api_retry_counter_resets_on_progress(tmp_path: Path, monkeypatch)
         for spec in messages:
             yield _make_message(spec)
 
-    monkeypatch.setattr("worca_t.claude_runner.query", _fake_query)
+    monkeypatch.setattr("qtea.claude_runner.query", _fake_query)
 
     agent_path = _fake_agent_file(tmp_path)
     workdir = tmp_path / "wd"
@@ -275,13 +275,13 @@ async def test_api_retry_counter_resets_on_progress(tmp_path: Path, monkeypatch)
 
 
 async def test_api_retry_env_override_lowers_threshold(tmp_path: Path, monkeypatch):
-    """`WORCA_T_API_RETRY_THRESHOLD=2` → abort on the 2nd consecutive retry
+    """`QTEA_API_RETRY_THRESHOLD=2` → abort on the 2nd consecutive retry
     (useful for debugging agent-loop bugs, where any retry is suspicious)."""
     from ._fake_claude import _make_message
 
-    monkeypatch.setenv("WORCA_T_API_RETRY_THRESHOLD", "2")
+    monkeypatch.setenv("QTEA_API_RETRY_THRESHOLD", "2")
     monkeypatch.setattr(
-        "worca_t.claude_runner.shutil.which",
+        "qtea.claude_runner.shutil.which",
         lambda *_a, **_kw: "/fake/claude",
     )
 
@@ -299,7 +299,7 @@ async def test_api_retry_env_override_lowers_threshold(tmp_path: Path, monkeypat
         for spec in messages:
             yield _make_message(spec)
 
-    monkeypatch.setattr("worca_t.claude_runner.query", _fake_query)
+    monkeypatch.setattr("qtea.claude_runner.query", _fake_query)
 
     agent_path = _fake_agent_file(tmp_path)
     workdir = tmp_path / "wd"
@@ -344,9 +344,9 @@ async def test_api_fatal_error_aborts_on_first_4xx(tmp_path: Path, monkeypatch):
     never retryable."""
     from ._fake_claude import _make_message
 
-    monkeypatch.delenv("WORCA_T_API_RETRY_THRESHOLD", raising=False)
+    monkeypatch.delenv("QTEA_API_RETRY_THRESHOLD", raising=False)
     monkeypatch.setattr(
-        "worca_t.claude_runner.shutil.which",
+        "qtea.claude_runner.shutil.which",
         lambda *_a, **_kw: "/fake/claude",
     )
 
@@ -364,7 +364,7 @@ async def test_api_fatal_error_aborts_on_first_4xx(tmp_path: Path, monkeypatch):
         for spec in messages:
             yield _make_message(spec)
 
-    monkeypatch.setattr("worca_t.claude_runner.query", _fake_query)
+    monkeypatch.setattr("qtea.claude_runner.query", _fake_query)
 
     agent_path = _fake_agent_file(tmp_path)
     workdir = tmp_path / "wd"
@@ -390,9 +390,9 @@ async def test_api_fatal_error_aborts_on_first_5xx(tmp_path: Path, monkeypatch):
     outages waste the step timeout budget without hope of recovery."""
     from ._fake_claude import _make_message
 
-    monkeypatch.delenv("WORCA_T_API_RETRY_THRESHOLD", raising=False)
+    monkeypatch.delenv("QTEA_API_RETRY_THRESHOLD", raising=False)
     monkeypatch.setattr(
-        "worca_t.claude_runner.shutil.which",
+        "qtea.claude_runner.shutil.which",
         lambda *_a, **_kw: "/fake/claude",
     )
 
@@ -409,7 +409,7 @@ async def test_api_fatal_error_aborts_on_first_5xx(tmp_path: Path, monkeypatch):
         for spec in messages:
             yield _make_message(spec)
 
-    monkeypatch.setattr("worca_t.claude_runner.query", _fake_query)
+    monkeypatch.setattr("qtea.claude_runner.query", _fake_query)
 
     agent_path = _fake_agent_file(tmp_path)
     workdir = tmp_path / "wd"

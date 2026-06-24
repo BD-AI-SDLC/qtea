@@ -8,7 +8,7 @@ Do NOT debug logic, do NOT edit assertions, do NOT mask bugs.
 
 ## Interaction with JIT mode (Python + pytest + Playwright)
 
-When the SUT is Python+pytest+Playwright, the Step 8-vendored runtime plugin (`tests/worca_t_runtime.py`) intercepts every `tbd("…")` sentinel and runs its own **cache-invalidate-and-re-resolve retry on `TimeoutError`** before this agent ever sees the failure. By the time you're invoked under JIT, the failure is one of:
+When the SUT is Python+pytest+Playwright, the Step 8-vendored runtime plugin (`tests/qtea_runtime.py`) intercepts every `tbd("…")` sentinel and runs its own **cache-invalidate-and-re-resolve retry on `TimeoutError`** before this agent ever sees the failure. By the time you're invoked under JIT, the failure is one of:
 - A locator the JIT runtime could not resolve even on a fresh LLM pass (the cache entry has `source: "unresolvable"` in `artifacts/step09/locator-cache.json` if you want to check).
 - A non-locator failure (assertion mismatch, navigation timeout, etc.) — out of scope for this agent's heal rules.
 - A locator the JIT runtime resolved correctly but whose action subsequently broke (e.g. the element appeared then disappeared mid-flow).
@@ -44,7 +44,7 @@ FORBIDDEN:
 - **Deleting OR renaming any file present in the SUT before this run** —
   including pre-existing tests, POMs, fixtures, configs, lockfiles,
   `conftest.py`, `.gitignore`, CI workflow files. You may only CREATE new
-  `worca_*` files and MODIFY the in-scope files enumerated above. If a file
+  `qtea_*` files and MODIFY the in-scope files enumerated above. If a file
   appears stale, broken, or wrong, raise it as a bug-candidate; do not
   delete or rename it. The git working-tree diff Step 9 records will detect
   any removal and revert the heal.
@@ -54,7 +54,7 @@ FORBIDDEN:
 - POM/page-object source files (e.g. `**/pages/object/*.py`, `**/pages/**.ts`, `**/pages/**.java`, equivalent for the active stack).
 - Locator constant files paired with those POMs (e.g. `**/pages/locators/*.py`, equivalent for the active stack).
 - **Codegen-generated test files** listed in the prompt's `--- GENERATED TEST FILES
-  (EDITABLE) ---` section. These are test files that worca-t's codegen (Step 8)
+  (EDITABLE) ---` section. These are test files that qtea's codegen (Step 8)
   authored this run. You may fix interaction patterns (method calls, API usage,
   navigation) but MUST NOT alter assertions.
 
@@ -83,7 +83,7 @@ Instead, emit `OUT_OF_SCOPE: <category>` (e.g. `fixture-defect`, `config-defect`
 inspection. Snapshot only — no trace/video recording.
 
 When the SUT itself runs Playwright (Python/TS/Java + Playwright), this
-is also the canonical capture method per worca-t's snapshot discipline
+is also the canonical capture method per qtea's snapshot discipline
 rule: **AOM only — `page.content()` / raw page-source dumps are forbidden
 in tests AND in your live observation**.
 
@@ -162,7 +162,7 @@ When the user prompt includes a "LIVE DIAGNOSIS" section, treat it as authoritat
      (`expect(locator).toBeVisible()` equivalent) — never `sleep`.
 6. Patch POM (NOT the test) with new selector. Single-file edit when possible.
 7. The Step 9 runner re-runs the single failing test via
-   `test_runner.run_tests(..., target=<test>)` (see `src/worca_t/test_runner.py`).
+   `test_runner.run_tests(..., target=<test>)` (see `src/qtea/test_runner.py`).
    The runner is polyglot; do not assume any framework-specific helper exists.
 8. If now passes: orchestrator marks `status="self_healed"`,
    `self_heal_success=true`. If still fails: STOP, leave locator as-is,
@@ -171,7 +171,7 @@ When the user prompt includes a "LIVE DIAGNOSIS" section, treat it as authoritat
 ## Output
 
 - Patched POM/locator files in-place (never new test files).
-- Your final response must be a one-line summary of what you changed (e.g. `"updated GEMINI_ENTERPRISE_LINK selector from '...' to '...'"`). Worca-t records the heal outcome from your exit status — DO NOT write any log file.
+- Your final response must be a one-line summary of what you changed (e.g. `"updated GEMINI_ENTERPRISE_LINK selector from '...' to '...'"`). Qtea-t records the heal outcome from your exit status — DO NOT write any log file.
 - On give-up: orchestrator handles bug report rendering — do not duplicate.
 
 ## Composed Skills

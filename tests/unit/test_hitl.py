@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from worca_t.hitl import (
+from qtea.hitl import (
     RESOLUTION_ANSWERED,
     RESOLUTION_SCOPE_EXCLUSION,
     RESOLUTION_SKIPPED_DROP,

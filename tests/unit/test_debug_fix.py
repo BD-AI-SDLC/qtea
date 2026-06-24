@@ -5,16 +5,16 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from worca_t.checkpoints import RunState
-from worca_t.pipeline import PipelineOptions
-from worca_t.steps.base import (
+from qtea.checkpoints import RunState
+from qtea.pipeline import PipelineOptions
+from qtea.steps.base import (
     Step,
     StepContext,
     StepResult,
     _run_fix_proposal,
     _snapshot_debug_artifacts,
 )
-from worca_t.workspace import create_workspace
+from qtea.workspace import create_workspace
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -266,7 +266,7 @@ async def test_fix_proposal_invoked_on_double_failure(tmp_path: Path):
     ctx = _ctx(tmp_path, fix=True)
     step = _AlwaysFailStep()
 
-    with patch("worca_t.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
+    with patch("qtea.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
         mock_agent.return_value = type("R", (), {
             "success": False, "final_text": "mock analysis", "error": None,
         })()
@@ -291,7 +291,7 @@ async def test_fix_flow_failure_does_not_crash(tmp_path: Path):
     step = _AlwaysFailStep()
 
     with patch(
-        "worca_t.steps.base.run_agent",
+        "qtea.steps.base.run_agent",
         new=AsyncMock(side_effect=Exception("agent unavailable")),
     ):
         result = await step.execute(ctx)
@@ -312,7 +312,7 @@ async def test_fix_flow_failure_does_not_crash(tmp_path: Path):
 async def test_run_fix_proposal_writes_files(tmp_path: Path):
     ctx = _ctx(tmp_path)
 
-    with patch("worca_t.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
+    with patch("qtea.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
         mock_agent.return_value = type("R", (), {
             "success": False, "final_text": "analysis text", "error": None,
         })()

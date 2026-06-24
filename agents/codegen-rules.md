@@ -22,11 +22,11 @@ Every **new** locator constant added by codegen MUST use `tbd("intent")` (or the
 
 **Four emission styles**, chosen by the active module's stack — pick exactly one branch based on `sut_inventory.json["modules"][active_module].language` + framework:
 
-**3a — Python + pytest + Playwright (JIT runtime path).** Import the worca-t runtime helper and use `tbd("intent")` in place of the bare `TBD_LOCATOR` literal. The Step 8 codegen step vendors a `tests/worca_t_runtime.py` plugin into the SUT; the helper produces a sentinel that the plugin intercepts at runtime via the live Playwright page. The plugin patches `Page.locator`, `Frame.locator`, AND `Locator.locator` on BOTH the sync (`playwright.sync_api`) AND async (`playwright.async_api`) API surfaces. **Mirror the SUT's existing Playwright API style** (sync vs async).
+**3a — Python + pytest + Playwright (JIT runtime path).** Import the qtea runtime helper and use `tbd("intent")` in place of the bare `TBD_LOCATOR` literal. The Step 8 codegen step vendors a `tests/qtea_runtime.py` plugin into the SUT; the helper produces a sentinel that the plugin intercepts at runtime via the live Playwright page. The plugin patches `Page.locator`, `Frame.locator`, AND `Locator.locator` on BOTH the sync (`playwright.sync_api`) AND async (`playwright.async_api`) API surfaces. **Mirror the SUT's existing Playwright API style** (sync vs async).
 
 ```python
 # In the locators module:
-from tests.worca_t_runtime import tbd
+from tests.qtea_runtime import tbd
 
 class LoginLocators:
     LOGIN_BUTTON = tbd("primary submit button on the login form")
@@ -35,10 +35,10 @@ class LoginLocators:
 
 The POM access pattern stays unchanged: `self.page.locator(self.locators.LOGIN_BUTTON).click()`. The runtime plugin transparently resolves the sentinel against the live page when the test executes.
 
-**3b — TypeScript / JavaScript + Playwright (Playwright Test, Jest, Vitest) — JIT runtime path.** Import the vendored `tbd()` helper from `./worca-t-runtime`.
+**3b — TypeScript / JavaScript + Playwright (Playwright Test, Jest, Vitest) — JIT runtime path.** Import the vendored `tbd()` helper from `./qtea-runtime`.
 
 ```typescript
-import { tbd } from "./worca-t-runtime";
+import { tbd } from "./qtea-runtime";
 
 export const LoginLocators = {
   LOGIN_BUTTON: tbd("primary submit button on the login form"),
@@ -46,10 +46,10 @@ export const LoginLocators = {
 };
 ```
 
-**3c — Java + Playwright (JUnit5 OR TestNG) — JIT runtime path.** Import `com.worca.runtime.Tbd` and use `Tbd.of("intent")`.
+**3c — Java + Playwright (JUnit5 OR TestNG) — JIT runtime path.** Import `com.qtea.runtime.Tbd` and use `Tbd.of("intent")`.
 
 ```java
-import com.worca.runtime.Tbd;
+import com.qtea.runtime.Tbd;
 
 public final class LoginLocators {
     public static final String LOGIN_BUTTON   = Tbd.of("primary submit button on the login form");
@@ -71,7 +71,7 @@ public static final String EMAIL_INPUT = "TBD_LOCATOR";
 
 **Heuristic-friendly intent style (saves LLM cost).** When you can name the element by its visible role + label, do so — e.g. `tbd("sign in button")` over `tbd("primary submit on the login form")`. The runtime's in-process heuristic resolves the former without an LLM call by walking the accessibility tree for an exact role+name match. When semantic context is genuinely needed for disambiguation, the longer form is correct. **Spatial qualifiers help when two same-role+name elements coexist** (e.g. `tbd("top sign in button")`, `tbd("header search button")`) — on Playwright 1.60+, the runtime captures bounding boxes and breaks ties by visual position, and the LLM resolver tier is prompted to honor those spatial hints.
 
-**TBD sentinel strings are NOT raw selectors.** A `tbd("…")` return value is an opaque sentinel (`__WORCA_T_TBD__::<intent>`). It only becomes a real selector when the framework's locator API resolves it — `page.locator(<sentinel>)` for Playwright, `driver.find_element(<sentinel>)` for Selenium, etc. NEVER pass a TBD sentinel into:
+**TBD sentinel strings are NOT raw selectors.** A `tbd("…")` return value is an opaque sentinel (`__QTEA_TBD__::<intent>`). It only becomes a real selector when the framework's locator API resolves it — `page.locator(<sentinel>)` for Playwright, `driver.find_element(<sentinel>)` for Selenium, etc. NEVER pass a TBD sentinel into:
 
 - `page.evaluate("(selector) => document.querySelector(selector)", self.locators.X)`
 - `browser.executeScript("return document.querySelector(arguments[0])", self.locators.X)`
@@ -90,7 +90,7 @@ return self.page.evaluate(
 ```
 
 ```python
-# WRONG — `self.locators.GEMINI_LINK` is `__WORCA_T_TBD__::gemini link`
+# WRONG — `self.locators.GEMINI_LINK` is `__QTEA_TBD__::gemini link`
 return self.page.evaluate(
     "([sel, prop]) => window.getComputedStyle(document.querySelector(sel)).getPropertyValue(prop)",
     [self.locators.GEMINI_LINK, property_name],
@@ -130,8 +130,8 @@ The active module's inventory record is provided to you as context — inlined i
   - **Test files** go under `./tests/<subdir>/` where `<subdir>` matches the active module's `test_directory_layout.subdirs` (prefer `default_target`).
   - **Page objects, locators, and helpers** go under the active module's `src_directory_layout.{pages_object_dir, pages_locators_dir, helpers_dir}`.
   - **Test data and fixtures** stay under `./tests/` since they are test-only assets.
-- Prefix every generated filename with `worca_` to avoid collisions. **Test file naming:** `worca_<feature>_test.py` (start with `worca_`, then the feature, end with `_test.py`). Page objects and locators: `worca_<feature>_page.py` / `worca_<feature>_locators.py`. **Never** `worca_test_*.py`.
-- **NEVER modify existing SUT test files.** worca-t always writes TDD tests from scratch into new `worca_*_test.py` files. Existing test files (e.g. `test_chat_page.py`, `test_login.py`) belong to the SUT team and must not be touched. The "reuse" principle applies to page objects, locators, helpers, and fixtures — not to test files. If you find yourself about to add a `def test_*` function to an existing file, stop: create a new `worca_<feature>_test.py` instead.
+- Prefix every generated filename with `qtea_` to avoid collisions. **Test file naming:** `qtea_<feature>_test.py` (start with `qtea_`, then the feature, end with `_test.py`). Page objects and locators: `qtea_<feature>_page.py` / `qtea_<feature>_locators.py`. **Never** `qteaest_*.py`.
+- **NEVER modify existing SUT test files.** qtea always writes TDD tests from scratch into new `qtea_*_test.py` files. Existing test files (e.g. `test_chat_page.py`, `test_login.py`) belong to the SUT team and must not be touched. The "reuse" principle applies to page objects, locators, helpers, and fixtures — not to test files. If you find yourself about to add a `def test_*` function to an existing file, stop: create a new `qtea_<feature>_test.py` instead.
 
 ### Prefer POM/BasePage helper methods over raw `page.*` / `driver.*` calls
 
@@ -204,19 +204,19 @@ TS/JS rules:
 - Return type is `Promise<string | null>` — `Locator.getAttribute()` returns `string | null` in TS; never widen to `Promise<string>`.
 - `allure-playwright` is a peer dep of the SUT's test setup; if the SUT does not have it installed, omit the attachment rather than adding the dependency.
 
-## 9. Worca-t Attribution Markers (pytest stacks only)
+## 9. Qtea-t Attribution Markers (pytest stacks only)
 
-Every test function in a worca-generated test file MUST carry a `@pytest.mark.worca_<phase>` decorator. The phase comes from the test strategy entry for that TC (`smoke`, `regression`, `e2e`, or `exploratory`); default to `smoke` when absent. The markers are auto-registered by the vendored `tests/worca_t_runtime.py` plugin — without them the worca-t runner's marker filter will collect zero tests. Skip this rule on non-pytest stacks.
+Every test function in a qtea-generated test file MUST carry a `@pytest.mark.qtea_<phase>` decorator. The phase comes from the test strategy entry for that TC (`smoke`, `regression`, `e2e`, or `exploratory`); default to `smoke` when absent. The markers are auto-registered by the vendored `tests/qtea_runtime.py` plugin — without them the qtea runner's marker filter will collect zero tests. Skip this rule on non-pytest stacks.
 
 ```python
 import pytest
 
-@pytest.mark.worca_smoke
+@pytest.mark.qtea_smoke
 def test_should_open_chat_when_landing_page_loads(chat_page):
     ...
 ```
 
-**Opt-out marker `@pytest.mark.worca_setup`** — apply ONLY to tests that legitimately perform setup-only work (state-mutation under a fixture, smoke probes whose verification lives inside a fixture, etc.). The Step 8 `zero-assertions` gate skips functions carrying this marker, but every use is audited; the rule is "almost never needed — if you're tempted, add an assertion instead."
+**Opt-out marker `@pytest.mark.qtea_setup`** — apply ONLY to tests that legitimately perform setup-only work (state-mutation under a fixture, smoke probes whose verification lives inside a fixture, etc.). The Step 8 `zero-assertions` gate skips functions carrying this marker, but every use is audited; the rule is "almost never needed — if you're tempted, add an assertion instead."
 
 ## 10. Network Egress Restrictions
 
@@ -226,13 +226,13 @@ Generated tests, fixtures, and POMs MUST NOT issue HTTP(S) requests, websocket c
 
 Generated tests, fixtures, and POMs MUST NOT use `subprocess.run(..., shell=True)`, `subprocess.Popen(..., shell=True)`, `os.system(...)`, `os.popen(...)`, `eval(...)`, `exec(...)`, `pickle.loads`, Node backtick command substitution, `child_process.exec(<string>)`, or any string-concatenated command construction. When a test genuinely needs to spawn a process, use list-form argv (`subprocess.run(["cmd", arg1, arg2], shell=False, check=True)` / `child_process.execFile("cmd", [args])`) and never interpolate test-derived data into the command. Shell injection in test code is just as exploitable as in production — tests often run under broader credentials (CI tokens, deploy keys) than the SUT itself.
 
-**Subprocess env scrubbing.** When a generated test spawns a child process, pass `env=` explicitly with only the variables the child genuinely needs — never inherit the parent process env wholesale (the default when `env=` is omitted). The parent env contains `WORCA_T_RESOLVER_TOKEN`, `WORCA_T_RESOLVER_PORT`, JIRA tokens, `ANTHROPIC_API_KEY` (in the parent worca-t process, not the SUT), and any CI deploy keys; leaking these into a third-party binary's env (or its log output, or its own subprocess fan-out) is a credential exfiltration path. Pattern: `subprocess.run(["tool", arg], env={"PATH": os.environ["PATH"], "HOME": os.environ["HOME"]}, shell=False, check=True)` — start from an empty dict and copy in only what's required.
+**Subprocess env scrubbing.** When a generated test spawns a child process, pass `env=` explicitly with only the variables the child genuinely needs — never inherit the parent process env wholesale (the default when `env=` is omitted). The parent env contains `QTEA_RESOLVER_TOKEN`, `QTEA_RESOLVER_PORT`, JIRA tokens, `ANTHROPIC_API_KEY` (in the parent qtea process, not the SUT), and any CI deploy keys; leaking these into a third-party binary's env (or its log output, or its own subprocess fan-out) is a credential exfiltration path. Pattern: `subprocess.run(["tool", arg], env={"PATH": os.environ["PATH"], "HOME": os.environ["HOME"]}, shell=False, check=True)` — start from an empty dict and copy in only what's required.
 
 ## 12. Filesystem Scope for Generated Code
 
 Generated tests, fixtures, and POMs may read files only from inside `<sut>/` and write files only into the SUT's test-artifact dirs (e.g. `<sut>/tests/_artifacts/`, `<sut>/test-results/`) or paths derived from `tmp_path` / `tmpdir` fixtures. Never read `~/.ssh/`, `~/.aws/`, `~/.config/`, `~/.netrc`, `/etc/`, `.env` files, the user's git config, browser profile dirs, sibling repos, or any absolute path outside `<sut>/`. Never write outside the two roots above. Forbidden patterns: `open("/tmp/...")`, `Path.home() / ".secret"`, `os.path.expanduser("~/...")` for read, `os.environ` dumps to disk, `shutil.copy(<credential-file>, …)`. A test that quietly reads `~/.aws/credentials` and posts it via a form field is a one-line exfiltration — closing this surface is non-negotiable.
 
-**Never delete or rename pre-existing SUT files.** Codegen only CREATES new `worca_*_test.py` / `worca_*_page.py` / `worca_*_locators.py` files and EXTENDS existing classes via import. You may not `os.remove`, `Path.unlink`, `shutil.rmtree`, `shutil.move`, or `Path.rename` any file the SUT team authored — tests, POMs, fixtures, configs, lockfiles, `conftest.py`, `.gitignore`, CI workflow files. If you believe an existing file is broken, raise a bug-candidate via the strategy's blocker channel; do not "clean it up". Step 9's git working-tree diff detects removals and reverts the change.
+**Never delete or rename pre-existing SUT files.** Codegen only CREATES new `qtea_*_test.py` / `qtea_*_page.py` / `qtea_*_locators.py` files and EXTENDS existing classes via import. You may not `os.remove`, `Path.unlink`, `shutil.rmtree`, `shutil.move`, or `Path.rename` any file the SUT team authored — tests, POMs, fixtures, configs, lockfiles, `conftest.py`, `.gitignore`, CI workflow files. If you believe an existing file is broken, raise a bug-candidate via the strategy's blocker channel; do not "clean it up". Step 9's git working-tree diff detects removals and reverts the change.
 
 ---
 

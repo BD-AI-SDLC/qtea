@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from worca_t.checkpoints import RunState
-from worca_t.pipeline import PipelineOptions
-from worca_t.steps.base import StepContext
-from worca_t.steps.s06_research import (
+from qtea.checkpoints import RunState
+from qtea.pipeline import PipelineOptions
+from qtea.steps.base import StepContext
+from qtea.steps.s06_research import (
     ResearchStep,
     _detect_stack,
     _discover_pydantic_env_keys,
@@ -17,7 +17,7 @@ from worca_t.steps.s06_research import (
     _materialize_sut,
     _project_research,
 )
-from worca_t.workspace import create_workspace
+from qtea.workspace import create_workspace
 
 from ._fake_claude import install_fake_query
 
@@ -359,7 +359,7 @@ def test_discover_sut_env_keys_skips_vendored_dirs(tmp_path: Path):
 def test_discover_sut_env_keys_excludes_secrets(tmp_path: Path):
     """SECRET_ENV_KEYS must never leak through env-key discovery, even if
     the SUT source explicitly references them."""
-    from worca_t.config import SECRET_ENV_KEYS
+    from qtea.config import SECRET_ENV_KEYS
 
     sut = tmp_path / "sut"
     sut.mkdir()
@@ -379,7 +379,7 @@ def test_materialize_sut_git_clone_uses_double_dash(tmp_path: Path, monkeypatch)
 
     Also verifies the branch-setup contract: after the clone succeeds,
     `_materialize_sut` calls `ensure_git_repo_and_branch` to put the SUT
-    on the worca-t/run-<id> branch. s06_research and _sut_git share the
+    on the qtea/run-<id> branch. s06_research and _sut_git share the
     global `subprocess.run` (both import the same module), so a single
     fake captures every call site regardless of which module dispatched it.
     """
@@ -397,9 +397,9 @@ def test_materialize_sut_git_clone_uses_double_dash(tmp_path: Path, monkeypatch)
             (dst_path / ".git").mkdir(exist_ok=True)
         # `_sut_git.current_branch` (not invoked here, but harmless) inspects
         # stdout; return a string so its `.strip()` doesn't blow up.
-        return subprocess.CompletedProcess(cmd, 0, stdout="worca-t/run-test\n")
+        return subprocess.CompletedProcess(cmd, 0, stdout="qtea/run-test\n")
 
-    monkeypatch.setattr("worca_t.steps.s06_research.subprocess.run", fake_run)
+    monkeypatch.setattr("qtea.steps.s06_research.subprocess.run", fake_run)
 
     dst = tmp_path / "sut"
     _materialize_sut(
@@ -410,10 +410,10 @@ def test_materialize_sut_git_clone_uses_double_dash(tmp_path: Path, monkeypatch)
     assert "--" in clone_call, "git clone must use -- separator before positional args"
     dd_idx = clone_call.index("--")
     assert clone_call[dd_idx + 1] == "https://github.com/org/repo.git"
-    # Branch setup ran: at least one `checkout -B worca-t/run-test` call.
+    # Branch setup ran: at least one `checkout -B qtea/run-test` call.
     checkout_calls = [c for c in calls if "checkout" in c and "-B" in c]
     assert checkout_calls, "ensure_git_repo_and_branch must run after clone"
-    assert "worca-t/run-test" in checkout_calls[0]
+    assert "qtea/run-test" in checkout_calls[0]
 
 
 def test_pydantic_inherited_basesettings_via_attribute_access(tmp_path: Path):

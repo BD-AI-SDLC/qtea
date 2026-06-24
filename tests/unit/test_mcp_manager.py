@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from worca_t.mcp_manager import (
+from qtea.mcp_manager import (
     _substitute_env,
     load_mcp_config,
     stage_empty_mcp_config,
@@ -68,8 +68,8 @@ def test_probe_server_strips_secrets(monkeypatch):
     """SECRET_ENV_KEYS must not appear in the env passed to MCP server probes."""
     import subprocess
 
-    from worca_t.config import SECRET_ENV_KEYS
-    from worca_t.mcp_manager import McpServer, probe_server
+    from qtea.config import SECRET_ENV_KEYS
+    from qtea.mcp_manager import McpServer, probe_server
 
     for key in SECRET_ENV_KEYS:
         monkeypatch.setenv(key, f"FAKE_{key}")
@@ -110,7 +110,7 @@ def test_probe_server_passes_resolved_path_to_popen(monkeypatch):
     """
     import subprocess
 
-    from worca_t.mcp_manager import McpServer, probe_server
+    from qtea.mcp_manager import McpServer, probe_server
 
     captured_argv: list[str] | None = None
 
@@ -165,7 +165,7 @@ def test_stage_mcp_config_isolates_per_workdir(tmp_path: Path):
 
 
 def test_stage_mcp_config_does_not_rewrite_playwright_args(tmp_path: Path):
-    """Regression: worca-t must NOT touch the Playwright MCP's `--headless`
+    """Regression: qtea must NOT touch the Playwright MCP's `--headless`
     flag based on the CLI `--headed` option. The MCP is a background tool;
     its head state is controlled solely by `.mcp.json`. The CLI flag instead
     controls Step 8's SUT test execution (see `test_runner._strip_headless_flag`).
@@ -195,7 +195,7 @@ def test_stage_mcp_config_does_not_rewrite_playwright_args(tmp_path: Path):
 
 def test_substitute_env_uses_explicit_env_dict_first(monkeypatch):
     """When ``env`` is provided, its values win over ``os.environ`` —
-    lets Step 9 inject ``WORCA_T_STORAGE_STATE_ARG`` per-run without
+    lets Step 9 inject ``QTEA_STORAGE_STATE_ARG`` per-run without
     mutating process env (which would leak into Step 10+)."""
     monkeypatch.setenv("FOO", "from-os")
     out = _substitute_env({"a": "${FOO}"}, env={"FOO": "from-env-dict"})
@@ -242,13 +242,13 @@ def test_load_mcp_config_threads_env_overlay(tmp_path: Path):
             "playwright": {
                 "command": "npx",
                 "args": ["-y", "@playwright/mcp", "--headless",
-                         "${WORCA_T_STORAGE_STATE_ARG}"],
+                         "${QTEA_STORAGE_STATE_ARG}"],
             }
         }
     }), encoding="utf-8")
     servers = load_mcp_config(
         cfg,
-        env={"WORCA_T_STORAGE_STATE_ARG": "--storage-state=/abs/path/s.json"},
+        env={"QTEA_STORAGE_STATE_ARG": "--storage-state=/abs/path/s.json"},
     )
     assert servers["playwright"].args == [
         "-y", "@playwright/mcp", "--headless",

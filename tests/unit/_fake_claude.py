@@ -1,7 +1,7 @@
 """Shared SDK-fake helpers for step / runner tests.
 
 Replaces the old subprocess-based `claude` CLI shim. Now we monkeypatch
-`claude_agent_sdk.query` (as imported by `worca_t.claude_runner`) to yield
+`claude_agent_sdk.query` (as imported by `qtea.claude_runner`) to yield
 fake SDK Message objects. Optionally writes files into the agent's workdir
 (matching the CWD-write side-effect the old shim provided).
 """
@@ -46,7 +46,7 @@ def install_fake_query(
     delay_s: float = 0.0,
     on_call=None,
 ) -> None:
-    """Replace ``worca_t.claude_runner.query`` with an async iterator factory.
+    """Replace ``qtea.claude_runner.query`` with an async iterator factory.
 
     Parameters
     ----------
@@ -81,10 +81,10 @@ def install_fake_query(
 
     # Bypass the missing-binary precheck so tests don't need a real `claude`.
     monkeypatch.setattr(
-        "worca_t.claude_runner.shutil.which",
+        "qtea.claude_runner.shutil.which",
         lambda *_a, **_kw: "/fake/claude",
     )
-    monkeypatch.setattr("worca_t.claude_runner.query", _fake_query)
+    monkeypatch.setattr("qtea.claude_runner.query", _fake_query)
 
 
 def fake_playwright_mcp_call(tool: str = "browser_snapshot") -> dict:

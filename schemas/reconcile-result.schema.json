@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://worca-t/schemas/reconcile-result.schema.json",
+  "$id": "https://qtea/schemas/reconcile-result.schema.json",
   "title": "ReconciliationResult",
   "description": "Audit artifact for Phase B.5 of Step 8 codegen: static reconciliation between generated test files and the post-extension POMs they import. Records every call site checked and every mismatch (method not found, arity mismatch, parse error) discovered. Persisted to `artifacts/step08/reconcile-result.json` regardless of whether auto-patch succeeded.",
   "type": "object",

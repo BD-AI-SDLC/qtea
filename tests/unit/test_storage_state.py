@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from worca_t.storage_state import (
+from qtea.storage_state import (
     mask_path,
     resolve,
     summary_for_prompt,
@@ -35,7 +35,7 @@ def test_resolve_cli_opt_wins_over_env_and_convention(tmp_path):
     sut.mkdir()
     ws.mkdir()
     cli_path = _make_file(tmp_path / "explicit.json")
-    _make_file(sut / ".worca-t" / "storage-state.json", '{"src":"convention"}')
+    _make_file(sut / ".qtea" / "storage-state.json", '{"src":"convention"}')
     _make_file(ws / "storage-state.json", '{"src":"workspace"}')
     env_path = _make_file(tmp_path / "env.json")
 
@@ -43,7 +43,7 @@ def test_resolve_cli_opt_wins_over_env_and_convention(tmp_path):
         sut_root=sut,
         workspace_root=ws,
         cli_opt=cli_path,
-        env={"WORCA_T_STORAGE_STATE": str(env_path)},
+        env={"QTEA_STORAGE_STATE": str(env_path)},
     )
     assert result == cli_path
 
@@ -51,14 +51,14 @@ def test_resolve_cli_opt_wins_over_env_and_convention(tmp_path):
 def test_resolve_env_wins_over_convention(tmp_path):
     sut = tmp_path / "sut"
     sut.mkdir()
-    _make_file(sut / ".worca-t" / "storage-state.json", '{"src":"convention"}')
+    _make_file(sut / ".qtea" / "storage-state.json", '{"src":"convention"}')
     env_path = _make_file(tmp_path / "env.json")
 
     result = resolve(
         sut_root=sut,
         workspace_root=None,
         cli_opt=None,
-        env={"WORCA_T_STORAGE_STATE": str(env_path)},
+        env={"QTEA_STORAGE_STATE": str(env_path)},
     )
     assert result == env_path
 
@@ -69,7 +69,7 @@ def test_resolve_convention_path_in_sut(tmp_path):
     ws = tmp_path / "ws"
     sut.mkdir()
     ws.mkdir()
-    sut_path = _make_file(sut / ".worca-t" / "storage-state.json", '{"src":"sut"}')
+    sut_path = _make_file(sut / ".qtea" / "storage-state.json", '{"src":"sut"}')
     _make_file(ws / "storage-state.json", '{"src":"workspace"}')
 
     result = resolve(sut_root=sut, workspace_root=ws, cli_opt=None, env={})
@@ -104,21 +104,21 @@ def test_resolve_env_path_missing_file_falls_through(tmp_path):
     masking a valid SUT-side capture."""
     sut = tmp_path / "sut"
     sut.mkdir()
-    sut_path = _make_file(sut / ".worca-t" / "storage-state.json")
+    sut_path = _make_file(sut / ".qtea" / "storage-state.json")
     result = resolve(
         sut_root=sut,
         workspace_root=None,
         cli_opt=None,
-        env={"WORCA_T_STORAGE_STATE": str(tmp_path / "missing.json")},
+        env={"QTEA_STORAGE_STATE": str(tmp_path / "missing.json")},
     )
     assert result == sut_path
 
 
 def test_resolve_uses_os_environ_when_env_dict_is_none(tmp_path, monkeypatch):
     """When `env=None`, the resolver falls back to `os.environ` for the
-    WORCA_T_STORAGE_STATE lookup."""
+    QTEA_STORAGE_STATE lookup."""
     env_path = _make_file(tmp_path / "env.json")
-    monkeypatch.setenv("WORCA_T_STORAGE_STATE", str(env_path))
+    monkeypatch.setenv("QTEA_STORAGE_STATE", str(env_path))
     result = resolve(sut_root=None, workspace_root=None, cli_opt=None, env=None)
     assert result == env_path
 
@@ -176,8 +176,8 @@ def test_summary_for_prompt_handles_missing_file_gracefully(tmp_path):
 
 
 def test_mask_path_collapses_sut_convention(tmp_path):
-    p = tmp_path / "some" / "deep" / "sut" / ".worca-t" / "storage-state.json"
-    assert mask_path(p) == "<sut>/.worca-t/storage-state.json"
+    p = tmp_path / "some" / "deep" / "sut" / ".qtea" / "storage-state.json"
+    assert mask_path(p) == "<sut>/.qtea/storage-state.json"
 
 
 def test_mask_path_collapses_workspace_convention(tmp_path):

@@ -1,4 +1,4 @@
-"""Unit tests for src/worca_t/test_runner.py."""
+"""Unit tests for src/qtea/test_runner.py."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from worca_t.test_runner import (
+from qtea.test_runner import (
     _normalize_id,
     _python_prod_files,
     audit_missing_deps,
@@ -43,12 +43,12 @@ def test_resolve_command_uses_default(tmp_path: Path) -> None:
     cmd, parser = resolve_command("jest", detected=None, cwd=tmp_path)
     assert "jest" in cmd
     assert parser == "jest-json"
-    assert "worca-results.json" in cmd
+    assert "qtea-results.json" in cmd
 
 
 def test_resolve_command_fallback_for_unknown(tmp_path: Path) -> None:
     cmd, parser = resolve_command("nodescript", detected=None, cwd=tmp_path)
-    expected = str((tmp_path / "worca-junit.xml").as_posix())
+    expected = str((tmp_path / "qtea-junit.xml").as_posix())
     assert cmd == f"pytest --junitxml={expected}"
     assert parser == "junit"
 
@@ -59,7 +59,7 @@ def test_resolve_command_fallback_for_unknown(tmp_path: Path) -> None:
 
 
 def test_resolve_command_wraps_default_with_poetry(tmp_path: Path) -> None:
-    from worca_t.stack_profile import StackProfile
+    from qtea.stack_profile import StackProfile
 
     profile = StackProfile(package_manager="poetry", wrapper_prefix="poetry run")
     cmd, parser = resolve_command(
@@ -71,7 +71,7 @@ def test_resolve_command_wraps_default_with_poetry(tmp_path: Path) -> None:
 
 
 def test_resolve_command_wraps_default_with_npx(tmp_path: Path) -> None:
-    from worca_t.stack_profile import StackProfile
+    from qtea.stack_profile import StackProfile
 
     profile = StackProfile(package_manager="npm", wrapper_prefix="npx")
     cmd, parser = resolve_command(
@@ -83,7 +83,7 @@ def test_resolve_command_wraps_default_with_npx(tmp_path: Path) -> None:
 
 def test_resolve_command_detected_overrides_wrapping(tmp_path: Path) -> None:
     """When the researcher gives an explicit command, we use it verbatim."""
-    from worca_t.stack_profile import StackProfile
+    from qtea.stack_profile import StackProfile
 
     profile = StackProfile(package_manager="poetry", wrapper_prefix="poetry run")
     cmd, _ = resolve_command(
@@ -99,7 +99,7 @@ def test_resolve_command_detected_overrides_wrapping(tmp_path: Path) -> None:
 
 def test_resolve_command_unknown_framework_wrapped(tmp_path: Path) -> None:
     """Bare-pytest fallback also gets wrapped when a profile is provided."""
-    from worca_t.stack_profile import StackProfile
+    from qtea.stack_profile import StackProfile
 
     profile = StackProfile(package_manager="poetry", wrapper_prefix="poetry run")
     cmd, _ = resolve_command("xyz", detected=None, cwd=tmp_path, profile=profile)
@@ -107,7 +107,7 @@ def test_resolve_command_unknown_framework_wrapped(tmp_path: Path) -> None:
 
 
 def test_prepare_sut_no_profile_is_noop(tmp_path: Path) -> None:
-    from worca_t.test_runner import prepare_sut
+    from qtea.test_runner import prepare_sut
 
     result = prepare_sut(None, cwd=tmp_path)
     assert result.ran is False
@@ -116,8 +116,8 @@ def test_prepare_sut_no_profile_is_noop(tmp_path: Path) -> None:
 
 
 def test_prepare_sut_no_install_command_is_noop(tmp_path: Path) -> None:
-    from worca_t.stack_profile import StackProfile
-    from worca_t.test_runner import prepare_sut
+    from qtea.stack_profile import StackProfile
+    from qtea.test_runner import prepare_sut
 
     profile = StackProfile(package_manager="custom", wrapper_prefix="x")
     result = prepare_sut(profile, cwd=tmp_path)
@@ -127,8 +127,8 @@ def test_prepare_sut_no_install_command_is_noop(tmp_path: Path) -> None:
 
 def test_prepare_sut_runs_command(tmp_path: Path) -> None:
     """A command that exists and exits 0 yields ran=True, ok=True."""
-    from worca_t.stack_profile import StackProfile
-    from worca_t.test_runner import prepare_sut
+    from qtea.stack_profile import StackProfile
+    from qtea.test_runner import prepare_sut
 
     profile = StackProfile(
         package_manager="custom",
@@ -142,8 +142,8 @@ def test_prepare_sut_runs_command(tmp_path: Path) -> None:
 
 def test_prepare_sut_runs_pre_install_then_install(tmp_path: Path) -> None:
     """When profile has pre_install_command + install_command, both run in order."""
-    from worca_t.stack_profile import StackProfile
-    from worca_t.test_runner import prepare_sut
+    from qtea.stack_profile import StackProfile
+    from qtea.test_runner import prepare_sut
 
     marker = tmp_path / "pre_ran.txt"
     pre_script = _write_py_script(
@@ -171,42 +171,42 @@ def test_prepare_sut_runs_pre_install_then_install(tmp_path: Path) -> None:
 
 
 def test_strip_headless_bare_flag():
-    from worca_t.test_runner import _strip_headless_flag
+    from qtea.test_runner import _strip_headless_flag
     assert _strip_headless_flag("pytest -m smoke --headless --ci") == "pytest -m smoke --ci"
 
 
 def test_strip_headless_with_equals_value():
-    from worca_t.test_runner import _strip_headless_flag
+    from qtea.test_runner import _strip_headless_flag
     assert _strip_headless_flag("pytest --headless=true -k foo") == "pytest -k foo"
     assert _strip_headless_flag("pytest --headless=0 -k foo") == "pytest -k foo"
 
 
 def test_strip_headless_with_space_value():
-    from worca_t.test_runner import _strip_headless_flag
+    from qtea.test_runner import _strip_headless_flag
     assert _strip_headless_flag("pytest --headless true -k foo") == "pytest -k foo"
 
 
 def test_strip_headless_at_end_of_command():
-    from worca_t.test_runner import _strip_headless_flag
+    from qtea.test_runner import _strip_headless_flag
     assert _strip_headless_flag("pytest --ci --headless") == "pytest --ci"
 
 
 def test_strip_headless_no_op_when_absent():
-    from worca_t.test_runner import _strip_headless_flag
+    from qtea.test_runner import _strip_headless_flag
     cmd = "pytest -m smoke --ci --junitxml=x.xml"
     assert _strip_headless_flag(cmd) == cmd
 
 
 def test_strip_headless_does_not_match_substring():
     """Defensive: must not strip `--headless-mode`, `--headless-foo`, etc."""
-    from worca_t.test_runner import _strip_headless_flag
+    from qtea.test_runner import _strip_headless_flag
     cmd = "pytest --headless-mode --ci"
     assert _strip_headless_flag(cmd) == cmd
 
 
 def test_run_tests_headless_default_sets_env_and_keeps_flag(tmp_path: Path, monkeypatch):
     """`headless=True` (default) sets HEADLESS=1 and leaves `--headless` alone."""
-    from worca_t.test_runner import run_tests
+    from qtea.test_runner import run_tests
 
     seen_env: dict[str, str] = {}
     seen_cmd: str = ""
@@ -218,7 +218,7 @@ def test_run_tests_headless_default_sets_env_and_keeps_flag(tmp_path: Path, monk
             seen_env.update(env_extra)
         return 0, "", "", 0.1
 
-    monkeypatch.setattr("worca_t.test_runner.execute_command", fake_execute)
+    monkeypatch.setattr("qtea.test_runner.execute_command", fake_execute)
     run_tests("pytest", cwd=tmp_path,
               detected_command="pytest -m smoke --headless")
     assert seen_env.get("HEADLESS") == "1"
@@ -227,7 +227,7 @@ def test_run_tests_headless_default_sets_env_and_keeps_flag(tmp_path: Path, monk
 
 def test_run_tests_headed_sets_env_zero_and_strips_flag(tmp_path: Path, monkeypatch):
     """`headless=False` sets HEADLESS=0 AND strips `--headless` from the cmd."""
-    from worca_t.test_runner import run_tests
+    from qtea.test_runner import run_tests
 
     seen_env: dict[str, str] = {}
     seen_cmd: str = ""
@@ -239,7 +239,7 @@ def test_run_tests_headed_sets_env_zero_and_strips_flag(tmp_path: Path, monkeypa
             seen_env.update(env_extra)
         return 0, "", "", 0.1
 
-    monkeypatch.setattr("worca_t.test_runner.execute_command", fake_execute)
+    monkeypatch.setattr("qtea.test_runner.execute_command", fake_execute)
     run_tests("pytest", cwd=tmp_path,
               detected_command="pytest -m smoke --headless",
               headless=False)
@@ -252,7 +252,7 @@ def test_run_tests_headed_sets_env_zero_and_strips_flag(tmp_path: Path, monkeypa
 
 def test_run_tests_headed_preserves_caller_env_extra(tmp_path: Path, monkeypatch):
     """The caller's `env_extra` must not be mutated; HEADLESS gets added on top."""
-    from worca_t.test_runner import run_tests
+    from qtea.test_runner import run_tests
 
     seen_env: dict[str, str] = {}
 
@@ -261,19 +261,19 @@ def test_run_tests_headed_preserves_caller_env_extra(tmp_path: Path, monkeypatch
             seen_env.update(env_extra)
         return 0, "", "", 0.1
 
-    monkeypatch.setattr("worca_t.test_runner.execute_command", fake_execute)
-    caller_env = {"WORCA_T_TESTS_DIR": "/some/path"}
+    monkeypatch.setattr("qtea.test_runner.execute_command", fake_execute)
+    caller_env = {"QTEA_TESTS_DIR": "/some/path"}
     run_tests("pytest", cwd=tmp_path, detected_command="pytest",
               env_extra=caller_env, headless=False)
-    assert seen_env.get("WORCA_T_TESTS_DIR") == "/some/path"
+    assert seen_env.get("QTEA_TESTS_DIR") == "/some/path"
     assert seen_env.get("HEADLESS") == "0"
     # Caller's dict is not mutated.
     assert "HEADLESS" not in caller_env
 
 
 def test_prepare_sut_captures_failure(tmp_path: Path) -> None:
-    from worca_t.stack_profile import StackProfile
-    from worca_t.test_runner import prepare_sut
+    from qtea.stack_profile import StackProfile
+    from qtea.test_runner import prepare_sut
 
     script = _write_py_script(tmp_path / "fail.py", "import sys; sys.exit(7)")
     profile = StackProfile(
@@ -288,8 +288,8 @@ def test_prepare_sut_captures_failure(tmp_path: Path) -> None:
 
 def test_prepare_sut_pre_install_failure_aborts(tmp_path: Path) -> None:
     """If pre_install_command fails, install_command must not run."""
-    from worca_t.stack_profile import StackProfile
-    from worca_t.test_runner import prepare_sut
+    from qtea.stack_profile import StackProfile
+    from qtea.test_runner import prepare_sut
 
     marker = tmp_path / "should_not_exist.txt"
     pre_script = _write_py_script(
@@ -311,9 +311,9 @@ def test_prepare_sut_pre_install_failure_aborts(tmp_path: Path) -> None:
 
 
 def test_prepare_sut_does_not_leak_secrets(tmp_path: Path, monkeypatch) -> None:
-    from worca_t.config import SECRET_ENV_KEYS
-    from worca_t.stack_profile import StackProfile
-    from worca_t.test_runner import prepare_sut
+    from qtea.config import SECRET_ENV_KEYS
+    from qtea.stack_profile import StackProfile
+    from qtea.test_runner import prepare_sut
 
     for key in SECRET_ENV_KEYS:
         monkeypatch.setenv(key, f"FAKE_{key}")
@@ -622,7 +622,7 @@ def test_execute_command_timeout(tmp_path: Path) -> None:
 
 
 def test_execute_command_does_not_leak_secrets(tmp_path: Path, monkeypatch) -> None:
-    from worca_t.config import SECRET_ENV_KEYS
+    from qtea.config import SECRET_ENV_KEYS
 
     for key in SECRET_ENV_KEYS:
         monkeypatch.setenv(key, f"FAKE_{key}")
@@ -644,7 +644,7 @@ def test_execute_command_does_not_leak_secrets(tmp_path: Path, monkeypatch) -> N
 
 
 def test_run_tests_junit_end_to_end(tmp_path: Path) -> None:
-    out_file = (tmp_path / "worca-junit.xml").as_posix()
+    out_file = (tmp_path / "qtea-junit.xml").as_posix()
     body = (
         "import sys\n"
         f"open(r'{out_file}', 'w', encoding='utf-8').write({_JUNIT_XML!r})\n"
@@ -797,7 +797,7 @@ def test_install_command_for_poetry_returns_argv_list():
 
 def test_install_command_for_pip_requires_venv_bin():
     """Bare `pip` is unsafe: it would target whatever pip is first on PATH
-    (worca-t's venv when VIRTUAL_ENV leaks, system Python otherwise) —
+    (qtea's venv when VIRTUAL_ENV leaks, system Python otherwise) —
     neither matches the venv the test runner actually uses. Without
     `venv_bin`, the call must return None so the caller falls back to the
     prose hint instead of silently mis-installing."""
