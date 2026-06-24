@@ -2707,12 +2707,12 @@ def _install_monkey_patch() -> None:
 # ---------------------------------------------------------------------------
 
 
-_WORCA_PHASE_MARKERS = ("smoke", "regression", "e2e", "exploratory")
+_QTEA_PHASE_MARKERS = ("smoke", "regression", "e2e", "exploratory")
 # Opt-out marker for the Step 8 zero-assertions gate. Apply to tests that
 # legitimately perform setup-only work (state mutation under a fixture, smoke
 # probes that rely on fixture-internal asserts, etc.). Use sparingly — the
 # gate logs every qtea_setup-marked function for audit.
-_WORCA_OPT_OUT_MARKERS = ("setup",)
+_QTEA_OPT_OUT_MARKERS = ("setup",)
 
 
 def pytest_configure(config):  # noqa: D401 - pytest hook signature
@@ -2724,12 +2724,12 @@ def pytest_configure(config):  # noqa: D401 - pytest hook signature
     Playwright and patch classes simultaneously during collection —
     a race that crashes worker processes on resource-constrained systems.
     """
-    for phase in _WORCA_PHASE_MARKERS:
+    for phase in _QTEA_PHASE_MARKERS:
         config.addinivalue_line(
             "markers",
             f"qtea_{phase}: qtea generated {phase} test",
         )
-    for marker in _WORCA_OPT_OUT_MARKERS:
+    for marker in _QTEA_OPT_OUT_MARKERS:
         config.addinivalue_line(
             "markers",
             f"qtea_{marker}: qtea generated {marker} test (opts out of "

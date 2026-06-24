@@ -1,10 +1,21 @@
 # Changelog
 
-All notable changes to `worca-t` are tracked here. Format: Keep a Changelog;
-auto-appended by `worca-t` runs and the `tools/hooks/update-changelog.py`
+All notable changes to `qtea` are tracked here. Format: Keep a Changelog;
+auto-appended by `qtea` runs and the `tools/hooks/update-changelog.py`
 pre-commit hook.
 
 ## [Unreleased]
+
+### Added (desktop UI)
+- `src/qtea/ui/`: Flet-based desktop UI — config panel (spec + SUT file
+  pickers, all run options, skip-step toggles), live pipeline view (per-step
+  status cards, HITL + review-gate dialogs, log stream, cost metrics panel),
+  and results view.
+- `qtea ui` CLI command + `qtea-ui` console script. Both require the `[ui]`
+  optional extra (`flet>=0.28`, `flet-desktop>=0.28`). Graceful import-error
+  with install hint when the extra is absent.
+- HITL and review-gate bridges wire the headless interactive prompts into the
+  UI so the full pipeline can run interactively without a terminal.
 
 ### Added (phased codegen, heal-scope hardening, HITL resilience)
 - `src/worca_t/steps/s08_codegen.py`: phased codegen pipeline

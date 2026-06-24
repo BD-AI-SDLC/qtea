@@ -244,7 +244,7 @@ async def test_cache_flag_on_clears_disable_env(tmp_path: Path, monkeypatch):
 
 def test_claude_runner_forwards_disable_prompt_caching():
     """claude_runner's env-forwarding filter must include the cache-
-    disable knobs even though they don't match the WORCA_/ANTHROPIC_/HTTP
+    disable knobs even though they don't match the QTEA_/ANTHROPIC_/HTTP
     prefix set. Without this forward, setting the var in pipeline.py is
     inert because the subprocess never sees it."""
 

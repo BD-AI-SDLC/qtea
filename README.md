@@ -52,6 +52,21 @@ fully offline-viewable and always produced as a fallback.
 Force one or the other: `--report allure`, `--report builtin`, `--report both`.
 `--report allure` and `--report both` auto-open the Allure UI when generation succeeds — no `--open-report` flag needed.
 
+## Desktop UI
+
+```bash
+# Install with the UI extra
+uv tool install 'qtea[ui]'
+
+# Launch
+qtea ui
+```
+
+A Flet-based desktop window that wraps the full CLI: a configuration panel (spec source, SUT path, all run options, skip-step toggles), a live pipeline view (per-step status cards, HITL dialogs, log stream, cost metrics), and a results view. HITL and review-gate prompts surface as dialogs so the pipeline runs fully interactively without a terminal.
+
+`qtea-ui` is also registered as a standalone console script.  
+Without the `[ui]` extra, `qtea ui` prints an install hint and exits.
+
 ## Resume & debug
 
 ```bash
