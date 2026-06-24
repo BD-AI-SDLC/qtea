@@ -14,6 +14,7 @@ in memory and is mirrored to ``<workspace>/.hitl-ledger.jsonl`` for resume.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from dataclasses import asdict, dataclass, field
@@ -714,7 +715,7 @@ def prompt_user(
     Returns an empty dict when stdin is not a TTY (CI) so callers can skip
     the re-invocation loop cleanly.
     """
-    if not sys.stdin.isatty():
+    if not sys.stdin.isatty() and not os.environ.get("WORCA_T_UI_MODE"):
         log.info("hitl.skip_non_tty", agent=agent_label, count=len(questions))
         return {}
 

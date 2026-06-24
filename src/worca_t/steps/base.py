@@ -763,7 +763,7 @@ class Step(ABC):
             decision = "retry"
             interactive = (
                 storm
-                and sys.stdin.isatty()
+                and (sys.stdin.isatty() or getattr(ctx.options, "ui_mode", False))
                 and not getattr(ctx.options, "no_hitl", False)
                 and not getattr(ctx.options, "yes", False)
             )

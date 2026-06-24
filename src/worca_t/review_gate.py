@@ -21,12 +21,13 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import io
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from rich.console import Console
 from rich.panel import Panel
@@ -43,6 +44,64 @@ if TYPE_CHECKING:
     from worca_t.steps.base import StepContext, StepResult
 
 log = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# UI bridge hook
+# ---------------------------------------------------------------------------
+#
+# When the desktop UI is active, the bridge installs a hook here that
+# replaces the interactive ``Prompt.ask`` flow with a UI dialog. The hook
+# returns ``"approve"`` or ``"reject"`` (Edit-by-text is not yet wired
+# through the bridge — treat as approve). The signature is intentionally
+# minimal so review_gate.py stays decoupled from Flet / AppState.
+
+_UI_PROMPT_HOOK: Callable[..., str] | None = None
+
+
+def set_ui_prompt_hook(hook: Callable[..., str] | None) -> None:
+    """Install / clear the UI prompt hook.
+
+    Hook signature: ``hook(step, title, summary_text, *, kind="", data=None) -> str``
+    where the return is ``"approve"``, ``"reject"``, or ``"edit"``.
+
+    ``kind`` + ``data`` carry the structured payload (strategy / plan /
+    intents dict). The UI renders a real table from ``data`` and uses
+    ``summary_text`` only as a fallback for unknown kinds.
+    """
+    global _UI_PROMPT_HOOK
+    _UI_PROMPT_HOOK = hook
+
+
+def _capture_render(render_fn, *args) -> str:
+    """Render a Rich table/panel into plain text without touching the terminal.
+
+    Used in UI mode so the gate's table summary can be surfaced inside the
+    dialog instead of being printed to stderr/stdout.
+    """
+    buf = io.StringIO()
+    cap = Console(
+        file=buf,
+        force_terminal=False,
+        color_system=None,
+        width=120,
+    )
+    render_fn(*args, cap)
+    return buf.getvalue()
+
+
+def _ui_decision_to_choice(decision: str) -> str:
+    """Map the UI dialog's decision string into the gate's choice char."""
+    if decision == "reject":
+        return "q"
+    if decision == "edit":
+        # MVP: surface edit as approve+log. Inline editing in the UI
+        # requires routing back through _apply_*_nlp_edit which still
+        # uses terminal prompts internally; treat Edit as Approve for
+        # now and log so users notice if they hit it by mistake.
+        log.warning("review_gate.ui_edit_not_supported_yet")
+        return "a"
+    return "a"  # default + explicit "approve"
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +143,7 @@ async def review_step_4_strategy(
     from worca_t.steps.s04_strategy import _project_strategy
 
     opts = ctx.options
-    if getattr(opts, "no_hitl", False) or not sys.stdin.isatty():
+    if getattr(opts, "no_hitl", False) or not (sys.stdin.isatty() or getattr(opts, "ui_mode", False)):
         log.info("step04.review_gate.skip", reason="non_tty_or_no_hitl")
         return True
 
@@ -102,6 +161,24 @@ async def review_step_4_strategy(
         except (OSError, json.JSONDecodeError) as e:
             console.print(f"[red]cannot read strategy JSON:[/] {e}")
             return False
+
+        # UI mode: pass the structured strategy through so the dialog
+        # can render a proper Flet table; the captured monospace text is
+        # only a fallback if the dialog doesn't recognise the kind.
+        if _UI_PROMPT_HOOK is not None:
+            summary_text = _capture_render(_render_strategy, strategy)
+            decision = _UI_PROMPT_HOOK(
+                step=4,
+                title="Test Strategy Review",
+                summary_text=summary_text,
+                kind="strategy",
+                data=strategy,
+            )
+            if decision == "reject":
+                log.info("step04.review_gate.rejected", source="ui")
+                return False
+            log.info("step04.review_gate.approved", source="ui")
+            return True
 
         _render_strategy(strategy, console)
         choice = Prompt.ask(
@@ -328,7 +405,7 @@ async def review_step_7_plan(
     re-renders. On schema failure after edit, the user can re-edit or abort.
     """
     opts = ctx.options
-    if getattr(opts, "no_hitl", False) or not sys.stdin.isatty():
+    if getattr(opts, "no_hitl", False) or not (sys.stdin.isatty() or getattr(opts, "ui_mode", False)):
         log.info("step07.review_gate.skip", reason="non_tty_or_no_hitl")
         return True
 
@@ -345,6 +422,21 @@ async def review_step_7_plan(
             console.print(f"[red]cannot read plan:[/] {e}")
             log.warning("step07.review_gate.plan_unreadable", error=str(e))
             return False
+
+        if _UI_PROMPT_HOOK is not None:
+            summary_text = _capture_render(_render_plan, plan)
+            decision = _UI_PROMPT_HOOK(
+                step=7,
+                title="Code Modification Plan Review",
+                summary_text=summary_text,
+                kind="plan",
+                data=plan,
+            )
+            if decision == "reject":
+                log.info("step07.review_gate.rejected", source="ui")
+                return False
+            log.info("step07.review_gate.approved", source="ui")
+            return True
 
         _render_plan(plan, console)
         choice = Prompt.ask(
@@ -707,7 +799,7 @@ async def review_step_8_intents(
     in place via the file:line anchors recorded by `tbd_scanner`.
     """
     opts = ctx.options
-    if getattr(opts, "no_hitl", False) or not sys.stdin.isatty():
+    if getattr(opts, "no_hitl", False) or not (sys.stdin.isatty() or getattr(opts, "ui_mode", False)):
         log.info("step08.intent_review_gate.skip", reason="non_tty_or_no_hitl")
         return True
 
@@ -716,6 +808,25 @@ async def review_step_8_intents(
         return True
 
     while True:
+        if _UI_PROMPT_HOOK is not None:
+            summary_text = _capture_render(_render_intent_warnings, warnings)
+            decision = _UI_PROMPT_HOOK(
+                step=8,
+                title="TBD Intent Quality Review",
+                summary_text=summary_text,
+                kind="intents",
+                data=warnings,
+            )
+            if decision == "reject":
+                log.info("step08.intent_review_gate.rejected", source="ui")
+                return False
+            log.info(
+                "step08.intent_review_gate.approved",
+                source="ui",
+                count=len(warnings),
+            )
+            return True
+
         _render_intent_warnings(warnings, console)
         choice = Prompt.ask(
             "[bold]Approve and continue to step 9?[/bold] "
