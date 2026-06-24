@@ -1,5 +1,6 @@
 # QTea
 
+> **Quality** **Testing** **environment** for **agentic** **AI**  
 > Fully autonomous QA SDLC orchestrator. Hybrid workflow consists of Python + LLM calls.  
 > It uses Python to run the pipeline deterministically, and spins up agents via direct SDK invocation (solely LLM prompt) or Claude Agent SDK (file management, MCP).
 
