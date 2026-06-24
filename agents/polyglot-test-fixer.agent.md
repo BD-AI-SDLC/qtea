@@ -133,7 +133,12 @@ fallback is auditable.
 
 When the user prompt includes a "LIVE DIAGNOSIS" section, treat it as authoritative:
 
-1. **Always navigate live first** — `browser_navigate` to the SUT base URL, then follow the SUT's own sign-in flow via the staged helpers under `./_sut/`. Do NOT reimplement auth inline; call the staged `sign_in` / `chat_setup` / fixture method via a Bash one-liner matching the active module's `language` (Python: `python -c "..."`, Node: `node -e "..."`, etc.).
+1. **Check the `Failure class:` line first** (when present in the prompt). This classification comes from the orchestrator and guides your strategy:
+   - `locator_timeout` or `tbd_unresolvable`: **Navigate live first** — the failure is about finding/interacting with an element, and browser inspection is essential. Proceed to step (1a).
+   - `assertion_value`: **Diagnose from the traceback first.** Read the assertion line and the expected vs actual values. If the mismatch indicates a wrong-element problem (e.g. `get_attribute` returned `None` for an attribute the element should have — suggesting the locator found a different element), proceed to step (1a) to navigate and find the correct locator. If the mismatch indicates a genuine app defect (the correct element was found but it genuinely lacks the expected attribute), emit `OUT_OF_SCOPE: assertion-attribute-defect` and stop — do not burn turns navigating.
+   - `unknown` or absent: **Navigate live first** — fall back to the default workflow below.
+
+1a. **Navigate live** — `browser_navigate` to the SUT base URL, then follow the SUT's own sign-in flow via the staged helpers under `./_sut/`. Do NOT reimplement auth inline; call the staged `sign_in` / `chat_setup` / fixture method via a Bash one-liner matching the active module's `language` (Python: `python -c "..."`, Node: `node -e "..."`, etc.).
 2. **Snapshot the page that the failing test targets** before writing any patch. Compare what you see against what the traceback claims the test expected. Locator drift, missing elements, or a redirect to an error page all point at different fixes.
 3. **Patch based on the live observation**, not the traceback text alone. The traceback tells you *which* assertion failed; the snapshot tells you *what changed in the DOM*.
 4. **Match the active module's language** when writing the patched file. Never emit a Python patch for a TypeScript test or vice versa. If the staged auth helper is missing, refuses to import, or returns an error, abort the heal attempt with the literal token `AUTH_PATH_UNAVAILABLE` — the orchestrator handles bug-report classification from there.
