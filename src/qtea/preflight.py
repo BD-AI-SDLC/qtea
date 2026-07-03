@@ -534,10 +534,7 @@ def _check_auth_fixture_missing(
         # Build the set of POM class names imported in this file.
         imported_names: set[str] = set()
         for node in _ast.walk(tree):
-            if isinstance(node, _ast.ImportFrom):
-                for alias in node.names:
-                    imported_names.add(alias.asname or alias.name)
-            elif isinstance(node, _ast.Import):
+            if isinstance(node, _ast.ImportFrom) or isinstance(node, _ast.Import):
                 for alias in node.names:
                     imported_names.add(alias.asname or alias.name)
         relevant_poms = imported_names & auth_scoped_poms

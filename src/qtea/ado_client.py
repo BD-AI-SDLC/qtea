@@ -328,9 +328,7 @@ def html_to_markdown(html: str | None) -> str:
             result.append("**")
         elif tag in ("em", "i"):
             result.append("*")
-        elif tag == "code" and not closing:
-            result.append("`")
-        elif tag == "code" and closing:
+        elif (tag == "code" and not closing) or (tag == "code" and closing):
             result.append("`")
         elif tag == "pre":
             if not closing:

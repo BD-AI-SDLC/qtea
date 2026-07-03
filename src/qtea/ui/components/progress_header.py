@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import flet as ft
 
-from qtea.ui.state import AppState, STEP_DEFINITIONS
+from qtea.ui.state import STEP_DEFINITIONS, AppState
 from qtea.ui.theme import (
     BACKGROUND,
     CARD_BG,

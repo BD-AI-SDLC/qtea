@@ -19,7 +19,6 @@ from pathlib import Path
 
 from qtea.hitl import (
     RESOLUTION_OVERLAY_BUG,
-    RESOLUTION_OVERLAY_ONCE,
     RESOLUTION_OVERLAY_PERSIST,
     Question,
     prompt_user,
@@ -127,7 +126,7 @@ def _hitl_overlay_sweep(
 
     try:
         answers = prompt_user(questions, agent_label="overlay-dismiss")
-    except Exception as e:  # noqa: BLE001 — best-effort; never block Step 9
+    except Exception as e:
         log.warning("step09.overlay_sweep_hitl_failed", error=str(e))
         return deduped, set()
 

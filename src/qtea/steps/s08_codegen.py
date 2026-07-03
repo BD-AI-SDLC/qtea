@@ -50,22 +50,24 @@ from qtea.codegen_reconcile import (
 from qtea.config import AUTOFIX_MAX_TURNS, package_resource_root, step_timeout
 from qtea.llm.reasoning import call_reasoning_llm
 from qtea.logging_setup import get_logger
-from qtea.runtime.dev_locators import DevLocator, load_dev_locators
-from qtea.schemas import is_valid
 from qtea.parse_check import (
     ParseCheckResult,
-    format_for_fixer as parse_check_format_for_fixer,
     has_degraded_violations,
     run_parse_check,
 )
+from qtea.parse_check import (
+    format_for_fixer as parse_check_format_for_fixer,
+)
 from qtea.playwright_config_editor import ensure_test_id_attribute
+from qtea.preflight import run_preflight
+from qtea.runtime.dev_locators import DevLocator, load_dev_locators
+from qtea.schemas import is_valid
 from qtea.static_check import (
     StaticCheckResult,
     format_for_fixer,
     run_static_check,
 )
 from qtea.steps.base import Step, StepContext, StepResult
-from qtea.preflight import run_preflight
 from qtea.test_indexer import (
     IndexResult,
     blocking_violations,
@@ -1666,22 +1668,21 @@ def _write_tbd_locators(
                     selector=selector[:80],
                     source=dev_match.constant_name,
                 )
+            elif is_java:
+                new_lines.append(
+                    f'{const_indent}public static final String '
+                    f'{task.constant_name} = Tbd.of("{task.intent}");'
+                )
+            elif use_self:
+                new_lines.append(
+                    f'{const_indent}self.{task.constant_name} = '
+                    f'tbd("{task.intent}")'
+                )
             else:
-                if is_java:
-                    new_lines.append(
-                        f'{const_indent}public static final String '
-                        f'{task.constant_name} = Tbd.of("{task.intent}");'
-                    )
-                elif use_self:
-                    new_lines.append(
-                        f'{const_indent}self.{task.constant_name} = '
-                        f'tbd("{task.intent}")'
-                    )
-                else:
-                    new_lines.append(
-                        f'{const_indent}{task.constant_name} = '
-                        f'tbd("{task.intent}")'
-                    )
+                new_lines.append(
+                    f'{const_indent}{task.constant_name} = '
+                    f'tbd("{task.intent}")'
+                )
             written += 1
 
         if new_lines:
@@ -1758,7 +1759,7 @@ def _run_phase_b55_xpath_normalisation(
             continue
         try:
             report = rewrite_file(p)
-        except Exception as e:  # noqa: BLE001 — defensive: never kill Step 8 on this pass
+        except Exception as e:
             log.warning(
                 "step08.b55.rewrite_failed",
                 path=str(p.relative_to(sut_root))

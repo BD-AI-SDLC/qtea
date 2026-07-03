@@ -19,12 +19,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tests.unit._fake_anthropic import install_fake_anthropic
 from qtea.checkpoints import RunState
 from qtea.pipeline import PipelineOptions
 from qtea.steps.base import StepContext
 from qtea.steps.s04_strategy import StrategyStep
 from qtea.workspace import create_workspace
+from tests.unit._fake_anthropic import install_fake_anthropic
 
 # ---------- canned markdown fixtures ----------
 

@@ -20,7 +20,6 @@ from qtea.jit_resolver import (
     validate_selector_payload,
 )
 
-
 # ---------------------------------------------------------------------------
 # validate_selector_payload: string-only path (back-compat, no payload)
 # ---------------------------------------------------------------------------

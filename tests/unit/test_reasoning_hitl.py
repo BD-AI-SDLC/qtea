@@ -18,12 +18,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
+from qtea.llm.reasoning import call_reasoning_llm_with_hitl
 from tests.unit._fake_anthropic import (
     FakeResponse,
     FakeTextBlock,
     FakeUsage,
 )
-from qtea.llm.reasoning import call_reasoning_llm_with_hitl
 
 
 def _write_agent_file(tmp_path: Path) -> Path:

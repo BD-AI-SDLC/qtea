@@ -19,14 +19,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import os
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 import pytest
 
 from qtea.steps.s09_execute import _bug_candidates_for_dev_pool_drift
-
 
 # ---------------------------------------------------------------------------
 # Load runtime template (mirrors `test_runtime_plugin._load_runtime`)

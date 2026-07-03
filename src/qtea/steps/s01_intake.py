@@ -39,9 +39,11 @@ import httpx
 from qtea.ado_client import (
     AdoFetchError,
     fetch_work_item,
-    normalize_description as ado_normalize_description,
     parse_ado_spec_source,
     slim_ado_payload,
+)
+from qtea.ado_client import (
+    normalize_description as ado_normalize_description,
 )
 from qtea.config import package_resource_root, step_timeout
 from qtea.jira_client import (

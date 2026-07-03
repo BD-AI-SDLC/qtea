@@ -15,22 +15,20 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
 from qtea.static_check import (
-    StaticCheckResult,
     TYPE_ERROR_RULE,
+    StaticCheckResult,
     _filter_to_scope,
     _parse_pyright_json,
     _parse_tsc_text,
-    format_for_fixer,
     run_static_check,
 )
 from qtea.steps.s08_codegen import _run_phase_b6
 from qtea.test_indexer import Violation
-
 
 # ---------------------------------------------------------------------------
 # Helpers

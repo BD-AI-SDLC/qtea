@@ -25,9 +25,6 @@ import contextlib
 import dataclasses
 import json
 import os
-import re
-import shutil
-import subprocess
 import sys
 import time
 from datetime import UTC, datetime
@@ -37,9 +34,6 @@ from qtea._sut_git import commit_step
 from qtea.auth_helpers import (
     auth_relevant_sut_files as _auth_relevant_sut_files,
 )
-from qtea.auth_helpers import (
-    auth_summary_for_prompt as _auth_summary_for_prompt,
-)
 from qtea.claude_runner import run_agent
 from qtea.config import (
     HEAL_AGENT_MAX_TURNS,
@@ -47,36 +41,18 @@ from qtea.config import (
     package_resource_root,
     step_timeout,
 )
-from qtea.hitl import (
-    RESOLUTION_OVERLAY_BUG,
-    RESOLUTION_OVERLAY_ONCE,
-    RESOLUTION_OVERLAY_PERSIST,
-    Question,
-    prompt_user,
-)
 from qtea.logging_setup import get_logger
 from qtea.overlay_handling import (
-    OverlayEvent,
-    append_interceptor,
-    build_overlay_question_metadata,
-    dedup_overlay_events,
-    delete_screenshot,
-    filter_already_registered,
-    load_interceptors,
-    load_overlay_events,
-    parse_overlay_answer,
     reclassify_bug_candidates,
 )
-from qtea.proxy import safe_subprocess_env
 from qtea.resolver_server import ResolverServer
 from qtea.schemas import is_valid
 from qtea.stack_profile import PYTHON_VENV_MANAGERS, StackProfile, wrap_command
 from qtea.steps.base import Step, StepContext, StepResult
 from qtea.test_runner import (
-    _PYTEST_PLUGIN_PROVIDERS,
     _PW_TEST_FRAMEWORKS,
+    _PYTEST_PLUGIN_PROVIDERS,
     RunResult,
-    TestRunEntry,
     execute_command,
     install_command_for,
     prepare_sut,
@@ -115,44 +91,26 @@ _QTEA_PYTEST_MARKER_FILTER = os.environ.get(
 # test suite keep resolving `qtea.steps.s09_execute._foo` at the historical
 # dotted path (test files pin these names via `from qtea.steps.s09_execute
 # import _foo` and monkeypatch targets like `qtea.steps.s09_execute._foo`).
-from qtea.steps.s09.patch_gates import (  # noqa: E402
-    _ASSERTION_LINE_PATTERNS,
-    _EMPTY_HANDLER_PATTERNS,
-    _XPATH_PATTERNS,
-    _count_empty_handlers,
-    _count_xpath_markers,
-    _extract_assertion_lines,
-    _patch_has_anti_patterns,
-    _patch_introduces_xpath,
-    _patch_modifies_assertions,
+# Attempt-N state persistence + install-signature fingerprinting live in a
+# dedicated submodule. Re-exported here to preserve the historical dotted path.
+from qtea.steps.s09.attempt_state import (
+    _compute_install_sig,
+    _load_attempt_state,
+    _save_attempt_state,
 )
 
-
-# Heal-scope predicates + git revert helpers live in a dedicated submodule.
-# Re-exported here so tests using `monkeypatch.setattr("qtea.steps.s09_execute._foo", ...)`
-# and callers using `from qtea.steps.s09_execute import _foo` keep working.
-from qtea.steps.s09.heal_scope import (  # noqa: E402
-    _git_revert_path,
-    _git_status_porcelain,
-    _heal_allowlist_dirs,
-    _heal_path_in_scope,
-    _heal_path_is_forbidden,
-    _heal_revert_all_uncommitted,
-    _heal_scope_check_and_revert,
+# JIT-resolver bug-candidate emitters (dev-pool drift + unresolvable TBDs)
+# live in a dedicated submodule. Re-exported here to preserve the historical
+# dotted path used by tests (test_dev_pool_quarantine imports these via
+# `from qtea.steps.s09_execute import _bug_candidates_for_dev_pool_drift`).
+from qtea.steps.s09.bug_candidates_ext import (
+    _bug_candidates_for_dev_pool_drift,
+    _bug_candidates_for_unresolvable_tbds,
 )
-# Dep-recovery HITL + package-manager install shim live in a dedicated
-# submodule. Re-exported here to preserve the historical dotted path.
-from qtea.steps.s09.dep_install import (  # noqa: E402
-    _POETRY_NOOP_MARKERS,
-    _hitl_confirm_dep_install,
-    _run_dep_install,
-)
-
 
 # Read-side helpers that load prior-step artifacts + resolve SUT tests dir
 # live in a dedicated submodule. Re-exported here to preserve dotted paths.
-from qtea.steps.s09.context_loaders import (  # noqa: E402
-    _ISOLATED_TESTS_DIR_NAME,
+from qtea.steps.s09.context_loaders import (
     _active_module,
     _attachment_glob,
     _clean_sut_artifacts,
@@ -165,95 +123,84 @@ from qtea.steps.s09.context_loaders import (  # noqa: E402
     _sut_tests_dir,
 )
 
-
-# Fixer-agent prompt builder, patch application, and runner-narrowing helpers
-# live in a dedicated submodule. Re-exported here to preserve the historical
-# dotted path. `_NO_PATCH_SUMMARY` (the summary_text sentinel that gates the
-# real-bug classification on the ExecuteStep side) also lives there.
-from qtea.steps.s09.fixer_prompt import (  # noqa: E402
-    _NO_PATCH_SUMMARY,
-    _apply_fixer_outputs,
-    _build_fixer_prompt,
-    _filter_command_for_tests,
-    _narrow_command_to_ids,
+# Dep-recovery HITL + package-manager install shim live in a dedicated
+# submodule. Re-exported here to preserve the historical dotted path.
+from qtea.steps.s09.dep_install import (
+    _hitl_confirm_dep_install,
+    _run_dep_install,
 )
-
-
-# Attempt-N state persistence + install-signature fingerprinting live in a
-# dedicated submodule. Re-exported here to preserve the historical dotted path.
-from qtea.steps.s09.attempt_state import (  # noqa: E402
-    _attempt_state_path,
-    _compute_install_sig,
-    _load_attempt_state,
-    _save_attempt_state,
-)
-
 
 # Failure classification + _failing_tests / _build_bug_candidates live in a
 # dedicated submodule (failure_class heuristics, real-bug bucketing).
 # Re-exported here to preserve the historical dotted path used by tests
 # (`from qtea.steps.s09_execute import _failing_tests`, etc.).
-from qtea.steps.s09.failure_class import (  # noqa: E402
-    _CLASSIFY_PATTERNS,
-    _FAILURE_CLASS_HEALABLE,
+from qtea.steps.s09.failure_class import (
     _build_bug_candidates,
     _classify_failure,
     _failing_tests,
     _partition_failures,
 )
 
-# JIT locator-cache dev-pool prewarm + resolver-spend telemetry summarizer
-# live in a dedicated submodule. Re-exported here to preserve dotted paths.
-from qtea.steps.s09.jit_prewarm import (  # noqa: E402
-    _prewarm_jit_cache_dev_pool,
-    _summarize_resolver_spend,
+# Fixer-agent prompt builder, patch application, and runner-narrowing helpers
+# live in a dedicated submodule. Re-exported here to preserve the historical
+# dotted path. `_NO_PATCH_SUMMARY` (the summary_text sentinel that gates the
+# real-bug classification on the ExecuteStep side) also lives there.
+from qtea.steps.s09.fixer_prompt import (
+    _NO_PATCH_SUMMARY,
+    _apply_fixer_outputs,
+    _build_fixer_prompt,
+    _filter_command_for_tests,
 )
 
+# Heal-scope predicates + git revert helpers live in a dedicated submodule.
+# Re-exported here so tests using `monkeypatch.setattr("qtea.steps.s09_execute._foo", ...)`
+# and callers using `from qtea.steps.s09_execute import _foo` keep working.
+from qtea.steps.s09.heal_scope import (
+    _git_status_porcelain,
+    _heal_allowlist_dirs,
+    _heal_revert_all_uncommitted,
+    _heal_scope_check_and_revert,
+)
 
 # JIT resolver HITL escalation for unresolvable TBD sentinels lives in a
 # dedicated submodule. Re-exported here to preserve the historical dotted path.
-from qtea.steps.s09.jit_hitl import (  # noqa: E402
-    _append_resolved_to_dev_locators,
+from qtea.steps.s09.jit_hitl import (
     _collect_hitl_pending,
     _hitl_resolve_unresolvable,
 )
 
-
-# End-of-attempt overlay-event sweep + HITL persistence lives in a dedicated
-# submodule. Re-exported here to preserve the historical dotted path.
-from qtea.steps.s09.overlay_sweep import (  # noqa: E402
-    _hitl_overlay_sweep,
-    _interceptors_path,
-    _overlay_events_path,
+# JIT locator-cache dev-pool prewarm + resolver-spend telemetry summarizer
+# live in a dedicated submodule. Re-exported here to preserve dotted paths.
+from qtea.steps.s09.jit_prewarm import (
+    _prewarm_jit_cache_dev_pool,
+    _summarize_resolver_spend,
 )
-
-
-# TBD-sentinel promotion (rewrites tbd("intent") calls end-of-attempt) lives
-# in a dedicated submodule. Re-exported here to preserve the historical
-# dotted path used by tests (test_promote_tbd_gating imports these via
-# `from qtea.steps.s09_execute import _promote_resolved_tbds`).
-from qtea.steps.s09.tbd_promotion import (  # noqa: E402
-    _ensure_runtime_imports,
-    _format_promoted_substitution,
-    _promote_resolved_tbds,
-)
-
-
-# JIT-resolver bug-candidate emitters (dev-pool drift + unresolvable TBDs)
-# live in a dedicated submodule. Re-exported here to preserve the historical
-# dotted path used by tests (test_dev_pool_quarantine imports these via
-# `from qtea.steps.s09_execute import _bug_candidates_for_dev_pool_drift`).
-from qtea.steps.s09.bug_candidates_ext import (  # noqa: E402
-    _bug_candidates_for_dev_pool_drift,
-    _bug_candidates_for_unresolvable_tbds,
-)
-
 
 # Playwright MCP server lazy-probe (warms npx cache before first heal)
 # lives in a dedicated submodule. Re-exported here to preserve the
 # monkey-patch path used by tests/unit/test_mcp_preflight_lazy.py, which
 # patches `qtea.steps.s09_execute._lazy_probe_heal_mcp` directly.
-from qtea.steps.s09.mcp_probe import _lazy_probe_heal_mcp  # noqa: E402
+from qtea.steps.s09.mcp_probe import _lazy_probe_heal_mcp
+
+# End-of-attempt overlay-event sweep + HITL persistence lives in a dedicated
+# submodule. Re-exported here to preserve the historical dotted path.
+from qtea.steps.s09.overlay_sweep import (
+    _hitl_overlay_sweep,
+    _interceptors_path,
+)
+from qtea.steps.s09.patch_gates import (
+    _patch_has_anti_patterns,
+    _patch_introduces_xpath,
+    _patch_modifies_assertions,
+)
+
+# TBD-sentinel promotion (rewrites tbd("intent") calls end-of-attempt) lives
+# in a dedicated submodule. Re-exported here to preserve the historical
+# dotted path used by tests (test_promote_tbd_gating imports these via
+# `from qtea.steps.s09_execute import _promote_resolved_tbds`).
+from qtea.steps.s09.tbd_promotion import (
+    _promote_resolved_tbds,
+)
 
 
 def _compose_runner_stream_diagnostics(
@@ -1144,7 +1091,7 @@ class ExecuteStep(Step):
                         count=_prewarm_count,
                         tier="dev-pool",
                     )
-            except Exception as _e:  # noqa: BLE001 — best-effort, never poison run
+            except Exception as _e:
                 log.warning("step09.jit_cache_prewarm_failed", error=str(_e))
 
         return _BootstrapResult(

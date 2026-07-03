@@ -15,7 +15,6 @@ from qtea.preflight import (
     run_preflight,
 )
 
-
 _INVENTORY_WITH_AUTH = {
     "active_module": "app",
     "modules": [{

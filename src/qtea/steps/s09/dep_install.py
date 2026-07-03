@@ -149,7 +149,7 @@ def _hitl_confirm_dep_install(
     )
     try:
         answers = prompt_user([q], agent_label="dep-recovery")
-    except Exception as e:  # noqa: BLE001 — best-effort; never block Step 9
+    except Exception as e:
         log.warning("step09.dep_recover_hitl_failed", error=str(e))
         return default
 

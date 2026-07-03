@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
 
 import flet as ft
 
 from qtea.ui.state import AppState
-from qtea.ui.theme import BACKGROUND, CARD_BG, DIVIDER, ON_SURFACE, ON_SURFACE_DIM, PRIMARY, SECONDARY
+from qtea.ui.theme import (
+    BACKGROUND,
+    CARD_BG,
+    DIVIDER,
+    ON_SURFACE,
+    ON_SURFACE_DIM,
+    PRIMARY,
+    SECONDARY,
+)
 
 
 def build_config_view(

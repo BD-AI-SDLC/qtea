@@ -20,8 +20,6 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 from qtea.parse_check import (
     PARSE_ERROR_RULE,
     ParseCheckResult,
@@ -32,7 +30,6 @@ from qtea.parse_check import (
     run_parse_check,
 )
 from qtea.schemas import is_valid
-
 
 # ---------------------------------------------------------------------------
 # Python: ast.parse (always available)
