@@ -1123,15 +1123,14 @@ def _find_matching_brace(text: str, open_idx: int) -> int:
                 continue
             if ch == quote:
                 quote = None
-        else:
-            if ch in "\"'`":
-                quote = ch
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    return i
+        elif ch in "\"'`":
+            quote = ch
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
         i += 1
     return -1
 

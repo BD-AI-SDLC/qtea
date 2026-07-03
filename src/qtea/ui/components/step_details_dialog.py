@@ -16,7 +16,6 @@ from qtea.ui.theme import (
     ON_SURFACE,
     ON_SURFACE_DIM,
     PHASE_COLORS,
-    PRIMARY,
     SECONDARY,
     STATUS_COLORS,
     STATUS_ICONS,

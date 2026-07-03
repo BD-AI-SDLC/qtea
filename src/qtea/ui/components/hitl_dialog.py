@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 import flet as ft
 
@@ -14,7 +14,7 @@ from qtea.hitl import (
     RESOLUTION_OVERLAY_ONCE,
     RESOLUTION_OVERLAY_PERSIST,
 )
-from qtea.ui.state import AppState, HitlRequest, ReviewGateRequest
+from qtea.ui.state import AppState, ReviewGateRequest
 from qtea.ui.theme import (
     BACKGROUND,
     CARD_BG,
@@ -1758,7 +1758,7 @@ def _build_review_body(
             return _render_plan_summary(req.data, on_edit_submit=on_edit_submit)
         if kind == "intents" and isinstance(req.data, list):
             return _render_intents_list(req.data)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         return ft.Text(
             f"[render error: {e}]\n\n{req.summary}",
             size=12,

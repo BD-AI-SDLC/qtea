@@ -13,13 +13,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tests.unit._fake_anthropic import install_fake_anthropic
 from qtea.checkpoints import RunState
 from qtea.pipeline import PipelineOptions
 from qtea.steps.base import StepContext
 from qtea.steps.s02_refine import RefineStep
 from qtea.steps.s03_plan import PlanStep
 from qtea.workspace import create_workspace
+from tests.unit._fake_anthropic import install_fake_anthropic
 
 # ---------- canned markdown fixtures ----------
 

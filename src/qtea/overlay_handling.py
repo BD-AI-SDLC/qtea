@@ -26,9 +26,10 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import asdict, dataclass, field
+from collections.abc import Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -309,7 +310,7 @@ def write_interceptors(path: Path, entries: Iterable[Interceptor]) -> None:
         _validate(envelope, "interceptors")
     except (ImportError, FileNotFoundError):
         pass
-    except Exception as e:  # noqa: BLE001 — schema errors surface here
+    except Exception as e:
         raise ValueError(f"interceptors.json failed schema validation: {e}") from e
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -734,13 +735,13 @@ __all__ = [
     "CONSENT_COOKIE_PATTERNS",
     "DISMISS_RISKY_TOKENS",
     "DISMISS_SAFE_TOKENS",
-    "DismissCandidate",
     "INTERCEPTORS_SCHEMA_VERSION",
-    "Interceptor",
-    "OverlayEvent",
     "RESOLUTION_OVERLAY_BUG",
     "RESOLUTION_OVERLAY_ONCE",
     "RESOLUTION_OVERLAY_PERSIST",
+    "DismissCandidate",
+    "Interceptor",
+    "OverlayEvent",
     "append_interceptor",
     "build_overlay_question_metadata",
     "classify_dismiss_name",

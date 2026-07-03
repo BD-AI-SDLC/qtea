@@ -103,7 +103,6 @@ def _heal_path_in_scope(
 
 def _git_revert_path(sut_root: Path, rel_path: str, status_code: str) -> bool:
     """Revert a single uncommitted change. Returns True on success."""
-    import subprocess
     try:
         if status_code.strip() == "??":
             (sut_root / rel_path).unlink(missing_ok=True)
@@ -128,7 +127,6 @@ def _git_status_porcelain(sut_root: Path) -> list[tuple[str, str]]:
     git-missing / error. Handles rename entries by taking the destination
     path.
     """
-    import subprocess
     if not (sut_root / ".git").exists():
         return []
     try:

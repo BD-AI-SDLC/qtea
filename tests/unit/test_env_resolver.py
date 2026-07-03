@@ -183,9 +183,9 @@ def test_interactive_strategy_accepts_resolution_answered(monkeypatch):
     Regression: the UI dialog previously stored ('user', value) which
     the env resolver silently discarded because 'user' != 'answered'.
     """
+    import qtea.hitl as hitl_mod
     from qtea.env_resolver import InteractivePromptStrategy
     from qtea.hitl import RESOLUTION_ANSWERED
-    import qtea.hitl as hitl_mod
 
     monkeypatch.setenv("QTEA_UI_MODE", "1")
     monkeypatch.setattr(

@@ -1025,7 +1025,8 @@ async def test_step09_dep_recovery_refreshes_install_sig(
     Latent today (blocked by ``MAX_ATTEMPTS=2``) but the check is cheap
     and protects the retry state machine if attempts are ever bumped.
     """
-    from qtea.test_runner import RunResult, TestRunEntry as _TRE
+    from qtea.test_runner import RunResult
+    from qtea.test_runner import TestRunEntry as _TRE
 
     ctx = _ctx(tmp_path)
     initial_cmd = "pytest tests/"
@@ -1048,7 +1049,8 @@ async def test_step09_dep_recovery_refreshes_install_sig(
         parallelism=0,
     ):
         call_seq["n"] += 1
-        from datetime import UTC as _UTC, datetime as _dt
+        from datetime import UTC as _UTC
+        from datetime import datetime as _dt
         _now = _dt.now(_UTC).isoformat()
         if call_seq["n"] == 1:
             entry = _TRE(
@@ -1112,7 +1114,8 @@ async def test_step09_dep_recovery_uses_unnarrowed_cmd_on_retry(
     previously-passing tests across attempts.
     """
     from qtea.checkpoints import StepRecord
-    from qtea.test_runner import RunResult, TestRunEntry as _TRE
+    from qtea.test_runner import RunResult
+    from qtea.test_runner import TestRunEntry as _TRE
 
     ctx = _ctx(tmp_path)
     # Command tokenized as pytest so `_filter_command_for_tests` actually
@@ -1145,7 +1148,8 @@ async def test_step09_dep_recovery_uses_unnarrowed_cmd_on_retry(
     ):
         call_seq["n"] += 1
         captured_cmds.append(detected_command or "(default)")
-        from datetime import UTC as _UTC, datetime as _dt
+        from datetime import UTC as _UTC
+        from datetime import datetime as _dt
         _now = _dt.now(_UTC).isoformat()
         if call_seq["n"] == 1:
             # Initial narrowed run — simulate missing_module runner failure.

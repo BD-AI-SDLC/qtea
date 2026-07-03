@@ -14,14 +14,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from qtea.steps.s09_execute import (
     _ensure_runtime_imports,
     _format_promoted_substitution,
     _promote_resolved_tbds,
 )
-
 
 # ---------------------------------------------------------------------------
 # _format_promoted_substitution: payload → Python expression

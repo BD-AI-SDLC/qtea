@@ -15,15 +15,15 @@ from pathlib import Path
 
 from qtea.checkpoints import RunState
 from qtea.pipeline import PipelineOptions
-from qtea.steps.base import StepContext
 from qtea.runtime.dev_locators import DevLocator
+from qtea.steps.base import StepContext
 from qtea.steps.s08_codegen import (
     CodegenStep,
-    _LocatorTask,
     _b5_filter_test_files,
     _detect_init_placement,
     _filter_index_to_qtea,
     _framework_mismatch_message,
+    _LocatorTask,
     _match_dev_locator,
     _parse_test_command_head,
     _run_phase_b55_xpath_normalisation,

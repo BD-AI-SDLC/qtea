@@ -6,7 +6,6 @@ from pathlib import Path
 
 from qtea.playwright_config_editor import ensure_test_id_attribute, find_config
 
-
 _CONFIG_WITH_USE = """\
 import { defineConfig } from '@playwright/test';
 

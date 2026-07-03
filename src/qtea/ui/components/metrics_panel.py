@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import flet as ft
 
-from qtea.ui.state import AppState, STEP_DEFINITIONS
+from qtea.ui.state import STEP_DEFINITIONS, AppState
 from qtea.ui.theme import (
     CARD_BG,
     DIVIDER,
@@ -12,7 +12,6 @@ from qtea.ui.theme import (
     ON_SURFACE_DIM,
     PHASE_COLORS,
     SECONDARY,
-    STATUS_COLORS,
 )
 
 
@@ -52,8 +51,7 @@ def _metric_row(label: str, value: str, color: str = ON_SURFACE) -> ft.Row:
 def _build_cost_bars(state: AppState) -> ft.Column:
     """Per-step cost breakdown as horizontal bars."""
     max_cost = max((s.cost_usd for s in state.steps.values()), default=0.01)
-    if max_cost < 0.01:
-        max_cost = 0.01
+    max_cost = max(max_cost, 0.01)
 
     bars: list[ft.Control] = []
     for num, name, phase in STEP_DEFINITIONS:

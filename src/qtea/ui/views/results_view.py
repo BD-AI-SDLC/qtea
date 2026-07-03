@@ -6,12 +6,12 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 import flet as ft
 
-from qtea.ui.state import AppState, STEP_DEFINITIONS
+from qtea.ui.state import STEP_DEFINITIONS, AppState
 from qtea.ui.theme import (
     BACKGROUND,
     CARD_BG,
@@ -20,7 +20,6 @@ from qtea.ui.theme import (
     ON_SURFACE_DIM,
     PHASE_COLORS,
     PRIMARY,
-    SECONDARY,
     STATUS_COLORS,
 )
 

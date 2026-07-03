@@ -17,7 +17,6 @@ from pathlib import Path
 from qtea.stack_profile import StackProfile
 from qtea.steps.base import StepContext
 
-
 # Fallback tests subdirectory used when:
 #   - --isolated-tests is set (explicit user opt-in to today's behavior), OR
 #   - sut_inventory has no test_directory_layout for the active module.
@@ -167,7 +166,6 @@ def _attachment_glob(sut_root: Path) -> list[dict]:
 
 def _clean_sut_artifacts(sut_root: Path) -> None:
     """Remove prior-attempt screenshots/traces so only the last run's artifacts survive."""
-    import contextlib
 
     patterns = [
         "test-results/**/*.png",

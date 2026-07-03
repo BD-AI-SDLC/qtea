@@ -15,17 +15,17 @@ from pathlib import Path
 
 import pytest
 
+from qtea.llm.reasoning import (
+    call_reasoning_llm,
+    reset_vertex_structured_outputs_warning_latch,
+)
+from qtea.metrics import CURRENT_STEP_METRICS, StepMetricsAccumulator
 from tests.unit._fake_anthropic import (
     FakeUsage,
     disable_vertex_env,
     enable_vertex_env,
     install_fake_anthropic,
 )
-from qtea.llm.reasoning import (
-    call_reasoning_llm,
-    reset_vertex_structured_outputs_warning_latch,
-)
-from qtea.metrics import CURRENT_STEP_METRICS, StepMetricsAccumulator
 
 
 @pytest.fixture(autouse=True)

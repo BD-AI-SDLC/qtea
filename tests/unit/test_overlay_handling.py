@@ -12,19 +12,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from qtea.overlay_handling import (
     CONSENT_COOKIE_PATTERNS,
     DISMISS_RISKY_TOKENS,
     DISMISS_SAFE_TOKENS,
     INTERCEPTORS_SCHEMA_VERSION,
-    DismissCandidate,
-    Interceptor,
-    OverlayEvent,
     RESOLUTION_OVERLAY_BUG,
     RESOLUTION_OVERLAY_ONCE,
     RESOLUTION_OVERLAY_PERSIST,
+    Interceptor,
+    OverlayEvent,
     append_interceptor,
     build_overlay_question_metadata,
     classify_dismiss_name,
@@ -40,7 +37,6 @@ from qtea.overlay_handling import (
     score_candidates,
     write_interceptors,
 )
-
 
 # ---------------------------------------------------------------------------
 # Heuristic scoring — the safety-critical piece.

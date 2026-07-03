@@ -138,6 +138,7 @@ def main(page: ft.Page):
             # the pipeline don't bleed onto the terminal (the UI log panel
             # captures everything via structlog events).
             import io
+
             from rich.console import Console
             silent_console = Console(file=io.StringIO(), force_terminal=False)
 

@@ -68,9 +68,8 @@ def _hitl_resolve_unresolvable(
     Returns ``(resolved, remaining)`` — ``resolved`` were answered by the
     user, ``remaining`` are still unresolved and flow into bug-candidates.
     """
-    import sys
-
     import os
+    import sys
     is_tty = sys.stdin is not None and sys.stdin.isatty()
     is_ui = bool(os.environ.get("QTEA_UI_MODE"))
     if is_ui or not is_tty or no_hitl or not pendings:
