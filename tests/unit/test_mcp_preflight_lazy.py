@@ -137,6 +137,36 @@ def test_preflight_fails_fast_on_probe_failure_in_non_tty(_console):
     assert result is False
 
 
+def test_preflight_ui_mode_bails_instead_of_hanging_on_confirm(_console, monkeypatch):
+    # Regression guard: UI mode + probe failure used to fall through to
+    # `Confirm.ask`, which reads from stdin — unreachable from the Flet
+    # worker thread, so the run hung at "Initializing... 0/11 steps" with
+    # no UI affordance to recover. UI mode must join non-TTY / no_hitl /
+    # yes on the early-bail path.
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)  # would fall through pre-fix
+
+    def _exploding_confirm(*args, **kwargs):
+        raise AssertionError(
+            "Confirm.ask called in ui_mode — would hang the Flet worker thread",
+        )
+    monkeypatch.setattr("rich.prompt.Confirm.ask", _exploding_confirm)
+
+    opts = PipelineOptions(workspace_base=Path(), ui_mode=True)
+    assert opts.no_hitl is False
+    assert opts.yes is False
+    step = _PlaywrightStep()
+    fake_config = {"playwright": McpServer(name="x", command="echo", args=[], env={})}
+
+    with patch(
+        "qtea.mcp_manager.load_mcp_config", return_value=fake_config,
+    ), patch(
+        "qtea.mcp_manager.probe_server", return_value=(False, "spawn error"),
+    ):
+        result = _mcp_preflight_for_step(step, opts=opts, console=_console)
+
+    assert result is False
+
+
 # ---------------------------------------------------------------------------
 # End-to-end: full pipeline never preflights when no step requires MCP
 # ---------------------------------------------------------------------------

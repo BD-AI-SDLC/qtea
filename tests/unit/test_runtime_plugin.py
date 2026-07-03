@@ -1293,7 +1293,11 @@ def test_storage_state_auto_capture_on_first_passing_test(runtime, tmp_path, mon
     item1 = _FakeItem(funcargs={"context": ctx1}, passed=True, nodeid="t.py::a")
     runtime.pytest_runtest_teardown(item1, nextitem=None)
     assert (tmp_path / "storage-state.json").is_file()
-    assert ctx1.calls == [{"path": str(tmp_path / "storage-state.json")}]
+    # The overlay-handling change routes storage state through the consent-
+    # cookie filter: the runtime now calls context.storage_state() WITHOUT
+    # path (dict return), filters, then writes to disk itself. Older
+    # signatures (path-only) fall back to a post-write re-filter pass.
+    assert ctx1.calls == [{"path": None}]
     assert runtime._storage_state_captured is True
 
     # Second passing test: no further capture (idempotent, single-shot).
@@ -1351,8 +1355,11 @@ def test_storage_state_auto_capture_falls_back_to_funcarg_scan(runtime, tmp_path
     ctx = _FakeContext()
     item = _FakeItem(funcargs={"playwright_context": ctx}, passed=True)
     runtime.pytest_runtest_teardown(item, nextitem=None)
-    assert ctx.calls == [{"path": str(tmp_path / "storage-state.json")}]
+    # See test_storage_state_auto_capture_on_first_passing_test for the
+    # rationale — filter-then-write flow calls storage_state() with no path.
+    assert ctx.calls == [{"path": None}]
     assert runtime._storage_state_captured is True
+    assert (tmp_path / "storage-state.json").is_file()
 
 
 def test_storage_state_auto_capture_swallows_exceptions(runtime, tmp_path, monkeypatch):

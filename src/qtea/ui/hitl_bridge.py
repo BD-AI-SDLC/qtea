@@ -99,6 +99,11 @@ class HitlBridge:
                     "text": q.prompt_text,
                     "context": q.context or "",
                     "type": q.kind,
+                    # Structured payload for kinds that render more than text
+                    # (e.g. overlay_dismiss → screenshot + candidates). Kept
+                    # as a flat dict here so the hitl_dialog branch on
+                    # metadata.type can render appropriately.
+                    "metadata": dict(q.metadata or {}),
                 }
                 for q in pending.questions
             ],

@@ -273,7 +273,7 @@ All scenarios assume the normal qtea pipeline path: `./sut_inventory.json` is st
 → The fallback language/framework/pattern prompt is presented by the agent (see `codegen-violation-fixer.agent.md` workflow). **WAIT** for explicit selection. Do NOT scan the SUT root yourself.
 
 **Scenario D (User explicitly overrides):** User states "Generate Python pytest tests" in the task prompt even though `sut_inventory.json["modules"][active]` says TypeScript.
-→ Trust the explicit override but document it: top-of-file comment `# Stack: python+pytest (user override; sut_inventory.json detected typescript)`. This is rare and intentional.
+→ Trust the explicit override but document it with a **language-appropriate** top-of-file comment. Python target → `# Stack: python+pytest (user override; sut_inventory.json detected typescript)`. TypeScript target → `// Stack: typescript+playwright (user override; sut_inventory.json detected python)`. Do NOT emit `#` at the top of a `.ts`/`.js`/`.java` file — it fails to parse. This is rare and intentional.
 
 **Scenario E (Robot Framework):** `sut_inventory.json["modules"][active]` shows `language: "robot"`, `existing_page_objects` may be empty (Tier 3 LLM-augmented from researcher).
 → Generate `Tests/qtea_<feature>.robot` and `Resources/<feature>_keywords.resource` using Browser Library locators (`id=`, `css=`, `role=`, `text=`). Reuse existing `*.resource` keywords listed in `sut_inventory.existing_helpers`.

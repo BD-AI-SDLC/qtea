@@ -119,8 +119,6 @@ class AppState:
     spec: str = ""
     sut: str = ""
     headless: bool = True
-    debug: bool = False
-    fix: bool = False
     parallel_run: int = 2
     report: str = "auto"
     cache: str = "auto"  # "auto" | "on" | "off"
@@ -266,8 +264,6 @@ class AppState:
                 "spec": self.spec,
                 "sut": self.sut,
                 "headless": self.headless,
-                "debug": self.debug,
-                "fix": self.fix,
                 "parallel_run": self.parallel_run,
                 "report": self.report,
                 "cache": self.cache,
@@ -284,8 +280,6 @@ class AppState:
         self.spec = prefs.get("spec", self.spec)
         self.sut = prefs.get("sut", self.sut)
         self.headless = prefs.get("headless", self.headless)
-        self.debug = prefs.get("debug", self.debug)
-        self.fix = prefs.get("fix", self.fix)
         self.parallel_run = prefs.get("parallel_run", self.parallel_run)
         self.report = prefs.get("report", self.report)
         self.cache = prefs.get("cache", self.cache)

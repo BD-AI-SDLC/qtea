@@ -52,6 +52,13 @@ from qtea.llm.reasoning import call_reasoning_llm
 from qtea.logging_setup import get_logger
 from qtea.runtime.dev_locators import DevLocator, load_dev_locators
 from qtea.schemas import is_valid
+from qtea.parse_check import (
+    ParseCheckResult,
+    format_for_fixer as parse_check_format_for_fixer,
+    has_degraded_violations,
+    run_parse_check,
+)
+from qtea.playwright_config_editor import ensure_test_id_attribute
 from qtea.static_check import (
     StaticCheckResult,
     format_for_fixer,
@@ -66,6 +73,7 @@ from qtea.test_indexer import (
     resolve_framework,
     violations_summary,
 )
+from qtea.xpath_rewriter import RewriteReport, XpathSite, rewrite_file
 
 log = get_logger(__name__)
 
@@ -83,11 +91,12 @@ B5_MAX_AUTOPATCH_RETRIES = 1
 # fix-proposal / human review.
 B6_MAX_AUTOPATCH_RETRIES = 1
 
-# Languages B.5 currently understands. Other languages (Java today) skip
-# reconciliation entirely; the StepResult records `b5_skipped=<lang>` so a
-# green B.5 line cannot be misread as "Java was covered."
+# Languages B.5 currently understands. Other languages skip reconciliation
+# entirely; the StepResult records `b5_skipped=<lang>` so a green B.5 line
+# cannot be misread as "that language was covered." The skip is logged at
+# WARNING level so it surfaces at the default log level.
 _B5_SUPPORTED_LANGUAGES: frozenset[str] = frozenset({
-    "python", "typescript", "javascript",
+    "python", "typescript", "javascript", "java",
 })
 
 
@@ -710,14 +719,22 @@ def _b5_filter_test_files(produced: list[Path], language: str) -> list[Path]:
     * Python / TS / JS: `qtea_<feature>_test.<ext>` — snake_case, ends in
       ``_test``. Files named ``qtea_<feature>_<role>.<ext>`` (role ∈ the
       non-test suffix table above) are explicitly skipped.
+    * TS / JS also: Playwright's ``.spec.ts`` / ``.spec.js`` convention
+      (``qtea_<feature>_test.spec.ts`` or ``qtea_<feature>.spec.ts``).
+      The compound extension leaves the stem ending in ``.spec``, so this
+      branch adds an explicit check. Missing this check was why
+      run 20260701-114656-9394eb's ``qtea_ropa_approval_test.spec.ts``
+      was silently skipped by B.5 (0 files scanned).
     * Java: ``Qtea<Feature>Test.java`` — CamelCase. Lowercased, the stem
       ends in ``test`` with no underscore separator. Only ``.java`` files
       get this looser match; without the extension gate, a Python POM
       named ``qtea_dashboardtest`` (unusual but legal) would false-match.
     """
     out: list[Path] = []
+    _JS_TS_EXTS = {".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"}
     for p in produced:
         stem = p.stem.lower()
+        name = p.name.lower()
         ext = p.suffix.lower()
         if any(stem.endswith(suf) for suf in _B5_NON_TEST_SUFFIXES):
             continue
@@ -726,6 +743,7 @@ def _b5_filter_test_files(produced: list[Path], language: str) -> list[Path]:
             or stem.startswith("test_")
             or "_test_" in stem
             or (ext == ".java" and stem.endswith("test"))
+            or (ext in _JS_TS_EXTS and (stem.endswith(".spec") or ".spec." in name))
         )
         if is_test:
             out.append(p)
@@ -811,6 +829,14 @@ class _LocatorTask:
     intent: str
     owning_page: str
     locator_file: str | None = None
+    # Where in the SUT to place the new TBD constant. Set from the
+    # matching ``LocatorClass.location_pattern`` when a matching entry is
+    # found in the inventory. None means "no locator source found for
+    # this POM" — the caller (``_write_tbd_locators``) falls back to
+    # emitting inline ``tbd("intent")`` in the POM method body via the
+    # POM extender agent.
+    location_pattern: str | None = None
+    container_name: str | None = None  # e.g. "elements" for inline_object_property
 
 
 @dataclass
@@ -882,13 +908,45 @@ def _build_locator_tasks(
     plan: dict[str, Any],
     inventory: dict[str, Any] | None,
 ) -> list[_LocatorTask]:
-    """Collect create_tbd locators across all TCs."""
-    inv_locators: dict[str, str] = {}
+    """Collect create_tbd locators across all TCs.
+
+    Locator-source resolution respects whatever convention the SUT
+    already uses (recorded on each ``existing_locators[]`` entry as
+    ``location_pattern``). Priority order per owning page:
+
+    1. ``owning_pom == owning_page`` — inline patterns
+       (``inline_object_property`` / ``readonly_locator_props``) win
+       when the POM itself owns the locators.
+    2. ``class_name == f"{owning_page}Locators"`` — separate-class
+       fallback for the historical Python-Selenium convention.
+    3. Nothing — task gets ``locator_file=None`` and ``_write_tbd_locators``
+       hands it to the POM extender agent for inline ``tbd()`` placement
+       (never silently dropped).
+    """
+    inv_entries: list[dict[str, Any]] = []
     if inventory:
         am = _active_module_dict(inventory) or {}
         for lc in am.get("existing_locators") or []:
             if isinstance(lc, dict):
-                inv_locators[lc.get("class_name", "")] = lc.get("file", "")
+                inv_entries.append(lc)
+
+    def _resolve(owning: str) -> dict[str, Any] | None:
+        if not owning:
+            return None
+        # Prefer inline/readonly-property entries where owning_pom matches.
+        inline_hit = next(
+            (lc for lc in inv_entries if lc.get("owning_pom") == owning),
+            None,
+        )
+        if inline_hit:
+            return inline_hit
+        # Backwards-compat: `{Owning}Locators` separate-class match.
+        legacy_name = f"{owning}Locators"
+        legacy_hit = next(
+            (lc for lc in inv_entries if lc.get("class_name") == legacy_name),
+            None,
+        )
+        return legacy_hit
 
     tasks: list[_LocatorTask] = []
     seen: set[str] = set()
@@ -901,12 +959,18 @@ def _build_locator_tasks(
                 continue
             seen.add(name)
             owning = loc.get("owning_page", "")
-            locator_cls = f"{owning}Locators" if owning else ""
+            entry = _resolve(owning)
             tasks.append(_LocatorTask(
                 constant_name=name,
                 intent=loc.get("intent", ""),
                 owning_page=owning,
-                locator_file=inv_locators.get(locator_cls),
+                locator_file=entry.get("file") if entry else None,
+                location_pattern=(
+                    entry.get("location_pattern") if entry else None
+                ),
+                container_name=(
+                    entry.get("container_name") if entry else None
+                ),
             ))
     return tasks
 
@@ -1451,19 +1515,58 @@ def _write_tbd_locators(
     The function also detects whether the target locator class uses instance
     attributes (``self.X = ...`` inside ``__init__``) and places new
     constants accordingly.
+
+    **Convention dispatch.** Only the historical ``separate_class`` /
+    ``module_const_bag`` patterns are written mechanically here. Inline
+    patterns (``inline_object_property``, ``readonly_locator_props``,
+    ``export_const_object``) are DEFERRED to the POM extender agent in
+    Phase A3 — the extender has the POM source loaded and can add
+    entries in the SUT's own style (append to ``elements = {...}``,
+    add a ``readonly`` Locator property, etc.). Deferred tasks are
+    logged at INFO level (not WARNING) — the previous behaviour of
+    warning "tbd_locator_no_file" for a well-detected inline pattern
+    was misleading.
     """
     if not locator_tasks:
         return 0
 
     by_file: dict[str, list[_LocatorTask]] = {}
+    _MECHANICAL_PATTERNS: frozenset[str | None] = frozenset({
+        None, "separate_class", "module_const_bag",
+    })
     for task in locator_tasks:
-        if task.locator_file:
+        mechanical = task.location_pattern in _MECHANICAL_PATTERNS
+        if task.locator_file and mechanical:
             by_file.setdefault(task.locator_file, []).append(task)
-        else:
-            log.warning(
-                "step08.tbd_locator_no_file",
+        elif task.locator_file and not mechanical:
+            # Convention detected but this function's mechanical writer
+            # doesn't yet know how to append to it — POM extender handles.
+            log.info(
+                "step08.tbd_locator_deferred_to_extender",
                 constant=task.constant_name,
                 owning_page=task.owning_page,
+                pattern=task.location_pattern,
+                container=task.container_name,
+                file=task.locator_file,
+                reason=(
+                    f"SUT uses {task.location_pattern!r} convention; "
+                    f"POM extender will add the constant in the same style"
+                ),
+            )
+        else:
+            # No matching locator source in inventory. The POM extender
+            # will emit the locator inline in the method body (Playwright
+            # `getBy*` / Selenium `driver.findElement`) — respects any
+            # SUT that doesn't keep locators in a separate structure.
+            log.info(
+                "step08.tbd_locator_no_source_defer",
+                constant=task.constant_name,
+                owning_page=task.owning_page,
+                reason=(
+                    f"No existing locator source found for POM "
+                    f"{task.owning_page!r}; POM extender will emit "
+                    f"the locator inline in the method body"
+                ),
             )
 
     written = 0
@@ -1612,6 +1715,85 @@ _HARDCODED_LOCATOR_RE = _re.compile(
     r"""(["'])(.+?)\3"""          # quoted string value
     r"\s*$",                      # end of line
 )
+
+
+def _run_phase_b55_xpath_normalisation(
+    sut_root: Path,
+    candidates: set[Path],
+) -> tuple[list[RewriteReport], list[XpathSite]]:
+    """Phase B.5.5 — deterministic XPath → Playwright locator rewrite.
+
+    Walks every ``.ts`` / ``.js`` / ``.mts`` / ``.mjs`` file in *candidates*
+    (the codegen-modified set), invokes ``qtea.xpath_rewriter.rewrite_file``
+    on each, and — if any rewrite emitted a ``getByTestId(...)`` call —
+    idempotently adds ``testIdAttribute: 'data-test'`` to the SUT's
+    playwright config.
+
+    Returns ``(reports, stragglers)`` where ``reports`` covers every file
+    the rewriter touched and ``stragglers`` aggregates the xpath sites the
+    deterministic layer refused to translate. The caller feeds stragglers
+    into the LLM violation-fixer via the existing gate path — the exempt
+    marker the rewriter stamps keeps the quality gate from failing on
+    them regardless of whether the LLM succeeds.
+    """
+    # Unconditional entry log so operators can confirm this phase fired
+    # even if every downstream step below is a no-op. Debugging aid: if
+    # `step08.b55.started` is missing from `run.log.jsonl`, Phase B.5.5
+    # was NOT invoked — check the call site in `CodegenStep.run` and any
+    # early-return that might have skipped it.
+    log.info(
+        "step08.b55.started",
+        candidates=len(candidates),
+        sut_root=str(sut_root),
+    )
+
+    reports: list[RewriteReport] = []
+    stragglers: list[XpathSite] = []
+    testid_needed = False
+    changed_files: list[Path] = []
+
+    ts_suffixes = {".ts", ".js", ".mts", ".mjs", ".cts", ".cjs"}
+    for p in sorted(candidates):
+        if not p.is_file() or p.suffix.lower() not in ts_suffixes:
+            continue
+        try:
+            report = rewrite_file(p)
+        except Exception as e:  # noqa: BLE001 — defensive: never kill Step 8 on this pass
+            log.warning(
+                "step08.b55.rewrite_failed",
+                path=str(p.relative_to(sut_root))
+                if p.is_relative_to(sut_root) else str(p),
+                error=str(e),
+            )
+            continue
+        if report.rewritten or report.stragglers or report.container_migrated:
+            reports.append(report)
+            stragglers.extend(report.stragglers)
+            if report.testid_attr_needed:
+                testid_needed = True
+            if report.changed:
+                changed_files.append(p)
+
+    if testid_needed:
+        cfg_edit = ensure_test_id_attribute(sut_root, attr_name="data-test")
+        log.info(
+            "step08.b55.playwright_config",
+            reason=cfg_edit.reason,
+            changed=cfg_edit.changed,
+            path=str(cfg_edit.path.relative_to(sut_root))
+            if cfg_edit.path and cfg_edit.path.is_relative_to(sut_root)
+            else None,
+        )
+
+    log.info(
+        "step08.b55.xpath_normalised",
+        files_touched=len(changed_files),
+        rewritten=sum(len(r.rewritten) for r in reports),
+        stragglers=len(stragglers),
+        call_sites_migrated=sum(r.call_sites_migrated for r in reports),
+        containers_migrated=sum(1 for r in reports if r.container_migrated),
+    )
+    return reports, stragglers
 
 
 def _scan_and_convert_hardcoded_locators(
@@ -2175,6 +2357,27 @@ _INTENT_QUALITY_SCHEMA: dict[str, Any] = {
 }
 
 
+def _extract_code_context(
+    sut_root: Path, rel_path: Path, line: int, radius: int = 3,
+) -> str:
+    """Return a few source lines around *line* with line numbers.
+
+    Best-effort: returns ``""`` on any I/O error so callers never fail.
+    """
+    try:
+        abs_path = sut_root / rel_path
+        all_lines = abs_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        start = max(0, line - 1 - radius)
+        end = min(len(all_lines), line + radius)
+        parts: list[str] = []
+        for i in range(start, end):
+            marker = ">" if i == line - 1 else " "
+            parts.append(f"{marker} {i + 1:4d} | {all_lines[i]}")
+        return "\n".join(parts)
+    except Exception:
+        return ""
+
+
 async def _phase_d_score_intents(
     produced_in_sut: list[Path],
     jit_files_added: list[Path],
@@ -2296,6 +2499,9 @@ async def _phase_d_score_intents(
             "language": intent_obj.language,
             "score": scored_entry.get("score", "WARN"),
             "rationale": scored_entry.get("rationale", ""),
+            "code_context": _extract_code_context(
+                sut_root, intent_obj.file, intent_obj.line,
+            ),
         })
 
     pass_n = sum(1 for e in enriched if e["score"] == "PASS")
@@ -2443,6 +2649,115 @@ async def _auto_fix_intents(
         )
 
     return rewritten, errors
+
+
+async def _run_phase_b65_parse_check(
+    *,
+    sut_root: Path,
+    qtea_files: set[Path],
+    agents_root: Path,
+    workdir: Path,
+    timeout_s: int | None,
+) -> ParseCheckResult:
+    """Phase B.6.5 — language-native parse gate.
+
+    Runs BEFORE Phase B.6 (type-check) because a file that doesn't tokenise
+    cannot be type-checked. Uses ``ast.parse`` for Python (always available)
+    and shells to ``tsc`` / ``node --check`` / ``javac`` for other languages,
+    with a regex smoke fallback when no native tool is on PATH.
+
+    On parse errors, invokes ``codegen-violation-fixer`` ONCE with
+    ``rule=parse-error`` and re-runs the check. Returns a
+    ``ParseCheckResult`` with ``autofix_attempted`` / ``post_fix_errors`` set
+    so the caller can decide whether to fail the step.
+
+    Honors opt-outs ``QTEA_SKIP_PARSE_CHECK=1`` and ``QTEA_NO_PARSE_CHECK=1``.
+
+    Motivating incident: run 20260701-114656-9394eb (`# Stack: typescript+playwright`
+    header emitted into a `.spec.ts` file — Playwright's TS parser refused it,
+    zero tests ran, both retry attempts hit the same broken file).
+    """
+    if os.environ.get("QTEA_SKIP_PARSE_CHECK") == "1":
+        log.info("step08.phase_b65.skipped", reason="QTEA_SKIP_PARSE_CHECK=1")
+        return ParseCheckResult(
+            ran=False, skipped_reason="env_skip", duration_s=0.0,
+            files_checked=0, in_scope_errors=0,
+        )
+    if os.environ.get("QTEA_NO_PARSE_CHECK") == "1":
+        log.info("step08.phase_b65.skipped", reason="QTEA_NO_PARSE_CHECK=1")
+        return ParseCheckResult(
+            ran=False, skipped_reason="flag_skip", duration_s=0.0,
+            files_checked=0, in_scope_errors=0,
+        )
+
+    result = await asyncio.to_thread(
+        run_parse_check, sut_root, qtea_files=qtea_files,
+    )
+
+    if result.in_scope_errors == 0:
+        log.info(
+            "step08.phase_b65.clean",
+            files_checked=result.files_checked,
+            degraded_languages=result.degraded_languages,
+            duration_s=round(result.duration_s, 2),
+        )
+        return result
+
+    # Parse errors present — one autofix attempt via the shared
+    # codegen-violation-fixer agent. The `parse-error` rule was added
+    # to `codegen-violation-fixer.agent.md` §"Violation Fix Workflow";
+    # the agent knows to rewrite `# Stack:` → `// Stack:` for TS/JS/Java
+    # and to fix leaked-fence / prose-preamble artefacts.
+    log.info(
+        "step08.phase_b65.autofix",
+        in_scope=result.in_scope_errors,
+        degraded_languages=result.degraded_languages,
+    )
+    fix_agent = agents_root / "codegen-violation-fixer.agent.md"
+    summary = parse_check_format_for_fixer(result)
+    await run_agent(
+        fix_agent,
+        workdir=workdir,
+        inputs={},
+        user_prompt=(
+            f"The language-native parse gate found "
+            f"{result.in_scope_errors} parse error(s) in your generated "
+            f"test code:\n\n```\n{summary}\n```\n\n"
+            f"Each row is rule `parse-error`. Read the file, identify the "
+            f"token the parser refused, and rewrite ONLY the offending "
+            f"tokens (not the whole file). Most common cause: a Python-style "
+            f"`# Stack:` comment on line 1 of a `.ts` / `.js` / `.java` "
+            f"file — rewrite to `// Stack:`. See "
+            f"`codegen-violation-fixer.agent.md` §\"Violation Fix Workflow\" "
+            f"row `parse-error` for the workflow and the prohibition on "
+            f"`@ts-nocheck` / equivalent escape hatches."
+        ),
+        extra_paths=[package_resource_root() / "skills" / "webapp-testing"],
+        add_dirs=[sut_root],
+        timeout_s=min(timeout_s or 1800, 300),
+        step=8,
+        max_turns=AUTOFIX_MAX_TURNS,
+    )
+
+    # Re-run the check. Single autofix pass — persisting errors escalate to
+    # the caller's fail-step branch, mirroring Phase B.6's philosophy.
+    post = await asyncio.to_thread(
+        run_parse_check, sut_root, qtea_files=qtea_files,
+    )
+    result.autofix_attempted = True
+    result.post_fix_errors = post.in_scope_errors
+    result.violations = post.violations
+    result.file_results = post.file_results
+    result.degraded_languages = post.degraded_languages
+    result.missing_tools = post.missing_tools
+    result.duration_s = result.duration_s + post.duration_s
+
+    log.info(
+        "step08.phase_b65.postfix",
+        in_scope=result.post_fix_errors,
+        degraded_languages=result.degraded_languages,
+    )
+    return result
 
 
 async def _run_phase_b6(
@@ -2823,6 +3138,36 @@ class CodegenStep(Step):
                 "for or attempt to create a qtea runtime file."
             )
 
+        def _fixture_import_guidance(lang: str, fix_list: list) -> str:
+            """Framework-specific fixture import instructions.
+
+            pytest auto-discovers fixtures via conftest; Playwright Test (TS/JS)
+            and Java require explicit imports from the file that defines them.
+            """
+            if lang in ("python",):
+                return (
+                    "FIXTURE IMPORT RULE: pytest auto-discovers fixtures via "
+                    "conftest.py — reference them by name in test function "
+                    "signatures. No explicit import needed.\n\n"
+                )
+            fixture_files = sorted(
+                {f.get("file") for f in fix_list if f.get("file")},
+            )
+            if not fixture_files:
+                return ""
+            file_list = ", ".join(f"`{fp}`" for fp in fixture_files)
+            return (
+                f"FIXTURE IMPORT RULE: This SUT uses custom test fixtures "
+                f"defined in {file_list}. You MUST import `test` (and "
+                f"`expect` if needed) from that fixture file — NOT from "
+                f"`@playwright/test`. The fixture file extends Playwright's "
+                f"`test` object with custom fixtures via `test.extend`. "
+                f"Importing from `@playwright/test` directly will cause "
+                f"all custom fixtures to be `undefined` at runtime.\n"
+                f"Example: `import {{ test, expect }} from "
+                f"'<relative-path-to-fixture-file>';`\n\n"
+            )
+
         # Reuse + folder integration: when an active module is known, tell the
         # agent which language to write in, which directories to land each
         # category of file in (tests vs production code), and which existing
@@ -2964,10 +3309,9 @@ class CodegenStep(Step):
                 f"  - helpers_dir: `{helpers_dir}`\n\n"
                 f"EXISTING PAGE OBJECTS (reuse these — do NOT redefine):\n"
                 f"{po_lines}\n\n"
-                f"EXISTING FIXTURES (auto-discovered by the framework — "
-                f"available by name in test function signatures / DI / "
-                f"setup hooks. Do NOT redefine these in your test file — "
-                f"use them directly):\n{fixture_lines}\n\n"
+                f"{_fixture_import_guidance(language, fixtures)}"
+                f"EXISTING FIXTURES (do NOT redefine these in your test "
+                f"file — use them directly):\n{fixture_lines}\n\n"
                 f"EXISTING HELPERS:\n{helper_lines}\n\n"
                 f"EXISTING LOCATORS (reuse these constants — do NOT redefine "
                 f"byte-identical selectors in a new locator class):\n"
@@ -3159,10 +3503,15 @@ class CodegenStep(Step):
         b5_skipped_reason: str | None = None
         if language not in _B5_SUPPORTED_LANGUAGES:
             b5_skipped_reason = language
-            log.info(
+            log.warning(
                 "step08.b5.skipped",
                 language=language,
-                hint="B.5 v1 supports python/typescript/javascript only.",
+                hint=(
+                    f"B.5 reconciliation supports "
+                    f"{sorted(_B5_SUPPORTED_LANGUAGES)}; language={language!r} "
+                    f"was skipped — generated tests were NOT statically "
+                    f"validated against POM/fixture signatures."
+                ),
             )
         b5_test_files = (
             _b5_filter_test_files(agent_produced, language)
@@ -3377,6 +3726,25 @@ class CodegenStep(Step):
             sut_root, codegen_modified, dev_locators_map,
         )
 
+        # -------------------------------------------------------------------
+        # Phase B.5.5 — legacy XPath normalisation.
+        # -------------------------------------------------------------------
+        # `codegen_modified` covers files the agent WROTE this run AND files
+        # it extended (e.g. a pre-existing POM class that got a new method).
+        # When those pre-existing POMs ship xpath locator strings, they hit
+        # the `[xpath]` gate — killing Step 8 for legacy code the agent
+        # didn't author. Phase B.5.5 rewrites those xpath sites to
+        # Playwright-idiomatic locators BEFORE the gate sees them.
+        #
+        # Handles ~90% of common patterns deterministically. Anything the
+        # rewriter can't safely translate is kept in-place with a
+        # `// qtea-xpath-exempt:` marker (test_indexer honours the marker)
+        # AND collected as a straggler bundle for the LLM violation-fixer.
+        xpath_reports, xpath_stragglers = _run_phase_b55_xpath_normalisation(
+            sut_root=sut_root,
+            candidates=codegen_modified,
+        )
+
         # Index the SUT clone, then filter to ONLY qtea-prefixed entries so
         # the SUT's own pre-existing tests don't pollute our tbd-index or
         # trigger rule-violation reports for code we didn't write. Also drop
@@ -3447,6 +3815,90 @@ class CodegenStep(Step):
         ok_schema, schema_err = is_valid(payload, "tbd-index")
         if not ok_schema:
             log.warning("step08.schema_invalid", error=schema_err)
+
+        # -------------------------------------------------------------------
+        # Phase B.6.5 — language-native parse gate (runs BEFORE B.6).
+        #
+        # A file that doesn't tokenise cannot be type-checked. This gate
+        # uses `ast.parse` for Python (stdlib, always available) and shells
+        # to `tsc --noEmit --isolatedModules` / `node --check` / `javac`
+        # for the other languages, with a regex smoke fallback when no
+        # native tool is on PATH. On parse errors it invokes
+        # `codegen-violation-fixer` once with rule=parse-error, re-runs
+        # the check, and hard-fails the step if errors remain (mirrors
+        # B.6's single-autofix philosophy).
+        #
+        # Added after run 20260701-114656-9394eb where the codegen agent
+        # emitted `# Stack: typescript+playwright` (Python-style comment)
+        # on line 1 of a `.spec.ts` file and B.6 was silently skipped
+        # because tsc wasn't on PATH — the invalid file reached Step 9
+        # unchallenged. This gate's loud-fail-on-degraded semantics close
+        # that hole.
+        # -------------------------------------------------------------------
+        parse_check_result = await _run_phase_b65_parse_check(
+            sut_root=sut_root,
+            qtea_files=all_codegen_files,
+            agents_root=agents_root,
+            workdir=wd,
+            timeout_s=self.timeout_s,
+        )
+        pc_path = out_dir / "parse-check-result.json"
+        pc_path.write_text(
+            json.dumps(parse_check_result.as_dict(), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        ok_pc, pc_err = is_valid(parse_check_result.as_dict(), "parse-check-result")
+        if not ok_pc:
+            log.warning("step08.b65_schema_invalid", error=pc_err)
+
+        # Fail-step gate for B.6.5.
+        #
+        # Case 1 — autofix ran and errors persisted: canonical hard fail
+        # (mirrors B.6). The violation-fixer had its single retry and did
+        # not resolve the parse error; escalate to the step retry.
+        #
+        # Case 2 — degraded mode fired a violation: even though the fixer
+        # may not have run yet (or ran and cleared other files), a
+        # regex-smoke violation on a language where no real parser was
+        # available cannot be trusted as "actually broken" without
+        # verification. Refuse to proceed so the operator installs the
+        # missing tool (surfaced in `missing_tools`).
+        if (
+            parse_check_result.ran
+            and parse_check_result.autofix_attempted
+            and parse_check_result.post_fix_errors > 0
+        ):
+            return StepResult(
+                success=False,
+                status="failed",
+                outputs=[index_path, manifest_path, pc_path],
+                error=(
+                    f"parse-check (Phase B.6.5): "
+                    f"{parse_check_result.post_fix_errors} "
+                    f"parse error(s) remain after one autofix pass"
+                ),
+                notes=parse_check_format_for_fixer(parse_check_result)[:500],
+            )
+        if (
+            parse_check_result.ran
+            and has_degraded_violations(parse_check_result)
+        ):
+            missing = ", ".join(parse_check_result.missing_tools) or "unknown"
+            return StepResult(
+                success=False,
+                status="failed",
+                outputs=[index_path, manifest_path, pc_path],
+                error=(
+                    f"parse-check (Phase B.6.5): running in degraded "
+                    f"(regex-smoke) mode for language(s) "
+                    f"{', '.join(parse_check_result.degraded_languages)} "
+                    f"and found parse violation(s) that can't be verified "
+                    f"without a real parser. Install: {missing} — then "
+                    f"re-run Step 8. Set QTEA_NO_PARSE_CHECK=1 to bypass "
+                    f"(NOT RECOMMENDED)."
+                ),
+                notes=parse_check_format_for_fixer(parse_check_result)[:500],
+            )
 
         # -------------------------------------------------------------------
         # Phase B.6 — native static-check gate.

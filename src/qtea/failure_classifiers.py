@@ -17,7 +17,7 @@ populates a `fix_hint` dict that the step's `run()` consumes on the
 NEXT attempt via `ctx.extras`. For non-recoverable categories (genuine
 agent confusion, infrastructure failures, API outages) it surfaces a
 human-readable category label and a `safe_to_auto_retry=False` flag so
-the existing fix-proposal chain still fires.
+the auto-firing fix-proposal chain still fires.
 
 This is pure-code rule-based. NO LLM call, NO new agent. Per
 `CLAUDE.md` boundary: "Python never reasons. Agents never checkpoint."
@@ -69,7 +69,7 @@ class FailureCategory(Enum):
     SCHEMA_MISSING_REQUIRED_FIELD = "schema_missing_required_field"
     JSON_UNPARSEABLE = "json_unparseable"
 
-    # Non-recoverable — surface for human, existing fix-proposal still fires
+    # Non-recoverable — surface for human, auto-firing fix-proposal still fires
     API_FATAL = "api_fatal"
     API_RETRY_STORM = "api_retry_storm"
     AGENT_NO_OUTPUT = "agent_no_output"
@@ -105,8 +105,8 @@ class ClassificationResult:
     - ``explanation``: one-line human-readable summary used in logs.
     - ``safe_to_auto_retry``: True iff the standard MAX_ATTEMPTS=2 retry
       is expected to succeed with the fix_hint applied. False → the
-      existing fix-proposal chain (critical-thinking + principal-engineer)
-      should fire as usual.
+      auto-firing fix-proposal chain (debug RCA → critical-thinking →
+      principal-software-engineer) fires on retry exhaustion as usual.
     """
 
     category: FailureCategory
@@ -380,8 +380,9 @@ def is_recoverable_category(category: FailureCategory) -> bool:
     """True iff the category has a deterministic recovery recipe.
 
     Convenience used by `pipeline.py` to gate the expensive
-    critical-thinking + principal-software-engineer fix-proposal chain —
-    we skip it for categories the classifier is already handling.
+    auto-firing fix-proposal chain (debug RCA → critical-thinking →
+    principal-software-engineer) — we skip it for categories the classifier
+    is already handling deterministically.
     """
     return category in _RECOVERABLE_CATEGORIES
 

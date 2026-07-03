@@ -579,7 +579,7 @@ async def test_cost_populated_via_pricing_table(tmp_path, monkeypatch):
     metrics = _json.loads(result.metrics_path.read_text())
     assert metrics["cost_usd"] == pytest.approx(0.105, abs=1e-6)
     assert "cost_estimation_basis" in metrics
-    assert "anthropic" in metrics["cost_estimation_basis"].lower()
+    assert "bosch" in metrics["cost_estimation_basis"].lower()
 
 
 async def test_cost_zero_for_unknown_model(tmp_path, monkeypatch):

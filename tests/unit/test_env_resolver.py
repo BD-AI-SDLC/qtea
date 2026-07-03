@@ -80,6 +80,10 @@ def test_resolve_sut_env_prompts_only_for_essentials(tmp_path: Path, monkeypatch
         encoding="utf-8",
     )
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    # Clear env vars that ProcessEnvStrategy would find (USERNAME is a
+    # standard Windows env var).
+    for k in ("BASE_URL", "USERNAME", "PASSWORD", "TIMEOUT", "BROWSER_NAME"):
+        monkeypatch.delenv(k, raising=False)
 
     captured: dict = {}
 
@@ -106,10 +110,9 @@ def test_resolve_sut_env_prompts_only_for_essentials(tmp_path: Path, monkeypatch
     assert "BROWSER_NAME" not in captured["keys"]
 
 
-def test_resolve_sut_env_passes_discovered_value_as_default(tmp_path: Path, monkeypatch):
-    """When a value is already discovered (e.g. from .env), it must be passed
-    to the interactive strategy as the default so the user can confirm with
-    Enter or override by typing.
+def test_resolve_sut_env_skips_interactive_for_silently_resolved(tmp_path: Path, monkeypatch):
+    """When a key is already resolved by a silent strategy (e.g. .env),
+    the interactive prompt must NOT re-ask for it.
     """
     from qtea import env_resolver
     from qtea.env_resolver import EnvResolverConfig, resolve_sut_env
@@ -117,14 +120,11 @@ def test_resolve_sut_env_passes_discovered_value_as_default(tmp_path: Path, monk
     (tmp_path / ".env").write_text("BASE_URL=https://staging.example.com\n", encoding="utf-8")
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
 
-    captured: dict = {}
+    prompted_keys: list[str] = []
 
     class FakeStrategy(env_resolver.InteractivePromptStrategy):
-        def __init__(self, defaults=None):
-            super().__init__(defaults)
-            captured["defaults"] = dict(self._defaults)
-
         def resolve(self, keys, already_resolved):
+            prompted_keys.extend(keys)
             return {}
 
     monkeypatch.setattr(env_resolver, "InteractivePromptStrategy", FakeStrategy)
@@ -132,7 +132,9 @@ def test_resolve_sut_env_passes_discovered_value_as_default(tmp_path: Path, monk
     cfg = EnvResolverConfig(env_file=None, sut_path=tmp_path, no_hitl=False)
     resolve_sut_env(cfg, ["BASE_URL"], tmp_path)
 
-    assert captured["defaults"] == {"BASE_URL": "https://staging.example.com"}
+    assert "BASE_URL" not in prompted_keys, (
+        "BASE_URL was already resolved by dotenv — interactive must not re-ask"
+    )
 
 
 def test_resolve_sut_env_no_hitl_skips_interactive(tmp_path: Path, monkeypatch):
@@ -155,22 +157,44 @@ def test_resolve_sut_env_no_hitl_skips_interactive(tmp_path: Path, monkeypatch):
 
 
 def test_resolve_sut_env_interactive_override_changes_source(tmp_path: Path, monkeypatch):
-    """If the user supplies a value through the prompt that differs from the
-    silently-discovered one, the source should be relabelled 'interactive'.
+    """If the user supplies a value through the prompt for an unresolved key,
+    the source should be labelled 'interactive'.
     """
     from qtea import env_resolver
     from qtea.env_resolver import EnvResolverConfig, resolve_sut_env
 
-    (tmp_path / ".env").write_text("BASE_URL=https://old.example.com\n", encoding="utf-8")
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
 
     class FakeStrategy(env_resolver.InteractivePromptStrategy):
         def resolve(self, keys, already_resolved):
-            return {"BASE_URL": "https://new.example.com"}
+            return {"SUT_BASE_URL": "https://new.example.com"}
 
     monkeypatch.setattr(env_resolver, "InteractivePromptStrategy", FakeStrategy)
     cfg = EnvResolverConfig(env_file=None, sut_path=tmp_path, no_hitl=False)
-    result = resolve_sut_env(cfg, ["BASE_URL"], tmp_path)
+    result = resolve_sut_env(cfg, ["SUT_BASE_URL"], tmp_path)
 
-    assert result.values["BASE_URL"] == "https://new.example.com"
-    assert result.sources["BASE_URL"] == "interactive"
+    assert result.values["SUT_BASE_URL"] == "https://new.example.com"
+    assert result.sources["SUT_BASE_URL"] == "interactive"
+
+
+def test_interactive_strategy_accepts_resolution_answered(monkeypatch):
+    """UI-mode answers with RESOLUTION_ANSWERED must be accepted, not dropped.
+
+    Regression: the UI dialog previously stored ('user', value) which
+    the env resolver silently discarded because 'user' != 'answered'.
+    """
+    from qtea.env_resolver import InteractivePromptStrategy
+    from qtea.hitl import RESOLUTION_ANSWERED
+    import qtea.hitl as hitl_mod
+
+    monkeypatch.setenv("QTEA_UI_MODE", "1")
+    monkeypatch.setattr(
+        hitl_mod,
+        "prompt_user",
+        lambda qs, *, agent_label: {
+            q.id: (RESOLUTION_ANSWERED, "secret_val") for q in qs
+        },
+    )
+    strategy = InteractivePromptStrategy()
+    result = strategy.resolve(["PASSWORD_X"], {})
+    assert result == {"PASSWORD_X": "secret_val"}

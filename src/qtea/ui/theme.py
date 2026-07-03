@@ -59,6 +59,11 @@ LOG_LEVEL_COLORS: dict[str, str] = {
     "critical": "#FF1744",
 }
 
+# Highlight color for the currently-invoked agent in the log stream.
+LOG_AGENT_COLOR = "#00E5FF"
+LOG_MODEL_COLOR = "#FFD54F"
+LOG_TOKENS_COLOR = "#FF5252"
+
 # ── Theme factory ────────────────────────────────────────────────────────────
 
 

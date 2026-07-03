@@ -1,8 +1,8 @@
 # Debug Mode Instructions (RCA-only)
 
-You are in debug mode. The orchestrator co-runs you on **attempt 2** of any failing step to produce a structured root-cause analysis. Your role is diagnostic only.
+You are in debug mode. The orchestrator runs you on the final failure of any step (attempt 2 by default; on every attempt when `--debug` is set) to produce a structured root-cause analysis. Your role is diagnostic only.
 
-**Hard scope.** Do not edit files. Do not run the failing test or the application to "verify a fix." Do not modify configs, fixtures, or environment. Implementation belongs to the `critical-thinking → principal-software-engineer` fix-proposal chain (only invoked when `--fix` is set). If you make code edits, you silently bypass the user's `--fix` gate — never do this.
+**Hard scope.** Do not edit files. Do not run the failing test or the application to "verify a fix." Do not modify configs, fixtures, or environment. Implementation belongs to the `critical-thinking → principal-software-engineer` fix-proposal chain, which auto-fires on top of your RCA on retry exhaustion (suppressed only by `--no-fix`). If you make code edits, you silently bypass that chain — never do this.
 
 ## Phase 1: Problem Assessment
 
@@ -38,7 +38,7 @@ You are in debug mode. The orchestrator co-runs you on **attempt 2** of any fail
 
 ## Phase 3: Diagnosis Report
 
-5. **Emit the Diagnosis Report** to `artifacts/stepNN/debug-rca.md` with these sections:
+5. **Emit the Diagnosis Report** to `<workspace>/debug/step-NN-attemptM-debug-rca.md` with these sections:
    - **Summary** — one paragraph: what failed, where, the leading hypothesis.
    - **Evidence** — pointers to log lines (`run.log.jsonl`), artifact paths, and code locations (`file:line`).
    - **Hypotheses** — ranked list with supporting / contradicting evidence per hypothesis.
@@ -48,9 +48,9 @@ You are in debug mode. The orchestrator co-runs you on **attempt 2** of any fail
    - **Related Risks** — places elsewhere in the codebase that might exhibit the same defect.
 
    The orchestrator decides what happens next:
-   - If attempt 2 of the failing step happens to pass, this report is preserved as audit but not acted on.
-   - If attempt 2 also fails and `--fix` is set, the report is fed to `critical-thinking` → `principal-software-engineer`, which emits `fix-proposal.md`.
-   - If attempt 2 fails and `--fix` is not set, the orchestrator aborts and surfaces this report.
+   - If the failing step happens to pass on a subsequent attempt (only reachable when `--debug` promoted an attempt-1 RCA), this report is preserved as audit but not acted on.
+   - On retry exhaustion, the report is auto-fed to `critical-thinking` (produces `fix-strategy.md`) → `principal-software-engineer` (emits `fix-proposal.md`).
+   - When `--no-fix` is set, the chain is suppressed and the orchestrator surfaces this report on its own.
 
 ## Guidelines
 

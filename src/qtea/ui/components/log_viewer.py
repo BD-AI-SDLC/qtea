@@ -5,7 +5,16 @@ from __future__ import annotations
 import flet as ft
 
 from qtea.ui.state import AppState, LogLine
-from qtea.ui.theme import CARD_BG, DIVIDER, LOG_LEVEL_COLORS, ON_SURFACE, ON_SURFACE_DIM
+from qtea.ui.theme import (
+    CARD_BG,
+    DIVIDER,
+    LOG_AGENT_COLOR,
+    LOG_LEVEL_COLORS,
+    LOG_MODEL_COLOR,
+    LOG_TOKENS_COLOR,
+    ON_SURFACE,
+    ON_SURFACE_DIM,
+)
 
 MAX_DISPLAY_LINES = 500
 
@@ -48,8 +57,54 @@ def _build_log_line(line: LogLine) -> ft.Container:
         )
     )
 
-    # Message / fields
-    if line.message:
+    # Message / fields. If the event carries an `agent` field, extract it and
+    # render it as a cyan span so the human can see at a glance which agent is
+    # driving the current turn. The remaining fields are rebuilt from the dict
+    # in the same order the parent used, minus the agent key.
+    _SKIP_KEYS = {"event", "timestamp", "level", "run_id", "agent"}
+    _MODEL_KEYS = {"model"}
+    _TOKEN_KEYS = {"tokens_input", "tokens_output"}
+    _HIGHLIGHT_KEYS = _MODEL_KEYS | _TOKEN_KEYS
+
+    agent_name = line.fields.get("agent") if line.fields else None
+    if agent_name:
+        parts.append(
+            ft.TextSpan(
+                f"agent={agent_name}",
+                style=ft.TextStyle(
+                    size=11,
+                    color=LOG_AGENT_COLOR,
+                    weight=ft.FontWeight.BOLD,
+                ),
+            )
+        )
+        remaining = [
+            (k, v)
+            for k, v in line.fields.items()
+            if k not in _SKIP_KEYS
+            and v is not None and v is not False
+        ]
+        need_comma = True
+        for k, v in remaining:
+            if k in _HIGHLIGHT_KEYS:
+                color = LOG_MODEL_COLOR if k in _MODEL_KEYS else LOG_TOKENS_COLOR
+                prefix = ", " if need_comma else ""
+                parts.append(
+                    ft.TextSpan(
+                        f"{prefix}{k}={v}",
+                        style=ft.TextStyle(size=11, color=color),
+                    )
+                )
+            else:
+                prefix = ", " if need_comma else ""
+                parts.append(
+                    ft.TextSpan(
+                        f"{prefix}{k}={v}",
+                        style=ft.TextStyle(size=11, color=ON_SURFACE_DIM),
+                    )
+                )
+            need_comma = True
+    elif line.message:
         parts.append(
             ft.TextSpan(
                 line.message,

@@ -56,14 +56,17 @@ log = get_logger(__name__)
 # through the bridge — treat as approve). The signature is intentionally
 # minimal so review_gate.py stays decoupled from Flet / AppState.
 
-_UI_PROMPT_HOOK: Callable[..., str] | None = None
+_UI_PROMPT_HOOK: Callable[..., tuple[str, str]] | None = None
 
 
-def set_ui_prompt_hook(hook: Callable[..., str] | None) -> None:
+def set_ui_prompt_hook(hook: Callable[..., tuple[str, str]] | None) -> None:
     """Install / clear the UI prompt hook.
 
-    Hook signature: ``hook(step, title, summary_text, *, kind="", data=None) -> str``
-    where the return is ``"approve"``, ``"reject"``, or ``"edit"``.
+    Hook signature:
+    ``hook(step, title, summary_text, *, kind="", data=None) -> tuple[str, str]``
+    where the first element is the decision (``"approve"`` / ``"reject"`` /
+    ``"edit"``) and the second is the user-typed edit instructions
+    (``""`` for non-edit decisions).
 
     ``kind`` + ``data`` carry the structured payload (strategy / plan /
     intents dict). The UI renders a real table from ``data`` and uses
@@ -88,20 +91,6 @@ def _capture_render(render_fn, *args) -> str:
     )
     render_fn(*args, cap)
     return buf.getvalue()
-
-
-def _ui_decision_to_choice(decision: str) -> str:
-    """Map the UI dialog's decision string into the gate's choice char."""
-    if decision == "reject":
-        return "q"
-    if decision == "edit":
-        # MVP: surface edit as approve+log. Inline editing in the UI
-        # requires routing back through _apply_*_nlp_edit which still
-        # uses terminal prompts internally; treat Edit as Approve for
-        # now and log so users notice if they hit it by mistake.
-        log.warning("review_gate.ui_edit_not_supported_yet")
-        return "a"
-    return "a"  # default + explicit "approve"
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +156,7 @@ async def review_step_4_strategy(
         # only a fallback if the dialog doesn't recognise the kind.
         if _UI_PROMPT_HOOK is not None:
             summary_text = _capture_render(_render_strategy, strategy)
-            decision = _UI_PROMPT_HOOK(
+            decision, edit_instructions = _UI_PROMPT_HOOK(
                 step=4,
                 title="Test Strategy Review",
                 summary_text=summary_text,
@@ -177,6 +166,18 @@ async def review_step_4_strategy(
             if decision == "reject":
                 log.info("step04.review_gate.rejected", source="ui")
                 return False
+            if decision == "edit" and edit_instructions.strip():
+                log.info(
+                    "step04.review_gate.ui_edit",
+                    instructions_preview=edit_instructions[:80],
+                )
+                await _apply_strategy_nlp_edit(
+                    md_path, json_path, ctx, console,
+                    instructions=edit_instructions,
+                )
+                # Loop back to re-show the (possibly updated) artifact;
+                # the top of the while-loop reloads JSON from disk.
+                continue
             log.info("step04.review_gate.approved", source="ui")
             return True
 
@@ -286,24 +287,35 @@ async def _apply_strategy_nlp_edit(
     json_path: Path,
     ctx: StepContext,
     console: Console,
+    instructions: str | None = None,
 ) -> dict | None:
-    """Apply free-text instructions to test-strategy.md via LLM."""
+    """Apply free-text instructions to test-strategy.md via LLM.
+
+    *instructions* is optional: ``None`` triggers the CLI ``Prompt.ask`` flow
+    (used by the terminal review gate). UI callers pass the user-typed text
+    directly so the ``Prompt.ask`` is skipped — the LLM-failure recover
+    prompt is also skipped on the UI path so the caller can loop back via
+    the dialog instead of hanging on stdin.
+    """
     from qtea.steps.s04_strategy import _project_strategy
 
-    console.print(Panel(
-        "Describe the changes you want in plain English.\n"
-        "Examples: [dim]\"remove TC-03\"[/], [dim]\"change TC-login "
-        "priority to P0\"[/], [dim]\"add a smoke test for the search "
-        "feature\"[/]",
-        title="Edit strategy",
-        border_style="yellow",
-    ))
-    try:
-        instructions = Prompt.ask("[bold]Your instructions[/]")
-    except (EOFError, KeyboardInterrupt):
-        log.info("step04.review_gate.rejected", reason="interrupt")
-        return None
+    ui_mode = instructions is not None
+    if not ui_mode:
+        console.print(Panel(
+            "Describe the changes you want in plain English.\n"
+            "Examples: [dim]\"remove TC-03\"[/], [dim]\"change TC-login "
+            "priority to P0\"[/], [dim]\"add a smoke test for the search "
+            "feature\"[/]",
+            title="Edit strategy",
+            border_style="yellow",
+        ))
+        try:
+            instructions = Prompt.ask("[bold]Your instructions[/]")
+        except (EOFError, KeyboardInterrupt):
+            log.info("step04.review_gate.rejected", reason="interrupt")
+            return None
 
+    assert instructions is not None
     if not instructions.strip():
         console.print("[dim]empty input — skipping edit[/]")
         return {}
@@ -328,6 +340,8 @@ async def _apply_strategy_nlp_edit(
         console.print(
             f"[red]LLM edit failed:[/] {llm_result.error or 'no output'}"
         )
+        if ui_mode:
+            return {}  # loop back; the dialog re-renders the unchanged artifact
         recover = Prompt.ask(
             r"\[r\]etry, \[q\]uit",
             choices=["r", "q"],
@@ -337,7 +351,9 @@ async def _apply_strategy_nlp_edit(
         return None if recover == "q" else {}
 
     md_path.write_text(llm_result.final_text, encoding="utf-8")
-    return _reproject_strategy(md_path, json_path, _project_strategy, ctx, console)
+    return _reproject_strategy(
+        md_path, json_path, _project_strategy, ctx, console, ui_mode=ui_mode,
+    )
 
 
 def _reproject_strategy(
@@ -346,8 +362,13 @@ def _reproject_strategy(
     project_strategy_fn,
     ctx: StepContext,
     console: Console,
+    ui_mode: bool = False,
 ) -> dict | None:
-    """Re-project test-strategy.md → .json, validate, persist."""
+    """Re-project test-strategy.md → .json, validate, persist.
+
+    *ui_mode* suppresses the interactive ``Prompt.ask`` recover prompts so
+    the worker thread doesn't hang on stdin the UI user can't reach.
+    """
     new_md = md_path.read_text(encoding="utf-8")
     projection = project_strategy_fn(new_md)
 
@@ -357,6 +378,8 @@ def _reproject_strategy(
             f"[red]duplicate TC IDs:[/] {', '.join(dup_ids)}. "
             f"Fix them in the markdown and retry."
         )
+        if ui_mode:
+            return {}  # loop back; dialog re-renders the prior JSON
         recover = Prompt.ask(
             r"\[r\]etry file edit, \[q\]uit",
             choices=["r", "q"],
@@ -368,6 +391,8 @@ def _reproject_strategy(
     ok, err = is_valid(projection, "test-strategy")
     if not ok:
         console.print(f"[red]edited strategy failed schema validation:[/] {err}")
+        if ui_mode:
+            return {}
         recover = Prompt.ask(
             r"\[r\]etry, \[q\]uit",
             choices=["r", "q"],
@@ -425,7 +450,7 @@ async def review_step_7_plan(
 
         if _UI_PROMPT_HOOK is not None:
             summary_text = _capture_render(_render_plan, plan)
-            decision = _UI_PROMPT_HOOK(
+            decision, edit_instructions = _UI_PROMPT_HOOK(
                 step=7,
                 title="Code Modification Plan Review",
                 summary_text=summary_text,
@@ -435,6 +460,18 @@ async def review_step_7_plan(
             if decision == "reject":
                 log.info("step07.review_gate.rejected", source="ui")
                 return False
+            if decision == "edit" and edit_instructions.strip():
+                log.info(
+                    "step07.review_gate.ui_edit",
+                    instructions_preview=edit_instructions[:80],
+                )
+                await _apply_nlp_edit(
+                    plan, plan_path, ctx, console,
+                    instructions=edit_instructions,
+                )
+                # Loop back; the top of the while-loop reloads the plan
+                # JSON from disk so we re-render the LLM-edited version.
+                continue
             log.info("step07.review_gate.approved", source="ui")
             return True
 
@@ -469,26 +506,36 @@ async def _apply_nlp_edit(
     plan_path: Path,
     ctx: StepContext,
     console: Console,
+    instructions: str | None = None,
 ) -> dict | None:
-    """Prompt for free-text instructions, apply via LLM, persist.
+    """Apply free-text instructions to the code-modification plan via LLM.
 
-    Returns the updated plan dict on success, or ``None`` if the user quits.
+    *instructions* is optional: ``None`` triggers the CLI ``Prompt.ask`` flow
+    (terminal review gate). UI callers pass the user-typed text directly;
+    on the UI path the LLM-failure / schema-failure recover prompts are
+    skipped (the dialog loops back so the user can retry or reject).
+
+    Returns the updated plan dict on success, ``plan`` (unchanged) for the
+    "loop back" outcomes, or ``None`` only when the CLI user explicitly quits.
     Writes the updated JSON to *plan_path* and refreshes checkpoint hashes.
     """
-    console.print(Panel(
-        "Describe the changes you want in plain English.\n"
-        "Examples: [dim]\"remove TC-03\"[/], [dim]\"change fixture X to "
-        "create instead of reuse\"[/], [dim]\"add a smoke marker to all "
-        "test functions\"[/]",
-        title="Edit plan",
-        border_style="yellow",
-    ))
-    try:
-        instructions = Prompt.ask("[bold]Your instructions[/]")
-    except (EOFError, KeyboardInterrupt):
-        log.info("step07.review_gate.rejected", reason="interrupt")
-        return None
+    ui_mode = instructions is not None
+    if not ui_mode:
+        console.print(Panel(
+            "Describe the changes you want in plain English.\n"
+            "Examples: [dim]\"remove TC-03\"[/], [dim]\"change fixture X to "
+            "create instead of reuse\"[/], [dim]\"add a smoke marker to all "
+            "test functions\"[/]",
+            title="Edit plan",
+            border_style="yellow",
+        ))
+        try:
+            instructions = Prompt.ask("[bold]Your instructions[/]")
+        except (EOFError, KeyboardInterrupt):
+            log.info("step07.review_gate.rejected", reason="interrupt")
+            return None
 
+    assert instructions is not None
     if not instructions.strip():
         console.print("[dim]empty input — skipping edit[/]")
         return plan
@@ -511,6 +558,8 @@ async def _apply_nlp_edit(
         console.print(
             f"[red]LLM edit failed:[/] {llm_result.error or 'no output'}"
         )
+        if ui_mode:
+            return plan
         recover = Prompt.ask(
             r"\[r\]etry, \[q\]uit",
             choices=["r", "q"],
@@ -530,6 +579,8 @@ async def _apply_nlp_edit(
     ok, err = is_valid(new_plan, "code-modification-plan")
     if not ok:
         console.print(f"[red]edited plan failed schema validation:[/] {err}")
+        if ui_mode:
+            return plan
         recover = Prompt.ask(
             r"\[r\]etry, \[a\]pprove anyway (risky), \[q\]uit",
             choices=["r", "a", "q"],
@@ -810,7 +861,7 @@ async def review_step_8_intents(
     while True:
         if _UI_PROMPT_HOOK is not None:
             summary_text = _capture_render(_render_intent_warnings, warnings)
-            decision = _UI_PROMPT_HOOK(
+            decision, edit_instructions = _UI_PROMPT_HOOK(
                 step=8,
                 title="TBD Intent Quality Review",
                 summary_text=summary_text,
@@ -820,6 +871,19 @@ async def review_step_8_intents(
             if decision == "reject":
                 log.info("step08.intent_review_gate.rejected", source="ui")
                 return False
+            if decision == "edit" and edit_instructions.strip():
+                log.info(
+                    "step08.intent_review_gate.ui_edit",
+                    instructions_preview=edit_instructions[:80],
+                )
+                edited = await _apply_intent_edit(
+                    warnings, ctx, console,
+                    instructions=edit_instructions,
+                )
+                if edited is not None:
+                    warnings = edited
+                    ctx.extras["step8_intent_warnings"] = warnings
+                continue
             log.info(
                 "step08.intent_review_gate.approved",
                 source="ui",
@@ -864,6 +928,7 @@ def _render_intent_warnings(
     table.add_column("Constant", no_wrap=True)
     table.add_column("Intent", overflow="fold")
     table.add_column("Why", overflow="fold")
+    table.add_column("Context", overflow="fold", style="dim")
 
     for w in warnings:
         score = w.get("score", "?")
@@ -879,6 +944,7 @@ def _render_intent_warnings(
             w.get("constant_name") or "—",
             w.get("intent", "?"),
             w.get("rationale", "?"),
+            w.get("code_context") or "",
         )
 
     console.print()
@@ -896,30 +962,40 @@ async def _apply_intent_edit(
     warnings: list[dict],
     ctx: StepContext,
     console: Console,
+    instructions: str | None = None,
 ) -> list[dict] | None:
-    """Prompt for free-text instructions, rewrite intents via LLM + source patch.
+    """Rewrite flagged TBD intents via LLM and patch the SUT source files.
+
+    *instructions* is optional: ``None`` triggers the CLI ``Prompt.ask`` flow
+    (terminal review gate). UI callers pass the user-typed text directly;
+    on the UI path the LLM-failure recover prompt is skipped (the dialog
+    loops back so the user can retry or reject).
 
     Returns the updated warnings list on success (with edited intents
-    substituted) or ``None`` if the user quits. Rewrites sentinel call-sites
-    in the SUT sources in-place using the file:line anchors.
+    substituted), ``warnings`` (unchanged) for "loop back" outcomes, or
+    ``None`` only when the CLI user explicitly quits. Rewrites sentinel
+    call-sites in the SUT sources in-place using the file:line anchors.
     """
-    console.print(Panel(
-        "Describe how you want the flagged intents changed in plain English.\n"
-        "Examples: [dim]\"make 'submit' specific by referring to the "
-        "'Save changes' button in the dialog footer\"[/], "
-        "[dim]\"replace any CSS-selector-looking intents with a "
-        "role + visible label\"[/], "
-        "[dim]\"all the 'OK' buttons are confirmation buttons in their "
-        "respective modals — name the modal in the intent\"[/]",
-        title="Edit intents",
-        border_style="yellow",
-    ))
-    try:
-        instructions = Prompt.ask("[bold]Your instructions[/]")
-    except (EOFError, KeyboardInterrupt):
-        log.info("step08.intent_review_gate.rejected", reason="interrupt")
-        return None
+    ui_mode = instructions is not None
+    if not ui_mode:
+        console.print(Panel(
+            "Describe how you want the flagged intents changed in plain English.\n"
+            "Examples: [dim]\"make 'submit' specific by referring to the "
+            "'Save changes' button in the dialog footer\"[/], "
+            "[dim]\"replace any CSS-selector-looking intents with a "
+            "role + visible label\"[/], "
+            "[dim]\"all the 'OK' buttons are confirmation buttons in their "
+            "respective modals — name the modal in the intent\"[/]",
+            title="Edit intents",
+            border_style="yellow",
+        ))
+        try:
+            instructions = Prompt.ask("[bold]Your instructions[/]")
+        except (EOFError, KeyboardInterrupt):
+            log.info("step08.intent_review_gate.rejected", reason="interrupt")
+            return None
 
+    assert instructions is not None
     if not instructions.strip():
         console.print("[dim]empty input — skipping edit[/]")
         return warnings
@@ -944,6 +1020,8 @@ async def _apply_intent_edit(
         console.print(
             f"[red]intent edit failed:[/] {llm_result.error or 'no output'}"
         )
+        if ui_mode:
+            return warnings
         recover = Prompt.ask(
             r"\[r\]etry, \[q\]uit",
             choices=["r", "q"],

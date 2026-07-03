@@ -103,6 +103,12 @@ class PageObject:
     methods: list[str] = field(default_factory=list)
     scope: str = "generic"  # "auth" | "navigation" | "form" | "generic"
     import_path: str | None = None
+    # True when the POM class body defines an inline locator container
+    # (e.g. ``elements: Record<string, string> = {...}``, ``selectors = {...}``,
+    # or ``readonly submitBtn = this.page.getByRole(...)``). Feeds Step 8's
+    # `_write_tbd_locators` placement decision so new TBD constants land in
+    # the same convention the SUT already uses.
+    has_inline_locators: bool = False
 
 
 @dataclass
@@ -130,12 +136,17 @@ class LocatorConstant:
 
 @dataclass
 class LocatorClass:
-    """A SUT class that holds locator constants (e.g. `ChatPageLocators`).
+    """A SUT class or object that holds locator constants.
 
     The codegen step uses this to prevent the agent from inventing
     byte-identical duplicates of locators that already exist in the SUT.
     `constants` is bounded by `_LOCATOR_CONSTANT_CAP` per class — agents
     only need enough samples to dedup, not the entire file.
+
+    ``location_pattern`` records the SUT convention so Step 8's
+    ``_write_tbd_locators`` can add new TBD constants in the same style
+    the SUT already uses (rather than imposing a Python-Selenium
+    ``class FooLocators`` file on every stack).
     """
 
     name: str
@@ -144,6 +155,16 @@ class LocatorClass:
     constants: list[LocatorConstant] = field(default_factory=list)
     import_path: str | None = None
     truncated_count: int = 0  # >0 when source had more than the cap allows
+    # One of: "separate_class" (default, backwards-compatible) |
+    #         "export_const_object" | "inline_object_property" |
+    #         "readonly_locator_props" | "module_const_bag"
+    location_pattern: str = "separate_class"
+    # For inline_object_property / readonly_locator_props: the POM class
+    # these locators belong to. None for separate_class / module-level.
+    owning_pom: str | None = None
+    # For inline_object_property: the property name on the POM
+    # (e.g. "elements", "selectors", "locators"). None otherwise.
+    container_name: str | None = None
 
 
 @dataclass
@@ -577,7 +598,11 @@ def detect_test_directory_layout(module_root: Path) -> TestDirectoryLayout:
 # ---------------------------------------------------------------------------
 
 
-_PAGE_DIR_NAMES = ("pages", "pageobjects", "po")
+_PAGE_DIR_NAMES = (
+    "pages", "pageobjects", "page-objects", "page_objects",
+    "po", "poms", "pom",
+    "screens", "views", "flows",
+)
 _HELPER_ROOTS_PY = ("tests/helpers", "tests/utils", "tests/support",
                     "lib/utils", "helpers", "utils", "src/utils")
 _AUTH_FILE_RE = re.compile(r"(sign[_-]?in|sign[_-]?on|sso|login|auth|authenticat)", re.I)
@@ -854,75 +879,370 @@ def _extract_locator_constants(class_def: ast.ClassDef) -> Iterator[LocatorConst
                     )
 
 
-# TS class-field locator patterns. Covers:
-#   static readonly NAME = "selector"
-#   public static NAME = 'selector'
-#   readonly NAME = "selector"
-#   NAME = "selector"  (inside a class body — only matches when preceded by
-#                       indent / public / private / protected)
-#   NAME: "selector"   (object-literal export pattern: `export const X = { NAME: "selector", ... }`)
+# TS/JS locator patterns — pattern-agnostic recognition.
+#
+# The scanner runs SEVERAL detectors per file and unions the results, so
+# a SUT is not forced into one convention. Real projects vary widely:
+#   1. `class RopaLocators { EMAIL = "..." }`         → separate_class
+#   2. `export const RopaLocators = { EMAIL: "..." }` → export_const_object
+#   3. `class RopaPage { elements = { btnX: "..." } }` → inline_object_property
+#   4. `class RopaPage { readonly submitBtn = page.getByRole(...) }` → readonly_locator_props
+#   5. `export const EMAIL_INPUT = "..."` at module scope  → module_const_bag
+#
+# All accept both UPPERCASE (`BTN_SEND`) and camelCase (`btnSend`) names,
+# and any of the three quote styles (single, double, template literal).
+
 _TS_LOCATOR_FIELD_RE = re.compile(
     r"""(?:^|[\s,{])(?:public\s+|private\s+|protected\s+|static\s+|readonly\s+)*"""
     r"""(?P<name>[A-Z][A-Z0-9_]*)\s*[:=]\s*"""
     r"""(?P<quote>["'`])(?P<value>(?:(?!(?P=quote))[^\\]|\\.)*)(?P=quote)""",
     re.M,
 )
+# Same as _TS_LOCATOR_FIELD_RE but accepts camelCase / snake_case / PascalCase
+# names. Used by inline-object and export-const patterns where SUT
+# convention often uses camelCase (`btnCreate`, `emailInput`) instead of
+# the Python-Selenium UPPERCASE convention.
+_TS_LOCATOR_FIELD_ANY_CASE_RE = re.compile(
+    r"""(?:^|[\s,{])(?:public\s+|private\s+|protected\s+|static\s+|readonly\s+)*"""
+    r"""(?P<name>[A-Za-z_$][\w$]*)\s*[:=]\s*"""
+    r"""(?P<quote>["'`])(?P<value>(?:(?!(?P=quote))[^\\]|\\.)*)(?P=quote)""",
+    re.M,
+)
 _TS_LOCATOR_CLASS_RE = re.compile(
     r"""(?:export\s+)?(?:class|const)\s+(?P<name>\w*Locators?\w*)\b""",
 )
+# Any exported const with an object literal named *Locators / *Selectors /
+# *Elements — the object-literal locator convention common in Playwright TS.
+_TS_EXPORT_CONST_LOCATOR_RE = re.compile(
+    r"""export\s+const\s+(?P<name>\w*(?:Locators?|Selectors?|Elements?))\s*"""
+    r"""(?::\s*[\w<>\[\],\s.]+?)?\s*=\s*\{""",
+)
+# `class Foo { elements: ... = { ... }` — inline object property inside a
+# POM class body. `container` captures the property name (elements,
+# selectors, locators, etc.) — used as owning_pom + container_name to
+# route new TBD constants back to the same place.
+_TS_INLINE_LOCATOR_PROP_RE = re.compile(
+    r"""(?:public\s+|private\s+|protected\s+|readonly\s+|static\s+)*"""
+    r"""(?P<container>elements|selectors|locators|selectorsMap|elems)\s*"""
+    r"""(?::\s*(?:Record<[^>]*>|\{[^}]*\}|[\w<>\[\],\s.]+?))?\s*=\s*\{""",
+)
+# `readonly submitBtn = this.page.getByRole('button', { name: 'Submit' })`
+# — Playwright-idiomatic Locator properties. The scanner records the
+# property name; the "selector" is left blank because the actual value is
+# a Locator object, not a string. Enough to prevent Step 8 from
+# planning a duplicate.
+_TS_READONLY_LOCATOR_PROP_RE = re.compile(
+    r"""(?:public\s+|private\s+|protected\s+|static\s+)*readonly\s+"""
+    r"""(?P<name>[\w$]+)\s*(?::\s*Locator)?\s*=\s*"""
+    r"""(?:this\.)?page\.(?:locator|getBy\w+)\(""",
+)
 
 
-def scan_ts_locators(module_root: Path) -> list[LocatorClass]:
-    """Regex-extract locator constants from `.ts`/`.tsx` files.
+def _scan_ts_separate_class(
+    src: Path, text: str, module_root: Path,
+) -> list[LocatorClass]:
+    """Detector #1 + #5: separate `class *Locators*` or module-level
+    UPPERCASE `const X = "selector"` bag under `locators/` dirs.
 
-    Files are candidates when the name contains "locator" or they live
-    under a directory named `locators`. We don't require a `class`
-    declaration — a `const X = { NAME: "selector", ... }` export is
-    equally common in TS POMs and surfaces the same way to the codegen
-    agent.
+    Mirrors the historical scanner's behaviour to keep Python-Selenium /
+    original-TS-Locators SUTs working identically.
+    """
+    name_low = src.name.lower()
+    in_locators_dir = any(p.lower() == "locators" for p in src.parts)
+    if _LOCATOR_CLASS_HINT not in name_low and not in_locators_dir:
+        return []
+    class_match = _TS_LOCATOR_CLASS_RE.search(text)
+    class_name = class_match.group("name") if class_match else src.stem
+    constants: list[LocatorConstant] = []
+    seen_names: set[str] = set()
+    for m in _TS_LOCATOR_FIELD_RE.finditer(text):
+        name = m.group("name")
+        if name in seen_names:
+            continue
+        value = m.group("value")
+        if not _looks_like_selector(value):
+            continue
+        seen_names.add(name)
+        line_no = text.count("\n", 0, m.start("name")) + 1
+        constants.append(LocatorConstant(name=name, selector=value, line=line_no))
+    if not constants:
+        return []
+    kept, dropped = _truncate_constants(constants)
+    rel = relative_posix(src, module_root)
+    return [LocatorClass(
+        name=class_name, file=rel, class_name=class_name,
+        constants=kept, import_path=None, truncated_count=dropped,
+        location_pattern="separate_class",
+    )]
+
+
+def _scan_ts_export_const_object(
+    src: Path, text: str, module_root: Path,
+) -> list[LocatorClass]:
+    """Detector #2: `export const *Locators*/*Selectors*/*Elements* = {...}`.
+
+    Accepts both UPPERCASE and camelCase keys. Fires on any file
+    regardless of directory — the export-const convention is common in
+    files named after the page (e.g. `LoginPage.ts` alongside a POM).
     """
     out: list[LocatorClass] = []
-    seen: set[Path] = set()
-    if not module_root.exists():
-        return out
-    for src in _iter_ts_files(module_root):
-        if src in seen:
+    for cm in _TS_EXPORT_CONST_LOCATOR_RE.finditer(text):
+        open_brace = text.find("{", cm.end() - 1)
+        if open_brace == -1:
             continue
-        seen.add(src)
-        name_low = src.name.lower()
-        in_locators_dir = any(p.lower() == "locators" for p in src.parts)
-        if _LOCATOR_CLASS_HINT not in name_low and not in_locators_dir:
+        close = _find_matching_brace(text, open_brace)
+        if close == -1:
             continue
-        text = _read_text(src)
-        # Find the containing class/object name; fall back to filename stem.
-        class_match = _TS_LOCATOR_CLASS_RE.search(text)
-        class_name = class_match.group("name") if class_match else src.stem
-        # Heuristic line-number recovery: count newlines up to the match.
+        body = text[open_brace + 1: close]
+        constants = _extract_locator_fields_any_case(body, text, open_brace + 1)
+        if not constants:
+            continue
+        kept, dropped = _truncate_constants(constants)
+        rel = relative_posix(src, module_root)
+        name = cm.group("name")
+        out.append(LocatorClass(
+            name=name, file=rel, class_name=name,
+            constants=kept, import_path=None, truncated_count=dropped,
+            location_pattern="export_const_object",
+        ))
+    return out
+
+
+def _scan_ts_inline_locator_prop(
+    src: Path, text: str, module_root: Path,
+) -> list[LocatorClass]:
+    """Detector #3: `class Foo { elements = {...} }` — the user's SUT
+    convention. `class Foo { selectors: Record<...> = {...} }` too.
+
+    Records `owning_pom` + `container_name` so Step 8 knows to APPEND new
+    TBD constants to the same inline object instead of creating a
+    separate `FooLocators.ts` file.
+    """
+    out: list[LocatorClass] = []
+    class_re = re.compile(r"(?:export\s+)?class\s+([\w$]+)")
+    for cls_m in class_re.finditer(text):
+        cls_name = cls_m.group(1)
+        # Find the class body (first `{` after the header).
+        class_body_open = text.find("{", cls_m.end())
+        if class_body_open == -1:
+            continue
+        class_body_close = _find_matching_brace(text, class_body_open)
+        if class_body_close == -1:
+            continue
+        class_body = text[class_body_open + 1: class_body_close]
+        for prop_m in _TS_INLINE_LOCATOR_PROP_RE.finditer(class_body):
+            container = prop_m.group("container")
+            # Locate the opening `{` of the container's object literal.
+            open_rel = class_body.find("{", prop_m.end() - 1)
+            if open_rel == -1:
+                continue
+            # Convert to absolute offset in `text` for _find_matching_brace.
+            open_abs = class_body_open + 1 + open_rel
+            close_abs = _find_matching_brace(text, open_abs)
+            if close_abs == -1:
+                continue
+            obj_body = text[open_abs + 1: close_abs]
+            constants = _extract_locator_fields_any_case(
+                obj_body, text, open_abs + 1,
+            )
+            if not constants:
+                continue
+            kept, dropped = _truncate_constants(constants)
+            rel = relative_posix(src, module_root)
+            out.append(LocatorClass(
+                name=f"{cls_name}.{container}",
+                file=rel,
+                class_name=cls_name,
+                constants=kept, import_path=None, truncated_count=dropped,
+                location_pattern="inline_object_property",
+                owning_pom=cls_name,
+                container_name=container,
+            ))
+    return out
+
+
+def _scan_ts_readonly_locator_props(
+    src: Path, text: str, module_root: Path,
+) -> list[LocatorClass]:
+    """Detector #4: `readonly submitBtn = this.page.getByRole(...)` etc.
+
+    The property value is a Playwright ``Locator`` object, not a string,
+    so ``constants[].selector`` is left empty (existence dedup only).
+    """
+    out: list[LocatorClass] = []
+    class_re = re.compile(r"(?:export\s+)?class\s+([\w$]+)")
+    for cls_m in class_re.finditer(text):
+        cls_name = cls_m.group(1)
+        class_body_open = text.find("{", cls_m.end())
+        if class_body_open == -1:
+            continue
+        class_body_close = _find_matching_brace(text, class_body_open)
+        if class_body_close == -1:
+            continue
+        class_body = text[class_body_open + 1: class_body_close]
         constants: list[LocatorConstant] = []
-        seen_names: set[str] = set()
-        for m in _TS_LOCATOR_FIELD_RE.finditer(text):
-            name = m.group("name")
-            if name in seen_names:
+        seen: set[str] = set()
+        for prop_m in _TS_READONLY_LOCATOR_PROP_RE.finditer(class_body):
+            name = prop_m.group("name")
+            if name in seen:
                 continue
-            value = m.group("value")
-            if not _looks_like_selector(value):
-                continue
-            seen_names.add(name)
-            line_no = text.count("\n", 0, m.start("name")) + 1
-            constants.append(LocatorConstant(name=name, selector=value, line=line_no))
+            seen.add(name)
+            line_no = text.count(
+                "\n", 0, class_body_open + 1 + prop_m.start("name"),
+            ) + 1
+            constants.append(LocatorConstant(
+                name=name, selector="", line=line_no,
+            ))
         if not constants:
             continue
         kept, dropped = _truncate_constants(constants)
         rel = relative_posix(src, module_root)
         out.append(LocatorClass(
-            name=class_name,
-            file=rel,
-            class_name=class_name,
-            constants=kept,
-            import_path=None,  # TS imports are by path, not by Python-style dotted path
-            truncated_count=dropped,
+            name=cls_name, file=rel, class_name=cls_name,
+            constants=kept, import_path=None, truncated_count=dropped,
+            location_pattern="readonly_locator_props",
+            owning_pom=cls_name,
         ))
     return out
+
+
+def _find_matching_brace(text: str, open_idx: int) -> int:
+    """Return the index of the `}` matching the `{` at *open_idx*, or -1."""
+    if open_idx >= len(text) or text[open_idx] != "{":
+        return -1
+    depth = 0
+    # Track quotes so `{` inside string literals doesn't count.
+    quote: str | None = None
+    i = open_idx
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if quote:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        else:
+            if ch in "\"'`":
+                quote = ch
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return i
+        i += 1
+    return -1
+
+
+def _extract_locator_fields_any_case(
+    body: str, full_text: str, body_offset: int,
+) -> list[LocatorConstant]:
+    """Extract `key: "value"` / `key = "value"` pairs from *body*.
+
+    Accepts any-case identifiers; filters values via ``_looks_like_selector``.
+    Returns constants with line numbers relative to ``full_text``.
+    """
+    out: list[LocatorConstant] = []
+    seen: set[str] = set()
+    for m in _TS_LOCATOR_FIELD_ANY_CASE_RE.finditer(body):
+        name = m.group("name")
+        if name in seen:
+            continue
+        # Filter TypeScript / JavaScript reserved words that could
+        # accidentally match (`return`, `if`, `class`, ...).
+        if name in _TS_RESERVED_WORDS:
+            continue
+        value = m.group("value")
+        if not _looks_like_selector(value):
+            continue
+        seen.add(name)
+        line_no = full_text.count("\n", 0, body_offset + m.start("name")) + 1
+        out.append(LocatorConstant(name=name, selector=value, line=line_no))
+    return out
+
+
+_TS_RESERVED_WORDS: frozenset[str] = frozenset({
+    "if", "else", "for", "while", "do", "return", "throw", "try",
+    "catch", "finally", "switch", "case", "default", "break", "continue",
+    "class", "extends", "implements", "interface", "type", "enum",
+    "const", "let", "var", "function", "async", "await", "new", "this",
+    "super", "import", "export", "from", "as", "in", "of", "instanceof",
+    "typeof", "void", "null", "undefined", "true", "false",
+    "public", "private", "protected", "static", "readonly", "abstract",
+})
+
+
+def scan_ts_locators(module_root: Path) -> list[LocatorClass]:
+    """Regex-extract locator constants from `.ts`/`.tsx`/`.js`/`.jsx`/`.mjs`.
+
+    Runs FIVE detectors per file and unions the results — SUTs can freely
+    mix conventions or use any single one:
+
+    1. **separate_class** — historical Python-Selenium-style ``class
+       FooLocators { X = "..."; }`` in files whose name/dir contains
+       "locator".
+    2. **export_const_object** — ``export const FooLocators = { X: "..."};``
+       (or ``Selectors``, ``Elements``). Any file.
+    3. **inline_object_property** — ``class Foo { elements = {btnX: "..."} }``
+       inline on a POM class. Common Playwright-TS convention.
+    4. **readonly_locator_props** — ``readonly submitBtn = page.getByRole(...)``
+       Playwright ``Locator`` properties.
+    5. Module-level UPPERCASE bag (folded into detector #1's file filter).
+
+    Each result records ``location_pattern`` so Step 8 can add new TBD
+    constants in the same style. Duplicates across detectors are deduped
+    by ``(file, class_name, constant_name)``.
+    """
+    if not module_root.exists():
+        return []
+    out: list[LocatorClass] = []
+    seen_files: set[Path] = set()
+    detectors = (
+        _scan_ts_separate_class,
+        _scan_ts_export_const_object,
+        _scan_ts_inline_locator_prop,
+        _scan_ts_readonly_locator_props,
+    )
+    for src in _iter_ts_files(module_root):
+        if src in seen_files:
+            continue
+        seen_files.add(src)
+        text = _read_text(src)
+        for detector in detectors:
+            try:
+                out.extend(detector(src, text, module_root))
+            except Exception:
+                # A malformed file shouldn't take down inventory —
+                # skip and continue with the next detector.
+                continue
+    return _dedup_locator_classes(out)
+
+
+def _dedup_locator_classes(entries: list[LocatorClass]) -> list[LocatorClass]:
+    """Dedup by (file, class_name, constant name).
+
+    When two detectors produce overlapping results (e.g. an export-const
+    object detected by both #1 and #2), keep the entry from the MORE
+    specific detector — priority: inline_object_property >
+    readonly_locator_props > export_const_object > separate_class.
+    """
+    priority = {
+        "inline_object_property": 4,
+        "readonly_locator_props": 3,
+        "export_const_object": 2,
+        "separate_class": 1,
+    }
+    best_by_key: dict[tuple[str, str], LocatorClass] = {}
+    for e in entries:
+        key = (e.file, e.class_name)
+        current = best_by_key.get(key)
+        if current is None or priority.get(e.location_pattern, 0) > priority.get(
+            current.location_pattern, 0,
+        ):
+            best_by_key[key] = e
+    return list(best_by_key.values())
 
 
 def _is_pytest_fixture_decorator(dec: ast.expr) -> bool:
@@ -1074,13 +1394,35 @@ def scan_python_auth_flow(
 
 
 _TS_GLOBS = ("**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx", "**/*.mjs")
-_TS_CLASS_RE = re.compile(r"\bclass\s+(\w+(?:Page|PageObject|PO))\s*[{<]")
+_TS_CLASS_RE = re.compile(
+    # Named `*Page*` / `*PageObject` / `*PO` classes (positive-signal path).
+    # Allow `extends`/`implements` between the name and the body — the
+    # original `[{<]` requirement missed every subclass in the wild.
+    r"\bclass\s+(\w+(?:Page|PageObject|PO))\b"
+)
+_TS_ANY_CLASS_RE = re.compile(
+    # Any class declaration — used for structural POM detection when the
+    # naming heuristic is absent (the SUT uses e.g. `class Login` or
+    # `class DashboardScreen` instead of `class DashboardPage`).
+    r"(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+([\w$]+)\b"
+)
 _TS_METHOD_RE = re.compile(
     r"^\s*(?:public\s+|private\s+|protected\s+|async\s+)*(\w+)\s*\([^)]*\)\s*[:{]",
     re.M,
 )
+# Structural POM signals — a class whose body calls one of these APIs is
+# almost certainly a page object regardless of what it's named.
+_TS_POM_CALL_HINTS: tuple[str, ...] = (
+    "page.locator", "page.getBy", "page.click", "page.fill",
+    "page.goto", "page.waitFor", "page.evaluate",
+    "this.page.locator", "this.page.getBy", "this.page.click",
+    "this.page.fill", "this.page.goto", "this.page.waitFor",
+    "driver.findElement", "driver.get", "driver.wait",
+    "cy.get", "cy.contains", "cy.visit",
+    "browser.$", "browser.url",
+)
 _TS_EXPORT_FUNC_RE = re.compile(r"export\s+(?:async\s+)?function\s+(\w+)\s*\(")
-_TS_FIXTURE_RE = re.compile(r"test\.extend\s*<[^>]*>\s*\(\s*\{")
+_TS_FIXTURE_RE = re.compile(r"\w+\.extend\s*(?:<[^>]*>\s*)?\(\s*\{")
 _TS_AUTH_NAME_RE = re.compile(r"\b(login|signIn|signOn|authenticate)\b")
 
 
@@ -1107,33 +1449,108 @@ def _iter_ts_files(root: Path) -> list[Path]:
 
 
 def scan_ts_page_objects(module_root: Path) -> list[PageObject]:
+    """Detect Playwright / Cypress / WebdriverIO page-object classes.
+
+    Two-signal recognition:
+
+    - **Naming heuristic** (positive signal): class name ends with ``Page``,
+      ``PageObject``, or ``PO``. Fast and precise for the common case.
+    - **Structural intent** (fallback): any class whose body calls
+      ``page.locator`` / ``page.getBy*`` / ``driver.findElement`` / ``cy.get``
+      / ``browser.$`` is treated as a POM even without a matching name.
+
+    Also populates ``has_inline_locators`` when the class body defines an
+    ``elements`` / ``selectors`` / ``locators`` inline object — Step 8
+    uses this to place new TBD constants in the same convention.
+    """
     out: list[PageObject] = []
     seen: set[Path] = set()
-    # Look under any page-object directory (nested anywhere via _find_page_dirs).
-    for page_dir in _find_page_dirs(module_root):
+
+    # Broadened search: page-object dirs (any name in _PAGE_DIR_NAMES) +
+    # module-level `src/` where SUTs often colocate POMs with production
+    # code. We still restrict to files where at least one POM signal
+    # fires to avoid indexing every TS class in the repo.
+    candidate_dirs: list[Path] = list(_find_page_dirs(module_root))
+    # Add well-known top-level source roots when they exist — POMs in
+    # `src/` at the root are common in Playwright-TS SUTs.
+    for candidate in ("src", "test", "tests", "e2e"):
+        p = module_root / candidate
+        if p.is_dir() and p not in candidate_dirs:
+            candidate_dirs.append(p)
+
+    for page_dir in candidate_dirs:
         for src in _iter_ts_files(page_dir):
             if src in seen:
                 continue
             seen.add(src)
             text = _read_text(src)
-            classes = _TS_CLASS_RE.findall(text)
-            if not classes:
+            # Skip files that don't even declare a class.
+            all_classes = _TS_ANY_CLASS_RE.findall(text)
+            if not all_classes:
                 continue
+
+            # Positive-signal names win — they get every class in the
+            # file. If no positive signals, fall back to structural
+            # detection: a class body with POM-shaped API calls.
+            named_pom = set(_TS_CLASS_RE.findall(text))
+            has_structural_signal = any(
+                hint in text for hint in _TS_POM_CALL_HINTS
+            )
+
+            if not named_pom and not has_structural_signal:
+                continue
+
+            # Which classes qualify? Union of the named set + all classes
+            # in a structural-signal file.
+            qualifying = set(all_classes) if has_structural_signal else set()
+            qualifying.update(named_pom)
+
             methods = sorted({
                 m for m in _TS_METHOD_RE.findall(text)
                 if m not in {"if", "for", "while", "switch", "return",
                              "function", "constructor"}
                 and not m.startswith("_")
             })
+            has_inline = _ts_class_has_inline_locator_container(text)
+
             rel = relative_posix(src, module_root)
-            for cls in classes:
+            for cls in sorted(qualifying):
                 out.append(PageObject(
                     name=cls,
                     file=rel,
                     class_name=cls,
                     methods=methods,
                     scope=_scope_for_name(cls),
+                    has_inline_locators=has_inline,
                 ))
+    # A class can be picked up twice when a file lives under BOTH
+    # `pages/` and `src/` (nested). Dedup on (file, class_name).
+    return _dedup_page_objects(out)
+
+
+def _ts_class_has_inline_locator_container(text: str) -> bool:
+    """True when *text* contains ``elements``/``selectors``/``locators`` = {...}.
+
+    Fast substring check first, then confirm with the property regex.
+    Used to set ``PageObject.has_inline_locators``.
+    """
+    if not any(hint in text for hint in (
+        "elements", "selectors", "locators", "selectorsMap", "elems",
+    )):
+        return False
+    return bool(_TS_INLINE_LOCATOR_PROP_RE.search(text))
+
+
+def _dedup_page_objects(entries: list[PageObject]) -> list[PageObject]:
+    """Dedup by (file, class_name). Preserve the first-seen entry."""
+    seen: set[tuple[str, str]] = set()
+    out: list[PageObject] = []
+    for e in entries:
+        key = (e.file, e.class_name)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(e)
     return out
 
 
@@ -1154,7 +1571,14 @@ def scan_ts_helpers(module_root: Path) -> list[Helper]:
 
 
 def scan_ts_fixtures(module_root: Path) -> list[Fixture]:
-    """Playwright `test.extend<...>({ ... })` fixture blocks."""
+    """Playwright `*.extend<...>({ ... })` fixture blocks.
+
+    Accepts both ``test.extend<T>({...})`` and ``baseTest.extend({...})``
+    forms (any receiver name, generic param optional), and both async
+    (``key: async ({page}, use) => ...``) and sync (``key: ({page}, use)
+    => ...``) fixture bodies. See ``codegen_reconcile._scan_ts_fixture_symbols``
+    for the twin scanner used during Phase B.5 reconciliation.
+    """
     out: list[Fixture] = []
     tests_root = module_root / "tests"
     if not tests_root.exists():
@@ -1164,12 +1588,18 @@ def scan_ts_fixtures(module_root: Path) -> list[Fixture]:
         if not _TS_FIXTURE_RE.search(text):
             continue
         rel = relative_posix(src, module_root)
-        # Extract the keys inside the first `{ ... }` after `test.extend<...>`.
-        m = re.search(r"test\.extend\s*<[^>]*>\s*\(\s*\{(.+?)\}\s*\)", text, re.S)
+        # Extract the keys inside the first `{ ... }` after `<receiver>.extend`.
+        m = re.search(
+            r"\w+\.extend\s*(?:<[^>]*>\s*)?\(\s*\{(.+?)\}\s*\)",
+            text,
+            re.S,
+        )
         if not m:
             continue
         body = m.group(1)
-        for key_match in re.finditer(r"^\s*(\w+)\s*:\s*async", body, re.M):
+        for key_match in re.finditer(
+            r"^\s*(\w+)\s*:\s*(?:async\s*)?\(", body, re.M,
+        ):
             out.append(Fixture(
                 name=key_match.group(1), file=rel,
                 scope="function", yields=None, depends_on=[],

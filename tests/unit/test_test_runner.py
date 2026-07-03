@@ -46,11 +46,41 @@ def test_resolve_command_uses_default(tmp_path: Path) -> None:
     assert "qtea-results.json" in cmd
 
 
-def test_resolve_command_fallback_for_unknown(tmp_path: Path) -> None:
+def test_resolve_command_unknown_framework_returns_unsupported_sentinel(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Unknown framework fails loud instead of silently defaulting to pytest.
+
+    Regression: previously fell back to ``pytest --junitxml=…`` for any
+    unknown framework — so Java/C#/Ruby/Go stacks silently ran the wrong
+    runner and reported "0 tests, all passed."
+    """
+    import logging
+    caplog.set_level(logging.ERROR)
     cmd, parser = resolve_command("nodescript", detected=None, cwd=tmp_path)
-    expected = str((tmp_path / "qtea-junit.xml").as_posix())
-    assert cmd == f"pytest --junitxml={expected}"
-    assert parser == "junit"
+    assert cmd == ""
+    assert parser == "unsupported"
+    # Error surfaces in logs for the operator.
+    assert any(
+        "unsupported_framework" in rec.message
+        or "nodescript" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_run_tests_unknown_framework_synthesises_runner_failure(
+    tmp_path: Path,
+) -> None:
+    """run_tests short-circuits an unsupported framework with a clean
+    T-runner-failure entry rather than blowing up on empty command."""
+    result = run_tests("nodescript", cwd=tmp_path, detected_command=None)
+    assert result.exit_code == 127
+    assert len(result.results) == 1
+    entry = result.results[0]
+    assert entry.id == "T-runner-failure"
+    assert entry.status == "error"
+    assert entry.runner_failure is not None
+    assert entry.runner_failure["kind"] == "unsupported_framework"
 
 
 # ---------------------------------------------------------------------------
@@ -98,12 +128,22 @@ def test_resolve_command_detected_overrides_wrapping(tmp_path: Path) -> None:
 
 
 def test_resolve_command_unknown_framework_wrapped(tmp_path: Path) -> None:
-    """Bare-pytest fallback also gets wrapped when a profile is provided."""
+    """Unknown framework returns unsupported sentinel even with a profile.
+
+    Regression: previously wrapped bare `pytest --junitxml=…` with the
+    package-manager prefix, so `resolve_command("xyz", …, profile=poetry)`
+    silently produced `poetry run pytest ...` and Java/Ruby/Go stacks ran
+    the wrong runner. The wrapper is now bypassed when the framework is
+    unknown — the sentinel signals `run_tests` to short-circuit.
+    """
     from qtea.stack_profile import StackProfile
 
     profile = StackProfile(package_manager="poetry", wrapper_prefix="poetry run")
-    cmd, _ = resolve_command("xyz", detected=None, cwd=tmp_path, profile=profile)
-    assert cmd.startswith("poetry run pytest")
+    cmd, parser = resolve_command(
+        "xyz", detected=None, cwd=tmp_path, profile=profile,
+    )
+    assert cmd == ""
+    assert parser == "unsupported"
 
 
 def test_prepare_sut_no_profile_is_noop(tmp_path: Path) -> None:
@@ -669,6 +709,31 @@ def test_run_tests_synthesises_runner_failure_when_no_output(tmp_path: Path) -> 
     assert len(result.results) == 1
     assert result.results[0].status == "error"
     assert result.results[0].id == "T-runner-failure"
+
+
+def test_run_tests_unknown_parser_emits_synthetic_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the parser dispatch doesn't recognise a parser, produce a
+    visible synthetic failure entry — never silent 0-tests-passed.
+
+    Simulates the case where a framework's _DEFAULT_COMMANDS entry has a
+    parser id that isn't wired into run_tests' dispatch (registration bug).
+    """
+    from qtea import test_runner as tr
+    monkeypatch.setitem(
+        tr._DEFAULT_COMMANDS,
+        "fakestack",
+        (f"{sys.executable} -c \"import sys; sys.exit(0)\"", "totally-fake-parser"),
+    )
+    result = run_tests("fakestack", cwd=tmp_path, detected_command=None)
+    assert len(result.results) == 1
+    entry = result.results[0]
+    assert entry.id == "T-runner-failure"
+    assert entry.status == "error"
+    assert entry.runner_failure is not None
+    assert entry.runner_failure["kind"] == "unknown_parser"
+    assert "totally-fake-parser" in entry.message
 
 
 def test_normalize_id_is_stable() -> None:

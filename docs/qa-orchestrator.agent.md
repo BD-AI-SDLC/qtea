@@ -16,7 +16,7 @@ rules.
 ## Execution protocol
 Follow `docs/qa-orchestrator.instructions.md` for the full operating protocol:
 initialization, pre-flight checks, dispatch, validation, checkpointing, and
-the retry/fix-proposal flow.
+the retry + auto-firing fix-proposal chain.
 
 ## Non-negotiable rules
 - Locator priority `id > data-testid > role > label > text > placeholder > scoped CSS`. **Never XPath.**

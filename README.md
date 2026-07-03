@@ -4,9 +4,9 @@
 > Fully autonomous QA SDLC orchestrator. Hybrid workflow consists of Python + LLM calls.  
 > It uses Python to run the pipeline deterministically, and spins up agents via direct SDK invocation (solely LLM prompt) or Claude Agent SDK (file management, MCP).
 
-`qtea` turns a requirement (Jira ticket or local markdown spec) into a tested
-feature, executed tests, self-heal, classified bugs, and a polished report - in 11
-deterministic, checkpointed steps.
+`qtea` turns a requirement (Jira ticket, Azure DevOps work item, or local
+markdown spec) into executed tests, self-heal, classified bugs, and a polished
+report — in 11 deterministic, checkpointed steps.
 
 ## Install
 clone the repo locally. then, to install it:
@@ -28,7 +28,7 @@ qtea run --spec ./feature.md --sut ./my-app
 
 | # | Step | Agent | Output |
 |---|---|---|---|
-| 1 | Intake | `jira-to-ai-spec` (or pure copy) | `spec.md` |
+| 1 | Intake | `ticket-to-ai-spec` (or pure copy) | `spec.md` |
 | 2 | Refine | `refine-spec` | `refined-spec.{md,json}` |
 | 3 | Plan | `polyglot-test-planner` | `plan.{md,json}` |
 | 4 | Strategy | `test-manager` | `test-strategy.{md,json}` |
@@ -76,8 +76,8 @@ qtea run --run-id <id> --spec ...       # resume a specific workspace by run-id
 qtea run --from-step 6 --run-id ...       # skip steps 1-5
 qtea run --only-step 11 --spec ...      # regenerate report only
 qtea run --force --spec ...             # ignore all checkpoints
-qtea run --debug --spec ...             # verbose debug agent from step 1
-qtea run --fix --spec ...               # RCA + fix proposal on failure
+qtea run --debug --spec ...             # RCA on attempt 1 too (default: final-failure only)
+qtea run --no-fix --spec ...            # suppress the auto fix-proposal chain (RCA still writes)
 qtea auth-capture --sut ./app           # one-shot Playwright storageState capture
                                            # (for MFA/SSO SUTs — lets Step 9's
                                            # heal agent skip auth-replay)

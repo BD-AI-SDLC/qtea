@@ -1977,10 +1977,24 @@ class _RetryingLocator(_SyncLocatorBase):
         if asyncio.iscoroutinefunction(attr):
             async def _async_retry_wrapper(*args, **kwargs):
                 # Walk any in-bundle fallbacks first (zero-cost resilience).
+                _overlay_retried = False
                 while True:
                     try:
                         result = await getattr(self._real, name)(*args, **kwargs)
                     except Exception as exc:  # noqa: BLE001
+                        if not _overlay_retried and _is_overlay_intercept_error(exc):
+                            _overlay_retried = True
+                            try:
+                                if await _try_overlay_dismiss_async(
+                                    self._page, self._real, self._resolution,
+                                ):
+                                    continue
+                            except Exception as ov_exc:  # noqa: BLE001
+                                log.debug(
+                                    "qtea.overlay_dismiss_wrapper_failed_async %s",
+                                    ov_exc,
+                                )
+                            raise
                         if not _is_playwright_timeout(exc):
                             raise
                         stale = self._resolution
@@ -2043,10 +2057,29 @@ class _RetryingLocator(_SyncLocatorBase):
             return _async_retry_wrapper
 
         def _retry_wrapper(*args, **kwargs):
+            _overlay_retried = False  # bounded: one dismiss attempt per action
             while True:
                 try:
                     result = getattr(self._real, name)(*args, **kwargs)
                 except Exception as exc:  # noqa: BLE001
+                    # Overlay intercept detection (L1). Distinct from timeout
+                    # retry — if a safe-class heuristic dismiss succeeds, we
+                    # retry the SAME action once. Never enters the LLM
+                    # re-resolve path (that's for locator-not-found, not
+                    # element-blocked-by-overlay).
+                    if not _overlay_retried and _is_overlay_intercept_error(exc):
+                        _overlay_retried = True
+                        try:
+                            if _try_overlay_dismiss_sync(
+                                self._page, self._real, self._resolution,
+                            ):
+                                continue  # dismissed — retry original action
+                        except Exception as ov_exc:  # noqa: BLE001
+                            log.debug("qtea.overlay_dismiss_wrapper_failed %s", ov_exc)
+                        # Heuristic failed / risky-only — propagate original
+                        # error. Event is recorded by _try_overlay_dismiss_sync
+                        # so the parent-side sweep can HITL-prompt.
+                        raise
                     if not _is_playwright_timeout(exc):
                         raise
                     stale = self._resolution
@@ -2543,6 +2576,856 @@ def _maybe_inject_proxy_kwarg(kwargs: dict) -> dict:
     return kwargs
 
 
+# ---------------------------------------------------------------------------
+# Overlay/popup auto-dismiss — runtime side.
+# ---------------------------------------------------------------------------
+#
+# Companion to ``src/qtea/overlay_handling.py`` (parent-side). This section
+# implements Layers 1, 2, 5, 6 of the overlay auto-dismiss system:
+#
+#   L1: detect "element intercepts pointer events" errors at action time,
+#       walking DOM/frames to identify the overlay causing the intercept.
+#   L2: heuristic dismiss — two-token-class scoring (safe/risky); only
+#       safe-class buttons (Close, Dismiss, ×, Skip) auto-fire.
+#   L5: register handlers from <sut>/.qtea/interceptors.json via Playwright's
+#       native page.add_locator_handler() so known overlays are invisible on
+#       every future run.
+#   L6: filter consent/GDPR cookies from Playwright storage_state auto-
+#       capture so dismissed banners don't leak into persisted state.
+#
+# Feature-flag ``QTEA_OVERLAY_HANDLING=1`` (default on). Set to ``0`` to
+# disable all overlay code paths (rollback to pre-feature thrash behavior).
+#
+# This section CANNOT import from qtea (the runtime is vendored into the
+# SUT subprocess). The token classes and cookie patterns below are
+# duplicated from qtea.overlay_handling; both sides must agree on them
+# for the parent's HITL candidate list to match what the runtime saw.
+
+_OVERLAY_ENABLED = os.environ.get("QTEA_OVERLAY_HANDLING", "1") != "0"
+
+# Dismiss-SAFE tokens: heuristic MAY auto-fire on these. Pure dismissal
+# semantics — clicking would essentially never mask a real bug.
+_OVERLAY_SAFE_TOKENS = (
+    "close", "dismiss", "not now", "skip", "later",
+    "maybe later", "remind me later", "×", "✕",
+)
+
+# Dismiss-RISKY tokens: heuristic MUST NOT auto-fire. They reach HITL as
+# candidates the operator can pick, but never zero-touch. "Accept" could
+# be terms-consent OR destructive-payment; two-class separation guardrails.
+_OVERLAY_RISKY_TOKENS = (
+    "accept", "agree", "continue", "ok", "got it",
+    "understand", "confirm", "proceed",
+)
+
+# Consent/GDPR cookie name/domain fragments filtered from storage_state
+# auto-capture (Layer 6). Prevents the consent flow's own regression
+# tests from silently passing on subsequent runs.
+_OVERLAY_CONSENT_COOKIE_PATTERNS = (
+    "consent", "cookie", "gdpr", "banner",
+    "onetrust", "trustarc", "cookiebot", "osano",
+)
+
+# Roles considered overlay-shaped when walking the DOM up from the
+# intercept point. Chosen to match interceptors.json schema.
+_OVERLAY_ROLES = ("dialog", "alertdialog", "banner", "region",
+                  "complementary", "status", "alert")
+
+# Pages we've registered locator handlers on. Set of Python id() values
+# so we don't re-register on every new_page call for the same page object.
+_overlay_registered_page_ids: set[int] = set()
+
+# Interceptor entries loaded once from interceptors.json at first use.
+# None = not yet loaded; [] = loaded and empty (or file missing).
+_overlay_interceptors_cache: list[dict[str, Any]] | None = None
+
+
+def _overlay_events_path() -> Path | None:
+    """Where the runtime writes OverlayEvent JSONL lines. None when
+    QTEA_WORKSPACE_DIR is unset (standalone pytest run, not from Step 9)."""
+    ws = os.environ.get("QTEA_WORKSPACE_DIR")
+    if not ws:
+        return None
+    return Path(ws) / "overlay-events.jsonl"
+
+
+def _overlay_screenshots_dir() -> Path | None:
+    ws = os.environ.get("QTEA_WORKSPACE_DIR")
+    if not ws:
+        return None
+    return Path(ws) / "overlay-screenshots"
+
+
+def _interceptors_json_path() -> Path | None:
+    """Where interceptors.json lives. Priority: QTEA_INTERCEPTORS env
+    (set by Step 9) > <cwd>/.qtea/interceptors.json (convention when
+    running pytest standalone in a SUT that has the file)."""
+    env = os.environ.get("QTEA_INTERCEPTORS")
+    if env:
+        return Path(env)
+    conv = Path.cwd() / ".qtea" / "interceptors.json"
+    if conv.exists():
+        return conv
+    return None
+
+
+def _is_overlay_intercept_error(exc: BaseException) -> bool:
+    """Multi-signal detector for 'element intercepts pointer events' failures.
+
+    Playwright's error text has shifted across versions — we look for both
+    the modern message ('intercepts pointer events') and legacy patterns
+    ('is not clickable' + 'another element'). Both must be tolerated
+    without over-matching genuine timeouts (which are handled elsewhere).
+    """
+    if not exc:
+        return False
+    msg = str(exc)
+    if "intercepts pointer events" in msg:
+        return True
+    if "is not clickable" in msg and "another element" in msg:
+        return True
+    return False
+
+
+def _classify_dismiss_name(name: str) -> str:
+    """Return "safe" / "risky" / "unknown" for a candidate's accessible name.
+    Mirrors qtea.overlay_handling.classify_dismiss_name."""
+    if not name:
+        return "unknown"
+    norm = name.strip().lower()
+    if not norm:
+        return "unknown"
+    tokens = set(_OVERLAY_TOKEN_SPLIT.split(norm))
+    tokens.discard("")
+    for phrase in _OVERLAY_SAFE_TOKENS:
+        if " " in phrase:
+            if phrase in norm:
+                return "safe"
+        elif phrase in tokens:
+            return "safe"
+    for phrase in _OVERLAY_RISKY_TOKENS:
+        if " " in phrase:
+            if phrase in norm:
+                return "risky"
+        elif phrase in tokens:
+            return "risky"
+    return "unknown"
+
+
+import re as _re_overlay
+_OVERLAY_TOKEN_SPLIT = _re_overlay.compile(r"[\s\-_/,.:;·|()\[\]{}]+")
+
+
+# JS returned to the parent by page.evaluate(). Introspects the DOM at
+# the target coordinates, walks up to find an overlay-shaped element, and
+# returns a JSON-serializable description including candidate dismiss
+# buttons. Kept as a single string constant so it can be shipped intact
+# into the browser without formatting surprises.
+_OVERLAY_INSPECT_JS = r"""
+({x, y, roles}) => {
+    function accessibleName(el) {
+        if (!el) return "";
+        const aria = el.getAttribute && el.getAttribute("aria-label");
+        if (aria) return aria.trim();
+        const labelled = el.getAttribute && el.getAttribute("aria-labelledby");
+        if (labelled) {
+            const l = document.getElementById(labelled);
+            if (l) return (l.textContent || "").trim();
+        }
+        return ((el.innerText || el.textContent) || "").trim().slice(0, 200);
+    }
+    function elementRole(el) {
+        if (!el || !el.getAttribute) return "";
+        const explicit = el.getAttribute("role");
+        if (explicit) return explicit;
+        const tag = (el.tagName || "").toLowerCase();
+        if (tag === "button") return "button";
+        if (tag === "a" && el.hasAttribute("href")) return "link";
+        if (tag === "dialog") return "dialog";
+        return "";
+    }
+    function bboxOf(el) {
+        if (!el || !el.getBoundingClientRect) return null;
+        const r = el.getBoundingClientRect();
+        return [r.left, r.top, r.width, r.height];
+    }
+    // Sample corners + center to be robust to large targets w/ small overlay
+    const samples = [
+        [x, y],
+        [x - 4, y - 4], [x + 4, y - 4],
+        [x - 4, y + 4], [x + 4, y + 4],
+    ];
+    let intercepting = null;
+    for (const [sx, sy] of samples) {
+        const el = document.elementFromPoint(sx, sy);
+        if (el) { intercepting = el; break; }
+    }
+    if (!intercepting) return null;
+    // Walk up to find an overlay-shaped ancestor.
+    let overlay = intercepting;
+    let hops = 0;
+    while (overlay && hops < 20) {
+        const r = elementRole(overlay);
+        if (roles.includes(r)) break;
+        overlay = overlay.parentElement;
+        hops += 1;
+    }
+    if (!overlay || !roles.includes(elementRole(overlay))) return null;
+    const overlayName = accessibleName(overlay);
+    const overlayBbox = bboxOf(overlay);
+    // Extract candidate buttons INSIDE the overlay
+    const buttons = Array.from(
+        overlay.querySelectorAll('button, [role="button"], a[href], [role="link"], [role="menuitem"]')
+    );
+    const cands = buttons.map(b => {
+        const r = elementRole(b) || "button";
+        const n = accessibleName(b);
+        const bb = bboxOf(b);
+        return { role: r, name: n, bbox: bb };
+    }).filter(c => c.name);
+    return {
+        overlay_role: elementRole(overlay),
+        overlay_name: overlayName,
+        overlay_bbox: overlayBbox,
+        candidates: cands,
+    };
+}
+"""
+
+
+def _target_bbox_sync(target_locator) -> tuple[float, float, float, float] | None:
+    try:
+        b = target_locator.bounding_box()
+        if b and "x" in b and "y" in b and "width" in b and "height" in b:
+            return (b["x"], b["y"], b["width"], b["height"])
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+async def _target_bbox_async(target_locator) -> tuple[float, float, float, float] | None:
+    try:
+        b = await target_locator.bounding_box()
+        if b and "x" in b and "y" in b and "width" in b and "height" in b:
+            return (b["x"], b["y"], b["width"], b["height"])
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _inspect_overlay_sync(page, target_bbox) -> dict[str, Any] | None:
+    """Run the DOM-introspection JS to find an overlay covering target_bbox."""
+    if target_bbox is None:
+        return None
+    cx = target_bbox[0] + target_bbox[2] / 2
+    cy = target_bbox[1] + target_bbox[3] / 2
+    try:
+        return page.evaluate(
+            _OVERLAY_INSPECT_JS, {"x": cx, "y": cy, "roles": list(_OVERLAY_ROLES)},
+        )
+    except Exception as e:  # noqa: BLE001
+        log.debug("qtea.overlay_inspect_failed_sync %s", e)
+        return None
+
+
+async def _inspect_overlay_async(page, target_bbox) -> dict[str, Any] | None:
+    if target_bbox is None:
+        return None
+    cx = target_bbox[0] + target_bbox[2] / 2
+    cy = target_bbox[1] + target_bbox[3] / 2
+    try:
+        return await page.evaluate(
+            _OVERLAY_INSPECT_JS, {"x": cx, "y": cy, "roles": list(_OVERLAY_ROLES)},
+        )
+    except Exception as e:  # noqa: BLE001
+        log.debug("qtea.overlay_inspect_failed_async %s", e)
+        return None
+
+
+def _score_overlay_candidates(
+    cands: list[dict[str, Any]],
+    overlay_bbox: tuple[float, float, float, float] | None,
+) -> list[dict[str, Any]]:
+    """Score candidates and sort best-first. Same rules as
+    qtea.overlay_handling.score_candidates."""
+    scored: list[dict[str, Any]] = []
+    for c in cands or []:
+        role = str(c.get("role") or "").strip()
+        name = str(c.get("name") or "").strip()
+        bbox_raw = c.get("bbox")
+        bbox = tuple(bbox_raw) if bbox_raw and len(bbox_raw) == 4 else None
+        cls = _classify_dismiss_name(name)
+        role_ok = role.lower() in ("button", "link", "menuitem")
+        if not role_ok and cls == "unknown":
+            continue
+        score = 0
+        if cls in ("safe", "risky"):
+            score += 3
+        if role.lower() == "button":
+            score += 1
+        if bbox is not None and overlay_bbox is not None:
+            bx, by, bw, bh = bbox
+            ox, oy, ow, oh = overlay_bbox
+            cx = bx + bw / 2
+            cy = by + bh / 2
+            if cx > ox + ow / 2 and cy < oy + oh / 3 and cx <= ox + ow:
+                score += 2
+        if score == 0:
+            continue
+        scored.append({
+            "role": role, "name": name, "safe": cls == "safe",
+            "score": score, "bbox": list(bbox) if bbox else None,
+        })
+    scored.sort(key=lambda c: (-int(c["score"]), not c["safe"], c["name"].lower()))
+    return scored
+
+
+def _pick_safe_candidate(scored: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for c in scored:
+        if c.get("safe"):
+            return c
+    return None
+
+
+def _capture_overlay_screenshot_sync(
+    page, overlay_bbox: tuple[float, float, float, float] | None, path: Path,
+) -> None:
+    """Cropped screenshot of overlay with password/email inputs masked.
+
+    Best-effort. Any exception degrades to no-screenshot (parent-side
+    HITL renders a "no screenshot captured" placeholder).
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        kwargs: dict[str, Any] = {"path": str(path)}
+        if overlay_bbox is not None:
+            ox, oy, ow, oh = overlay_bbox
+            # Guard against off-viewport bboxes (some banners are absolutely
+            # positioned outside the visible area). If invalid, fall back to
+            # a full-page shot.
+            if ow > 0 and oh > 0:
+                kwargs["clip"] = {
+                    "x": max(0.0, ox),
+                    "y": max(0.0, oy),
+                    "width": ow,
+                    "height": oh,
+                }
+        # Mask password/email inputs — CLAUDE.md rule: no credentials in
+        # visual artifacts. Best-effort — if no such inputs exist, mask
+        # list stays empty and Playwright ignores it.
+        masks: list[Any] = []
+        for sel in ('input[type="password"]', 'input[type="email"]'):
+            try:
+                loc = page.locator(sel)
+                if loc.count() > 0:
+                    masks.append(loc)
+            except Exception:  # noqa: BLE001
+                pass
+        if masks:
+            kwargs["mask"] = masks
+        page.screenshot(**kwargs)
+    except Exception as e:  # noqa: BLE001
+        log.debug("qtea.overlay_screenshot_failed %s", e)
+
+
+async def _capture_overlay_screenshot_async(
+    page, overlay_bbox: tuple[float, float, float, float] | None, path: Path,
+) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        kwargs: dict[str, Any] = {"path": str(path)}
+        if overlay_bbox is not None:
+            ox, oy, ow, oh = overlay_bbox
+            if ow > 0 and oh > 0:
+                kwargs["clip"] = {
+                    "x": max(0.0, ox), "y": max(0.0, oy),
+                    "width": ow, "height": oh,
+                }
+        masks: list[Any] = []
+        for sel in ('input[type="password"]', 'input[type="email"]'):
+            try:
+                loc = page.locator(sel)
+                if await loc.count() > 0:
+                    masks.append(loc)
+            except Exception:  # noqa: BLE001
+                pass
+        if masks:
+            kwargs["mask"] = masks
+        await page.screenshot(**kwargs)
+    except Exception as e:  # noqa: BLE001
+        log.debug("qtea.overlay_screenshot_failed_async %s", e)
+
+
+def _safe_page_url(page) -> str:
+    try:
+        u = page.url
+        return u() if callable(u) else str(u or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _write_overlay_event(event: dict[str, Any]) -> None:
+    """Atomic append to overlay-events.jsonl. Best-effort."""
+    path = _overlay_events_path()
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except OSError as e:
+        log.debug("qtea.overlay_event_write_failed %s", e)
+
+
+def _build_overlay_event(
+    inspect_result: dict[str, Any] | None,
+    resolution: "_Resolution" | None,
+    heuristic_attempted: bool,
+    heuristic_succeeded: bool,
+    scored_candidates: list[dict[str, Any]],
+    page_url: str,
+    screenshot_path: str,
+) -> dict[str, Any]:
+    """Assemble the JSONL event dict. Field names must match qtea.overlay_handling.OverlayEvent."""
+    nodeid = _current_test_nodeid() or ""
+    overlay_role = str((inspect_result or {}).get("overlay_role") or "")
+    overlay_name = str((inspect_result or {}).get("overlay_name") or "")
+    overlay_bbox = (inspect_result or {}).get("overlay_bbox")
+    return {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "test_id": nodeid,
+        "target_intent": (resolution.intent if resolution else "") or "",
+        "overlay_role": overlay_role,
+        "overlay_name": overlay_name,
+        "page_url": page_url,
+        "screenshot_path": screenshot_path,
+        "overlay_frame": "top",
+        "overlay_bbox": overlay_bbox,
+        "heuristic_attempted": heuristic_attempted,
+        "heuristic_succeeded": heuristic_succeeded,
+        "candidates": scored_candidates,
+    }
+
+
+def _screenshot_key(overlay_role: str, overlay_name: str, page_url: str) -> str:
+    import hashlib
+    h = hashlib.sha256(
+        f"{overlay_role}::{overlay_name}::{page_url}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{h}.png"
+
+
+def _try_overlay_dismiss_sync(page, target_locator, resolution) -> bool:
+    """L1 detection + L2 heuristic dismiss (sync path).
+
+    Returns True when the safe-class heuristic dismissed something and the
+    caller should retry the original action. Returns False when nothing
+    could be safely dismissed (event is recorded in either case).
+    """
+    if not _OVERLAY_ENABLED:
+        return False
+    target_bbox = _target_bbox_sync(target_locator)
+    page_url = _safe_page_url(page)
+    inspect = _inspect_overlay_sync(page, target_bbox)
+    if inspect is None:
+        # Not overlay-shaped — record so parent-side reclassifier still marks it
+        _write_overlay_event(_build_overlay_event(
+            None, resolution, False, False, [], page_url, "",
+        ))
+        return False
+    overlay_bbox = inspect.get("overlay_bbox")
+    scored = _score_overlay_candidates(inspect.get("candidates") or [], overlay_bbox)
+    # Screenshot AFTER inspection so the overlay is still visible when captured.
+    ss_path = ""
+    ss_dir = _overlay_screenshots_dir()
+    if ss_dir is not None:
+        key = _screenshot_key(
+            inspect.get("overlay_role") or "",
+            inspect.get("overlay_name") or "",
+            page_url,
+        )
+        candidate_path = ss_dir / key
+        _capture_overlay_screenshot_sync(page, overlay_bbox, candidate_path)
+        if candidate_path.exists():
+            ss_path = str(candidate_path)
+    safe = _pick_safe_candidate(scored)
+    if safe is None:
+        # Only risky/unknown candidates — record event, let it propagate.
+        _write_overlay_event(_build_overlay_event(
+            inspect, resolution, True, False, scored, page_url, ss_path,
+        ))
+        return False
+    # Try to click the safe candidate.
+    try:
+        overlay_loc = page.get_by_role(
+            inspect.get("overlay_role") or "dialog",
+            name=inspect.get("overlay_name") or "",
+        )
+        overlay_loc.get_by_role(
+            safe["role"] or "button", name=safe["name"],
+        ).first.click()
+        _write_overlay_event(_build_overlay_event(
+            inspect, resolution, True, True, scored, page_url, ss_path,
+        ))
+        log.info(
+            "qtea.overlay_heuristic_dismissed overlay=%s dismiss=%s",
+            inspect.get("overlay_name"), safe["name"],
+        )
+        return True
+    except Exception as e:  # noqa: BLE001 — heuristic is best-effort
+        log.debug("qtea.overlay_heuristic_click_failed %s", e)
+        _write_overlay_event(_build_overlay_event(
+            inspect, resolution, True, False, scored, page_url, ss_path,
+        ))
+        return False
+
+
+async def _try_overlay_dismiss_async(page, target_locator, resolution) -> bool:
+    """Async twin of :func:`_try_overlay_dismiss_sync`."""
+    if not _OVERLAY_ENABLED:
+        return False
+    target_bbox = await _target_bbox_async(target_locator)
+    page_url = _safe_page_url(page)
+    inspect = await _inspect_overlay_async(page, target_bbox)
+    if inspect is None:
+        _write_overlay_event(_build_overlay_event(
+            None, resolution, False, False, [], page_url, "",
+        ))
+        return False
+    overlay_bbox = inspect.get("overlay_bbox")
+    scored = _score_overlay_candidates(inspect.get("candidates") or [], overlay_bbox)
+    ss_path = ""
+    ss_dir = _overlay_screenshots_dir()
+    if ss_dir is not None:
+        key = _screenshot_key(
+            inspect.get("overlay_role") or "",
+            inspect.get("overlay_name") or "",
+            page_url,
+        )
+        candidate_path = ss_dir / key
+        await _capture_overlay_screenshot_async(page, overlay_bbox, candidate_path)
+        if candidate_path.exists():
+            ss_path = str(candidate_path)
+    safe = _pick_safe_candidate(scored)
+    if safe is None:
+        _write_overlay_event(_build_overlay_event(
+            inspect, resolution, True, False, scored, page_url, ss_path,
+        ))
+        return False
+    try:
+        overlay_loc = page.get_by_role(
+            inspect.get("overlay_role") or "dialog",
+            name=inspect.get("overlay_name") or "",
+        )
+        await overlay_loc.get_by_role(
+            safe["role"] or "button", name=safe["name"],
+        ).first.click()
+        _write_overlay_event(_build_overlay_event(
+            inspect, resolution, True, True, scored, page_url, ss_path,
+        ))
+        log.info(
+            "qtea.overlay_heuristic_dismissed_async overlay=%s dismiss=%s",
+            inspect.get("overlay_name"), safe["name"],
+        )
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.debug("qtea.overlay_heuristic_click_failed_async %s", e)
+        _write_overlay_event(_build_overlay_event(
+            inspect, resolution, True, False, scored, page_url, ss_path,
+        ))
+        return False
+
+
+# ---------------------------------------------------------------------------
+# L5: register add_locator_handler for persisted interceptors.
+# ---------------------------------------------------------------------------
+
+
+def _load_interceptors_once() -> list[dict[str, Any]]:
+    """Load + validate interceptors.json. Cached per-process."""
+    global _overlay_interceptors_cache
+    if _overlay_interceptors_cache is not None:
+        return _overlay_interceptors_cache
+    if not _OVERLAY_ENABLED:
+        _overlay_interceptors_cache = []
+        return _overlay_interceptors_cache
+    path = _interceptors_json_path()
+    if path is None or not path.exists():
+        _overlay_interceptors_cache = []
+        return _overlay_interceptors_cache
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        log.warning("qtea.interceptors_read_failed path=%s error=%s", path, e)
+        _overlay_interceptors_cache = []
+        return _overlay_interceptors_cache
+    if raw.get("schema_version") != 1:
+        log.warning("qtea.interceptors_wrong_version got=%r want=1", raw.get("schema_version"))
+        _overlay_interceptors_cache = []
+        return _overlay_interceptors_cache
+    entries_raw = raw.get("entries") or []
+    if not isinstance(entries_raw, list):
+        _overlay_interceptors_cache = []
+        return _overlay_interceptors_cache
+    # Whitelist check — must mirror qtea.overlay_handling.load_interceptors.
+    valid: list[dict[str, Any]] = []
+    for idx, e in enumerate(entries_raw):
+        if not isinstance(e, dict):
+            continue
+        dismiss = e.get("dismiss") or {}
+        if dismiss.get("kind") not in ("click", "press_escape"):
+            log.warning(
+                "qtea.interceptor_dismiss_kind_forbidden idx=%d kind=%r",
+                idx, dismiss.get("kind"),
+            )
+            continue
+        if dismiss.get("kind") == "click":
+            target = dismiss.get("target") or {}
+            if not target.get("name") or not target.get("role"):
+                continue
+        overlay = e.get("overlay") or {}
+        if not overlay.get("role") or not overlay.get("name"):
+            continue
+        valid.append(e)
+    _overlay_interceptors_cache = valid
+    log.info(
+        "qtea.interceptors_loaded path=%s count=%d",
+        path, len(valid),
+    )
+    return valid
+
+
+def _register_overlay_handlers_on_page_sync(page) -> None:
+    """Install page.add_locator_handler for each interceptor entry.
+    Idempotent per page — id() tracking prevents double-registration."""
+    if not _OVERLAY_ENABLED:
+        return
+    pid = id(page)
+    if pid in _overlay_registered_page_ids:
+        return
+    entries = _load_interceptors_once()
+    if not entries:
+        _overlay_registered_page_ids.add(pid)
+        return
+    handler_available = hasattr(page, "add_locator_handler")
+    if not handler_available:
+        # Playwright < 1.42 — feature unavailable, log once.
+        log.info("qtea.add_locator_handler_unavailable_page")
+        _overlay_registered_page_ids.add(pid)
+        return
+    for entry in entries:
+        overlay = entry.get("overlay") or {}
+        dismiss = entry.get("dismiss") or {}
+        hc = entry.get("handler_config") or {}
+        times = int(hc.get("times") or 100)
+        no_wait = bool(hc.get("no_wait_after", True))
+        try:
+            overlay_loc = page.get_by_role(
+                overlay.get("role"), name=overlay.get("name"),
+            )
+        except Exception as e:  # noqa: BLE001
+            log.debug("qtea.overlay_loc_build_failed %s", e)
+            continue
+
+        def _make_handler(_dismiss=dismiss):
+            def _handler(_overlay):
+                try:
+                    if _dismiss.get("kind") == "press_escape":
+                        page.keyboard.press("Escape")
+                    else:
+                        target = _dismiss.get("target") or {}
+                        page.get_by_role(
+                            target.get("role") or "button",
+                            name=target.get("name") or "",
+                        ).first.click()
+                except Exception as ex:  # noqa: BLE001
+                    log.debug("qtea.overlay_handler_action_failed %s", ex)
+            return _handler
+
+        try:
+            page.add_locator_handler(
+                overlay_loc, _make_handler(),
+                times=times, no_wait_after=no_wait,
+            )
+            log.info(
+                "qtea.overlay_handler_registered overlay=%s dismiss=%s",
+                overlay.get("name"), dismiss.get("kind"),
+            )
+        except TypeError:
+            # Older Playwright versions may not support no_wait_after kwarg.
+            try:
+                page.add_locator_handler(overlay_loc, _make_handler(), times=times)
+            except Exception as e:  # noqa: BLE001
+                log.debug("qtea.overlay_handler_register_failed %s", e)
+        except Exception as e:  # noqa: BLE001
+            log.debug("qtea.overlay_handler_register_failed %s", e)
+    _overlay_registered_page_ids.add(pid)
+
+
+def _register_overlay_handlers_on_page_async(page) -> None:
+    """Async page — the add_locator_handler call itself is sync-safe on async
+    Playwright (the handler callback needs to be async).
+
+    Playwright's async page.add_locator_handler expects an async callable.
+    We wrap the same dismiss logic in an async closure.
+    """
+    if not _OVERLAY_ENABLED:
+        return
+    pid = id(page)
+    if pid in _overlay_registered_page_ids:
+        return
+    entries = _load_interceptors_once()
+    if not entries:
+        _overlay_registered_page_ids.add(pid)
+        return
+    if not hasattr(page, "add_locator_handler"):
+        log.info("qtea.add_locator_handler_unavailable_async_page")
+        _overlay_registered_page_ids.add(pid)
+        return
+    for entry in entries:
+        overlay = entry.get("overlay") or {}
+        dismiss = entry.get("dismiss") or {}
+        hc = entry.get("handler_config") or {}
+        times = int(hc.get("times") or 100)
+        no_wait = bool(hc.get("no_wait_after", True))
+        try:
+            overlay_loc = page.get_by_role(
+                overlay.get("role"), name=overlay.get("name"),
+            )
+        except Exception as e:  # noqa: BLE001
+            log.debug("qtea.overlay_loc_build_failed_async %s", e)
+            continue
+
+        def _make_handler(_dismiss=dismiss):
+            async def _handler(_overlay):
+                try:
+                    if _dismiss.get("kind") == "press_escape":
+                        await page.keyboard.press("Escape")
+                    else:
+                        target = _dismiss.get("target") or {}
+                        await page.get_by_role(
+                            target.get("role") or "button",
+                            name=target.get("name") or "",
+                        ).first.click()
+                except Exception as ex:  # noqa: BLE001
+                    log.debug("qtea.overlay_handler_action_failed_async %s", ex)
+            return _handler
+
+        try:
+            page.add_locator_handler(
+                overlay_loc, _make_handler(),
+                times=times, no_wait_after=no_wait,
+            )
+            log.info(
+                "qtea.overlay_handler_registered_async overlay=%s dismiss=%s",
+                overlay.get("name"), dismiss.get("kind"),
+            )
+        except TypeError:
+            try:
+                page.add_locator_handler(overlay_loc, _make_handler(), times=times)
+            except Exception as e:  # noqa: BLE001
+                log.debug("qtea.overlay_handler_register_failed_async %s", e)
+        except Exception as e:  # noqa: BLE001
+            log.debug("qtea.overlay_handler_register_failed_async %s", e)
+    _overlay_registered_page_ids.add(pid)
+
+
+def _wrap_sync_new_page(original):
+    def wrapper(self, *args, **kwargs):
+        page = original(self, *args, **kwargs)
+        try:
+            _register_overlay_handlers_on_page_sync(page)
+        except Exception as e:  # noqa: BLE001
+            log.debug("qtea.overlay_register_wrapper_sync_failed %s", e)
+        return page
+    wrapper.__wrapped__ = original  # type: ignore[attr-defined]
+    return wrapper
+
+
+def _wrap_async_new_page(original):
+    async def wrapper(self, *args, **kwargs):
+        page = await original(self, *args, **kwargs)
+        try:
+            _register_overlay_handlers_on_page_async(page)
+        except Exception as e:  # noqa: BLE001
+            log.debug("qtea.overlay_register_wrapper_async_failed %s", e)
+        return page
+    wrapper.__wrapped__ = original  # type: ignore[attr-defined]
+    return wrapper
+
+
+_original_new_page_methods: dict[str, Any] = {}
+
+
+def _install_overlay_handler_patch() -> None:
+    """Monkey-patch BrowserContext.new_page (sync + async) to install
+    add_locator_handler entries on every fresh page. Idempotent.
+
+    Skipped entirely when QTEA_OVERLAY_HANDLING=0. Tolerates either API
+    surface being absent.
+    """
+    if not _OVERLAY_ENABLED:
+        return
+    if _original_new_page_methods:
+        return
+    # Sync
+    try:
+        from playwright.sync_api import BrowserContext as SyncCtx  # type: ignore[import-untyped]
+    except ImportError:
+        pass
+    else:
+        if hasattr(SyncCtx, "new_page"):
+            _original_new_page_methods["sync"] = SyncCtx.new_page
+            SyncCtx.new_page = _wrap_sync_new_page(SyncCtx.new_page)  # type: ignore[assignment]
+            log.info("qtea.overlay_patched class=sync.BrowserContext.new_page")
+    # Async
+    try:
+        from playwright.async_api import BrowserContext as AsyncCtx  # type: ignore[import-untyped]
+    except ImportError:
+        pass
+    else:
+        if hasattr(AsyncCtx, "new_page"):
+            _original_new_page_methods["async"] = AsyncCtx.new_page
+            AsyncCtx.new_page = _wrap_async_new_page(AsyncCtx.new_page)  # type: ignore[assignment]
+            log.info("qtea.overlay_patched class=async.BrowserContext.new_page")
+
+
+# ---------------------------------------------------------------------------
+# L6: storage-state consent cookie filter.
+# ---------------------------------------------------------------------------
+
+
+def _filter_consent_cookies_from_state(state: dict[str, Any]) -> tuple[dict[str, Any], int]:
+    """Strip consent/GDPR/tracking cookies from a Playwright storageState.
+
+    Returns (filtered, removed_count). Non-destructive (works on a shallow
+    copy). Mirrors qtea.overlay_handling.filter_consent_cookies.
+    """
+    if not _OVERLAY_ENABLED:
+        return state, 0
+    filtered = dict(state)
+    cookies = list(filtered.get("cookies") or [])
+    if not cookies:
+        return filtered, 0
+    kept: list[dict[str, Any]] = []
+    removed = 0
+    for c in cookies:
+        name = str(c.get("name") or "").lower()
+        domain = str(c.get("domain") or "").lower()
+        combined = f"{name} {domain}"
+        if any(pat in combined for pat in _OVERLAY_CONSENT_COOKIE_PATTERNS):
+            removed += 1
+            continue
+        kept.append(c)
+    filtered["cookies"] = kept
+    return filtered, removed
+
+
+# ---------------------------------------------------------------------------
+# End of overlay auto-dismiss section.
+# ---------------------------------------------------------------------------
+
+
 def _wrap_sync_launch(original):
     """Wrap a sync ``BrowserType.launch`` / ``launch_persistent_context``.
 
@@ -2645,6 +3528,7 @@ def _install_monkey_patch() -> None:
     other intact.
     """
     _install_proxy_patch()
+    _install_overlay_handler_patch()
     global _original_page_locator
     if _original_locator_methods:
         return
@@ -2924,7 +3808,48 @@ def pytest_runtest_teardown(item, nextitem):  # noqa: D401, ARG001 - pytest hook
     try:
         out_path = Path(workspace_dir) / "storage-state.json"
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        context.storage_state(path=str(out_path))
+        # Route the state through the consent-cookie filter (Layer 6) before
+        # persisting — dismissed cookie banners must NOT bake their acceptance
+        # into the persisted state, or the consent flow's own regression tests
+        # silently pass on subsequent runs. Filter is a no-op when
+        # QTEA_OVERLAY_HANDLING=0.
+        try:
+            raw_state = context.storage_state()
+        except TypeError:
+            # Very old Playwright signatures accept only ``path=`` — fall back
+            # to write-then-filter round-trip below.
+            raw_state = None
+        if isinstance(raw_state, dict):
+            filtered_state, removed = _filter_consent_cookies_from_state(raw_state)
+            out_path.write_text(
+                json.dumps(filtered_state, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            if removed:
+                log.info(
+                    "qtea.storage_state_consent_cookies_filtered "
+                    "path=%s removed=%d",
+                    out_path, removed,
+                )
+        else:
+            # Fallback: write via Playwright (unfiltered), then filter-in-place.
+            context.storage_state(path=str(out_path))
+            try:
+                on_disk = json.loads(out_path.read_text(encoding="utf-8"))
+                if isinstance(on_disk, dict):
+                    filtered_state, removed = _filter_consent_cookies_from_state(on_disk)
+                    if removed:
+                        out_path.write_text(
+                            json.dumps(filtered_state, indent=2, ensure_ascii=False),
+                            encoding="utf-8",
+                        )
+                        log.info(
+                            "qtea.storage_state_consent_cookies_filtered "
+                            "path=%s removed=%d (post-write)",
+                            out_path, removed,
+                        )
+            except (OSError, json.JSONDecodeError) as e:
+                log.debug("qtea.storage_state_post_filter_failed %s", e)
         _storage_state_captured = True
         log.info(
             "qtea.storage_state_captured path=%s test=%s",

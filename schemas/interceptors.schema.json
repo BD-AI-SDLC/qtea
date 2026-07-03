@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qtea/schemas/interceptors.schema.json",
+  "title": "Interceptors",
+  "description": "Per-SUT registry of overlay/popup patterns and their dismissal actions. Consumed by the qtea runtime at Playwright BrowserContext creation to register `page.add_locator_handler()` for each entry, so known overlays (cookie consent, what's-new modals, session-extension prompts) are invisible to every test on every future run. Entries are created via the Step 9 end-of-attempt HITL sweep after a first-encounter overlay blocks a test. The `dismiss.kind` field is a strict whitelist ({click, press_escape}) to close a supply-chain vector: a malicious PR cannot smuggle arbitrary JavaScript via `{\"dismiss\": {\"kind\": \"evaluate\", \"script\": \"...\"}}` because the loader rejects any kind outside the whitelist. Location: `<sut>/.qtea/interceptors.json` (shared per-SUT, committed to the repo).",
+  "type": "object",
+  "required": ["schema_version", "entries"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "description": "Schema envelope version. Bump when the entry shape changes incompatibly; loaders reject unknown versions with a warning rather than mis-interpreting."
+    },
+    "produced_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When this file was last written. Informational only; the loader does not consult it."
+    },
+    "entries": {
+      "type": "array",
+      "description": "One entry per known overlay pattern. Registered order is preserved (first-match on Playwright's side).",
+      "items": {
+        "type": "object",
+        "required": ["overlay", "dismiss"],
+        "additionalProperties": false,
+        "properties": {
+          "overlay": {
+            "type": "object",
+            "description": "How to recognize the overlay when it appears. Uses Playwright's role/name locator vocabulary — never CSS strings (would fail the CLAUDE.md 'no raw DOM / AOM-only' rule) and never XPath.",
+            "required": ["kind"],
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": ["role"],
+                "description": "Only role-based overlay matching is supported today. AOM-only per CLAUDE.md."
+              },
+              "role": {
+                "type": "string",
+                "enum": [
+                  "dialog", "alertdialog", "banner", "region",
+                  "complementary", "status", "alert"
+                ],
+                "description": "The overlay's ARIA role. `dialog`/`alertdialog` cover most modals; `banner`/`region`/`complementary` cover cookie/consent strips; `status`/`alert` cover toast-style interruptions."
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Accessible name to match on. Combined with `name_op` for equals/contains/regex semantics."
+              },
+              "name_op": {
+                "type": "string",
+                "enum": ["equals", "contains", "regex"],
+                "default": "equals",
+                "description": "How to compare `name`. `equals` is safest (locale-stable). `contains` is useful when the platform pads the name with dynamic tokens. `regex` requires escaping (loader validates the pattern)."
+              },
+              "frame": {
+                "type": "string",
+                "description": "Where the overlay lives. `top` = main frame only. A URL glob (e.g. `**/onetrust*.com/**`) restricts matching to cross-origin iframes matching that URL — common for OneTrust/TrustArc/Cookiebot widgets. Omit to match in any frame."
+              }
+            }
+          },
+          "dismiss": {
+            "type": "object",
+            "description": "What to do when the overlay appears. `kind` is a strict whitelist — the loader rejects `evaluate` / `fill` / `goto` / `set_localstorage` and any other operation that could smuggle arbitrary code or exfiltrate state. Adding a new kind requires a schema bump and a code change (audited).",
+            "required": ["kind"],
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": ["click", "press_escape"],
+                "description": "`click` = click a specific button inside the overlay (safest, most common). `press_escape` = send Escape key to dismiss modals with keyboard support. Deliberately NO `evaluate` (would allow arbitrary JS execution via a PR review that misses one JSON entry). Deliberately NO `fill` or `goto` (out of scope for dismissal; would enable exfiltration or navigation hijack)."
+              },
+              "target": {
+                "type": "object",
+                "description": "The dismiss control to click. Required when `kind=click`. Same role/name vocabulary as `overlay.*` for consistency. Rejected by the loader when `kind=press_escape`.",
+                "required": ["kind"],
+                "additionalProperties": false,
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": ["role"],
+                    "description": "AOM-only per CLAUDE.md."
+                  },
+                  "role": {
+                    "type": "string",
+                    "enum": ["button", "link", "menuitem"],
+                    "description": "The dismiss control's role. `button` is standard; `link` covers 'skip' or 'not now' text links; `menuitem` covers dismiss controls inside a menu overlay."
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Accessible name of the dismiss control (e.g. 'Reject all', 'Close', 'Not now')."
+                  },
+                  "name_op": {
+                    "type": "string",
+                    "enum": ["equals", "contains", "regex"],
+                    "default": "equals"
+                  }
+                }
+              }
+            }
+          },
+          "handler_config": {
+            "type": "object",
+            "description": "Playwright `add_locator_handler` configuration. Bounded to prevent runaway registration when a dismiss action reveals another overlay matching the same selector (deadlock scenario).",
+            "additionalProperties": false,
+            "properties": {
+              "times": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000,
+                "default": 100,
+                "description": "Maximum invocations per BrowserContext. On breach, the runtime removes the handler and emits an `overlay_handler_max_reached` event for follow-up HITL. Ceiling of 1000 is a sanity guard; typical value is 100."
+              },
+              "no_wait_after": {
+                "type": "boolean",
+                "default": true,
+                "description": "Passed to `add_locator_handler(noWaitAfter=...)`. `true` prevents the handler from blocking subsequent actionability checks."
+              }
+            }
+          },
+          "metadata": {
+            "type": "object",
+            "description": "Provenance and audit fields. Not consumed by the runtime — useful for humans reviewing PRs that touch this file.",
+            "additionalProperties": true,
+            "properties": {
+              "created_at": { "type": "string", "format": "date-time" },
+              "created_by": {
+                "type": "string",
+                "enum": ["hitl", "manual"],
+                "description": "`hitl` = added via the Step 9 end-of-attempt sweep after operator approved a dismiss action. `manual` = added by a human editing this file directly. No `heuristic` value: heuristic auto-dismisses are logged (audit) but never auto-persisted."
+              },
+              "first_seen_test": {
+                "type": "string",
+                "description": "The test id that first triggered this overlay (e.g. `tests/auth/test_login.py::test_login_flow`)."
+              },
+              "first_seen_url": {
+                "type": "string",
+                "description": "The page URL where this overlay first appeared."
+              },
+              "notes": {
+                "type": "string",
+                "description": "Free-text human note (e.g. 'GDPR consent shown on first visit only, gated by NEXT_LOCALE_GDPR cookie')."
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

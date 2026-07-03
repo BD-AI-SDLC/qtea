@@ -210,6 +210,8 @@ def run(
         "--spec",
         help=(
             "jira:KEY-123 | https://*.atlassian.net/browse/KEY-123 "
+            "| ado:ID | ado:ORG/PROJECT/ID "
+            "| https://dev.azure.com/{org}/{project}/_workitems/edit/{id} "
             "| path/to/spec.md | URL. Required for a fresh run; optional "
             "with --run-id (falls back to the prior run's stored value)."
         ),
@@ -240,13 +242,22 @@ def run(
         False,
         "--debug",
         help=(
-            "Invoke the debug agent on EVERY failed step attempt (not just "
-            "the final failure). Diagnosis-only RCA — never edits source. "
+            "Also invoke the debug agent on attempt 1 failures (attempt 2 "
+            "failure always gets RCA). Rarely useful — attempt 2 usually "
+            "succeeds; use for observability into intermittently-healed "
+            "failures. Diagnosis-only RCA, never edits source. "
             "Output: <workspace>/debug/step-NN-attemptM-debug-rca.md."
         ),
     ),
-    fix: bool = typer.Option(
-        False, "--fix", help="Critical-thinking + principal-eng after RCA."
+    no_fix: bool = typer.Option(
+        False,
+        "--no-fix",
+        help=(
+            "Suppress the automatic fix-proposal chain that fires after "
+            "retry exhaustion (debug RCA → critical-thinking → "
+            "principal-software-engineer). Use for cost-sensitive CI runs; "
+            "the debug RCA still writes either way."
+        ),
     ),
     strict_xray: bool = typer.Option(False, "--strict-xray"),
     skip_step: list[int] = typer.Option([], "--skip-step"),
@@ -385,7 +396,7 @@ def run(
         parallelism=parallelism,
         headless=headless,
         debug=debug,
-        fix=fix,
+        no_fix=no_fix,
         strict_xray=strict_xray,
         skip_steps=set(skip_step),
         report=report.value,

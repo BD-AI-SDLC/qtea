@@ -93,27 +93,25 @@ def build_config_view(
     )
 
     # ── Toggle switches ──────────────────────────────────────────────────
+    # Flet sends Switch/Checkbox state changes as native Python bools in
+    # ``e.data`` (and on ``e.control.value``). The old ``e.data == "true"``
+    # string compare always returned False, so any toggle set the underlying
+    # state to False — turning the Headless switch ON silently produced
+    # headed test runs in Step 9. Read ``e.control.value`` instead: it is
+    # the authoritative bool the user just landed on.
     headless_switch = ft.Switch(
         label="Headless",
         value=state.headless,
         active_color=SECONDARY,
-        on_change=lambda e: setattr(state, "headless", e.data == "true"),
-    )
-    debug_switch = ft.Switch(
-        label="Debug (RCA on every failure)",
-        value=state.debug,
-        active_color=SECONDARY,
-        on_change=lambda e: setattr(state, "debug", e.data == "true"),
-    )
-    fix_switch = ft.Switch(
-        label="Fix (propose fixes after RCA)",
-        value=state.fix,
-        active_color=SECONDARY,
-        on_change=lambda e: setattr(state, "fix", e.data == "true"),
+        on_change=lambda e: setattr(state, "headless", bool(e.control.value)),
     )
 
+    # The debug agent runs automatically on final-failure and the fix-proposal
+    # chain (critical-thinking → principal-software-engineer) auto-fires on
+    # top of it. Both used to be UI toggles; opinionated defaults now, with
+    # `--no-fix` / `--debug` on the CLI for power users.
     switches_row = ft.Row(
-        controls=[headless_switch, debug_switch, fix_switch],
+        controls=[headless_switch],
         spacing=24,
         wrap=True,
     )
@@ -206,7 +204,11 @@ def build_config_view(
 
         def make_handler(n: int) -> Callable:
             def handler(e: ft.ControlEvent) -> None:
-                if e.data == "true":
+                # Same fix as the Switch handlers above: Flet sends a real
+                # bool on ``e.control.value``; comparing ``e.data == "true"``
+                # always missed, so toggling a skip-step checkbox never
+                # actually added the step to the skip set.
+                if bool(e.control.value):
                     state.skip_steps.add(n)
                 else:
                     state.skip_steps.discard(n)

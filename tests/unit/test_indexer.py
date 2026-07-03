@@ -233,6 +233,53 @@ def test_x(driver):
     assert any(v.rule == "xpath" for v in result.violations)
 
 
+def test_violation_xpath_exempt_marker_suppresses(tmp_path: Path):
+    """`// qtea-xpath-exempt:` on the preceding line silences the xpath rule
+    for that specific site (Phase B.6 straggler containment)."""
+    (tmp_path / "bad.spec.ts").write_text(
+        """test('x', async ({ page }) => {
+  // qtea-xpath-exempt: unhandled parent:: axis
+  const q = '//div[@x="y"]/parent::td';
+});
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="playwright-ts")
+    assert not any(v.rule == "xpath" for v in result.violations)
+
+
+def test_violation_xpath_exempt_marker_is_scoped_per_line(tmp_path: Path):
+    """The marker must NOT suppress xpath violations on later lines."""
+    (tmp_path / "bad.spec.ts").write_text(
+        """test('x', async ({ page }) => {
+  // qtea-xpath-exempt: unhandled expression
+  const a = '//div[@x="y"]/parent::td';
+  const b = '//input[@data-test="still-a-violation"]';
+});
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="playwright-ts")
+    xpath_hits = [v for v in result.violations if v.rule == "xpath"]
+    assert len(xpath_hits) == 1
+    assert "still-a-violation" in xpath_hits[0].snippet
+
+
+def test_violation_xpath_exempt_marker_survives_blank_line(tmp_path: Path):
+    """A blank line between marker and offending line should not break the link."""
+    (tmp_path / "bad.spec.ts").write_text(
+        """test('x', async ({ page }) => {
+  // qtea-xpath-exempt: unhandled
+
+  const q = '//div[@x="y"]/parent::td';
+});
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="playwright-ts")
+    assert not any(v.rule == "xpath" for v in result.violations)
+
+
 def test_violation_hard_wait_time_sleep(tmp_path: Path):
     (tmp_path / "test_bad.py").write_text(
         """import time
@@ -321,6 +368,85 @@ def test_empty_handler_not_flagged_when_body_present(tmp_path: Path):
     )
     result = index_tests(tmp_path, framework="playwright-ts")
     assert not any(v.rule == "empty-handler" for v in result.violations)
+
+
+def test_invalid_escape_flagged_in_non_raw_string(tmp_path: Path):
+    (tmp_path / "test_bad.py").write_text(
+        """def test_x(page):
+    selector = "text=/[Tt]hank\\s+you/"
+    page.locator(selector).click()
+    assert True
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="pytest")
+    hits = [v for v in result.violations if v.rule == "invalid-escape"]
+    assert hits, "expected invalid-escape on non-raw string with \\s"
+    assert all(v.severity == "error" for v in hits)
+
+
+def test_invalid_escape_not_flagged_in_raw_string(tmp_path: Path):
+    # Regression: run-20260630-182728-334c90 wedged the violation-fixer
+    # because the line-regex flagged r"...\s..." (a valid raw-string fix)
+    # as still being invalid-escape, producing an unsatisfiable retry loop.
+    (tmp_path / "test_ok.py").write_text(
+        '''def test_x(page):
+    selector = r"text=/[Tt]hank\\s+you/"
+    bytes_sel = rb"[Tt]hank\\s+you"
+    fstring_sel = rf"text=/{{1}}\\s+ok/"
+    page.locator(selector).click()
+    page.locator(bytes_sel).count()
+    page.locator(fstring_sel).count()
+    assert True
+''',
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="pytest")
+    assert not any(v.rule == "invalid-escape" for v in result.violations), \
+        f"raw strings must NOT be flagged: {[v.as_dict() for v in result.violations if v.rule == 'invalid-escape']}"
+
+
+def test_invalid_escape_not_flagged_in_python_comment(tmp_path: Path):
+    (tmp_path / "test_comment.py").write_text(
+        """def test_x(page):
+    # selector matches \\s in the original markup
+    page.goto("/")
+    assert True
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="pytest")
+    assert not any(v.rule == "invalid-escape" for v in result.violations)
+
+
+def test_invalid_escape_flagged_in_non_raw_fstring(tmp_path: Path):
+    (tmp_path / "test_f.py").write_text(
+        '''def test_x(page):
+    name = "x"
+    selector = f"{name}\\s+ok"
+    page.locator(selector).count()
+    assert True
+''',
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="pytest")
+    assert any(v.rule == "invalid-escape" for v in result.violations)
+
+
+def test_invalid_escape_not_flagged_in_typescript(tmp_path: Path):
+    # The rule is Python-specific (JS regex `/\s+/` is valid). The pre-fix
+    # regex-based rule fired across all frameworks; this verifies the
+    # Python-only gating.
+    (tmp_path / "bad.spec.ts").write_text(
+        """test('x', async ({ page }) => {
+  const sel = "text=/\\s+ok/";
+  await page.locator(sel).click();
+});
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="playwright-ts")
+    assert not any(v.rule == "invalid-escape" for v in result.violations)
 
 
 def test_zero_assertions_flagged_on_assertless_pytest(tmp_path: Path):

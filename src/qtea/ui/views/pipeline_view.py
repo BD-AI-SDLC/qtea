@@ -12,6 +12,26 @@ from qtea.ui.state import AppState
 from qtea.ui.theme import BACKGROUND, CARD_BG, DIVIDER
 
 
+def _find_live_step_widget(controls: list[ft.Control]) -> ft.Text | None:
+    """Walk the control tree for the in-progress step card's elapsed widget."""
+    for ctrl in controls:
+        if isinstance(ctrl, ft.Text) and getattr(ctrl, "data", None) == "live_step_elapsed":
+            return ctrl
+        for attr in ("controls", "content"):
+            child = getattr(ctrl, attr, None)
+            if child is None:
+                continue
+            if isinstance(child, list):
+                found = _find_live_step_widget(child)
+                if found:
+                    return found
+            elif isinstance(child, ft.Control):
+                found = _find_live_step_widget([child])
+                if found:
+                    return found
+    return None
+
+
 def build_pipeline_view(page: ft.Page, state: AppState) -> ft.Container:
     """Build the three-panel pipeline monitoring view.
 
@@ -169,6 +189,13 @@ def build_pipeline_view(page: ft.Page, state: AppState) -> ft.Container:
             build_phase_group("B", state, on_step_click=_on_step_click),
             build_phase_group("C", state, on_step_click=_on_step_click),
         ]
+        # Locate the in-progress step card's elapsed Text widget so the
+        # 1-Hz tick loop can update it directly (same pattern as the
+        # header's live_elapsed widget).
+        if isinstance(page.data, dict):
+            page.data["live_step_elapsed"] = _find_live_step_widget(
+                phase_groups.controls,
+            )
         # Rebuild metrics
         metrics_panel.content = build_metrics_panel(state)
         # Rebuild progress header (reusing the live elapsed widget)

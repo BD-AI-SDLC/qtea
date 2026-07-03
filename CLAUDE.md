@@ -15,6 +15,8 @@
 | Runtime agent definitions (debug, heal, codegen, etc.) | `agents/*.md` |
 | Pipeline + step code | `src/qtea/pipeline.py`, `src/qtea/steps/sNN_*.py` |
 | CLI flags | `src/qtea/cli.py` |
+| Jira REST client (Step 1 intake) | `src/qtea/jira_client.py` |
+| Azure DevOps REST client (Step 1 intake) | `src/qtea/ado_client.py` |
 | Agent → model map | `src/qtea/agent_models.yaml` |
 | JSON schemas | `schemas/` |
 | JIT runtime (vendored into SUT for Playwright stacks) | `src/qtea/_resources/runtime/qtea_runtime.py.tpl` |
@@ -27,7 +29,7 @@
 - **Python state machine** drives sequencing, retry (`MAX_ATTEMPTS=2`), checkpoints, schema validation. Two LLM transports: `run_agent` (Agent SDK, multi-turn with tools) and `call_reasoning_llm` (direct SDK, single-turn, bounded).
 - **Boundary:** Python never reasons. Agents never checkpoint.
 - **Debug agent** runs after a failed attempt (last only by default; every attempt with `--debug`). Diagnosis-only — output at `<workspace>/debug/step-NN-attemptM-debug-rca.md`.
-- **Fix-proposal flow** (`--fix`) writes `fix-proposal.md` after retry exhaustion. Never auto-edits.
+- **Fix-proposal chain** auto-fires on retry exhaustion (suppressed by `--no-fix`): debug agent's RCA → `critical-thinking` agent produces `fix-strategy.md` (reasons about how to fix) → `principal-software-engineer` writes `fix-proposal.md`. Never auto-edits — the proposal is a hand-off to the operator.
 - **Prompt caching** is tri-state (`--cache` / `--no-cache` / auto): auto-enabled when `ANTHROPIC_CUSTOM_HEADERS` contains the BMF sticky-session header (`x-bmf-sticky-session-instance`), disabled otherwise. Without sticky sessions the BMF relay does not honour `cache_control` (25% creation surcharge, zero read-side payback). Detail: `GETTING_STARTED.md` §"Prompt caching (BMF sticky sessions)".
 
 ---
@@ -38,7 +40,7 @@ Phases: A = Requirements (1–4) · B = Research & Codegen (5–8) · C = Execut
 
 | # | Name | Step File | Agent | On Failure |
 | --- | --- | --- | --- | --- |
-| 1 | Intake | `s01_intake.py` | `jira-to-ai-spec` / file-copy | abort |
+| 1 | Intake | `s01_intake.py` | `ticket-to-ai-spec` / file-copy | abort |
 | 2 | Spec Refinement | `s02_refine.py` | `refine-spec` | abort |
 | 3 | Test Planning | `s03_plan.py` | `polyglot-test-planner` | abort |
 | 4 | Test Strategy | `s04_strategy.py` | `test-manager` | abort |
@@ -92,11 +94,13 @@ Action-time `TimeoutError` → bundle-fallback walk → cache invalidate (or **d
 
 **Selector allowlist (resolver + TBD promotion).** `validate_selector_payload` is the single enforcement point. For string-form selectors: accepts CSS (`#id`, `[data-testid=…]`, `.cls`, scoped CSS, pseudo-classes) + Playwright engine forms (`role=...`, `text=...`, `css=...`); rejects newlines, `<script`, `javascript:`, XPath, Playwright debug-print syntax (`link "..."`), and unbalanced brackets/quotes. For structured payloads: validates the discriminated union (`kind` + required fields per kind). Wired into `_normalise_candidates` (resolver-response intake), `write_cache` (last line of defence before disk), and `_promote_resolved_tbds` (last line of defence before SUT source). Older `is_unsafe_selector` is preserved for the injection-marker check and remains the inner gate inside the validator.
 
+**Overlay auto-dismissal (popup/cookie-banner handler).** Companion system to the resolver ladder — solves "what unexpected element is currently blocking my element?" (the resolver only answers "where is X?"). Toggle: `QTEA_OVERLAY_HANDLING=1` (default on; `=0` disables all overlay code paths). Runtime side (in `qtea_runtime.py.tpl`): (a) detects `"intercepts pointer events"` errors at action time via multi-signal check + JS `elementFromPoint` probe; (b) tries a heuristic dismiss on **safe-class** tokens only (`close|dismiss|not now|skip|×`) — never auto-fires on **risky-class** tokens (`accept|agree|continue|ok`) which reach HITL only; (c) records `OverlayEvent` JSONL to `<workspace>/overlay-events.jsonl` with cropped screenshot (masking password/email inputs) at `<workspace>/overlay-screenshots/<sha16>.png`; (d) registers persisted entries via Playwright's `page.add_locator_handler()` (times=100, no_wait_after=True) so known overlays are invisible on future runs; (e) filters consent/GDPR cookies (`consent|cookie|gdpr|banner|onetrust|trustarc|cookiebot|osano`) from `storage_state` auto-capture so dismissed banners don't leak into persisted state. Parent side (`s09_execute.py`): end-of-attempt sweep reads events, dedups by (role, name, url), routes unhandled entries through the shared HITL channel (`ft.Image` inline in UI mode; screenshot path + numbered candidates in CLI), and — on operator approve+persist — writes to `<sut>/.qtea/interceptors.json` (per-SUT, committed to the repo, shared across the team). Bug-candidate reclassifier marks matched failures as `overlay_pending_hitl` or `overlay_handled_next_run` so Step 10 doesn't file them as defects. **Supply-chain guardrail:** `dismiss.kind` whitelist = `{click, press_escape}`; no `evaluate`/`fill`/`goto`/`set_localstorage` — a malicious PR cannot smuggle arbitrary code via a JSON entry. **Heal-agent contract** (see `agents/polyglot-test-fixer.agent.md`): when a bug candidate carries either overlay marker, DO NOT propose locator changes — return `OUT_OF_SCOPE: overlay_intercept`. Test authors can call `page.remove_locator_handler(...)` to opt out for tests that legitimately assert overlay visibility.
+
 ---
 
 ## MCP & Playwright
 
-Single server: `playwright` (`@playwright/mcp`), used ONLY by Step 9's `polyglot-test-fixer` heal agent for live browser control. Probed lazily inside `s09_execute.py` (green runs skip the 5-15 s npx warmup). JIT runtime resolution does NOT use Playwright MCP — it consumes AOM in-process via `Locator.aria_snapshot()`. Step 1 Jira intake uses direct REST.
+Single server: `playwright` (`@playwright/mcp`), used ONLY by Step 9's `polyglot-test-fixer` heal agent for live browser control. Probed lazily inside `s09_execute.py` (green runs skip the 5-15 s npx warmup). JIT runtime resolution does NOT use Playwright MCP — it consumes AOM in-process via `Locator.aria_snapshot()`. Step 1 Jira / Azure DevOps intake uses direct REST.
 
 **Storage-state injection.** `.mcp.json` carries `${QTEA_STORAGE_STATE_ARG}`. Step 9 resolves a Playwright `storageState.json` and threads `--storage-state=<path>` into the MCP server via the per-call env overlay (`mcp_manager.load_mcp_config(env=...)`). Resolution priority: `--storage-state` flag > `QTEA_STORAGE_STATE` env > `<sut>/.qtea/storage-state.json` (from `qtea auth-capture`) > `<workspace>/storage-state.json` (auto-captured by the runtime on the first passing test). Heal agent's browser boots already authenticated, skipping the 10-30 s auth-replay per heal call.
 
@@ -110,6 +114,7 @@ Single server: `playwright` (`@playwright/mcp`), used ONLY by Step 9's `polyglot
 
 - Do NOT pre-explore, grep, or read the codebase before launching `qtea run` — the pipeline has built-in discovery steps. Trust the runner.
 - Only perform additional operations on explicit user request OR when the runner fails and needs troubleshooting.
+- **Debug-directory reads:** when investigating a failed step, read ONLY the aggregated final files — `<workspace>/debug/step-NN-rca.md` (a copy of the debug agent's RCA, promoted to the aggregated slot) and `<workspace>/debug/step-NN-fix-proposal.md` (principal-software-engineer's proposal). Do NOT read the per-attempt `step-NN-attemptM-debug-rca.md` files or the `step-NN-fix/thinking/` and `step-NN-fix/eng/` sub-workdirs — those are intermediate transcripts, often truncated ("Let me search…" stubs when the sub-agent's turn budget ran out) and superseded by the aggregated pair. Reach into per-attempt or intermediate files only if the aggregated ones are missing or contradict what the pipeline logged.
 - Never echo real env-var / `.env` values in any output. Mask or omit.
 - **Stop and ask, don't guess.** When any agent (any step, any sub-agent) encounters a missing required fact for which no sensible default exists in code, it MUST surface the gap via the current step's HITL channel (`[CLARIFICATION NEEDED]` tag picked up by `call_reasoning_llm_with_hitl`, Blockers-table row, or Open Questions bullet — whichever the step's output schema defines) rather than invent a value. Conversely: never prompt the user for a value that already has a sensible default in code — apply the default and proceed. Once the user has answered a clarification in step N, no later step may re-ask the same concern even paraphrased; the answer propagates via `user-answers.md` and the artifact's `## Coverage Notes` section.
 - **Resources** (`agents/`, `templates/`, `schemas/`, `skills/`, `examples/`, `CLAUDE.md`, `.mcp.json`) are baked into the installed wheel as a frozen `_resources/` snapshot. Markdown edits propagate when `QTEA_RESOURCE_ROOT=<repo-root>` is set. **Python code edits require a tool reinstall** (`uv tool install --reinstall --force <repo-root>`) or running from the dev `.venv` — the env var does not help with Python.

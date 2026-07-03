@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qtea/schemas/parse-check-result.schema.json",
+  "title": "ParseCheckResult",
+  "description": "Audit artifact for Phase B.6.5 of Step 8 codegen: language-native parse gate. Runs `ast.parse` for Python and shells to `tsc --noEmit --isolatedModules --skipLibCheck`, `node --check`, or `javac` for the other supported languages. Complements Phase B.6 by catching the class of failure the type-checker cannot even reach (the file's first byte isn't valid for the target language). Persisted to `artifacts/step08/parse-check-result.json` on every run, including skipped cases (opt-out flags, no in-scope files). Caller uses `in_scope_errors > 0` post-fixer to decide whether to fail Step 8; when the ONLY backend that ran was the regex smoke check (`degraded_languages` non-empty) and it fired a violation, the step fails LOUD with a `missing_tools`-based message rather than trusting the regex.",
+  "type": "object",
+  "required": [
+    "ran",
+    "skipped_reason",
+    "duration_s",
+    "files_checked",
+    "in_scope_errors",
+    "degraded_languages",
+    "missing_tools",
+    "autofix_attempted",
+    "post_fix_errors",
+    "file_results",
+    "violations"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "ran": {
+      "type": "boolean",
+      "description": "True iff the phase actually walked the qtea file set. False only when an opt-out env var (`QTEA_SKIP_PARSE_CHECK=1` / `QTEA_NO_PARSE_CHECK=1`) was set — `skipped_reason` then carries the cause."
+    },
+    "skipped_reason": {
+      "type": ["string", "null"],
+      "description": "Populated when `ran=false`. Values: `\"env_skip\"` (QTEA_SKIP_PARSE_CHECK=1), `\"flag_skip\"` (QTEA_NO_PARSE_CHECK=1). Null when `ran=true`."
+    },
+    "duration_s": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Wall-clock seconds from phase entry to result construction."
+    },
+    "files_checked": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of files for which at least one backend produced a verdict. Files whose extension has no mapping (e.g. `.txt`) are excluded from this count."
+    },
+    "in_scope_errors": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Count of parse-error violations (equal to the length of `violations[]`). This is what the caller uses to decide whether to invoke the autofix pass / fail the step."
+    },
+    "degraded_languages": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Languages for which every native backend was unavailable and the check fell back to the regex smoke test. Non-empty means the gate is running in reduced-confidence mode; if `in_scope_errors > 0` for a file in one of these languages, the caller should fail loud with a `missing_tools`-based message rather than trusting the regex."
+    },
+    "missing_tools": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Names of executables the gate looked for but did not find (e.g. `tsc`, `node`, `javac`). Surfaced to the operator when the gate fails so they know exactly what to install."
+    },
+    "autofix_attempted": {
+      "type": "boolean",
+      "description": "True iff `codegen-violation-fixer` was invoked on the parse-error violations. Mirrors Phase B.5/B.6's single-retry policy: at most one fixer pass per step run."
+    },
+    "post_fix_errors": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Parse-error count after the fixer pass and a re-run of the gate. Only meaningful when `autofix_attempted=true`. Non-zero here triggers `StepResult(success=False)` and escalates to the global step retry."
+    },
+    "file_results": {
+      "type": "array",
+      "description": "Per-file audit trail.",
+      "items": {
+        "type": "object",
+        "required": ["file", "language", "backend_used", "ran", "ok", "error_line", "error_message", "skipped_reason"],
+        "additionalProperties": false,
+        "properties": {
+          "file": {
+            "type": "string",
+            "description": "SUT-relative posix path of the file that was checked.",
+            "minLength": 1
+          },
+          "language": {
+            "type": "string",
+            "description": "Language the extension mapped to.",
+            "enum": ["python", "typescript", "javascript", "java", "robot"]
+          },
+          "backend_used": {
+            "type": "string",
+            "description": "Which backend produced the verdict. `ast.parse` = Python (stdlib); `tsc` = TypeScript compiler; `node --check` = Node native syntax check; `javac` = Java compiler; `regex-smoke` = fallback regex check when no native backend was available.",
+            "enum": ["ast.parse", "tsc", "node --check", "javac", "regex-smoke"]
+          },
+          "ran": {
+            "type": "boolean",
+            "description": "True iff at least one backend produced a verdict for this file."
+          },
+          "ok": {
+            "type": "boolean",
+            "description": "True iff the file parsed / smoke-checked without violation."
+          },
+          "error_line": {
+            "type": ["integer", "null"],
+            "minimum": 1,
+            "description": "1-based line number of the first error the backend reported. Null when the backend cannot localise (e.g. file-level read error)."
+          },
+          "error_message": {
+            "type": ["string", "null"],
+            "description": "Backend's error message, capped at 280 chars."
+          },
+          "skipped_reason": {
+            "type": ["string", "null"],
+            "description": "Populated when `ran=false` at the per-file level (currently unused; reserved for future per-file skip conditions)."
+          }
+        }
+      }
+    },
+    "violations": {
+      "type": "array",
+      "description": "Every parse-error violation the gate produced, in the same shape the `codegen-violation-fixer` agent consumes. `rule` is always `\"parse-error\"`.",
+      "items": {
+        "type": "object",
+        "required": ["rule", "file", "line", "snippet", "severity"],
+        "additionalProperties": false,
+        "properties": {
+          "rule": {
+            "type": "string",
+            "description": "Always `\"parse-error\"` for this artifact.",
+            "const": "parse-error"
+          },
+          "file": {
+            "type": "string",
+            "description": "SUT-relative posix path.",
+            "minLength": 1
+          },
+          "line": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "1-based line number of the error."
+          },
+          "snippet": {
+            "type": "string",
+            "description": "The backend's error message, capped at 280 chars.",
+            "maxLength": 280
+          },
+          "severity": {
+            "type": "string",
+            "description": "Always `\"error\"` for this gate.",
+            "enum": ["error"]
+          }
+        }
+      }
+    }
+  }
+}
