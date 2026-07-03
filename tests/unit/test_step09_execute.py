@@ -865,6 +865,352 @@ async def test_step09_unknown_dep_non_tty_skips_install(
     assert install_calls == []
 
 
+def test_hitl_confirm_dep_install_parses_yes(monkeypatch):
+    """`_hitl_confirm_dep_install` returns True for 'y'/'yes' answers.
+
+    Regression scaffolding for bug #2: guarantees the answer-parsing
+    contract stays stable so future rewires can't silently invert the
+    proceed decision.
+    """
+    from qtea.hitl import RESOLUTION_ANSWERED
+    from qtea.steps.s09_execute import _hitl_confirm_dep_install
+
+    def fake_prompt(questions, *, agent_label):
+        assert agent_label == "dep-recovery"
+        assert len(questions) == 1
+        return {questions[0].id: (RESOLUTION_ANSWERED, "y")}
+
+    monkeypatch.setattr("qtea.hitl.prompt_user", fake_prompt)
+    assert _hitl_confirm_dep_install(
+        module="allure", package="allure-pytest", hint="pip install",
+    ) is True
+
+    def fake_prompt_yes(questions, *, agent_label):
+        return {questions[0].id: (RESOLUTION_ANSWERED, "yes")}
+
+    monkeypatch.setattr("qtea.hitl.prompt_user", fake_prompt_yes)
+    assert _hitl_confirm_dep_install(
+        module="allure", package="allure-pytest", hint="",
+    ) is True
+
+
+def test_hitl_confirm_dep_install_parses_no(monkeypatch):
+    """`_hitl_confirm_dep_install` returns False for 'n'/'no' answers."""
+    from qtea.hitl import RESOLUTION_ANSWERED
+    from qtea.steps.s09_execute import _hitl_confirm_dep_install
+
+    def fake_prompt(questions, *, agent_label):
+        return {questions[0].id: (RESOLUTION_ANSWERED, "n")}
+
+    monkeypatch.setattr("qtea.hitl.prompt_user", fake_prompt)
+    assert _hitl_confirm_dep_install(
+        module="foo", package="foo-pkg", hint="", default=True,
+    ) is False
+
+
+def test_hitl_confirm_dep_install_falls_back_on_empty(monkeypatch):
+    """No answer (e.g. non-TTY without UI bridge) → default preserved."""
+    from qtea.steps.s09_execute import _hitl_confirm_dep_install
+
+    monkeypatch.setattr("qtea.hitl.prompt_user", lambda qs, *, agent_label: {})
+    assert _hitl_confirm_dep_install(
+        module="x", package="x", hint="", default=True,
+    ) is True
+    assert _hitl_confirm_dep_install(
+        module="x", package="x", hint="", default=False,
+    ) is False
+
+
+def test_hitl_confirm_dep_install_unclear_answer_uses_default(monkeypatch):
+    """Free-text answer that isn't y/n falls back to default with a warning."""
+    from qtea.hitl import RESOLUTION_ANSWERED
+    from qtea.steps.s09_execute import _hitl_confirm_dep_install
+
+    monkeypatch.setattr(
+        "qtea.hitl.prompt_user",
+        lambda qs, *, agent_label: {qs[0].id: (RESOLUTION_ANSWERED, "maybe?")},
+    )
+    assert _hitl_confirm_dep_install(
+        module="x", package="x", hint="", default=True,
+    ) is True
+
+
+async def test_step09_dep_recovery_ui_mode_routes_via_hitl_bridge(
+    tmp_path: Path, monkeypatch
+):
+    """Regression for bug #2: in UI mode (``ctx.options.ui_mode = True``,
+    ``sys.stdin.isatty() == False``) the dep-recovery HITL confirmation for
+    a ``guessed`` missing module MUST route through ``hitl.prompt_user``
+    (which the ``HitlBridge`` monkey-patches to reach the Flet dialog),
+    NOT through ``rich.prompt.Confirm.ask`` (which silently defaults or
+    EOFErrors on a closed stdin in UI mode).
+    """
+    from qtea.hitl import RESOLUTION_ANSWERED
+
+    ctx = _ctx(tmp_path)
+    ctx.options.ui_mode = True  # simulate Flet UI runtime
+    ctx.options.no_hitl = False
+    ctx.options.yes = False
+
+    # Fake pytest that errors with an UNMAPPED module (→ confidence=guessed
+    # → HITL branch fires).
+    script = tmp_path / "unmapped_pytest.py"
+    script.write_text(
+        "import sys\n"
+        "sys.stderr.write(\"ImportError while loading conftest 'tests/conftest.py'.\\n\")\n"
+        "sys.stderr.write(\"E   ModuleNotFoundError: No module named 'some_random_pkg_ui'\\n\")\n"
+        "sys.exit(4)\n",
+        encoding="utf-8",
+    )
+    cmd = f"{sys.executable} {script.as_posix()}"
+    _seed_with_stack_profile(ctx, command=cmd, package_manager="poetry")
+
+    # Force non-TTY — the historical bug was that with ui_mode=True but
+    # non-TTY, the code fell into the Confirm.ask branch anyway.
+    monkeypatch.setattr("qtea.steps.s09_execute.sys.stdin.isatty", lambda: False)
+
+    # If the buggy Confirm.ask path is taken, this raises → test fails loudly.
+    def poison_confirm(*a, **kw):
+        raise AssertionError(
+            "Bug #2 regression: dep-recovery reached rich.prompt.Confirm.ask "
+            "in UI mode instead of routing via hitl.prompt_user"
+        )
+    monkeypatch.setattr("rich.prompt.Confirm.ask", poison_confirm)
+
+    # Track prompt_user calls to prove the correct channel was used.
+    prompt_calls: list[tuple[str, list]] = []
+
+    def fake_prompt(questions, *, agent_label):
+        prompt_calls.append((agent_label, [q.id for q in questions]))
+        return {questions[0].id: (RESOLUTION_ANSWERED, "y")}
+
+    monkeypatch.setattr("qtea.hitl.prompt_user", fake_prompt)
+
+    install_calls: list = []
+    monkeypatch.setattr(
+        "qtea.steps.s09_execute._run_dep_install",
+        lambda *a, **kw: (install_calls.append(a), (True, "installed"))[1],
+    )
+    monkeypatch.setattr(
+        "qtea.steps.s09_execute.commit_step",
+        lambda *a, **kw: "fake-sha",
+    )
+
+    await ExecuteStep().run(ctx)
+
+    # Filter to the dep-recovery prompt (other steps may also call prompt_user
+    # via ctx.extras hooks; we only care that OUR prompt fired).
+    dep_prompts = [c for c in prompt_calls if c[0] == "dep-recovery"]
+    assert len(dep_prompts) == 1, (
+        f"Expected exactly one dep-recovery prompt_user call in UI mode, "
+        f"got {dep_prompts!r} (all prompt calls: {prompt_calls!r})"
+    )
+    assert dep_prompts[0][1] == ["DEPINSTALL-01"]
+    # Since fake_prompt answered 'y', the install must have fired.
+    assert install_calls, (
+        "Bug #2 regression: user answered 'y' via HITL bridge but "
+        "_run_dep_install was never called."
+    )
+
+
+async def test_step09_dep_recovery_refreshes_install_sig(
+    tmp_path: Path, monkeypatch
+):
+    """Regression for bug #4: when dep-recovery installs a package, the
+    ``install_sig`` persisted to ``attempt-N-state.json`` MUST reflect the
+    post-install state, not the pre-install signature captured at step
+    start. Otherwise a subsequent attempt could false-skip ``prepare_sut``
+    even though the dep set has changed.
+
+    Latent today (blocked by ``MAX_ATTEMPTS=2``) but the check is cheap
+    and protects the retry state machine if attempts are ever bumped.
+    """
+    from qtea.test_runner import RunResult, TestRunEntry as _TRE
+
+    ctx = _ctx(tmp_path)
+    initial_cmd = "pytest tests/"
+    _seed_with_stack_profile(ctx, command=initial_cmd, package_manager="poetry")
+
+    # Distinct sigs on successive calls: step-start (pre-recovery) vs
+    # post-recovery. If the fix is missing, the saved state carries the
+    # pre-recovery value.
+    sig_seq = iter(["sig-pre-recovery", "sig-post-recovery"])
+    monkeypatch.setattr(
+        "qtea.steps.s09_execute._compute_install_sig",
+        lambda sut, profile: next(sig_seq),
+    )
+
+    call_seq = {"n": 0}
+
+    def fake_run_tests(
+        framework, *, cwd, detected_command=None, timeout_s,
+        env_extra=None, profile=None, headless=True, marker_filter=None,
+        parallelism=0,
+    ):
+        call_seq["n"] += 1
+        from datetime import UTC as _UTC, datetime as _dt
+        _now = _dt.now(_UTC).isoformat()
+        if call_seq["n"] == 1:
+            entry = _TRE(
+                id="T-runner-failure", name="runner_failure",
+                file="conftest.py", status="failed",
+                message="ModuleNotFoundError: allure",
+                runner_failure={
+                    "kind": "missing_module", "module": "allure",
+                    "summary": "collection failed",
+                    "hint": "pip install allure-pytest",
+                },
+            )
+            return RunResult(
+                framework=framework, command=detected_command or "pytest",
+                cwd=str(cwd), started_at=_now, finished_at=_now,
+                duration_s=0.1, exit_code=4, results=[entry],
+                stdout="", stderr="",
+            )
+        return RunResult(
+            framework=framework, command=detected_command or "pytest",
+            cwd=str(cwd), started_at=_now, finished_at=_now,
+            duration_s=0.1, exit_code=0,
+            results=[_TRE(id="T-ok", name="test_ok",
+                          file="tests/a.py", status="passed")],
+            stdout="", stderr="",
+        )
+
+    monkeypatch.setattr("qtea.steps.s09_execute.run_tests", fake_run_tests)
+    monkeypatch.setattr(
+        "qtea.steps.s09_execute._run_dep_install",
+        lambda *a, **kw: (True, "installed"),
+    )
+    monkeypatch.setattr(
+        "qtea.steps.s09_execute.commit_step",
+        lambda *a, **kw: "fake-sha",
+    )
+
+    await ExecuteStep().run(ctx)
+
+    saved = json.loads(
+        (ctx.workspace.step_dir(9) / "attempt-1-state.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert saved["install_sig"] == "sig-post-recovery", (
+        f"Bug #4 regression: install_sig persisted to attempt state was "
+        f"{saved['install_sig']!r} (the pre-recovery value) instead of "
+        f"'sig-post-recovery'. Subsequent attempts would false-skip "
+        f"prepare_sut against a stale sig."
+    )
+
+
+async def test_step09_dep_recovery_uses_unnarrowed_cmd_on_retry(
+    tmp_path: Path, monkeypatch
+):
+    """Regression: on attempt 2 with retry narrowing, if dep-recovery fires
+    (missing_module runner failure), the re-run MUST use the original
+    unnarrowed command — not the ``-k``-narrowed subset from the retry
+    narrowing block. Otherwise ``_save_attempt_state`` persists a
+    ``failing_ids`` computed only over the narrowed subset and loses
+    previously-passing tests across attempts.
+    """
+    from qtea.checkpoints import StepRecord
+    from qtea.test_runner import RunResult, TestRunEntry as _TRE
+
+    ctx = _ctx(tmp_path)
+    # Command tokenized as pytest so `_filter_command_for_tests` actually
+    # narrows (non-pytest cmds pass through unchanged).
+    initial_cmd = "pytest tests/"
+    _seed_with_stack_profile(ctx, command=initial_cmd, package_manager="poetry")
+
+    # Simulate attempt 2: pre-populate the StepRecord + prior attempt state
+    # so run() sees ``_current_attempt == 2`` and enters the narrowing block.
+    ctx.state.steps[9] = StepRecord(step=9, name="execute", attempts=2)
+    prior_state_dir = ctx.workspace.step_dir(9)
+    prior_state_dir.mkdir(parents=True, exist_ok=True)
+    (prior_state_dir / "attempt-1-state.json").write_text(
+        json.dumps({
+            "attempt": 1,
+            "failing": [{"id": "T-login", "name": "test_login"}],
+            "no_patch_ids": [],
+            "install_sig": None,
+        }),
+        encoding="utf-8",
+    )
+
+    captured_cmds: list[str] = []
+    call_seq = {"n": 0}
+
+    def fake_run_tests(
+        framework, *, cwd, detected_command=None, timeout_s,
+        env_extra=None, profile=None, headless=True, marker_filter=None,
+        parallelism=0,
+    ):
+        call_seq["n"] += 1
+        captured_cmds.append(detected_command or "(default)")
+        from datetime import UTC as _UTC, datetime as _dt
+        _now = _dt.now(_UTC).isoformat()
+        if call_seq["n"] == 1:
+            # Initial narrowed run — simulate missing_module runner failure.
+            entry = _TRE(
+                id="T-runner-failure", name="runner_failure",
+                file="conftest.py", status="failed",
+                message="ModuleNotFoundError: No module named 'allure'",
+                runner_failure={
+                    "kind": "missing_module",
+                    "module": "allure",
+                    "summary": "collection failed",
+                    "hint": "pip install allure-pytest",
+                },
+            )
+            return RunResult(
+                framework=framework, command=detected_command or "pytest",
+                cwd=str(cwd), started_at=_now, finished_at=_now,
+                duration_s=0.1, exit_code=4, results=[entry],
+                stdout="", stderr="ModuleNotFoundError: allure",
+            )
+        # Post-recovery re-run — passing.
+        return RunResult(
+            framework=framework, command=detected_command or "pytest",
+            cwd=str(cwd), started_at=_now, finished_at=_now,
+            duration_s=0.1, exit_code=0,
+            results=[_TRE(id="T-login", name="test_login",
+                          file="tests/a.py", status="passed")],
+            stdout="", stderr="",
+        )
+
+    monkeypatch.setattr("qtea.steps.s09_execute.run_tests", fake_run_tests)
+    monkeypatch.setattr(
+        "qtea.steps.s09_execute._run_dep_install",
+        lambda *a, **kw: (True, "fake installed"),
+    )
+    # Prevent commit_step from doing real git work.
+    monkeypatch.setattr(
+        "qtea.steps.s09_execute.commit_step",
+        lambda *a, **kw: "fake-sha",
+    )
+
+    await ExecuteStep().run(ctx)
+
+    assert len(captured_cmds) >= 2, (
+        f"Expected at least 2 run_tests calls, got {captured_cmds}"
+    )
+    initial_call, recovery_call = captured_cmds[0], captured_cmds[1]
+    # Initial (narrowed) call carries the -k selector for the prior-failing
+    # test — confirms retry narrowing engaged (so this test actually
+    # exercises the bug path, not a trivially-passing setup).
+    assert "-k" in initial_call and "test_login" in initial_call, (
+        f"Setup precondition failed: expected initial call to be narrowed "
+        f"(-k test_login), got {initial_call!r}. Retry narrowing did not "
+        f"engage, so this test doesn't cover the bug."
+    )
+    # Recovery call MUST NOT be narrowed — the bug is that it inherited
+    # `detected_cmd` (the narrowed variant) instead of `_orig_cmd`.
+    assert "-k" not in recovery_call, (
+        f"Bug #1 regression: dep-recovery re-run used the -k-narrowed cmd "
+        f"({recovery_call!r}) instead of the unnarrowed original. This "
+        f"causes _save_attempt_state to persist a failing_ids computed "
+        f"only over the narrowed subset, losing previously-passing tests."
+    )
+
+
 # ---------------------------------------------------------------------------
 # B-3: Step 8 XPath rejection in the self-heal flow
 # ---------------------------------------------------------------------------

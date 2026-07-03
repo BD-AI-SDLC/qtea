@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -61,7 +62,7 @@ class PipelineOptions:
     parallelism: int = 2
     headless: bool = True
     debug: bool = False
-    fix: bool = False
+    no_fix: bool = False
     strict_xray: bool = False
     skip_steps: set[int] = field(default_factory=set)
     report: str = "auto"
@@ -205,10 +206,88 @@ def _kill_allure_for_workspace(ws: Workspace) -> None:
             pass
 
 
-def _cleanup_step_artifacts(ws: Workspace, from_step: int, console: Console | None = None) -> None:
+_CODE_WRITING_STEPS = frozenset({7, 8, 9})
+
+
+def _rollback_sut_to_before_step(
+    sut_root: Path, from_step: int,
+) -> str | None:
+    """Reset the SUT isolation branch to just before ``from_step``'s commits.
+
+    Commit subjects follow the pattern ``qtea/step-NN: <detail>``. We walk
+    the log backwards, find the oldest commit whose subject starts with
+    ``qtea/step-{from_step:02d}:`` (or any later step), and reset to its
+    parent. Returns the sha we reset to, or ``None`` when no rollback was
+    needed (no matching commits found).
+    """
+    import subprocess
+
+    if not (sut_root / ".git").exists():
+        return None
+
+    # Subjects that belong to from_step or later
+    prefixes = tuple(
+        f"qtea/step-{s:02d}:" for s in range(from_step, 12)
+    )
+
+    try:
+        result = subprocess.run(
+            ["git", "log", "--pretty=format:%H %s", "--reverse"],
+            cwd=str(sut_root), capture_output=True, text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError:
+        return None
+
+    first_sha: str | None = None
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        sha, _, subject = line.partition(" ")
+        if subject.startswith(prefixes):
+            first_sha = sha
+            break
+
+    if first_sha is None:
+        return None
+
+    try:
+        subprocess.run(
+            ["git", "reset", "--hard", f"{first_sha}~1"],
+            cwd=str(sut_root), capture_output=True, text=True,
+            check=True,
+        )
+        head = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(sut_root), capture_output=True, text=True,
+            check=True,
+        )
+        new_sha = head.stdout.strip()
+        _log.info(
+            "cleanup.sut_rollback",
+            from_step=from_step,
+            reset_to=new_sha,
+        )
+        return new_sha
+    except subprocess.CalledProcessError as e:
+        _log.warning(
+            "cleanup.sut_rollback_failed",
+            from_step=from_step,
+            error=(e.stderr or "").strip()[:300],
+        )
+        return None
+
+
+def _cleanup_step_artifacts(
+    ws: Workspace,
+    from_step: int,
+    console: Console | None = None,
+    *,
+    auto_confirm: bool = False,
+) -> None:
     """Delete step-specific directories from from_step onward to ensure clean state.
 
-    Removes both work directories (step-NN/) and artifact directories 
+    Removes both work directories (step-NN/) and artifact directories
     (artifacts/stepNN/) for the specified step and all subsequent steps,
     plus debug files and directories for each step. This prevents artifact pollution
     when re-running with --from-step and ensures accurate log analysis.
@@ -217,6 +296,12 @@ def _cleanup_step_artifacts(ws: Workspace, from_step: int, console: Console | No
         ws: Workspace containing the directories to clean
         from_step: First step number to clean (inclusive), all later steps also cleaned
         console: Optional console for user prompts (hitl confirmation)
+        auto_confirm: Skip the interactive [Y/n] confirmation and proceed. Set
+            when stdin is unreachable (UI mode, non-TTY/CI) or the user opted
+            into auto-confirm (--yes / --no-hitl). The structlog event
+            ``cleanup.auto_confirmed`` records the list of items wiped so the
+            UI log panel and JSONL run log preserve the trail even though the
+            user never saw the rich-formatted prompt.
     """
     if console is None:
         console = Console()
@@ -233,14 +318,33 @@ def _cleanup_step_artifacts(ws: Workspace, from_step: int, console: Console | No
         if artifact_dir.exists():
             items_to_clean.append(("dir", artifact_dir))
 
-        # Collect debug items for this step (both files and directories)
+        # Collect debug items for this step (both files and directories).
+        # The glob is intentionally broad: `step-NN-*` covers per-attempt RCAs
+        # (`step-NN-attempt*`), aggregated files (`step-NN-rca.md`,
+        # `step-NN-fix-proposal.md`), and the fix workdir (`step-NN-fix/`).
+        # Prior to run-20260701-114656-9394eb this only globbed
+        # `step-NN-attempt*`, leaving stale aggregated RCAs to mislead the
+        # next debug pass.
         debug_dir = ws.debug
         if debug_dir.exists():
-            for debug_entry in debug_dir.glob(f"step-{step:02d}-attempt*"):
+            for debug_entry in debug_dir.glob(f"step-{step:02d}-*"):
                 if debug_entry.is_file():
                     items_to_clean.append(("file", debug_entry))
                 elif debug_entry.is_dir():
                     items_to_clean.append(("dir", debug_entry))
+
+    # Sweep any remaining debug/ entries so `<workspace>/debug/` is empty on
+    # resume, regardless of which step's failure produced them or whether
+    # their naming matches the per-step pattern. Only fires when resuming
+    # (from_step >= 1) — a fresh run has no debug entries to sweep.
+    debug_dir = ws.debug
+    if debug_dir.exists():
+        already_queued = {p for _, p in items_to_clean}
+        for entry in debug_dir.iterdir():
+            if entry in already_queued:
+                continue
+            kind = "dir" if entry.is_dir() else "file"
+            items_to_clean.append((kind, entry))
 
     # When step 9 (execute) will rerun, also clear JIT-cache and SUT test
     # outputs that accumulate across runs and would otherwise mix stale data
@@ -274,13 +378,42 @@ def _cleanup_step_artifacts(ws: Workspace, from_step: int, console: Console | No
     if len(items_to_clean) > 10:
         console.print(f"  [dim]... and {len(items_to_clean) - 10} more[/]")
 
-    response = console.input("[yellow]Proceed with deletion? [Y/n]: ").strip().lower()
-    if response not in ("", "y", "yes"):
-        console.print("[yellow]cleanup:[/] cancelled by user")
-        return
+    if auto_confirm:
+        # Non-interactive context (UI mode / CI / --yes / --no-hitl). The
+        # console.print summary above lands in the silent UI console, so
+        # mirror the item list through structlog where the UI log panel
+        # (and the run.log.jsonl) can pick it up.
+        _log.info(
+            "cleanup.auto_confirmed",
+            from_step=from_step,
+            item_count=len(items_to_clean),
+            items=[
+                f"{kind}:{path.relative_to(ws.root)}"
+                for kind, path in items_to_clean
+            ],
+        )
+    else:
+        response = console.input(
+            "[yellow]Proceed with deletion? [Y/n]: "
+        ).strip().lower()
+        if response not in ("", "y", "yes"):
+            console.print("[yellow]cleanup:[/] cancelled by user")
+            return
 
     # Kill any allure server holding files open in this workspace.
     _kill_allure_for_workspace(ws)
+
+    # Roll back SUT isolation branch to before from_step's commits so
+    # stale generated files don't survive into the re-run.
+    if from_step in _CODE_WRITING_STEPS or any(
+        s in _CODE_WRITING_STEPS for s in range(from_step, 12)
+    ):
+        sha = _rollback_sut_to_before_step(ws.sut, from_step)
+        if sha:
+            console.print(
+                f"[green]cleanup:[/] rolled SUT back to [cyan]{sha}[/cyan]"
+                f" (before step {from_step:02d} commits)"
+            )
 
     # Perform cleanup
     deleted_count = 0
@@ -411,7 +544,13 @@ def _mcp_preflight_for_step(
             failed=[{"name": n, "error": m} for n, m in failed],
         )
 
-        if not (sys.stdin.isatty() or opts.ui_mode) or opts.no_hitl or opts.yes:
+        # UI mode joins non-TTY / --no-hitl / --yes on the bail path:
+        # `Confirm.ask` reads from stdin, which the Flet worker thread
+        # cannot reach — falling through would hang the run with no UI
+        # affordance to recover. Abort cleanly; the UI log panel will
+        # surface the structured event and the user can re-run after
+        # fixing MCP from a terminal.
+        if not sys.stdin.isatty() or opts.ui_mode or opts.no_hitl or opts.yes:
             console.print(
                 "[yellow]Non-interactive mode: fix MCP setup and re-run "
                 "(or omit --no-hitl / --yes to enable the retry prompt).[/yellow]"
@@ -528,8 +667,19 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
 
         # Clean up step artifacts and debug directories to prevent pollution
         # across multiple --from-step runs. Can be disabled with --no-cleanup.
+        # Skip the interactive [Y/n] confirmation when stdin isn't reachable
+        # (UI mode swallows the prompt — the worker thread would hang forever
+        # at "Initializing... 0/11 steps") or the user opted into auto-yes.
         if not opts.no_cleanup:
-            _cleanup_step_artifacts(ws, opts.from_step, console)
+            auto_confirm = (
+                opts.ui_mode
+                or opts.no_hitl
+                or opts.yes
+                or not sys.stdin.isatty()
+            )
+            _cleanup_step_artifacts(
+                ws, opts.from_step, console, auto_confirm=auto_confirm,
+            )
 
     log.info(
         "pipeline.start",
@@ -540,7 +690,7 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
         only_step=opts.only_step,
         force=opts.force,
         debug=opts.debug,
-        fix=opts.fix,
+        no_fix=opts.no_fix,
         report=opts.report,
     )
     console.print(f"[green]workspace[/] {ws.root}")

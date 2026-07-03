@@ -73,6 +73,22 @@ def test_inventory_symbols_indexes_all_categories():
     assert "wait_for" in syms["helpers"]
     assert "LOGIN_BUTTON" in syms["locators"]
     assert "LoginLocators" in syms["locators"]
+    assert "tests/conftest.py" in syms["fixtures"]  # file-only ref
+
+
+def test_inventory_symbols_strips_parenthetical_annotations():
+    am = {
+        "existing_fixtures": [
+            {"name": "test (extended)", "file": "src/fixtures/pageFixtures.ts"},
+        ],
+        "auth_flow": {"fixture_entry": "src/fixtures/pageFixtures.ts:test"},
+    }
+    syms = _inventory_symbols(am)
+    assert "src/fixtures/pageFixtures.ts:test (extended)" in syms["fixtures"]
+    assert "test (extended)" in syms["fixtures"]
+    assert "src/fixtures/pageFixtures.ts:test" in syms["fixtures"]
+    assert "test" in syms["fixtures"]
+    assert "src/fixtures/pageFixtures.ts" in syms["fixtures"]
 
 
 def test_approved_dirs_pulls_from_test_and_src_layouts():
@@ -794,3 +810,103 @@ def test_render_plan_markdown_handles_empty_test_cases():
         "test_cases": [],
     })
     assert "No test cases planned" in md
+
+
+# ---------------------------------------------------------------------------
+# _validate_plan_against_inventory — path normalization (Bug 3)
+# ---------------------------------------------------------------------------
+
+
+def _make_tc(*, fixtures=None, page_objects=None, locators=None):
+    """Minimal test-case dict for validation tests."""
+    return {
+        "id": "TC-1",
+        "test_file_target": "tests/qtea_x_test.py",
+        "test_functions": [{"name": "test_x", "markers": ["qtea_smoke"]}],
+        "fixtures": fixtures or [],
+        "page_objects": page_objects or [],
+        "locators": locators or [],
+    }
+
+
+def _make_plan(tc):
+    return {"plan_version": "1.0", "active_module": "sut", "test_cases": [tc]}
+
+
+def _make_am(*, fixtures=None, page_objects=None):
+    am = {
+        "test_directory_layout": {"default_target": "tests"},
+        "existing_fixtures": fixtures or [],
+        "existing_page_objects": page_objects or [],
+        "existing_helpers": [],
+        "existing_locators": [],
+    }
+    return am
+
+
+def test_validate_backslash_ref_matches_posix_inventory():
+    """Backslash refs from LLM should match POSIX-stored inventory entries."""
+    am = _make_am(page_objects=[
+        {"name": "LoginPage", "file": "src/pages/LoginPage.ts"},
+    ])
+    tc = _make_tc(page_objects=[{
+        "name": "LoginPage", "source": "reuse",
+        "from": "src\\pages\\LoginPage.ts:LoginPage",
+        "reuse_justification": "models /login route",
+    }])
+    violations = _validate_plan_against_inventory(_make_plan(tc), am)
+    reuse_violations = [v for v in violations if "not found in sut_inventory" in v]
+    assert not reuse_violations, f"backslash ref should match: {reuse_violations}"
+
+
+def test_validate_posix_ref_still_works():
+    """Forward-slash refs continue to work as before."""
+    am = _make_am(page_objects=[
+        {"name": "LoginPage", "file": "src/pages/LoginPage.ts"},
+    ])
+    tc = _make_tc(page_objects=[{
+        "name": "LoginPage", "source": "reuse",
+        "from": "src/pages/LoginPage.ts:LoginPage",
+        "reuse_justification": "models /login route",
+    }])
+    violations = _validate_plan_against_inventory(_make_plan(tc), am)
+    reuse_violations = [v for v in violations if "not found in sut_inventory" in v]
+    assert not reuse_violations
+
+
+# ---------------------------------------------------------------------------
+# _validate_plan_against_inventory — Qtea-prefix guard (Bug 4)
+# ---------------------------------------------------------------------------
+
+
+def test_validate_rejects_qtea_prefixed_page_object_as_reuse():
+    am = _make_am()
+    tc = _make_tc(page_objects=[{
+        "name": "QteaNotificationPage", "source": "reuse",
+        "from": "src/pages/QteaNotificationPage.ts",
+        "reuse_justification": "models notifications",
+    }])
+    violations = _validate_plan_against_inventory(_make_plan(tc), am)
+    assert any("Qtea" in v and "prefix" in v for v in violations)
+
+
+def test_validate_rejects_qtea_prefixed_fixture_as_reuse():
+    am = _make_am()
+    tc = _make_tc(fixtures=[{
+        "name": "qtea_custom_login", "source": "reuse",
+        "from": "tests/conftest.py:qtea_custom_login",
+        "reuse_justification": "yields auth session",
+    }])
+    violations = _validate_plan_against_inventory(_make_plan(tc), am)
+    assert any("qtea_" in v and "prefix" in v for v in violations)
+
+
+def test_validate_allows_qtea_prefixed_with_create():
+    am = _make_am()
+    tc = _make_tc(page_objects=[{
+        "name": "QteaNotificationPage", "source": "create",
+        "at": "tests/pages/qtea_notification_page.py",
+    }])
+    violations = _validate_plan_against_inventory(_make_plan(tc), am)
+    prefix_violations = [v for v in violations if "prefix" in v]
+    assert not prefix_violations

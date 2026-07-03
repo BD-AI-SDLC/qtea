@@ -34,6 +34,10 @@ _NOT_READY_RE = re.compile(r"\bNOT\s+READY\b", re.IGNORECASE)
 _XREF_BLOCKER_RE = re.compile(
     r"\s*(?:—|--|–|-)\s*see\s+(?:blocker\s+#?|block-)(\d+)", re.IGNORECASE
 )
+_BLOCKER_XREF_ONLY_RE = re.compile(
+    r"^(?:exact\s+copy\s+)?(?:per|see|ref|from|same\s+as)\s+BLOCK-(\d+)\.?$",
+    re.IGNORECASE,
+)
 _BLOCKER_PREFIX = "How should we resolve this blocker: "
 _TC_ID_RE = re.compile(r"TC-[A-Z]+-\d+", re.IGNORECASE)
 _AC_ID_RE = re.compile(r"\bAC(?:-[A-Z0-9]+)+\b", re.IGNORECASE)
@@ -145,6 +149,13 @@ RESOLUTION_ANSWERED = "answered"
 RESOLUTION_SKIPPED_DROP = "skipped_drop"
 RESOLUTION_SCOPE_EXCLUSION = "scope_exclusion"
 RESOLUTION_SKIPPED_LEGACY = "skipped"
+# Overlay-dismiss HITL resolutions — carried alongside the standard answer
+# tuple so the parent-side handler (s09_execute._hitl_overlay_sweep) can
+# route accepts / one-shots / bug flags without duplicating the answer
+# schema. See :mod:`qtea.overlay_handling` for wire format.
+RESOLUTION_OVERLAY_PERSIST = "overlay_persist"
+RESOLUTION_OVERLAY_ONCE = "overlay_once"
+RESOLUTION_OVERLAY_BUG = "overlay_bug"
 
 
 @dataclass
@@ -152,9 +163,14 @@ class Question:
     """A single unresolved question surfaced to the user."""
 
     id: str
-    kind: str  # "clarification" | "blocker" | "open_question"
+    kind: str  # "clarification" | "blocker" | "open_question" | "overlay_dismiss"
     prompt_text: str
     context: str = ""
+    # Optional structured payload for kinds that need more than text (e.g.
+    # ``overlay_dismiss`` carries screenshot_path + candidate list). Flows
+    # untouched through the HITL bridge into the UI dialog; CLI renderer
+    # branches on ``metadata["type"]`` to choose its rendering.
+    metadata: dict = field(default_factory=dict)
 
 
 def _normalize_question_text(text: str) -> str:
@@ -502,13 +518,20 @@ def _dedup(qs: list[Question]) -> list[Question]:
 
     xref_ids: set[str] = set()
 
-    # Pass 1: "see blocker #N" cross-references
+    # Pass 1: cross-references to existing blockers ("see blocker #N",
+    # "per BLOCK-N", "exact copy per BLOCK-N", etc.)
     for q in qs:
         if q.kind != "blocker":
             m = _XREF_BLOCKER_RE.search(q.prompt_text)
             if m:
                 ref_num = int(m.group(1))
                 if ref_num in blocker_by_num:
+                    xref_ids.add(q.id)
+                    continue
+            m2 = _BLOCKER_XREF_ONLY_RE.match(q.prompt_text.strip())
+            if m2:
+                ref_num2 = int(m2.group(1))
+                if ref_num2 in blocker_by_num:
                     xref_ids.add(q.id)
 
     # Pass 2: TC-ID / AC-ID overlap — drop non-blockers whose TCs or ACs are
@@ -549,10 +572,35 @@ def _dedup(qs: list[Question]) -> list[Question]:
     return out
 
 
-def _extract_clarifications(md_text: str) -> list[Question]:
+def _resolve_blocker_xref(
+    text: str, blockers: list[Question],
+) -> str | None:
+    """If *text* is a cross-reference like ``per BLOCK-003``, return the
+    referenced blocker's ``prompt_text`` so the clarification carries the real
+    question.  Returns ``None`` when *text* is not a cross-reference.
+    """
+    m = _BLOCKER_XREF_ONLY_RE.match(text)
+    if not m:
+        return None
+    ref_num = int(m.group(1))
+    for b in blockers:
+        if b.kind == "blocker" and b.id == f"BLOCK-{ref_num:02d}":
+            return b.prompt_text
+    # Referenced blocker not found — keep original text so the user at least
+    # sees *something* rather than a silent drop.
+    return None
+
+
+def _extract_clarifications(
+    md_text: str, blockers: list[Question] | None = None,
+) -> list[Question]:
     out: list[Question] = []
     for idx, m in enumerate(_CLARIFICATION_RE.finditer(md_text), start=1):
         text = m.group(1).strip()
+        if blockers:
+            resolved = _resolve_blocker_xref(text, blockers)
+            if resolved is not None:
+                text = resolved
         line_start = md_text.rfind("\n", 0, m.start()) + 1
         line_end = md_text.find("\n", m.end())
         if line_end == -1:
@@ -679,15 +727,152 @@ def _extract_open_questions(md_text: str) -> list[Question]:
 
 def extract_questions(md_text: str) -> list[Question]:
     """Return every unresolved question / blocker / clarification in the markdown."""
+    blockers = _extract_blockers(md_text)
     qs: list[Question] = []
-    qs.extend(_extract_clarifications(md_text))
-    qs.extend(_extract_blockers(md_text))
+    qs.extend(_extract_clarifications(md_text, blockers=blockers))
+    qs.extend(blockers)
     qs.extend(_extract_open_questions(md_text))
     return _dedup(qs)
 
 
 def has_not_ready_verdict(md_text: str) -> bool:
     return bool(_NOT_READY_RE.search(md_text))
+
+
+def _prompt_overlay_dismiss(
+    console: Console, q: Question,
+) -> tuple[str | None, str]:
+    """CLI-side rendering for an overlay-dismiss HITL question.
+
+    Returns ``(resolution, json_answer)`` where ``resolution`` is one of
+    :data:`RESOLUTION_OVERLAY_PERSIST` / :data:`RESOLUTION_OVERLAY_ONCE` /
+    :data:`RESOLUTION_OVERLAY_BUG`, or ``None`` when the user skips (empty
+    input / abort). ``json_answer`` is the wire format described in
+    :func:`qtea.overlay_handling.parse_overlay_answer`.
+
+    The dialog surfaces the cropped overlay screenshot (path only in CLI —
+    terminals can't render images reliably; the UI dialog does the inline
+    ``ft.Image`` render) plus:
+      - AOM-extracted candidates (safe class listed first, risky class
+        marked ``[risky — verify]``)
+      - Press-Escape option
+      - Custom locator (``role=button, name=<text>``)
+      - "This is a real bug" — fail the test class
+    """
+    meta = q.metadata or {}
+    test_id = meta.get("test_id") or "(unknown test)"
+    overlay_role = meta.get("overlay_role") or "?"
+    overlay_name = meta.get("overlay_name") or "?"
+    page_url = meta.get("page_url") or ""
+    screenshot = meta.get("screenshot_path") or ""
+    candidates = list(meta.get("candidates") or [])
+
+    console.print()
+    console.print(
+        Panel(
+            f"[bold]Test:[/bold] {test_id}\n"
+            f"[bold]Overlay:[/bold] role={overlay_role!r}  "
+            f"name={overlay_name!r}\n"
+            f"[bold]Page:[/bold] {page_url}\n"
+            f"[bold]Screenshot:[/bold] {screenshot or '(none)'}",
+            title=f"[bold yellow]Overlay blocked action:[/bold yellow] "
+                  f"{meta.get('target_intent') or '(unknown target)'}",
+            border_style="yellow",
+        )
+    )
+
+    console.print()
+    if candidates:
+        console.print("[bold]Dismiss candidates (from overlay AOM):[/bold]")
+        # Safe candidates first — matches the dialog's persist-friendly
+        # ordering. Numbering is 1-based for humans.
+        ordered: list[tuple[int, dict]] = []
+        for i, c in enumerate(candidates):
+            ordered.append((i, c))
+        ordered.sort(key=lambda p: (not p[1].get("safe"), -int(p[1].get("score") or 0)))
+        for display_num, (orig_idx, c) in enumerate(ordered, start=1):
+            role = c.get("role") or "?"
+            name = c.get("name") or "?"
+            safe_tag = "" if c.get("safe") else "  [yellow][risky — verify][/yellow]"
+            console.print(
+                f"  [cyan]{display_num}[/cyan]. Click {role} [green]{name!r}[/green]{safe_tag}"
+            )
+            # Remember the original index for the wire format.
+            c["_display_num"] = display_num
+            c["_orig_idx"] = orig_idx
+        next_num = len(ordered) + 1
+    else:
+        console.print("[dim](no button candidates extracted from AOM)[/dim]")
+        ordered = []
+        next_num = 1
+
+    esc_num = next_num
+    custom_num = esc_num + 1
+    bug_num = custom_num + 1
+    skip_num = bug_num + 1
+    console.print(f"  [cyan]{esc_num}[/cyan]. Press Escape key")
+    console.print(f"  [cyan]{custom_num}[/cyan]. Custom locator (provide role + name)")
+    console.print(f"  [cyan]{bug_num}[/cyan]. This is a real bug — fail the test")
+    console.print(f"  [cyan]{skip_num}[/cyan]. Skip (do nothing this run)")
+    console.print()
+
+    valid_nums = [str(i) for i in range(1, skip_num + 1)]
+    choice_str = Prompt.ask(
+        "[green]Pick a number[/green]",
+        choices=valid_nums,
+        default=str(skip_num),
+    ).strip()
+    try:
+        choice = int(choice_str)
+    except ValueError:
+        return None, ""
+
+    if choice == skip_num:
+        return None, ""
+
+    if choice == bug_num:
+        return RESOLUTION_OVERLAY_BUG, json.dumps({"kind": "bug"})
+
+    if choice == esc_num:
+        answer = json.dumps({"kind": "press_escape"})
+        return _confirm_persist(console, answer)
+
+    if choice == custom_num:
+        role = Prompt.ask(
+            "[green]Custom locator role[/green]",
+            choices=["button", "link", "menuitem"],
+            default="button",
+        ).strip()
+        name = Prompt.ask("[green]Custom locator accessible name[/green]", default="").strip()
+        if not name:
+            console.print("[dim](no name supplied — skipping)[/dim]")
+            return None, ""
+        answer = json.dumps({"kind": "custom", "role": role, "name": name})
+        return _confirm_persist(console, answer)
+
+    # Candidate click
+    for _display_num, (_orig_idx, c) in enumerate(ordered, start=1):
+        if c.get("_display_num") == choice:
+            answer = json.dumps({
+                "kind": "click_candidate",
+                "candidate_index": c["_orig_idx"],
+            })
+            return _confirm_persist(console, answer)
+    return None, ""
+
+
+def _confirm_persist(console: Console, answer: str) -> tuple[str, str]:
+    """Ask whether to persist this overlay entry to interceptors.json."""
+    persist = Prompt.ask(
+        "[bold]Persist to interceptors.json so future runs are clean?[/bold] "
+        "[dim](y = yes, n = one-shot only)[/dim]",
+        choices=["y", "n"],
+        default="y",
+    ).strip()
+    resolution = (
+        RESOLUTION_OVERLAY_PERSIST if persist == "y" else RESOLUTION_OVERLAY_ONCE
+    )
+    return resolution, answer
 
 
 def prompt_user(
@@ -739,6 +924,16 @@ def prompt_user(
         console.rule(f"[bold]{q.id}[/bold] · {q.kind}", style="cyan")
         if q.context and q.context != q.prompt_text:
             console.print(f"[dim]context:[/dim] {q.context}")
+
+        # Overlay-dismiss branch — bypass the free-text loop. Shows the
+        # cropped screenshot path, lists AOM-extracted candidates + Escape
+        # + custom + bug options, and returns a JSON-encoded answer plus a
+        # per-choice resolution the parent-side handler routes on.
+        if q.metadata and q.metadata.get("type") == "overlay_dismiss":
+            resolution, ans = _prompt_overlay_dismiss(console, q)
+            if resolution is not None:
+                answers[q.id] = (resolution, ans)
+            continue
 
         while True:
             ans = Prompt.ask(f"[green]{q.prompt_text}[/green]", default="").strip()

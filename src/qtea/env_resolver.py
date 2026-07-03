@@ -9,8 +9,10 @@ resolves their *values* via a cascade of strategies:
   4. InteractivePromptStrategy — Rich terminal prompt (skipped in CI)
 
 Resolved values are injected into ``os.environ`` so downstream steps
-(8, 9) pick them up transparently.  Values are never logged or persisted
-to disk.
+(8, 9) pick them up transparently.  Values are never logged but ARE
+persisted to ``<workspace>/.env.qtea`` (mode 600) so that
+``--from-step`` restarts can recover HITL-provided values without
+re-prompting.
 """
 
 from __future__ import annotations
@@ -497,7 +499,7 @@ def resolve_sut_env(
         discovered_keys, sut_path, extra_required=extra_required,
     )
     all_keys = required + optional
-    essentials = [k for k in all_keys if _is_essential_key(k)]
+    essentials = list(dict.fromkeys(k for k in all_keys if _is_essential_key(k)))
 
     silent: list[EnvStrategy] = [ProcessEnvStrategy()]
 
@@ -537,12 +539,13 @@ def resolve_sut_env(
                 label = strategy.source_label
             sources[k] = label
 
-    # Phase 2 — interactive confirmation for essentials only.
-    if not config.no_hitl and essentials:
+    # Phase 2 — interactive confirmation for essentials NOT yet resolved.
+    unconfirmed = [k for k in essentials if k not in resolved]
+    if not config.no_hitl and unconfirmed:
         interactive = InteractivePromptStrategy(
-            defaults={k: resolved.get(k, "") for k in essentials},
+            defaults={k: resolved.get(k, "") for k in unconfirmed},
         )
-        confirmed = interactive.resolve(essentials, {})
+        confirmed = interactive.resolve(unconfirmed, resolved)
         for k, v in confirmed.items():
             # An override is anything the user supplied that differs from
             # what the silent cascade had (or for a previously-missing key,

@@ -160,3 +160,70 @@ def test_replay_returns_true_when_only_mirror_fired(tmp_path: Path, clean_env, m
     monkeypatch.setenv("QA_URL", "https://qa.example.com")
     assert replay_env_from_artifacts(ws, _Opts()) is True
     assert os.environ["SUT_BASE_URL"] == "https://qa.example.com"
+
+
+# ---------------------------------------------------------------------------
+# .env.qtea persistence tests
+# ---------------------------------------------------------------------------
+
+
+def test_replay_reads_hitl_values_from_workspace_env_file(tmp_path: Path, clean_env, monkeypatch):
+    """HITL-provided values persisted in .env.qtea must be recovered on replay
+    without re-prompting (no_hitl=True)."""
+    ws = _make_workspace(tmp_path)
+    (ws.step_dir(6) / "research.json").write_text(
+        json.dumps({
+            "title": "x", "sections": [],
+            "sut_env_keys": ["USERNAME_APP", "PASSWORD_APP"],
+        }),
+        encoding="utf-8",
+    )
+    # Simulate Step 6 having persisted HITL answers to .env.qtea
+    (ws.root / ".env.qtea").write_text(
+        "USERNAME_APP=testuser\nPASSWORD_APP=secret123\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("USERNAME_APP", raising=False)
+    monkeypatch.delenv("PASSWORD_APP", raising=False)
+
+    assert replay_env_from_artifacts(ws, _Opts()) is True
+    assert os.environ["USERNAME_APP"] == "testuser"
+    assert os.environ["PASSWORD_APP"] == "secret123"
+
+
+def test_replay_prefers_user_env_file_over_workspace_env_file(tmp_path: Path, clean_env, monkeypatch):
+    """When the user provides --env-file, its values take precedence over
+    the workspace .env.qtea cache."""
+    ws = _make_workspace(tmp_path)
+    (ws.step_dir(6) / "research.json").write_text(
+        json.dumps({
+            "title": "x", "sections": [],
+            "sut_env_keys": ["PASSWORD_APP"],
+        }),
+        encoding="utf-8",
+    )
+    (ws.root / ".env.qtea").write_text("PASSWORD_APP=cached_old\n", encoding="utf-8")
+    user_env = tmp_path / "user.env"
+    user_env.write_text("PASSWORD_APP=fresh_override\n", encoding="utf-8")
+    monkeypatch.delenv("PASSWORD_APP", raising=False)
+
+    assert replay_env_from_artifacts(ws, _Opts(env_file=user_env)) is True
+    assert os.environ["PASSWORD_APP"] == "fresh_override"
+
+
+def test_replay_sut_dotenv_overrides_workspace_env_file(tmp_path: Path, clean_env, monkeypatch):
+    """SUT's own .env values must override cached HITL values from .env.qtea."""
+    ws = _make_workspace(tmp_path)
+    (ws.step_dir(6) / "research.json").write_text(
+        json.dumps({
+            "title": "x", "sections": [],
+            "sut_env_keys": ["PASSWORD_APP"],
+        }),
+        encoding="utf-8",
+    )
+    (ws.root / ".env.qtea").write_text("PASSWORD_APP=hitl_value\n", encoding="utf-8")
+    (ws.sut / ".env").write_text("PASSWORD_APP=sut_real_value\n", encoding="utf-8")
+    monkeypatch.delenv("PASSWORD_APP", raising=False)
+
+    assert replay_env_from_artifacts(ws, _Opts()) is True
+    assert os.environ["PASSWORD_APP"] == "sut_real_value"

@@ -12,7 +12,9 @@ Rule set (single source of truth for the enforcement layer):
   page-content   -> `page.content(` / `await page.content(` style calls
   raw-secret     -> obvious inline credentials (password = "...", token = "...")
   empty-handler  -> try/except or catch{} blocks with a no-op body
-  invalid-escape -> ``\\s``, ``\\d``, ``\\w`` etc. in non-raw Python strings (SyntaxWarning 3.12+, SyntaxError 3.14+)
+  invalid-escape -> ``\\s``, ``\\d``, ``\\w`` etc. in non-raw Python string literals
+                    (SyntaxWarning 3.12+, SyntaxError 3.14+). Tokenize-based so
+                    ``r"..."`` / ``rb"..."`` / ``rf"..."`` are correctly exempted.
 
 Each rule carries a `severity` of `error` (hard-rejects Step 8) or
 `warning` (logged to violations.log only — advisory mode). Step 8's reject
@@ -302,13 +304,12 @@ _VIOLATION_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
         re.compile(r"""(?P<snippet>catch\s*(?:\([^)]*\))?\s*\{\s*\})"""),
         "error",
     ),
-    # Python invalid escape sequence — \s, \d, \w etc. in non-raw strings.
-    # SyntaxWarning in 3.12+, becomes SyntaxError in 3.14+.
-    (
-        "invalid-escape",
-        re.compile(r"""(?P<snippet>(?<!\\)\\[sdwSDWpP])"""),
-        "error",
-    ),
+    # NOTE: `invalid-escape` is NOT in this list. A line-regex scan can't
+    # distinguish raw strings (`r"\s+"` is valid Python) from non-raw, so it
+    # produces false positives the violation-fixer cannot satisfy. The rule
+    # is enforced by `_scan_invalid_escape_python` (tokenize-based) for
+    # Python-family frameworks only — see that function for details.
+    #
     # Assertion-fidelity advisory (Change 4c). Bare `assert` on Playwright
     # objects when the auto-retrying `expect()` API is available — these
     # tests pass on transient state and miss the polling guarantee. Ships
@@ -689,28 +690,85 @@ def _scan_tc_refs_and_tags(block: str) -> tuple[list[str], list[str]]:
 
 
 def _is_in_comment(file_text: str, match_start: int) -> bool:
-    """True if the match position is inside a single-line comment.
+    """True if the match position is inside a comment.
 
-    Walks back from ``match_start`` to the previous newline (or start of file)
-    and looks for an unescaped ``#`` (Python/YAML/Ruby/shell) or ``//``
-    (JS/TS/Java/Go/C-family) comment marker. We deliberately do not parse
-    string literals — the cost of treating ``"// not a comment"`` as a
-    comment is a missed-violation false negative on a contrived snippet,
-    while the cost of NOT doing this check is real false positives on
-    legitimate documentation comments that mention banned APIs by name
-    (e.g. the standard header ``# never use page.content()``).
+    Detects three comment styles:
+      - single-line ``#`` (Python/YAML/Ruby/shell) on the same line before match
+      - single-line ``//`` (JS/TS/Java/Go/C-family) on the same line before match
+      - block ``/* … */`` (JS/TS/Java/C) — either on the same line (a `/*` that
+        opens before match without a matching `*/` in between) OR spanning
+        multiple lines (an open `/*` at some earlier point in the file with
+        no intervening `*/` between it and match_start).
 
-    Block comments (``/* ... */``, triple-quoted Python strings) are not
-    handled here; matches inside those will still flag. Acceptable tradeoff:
-    the upside is bounded (only the most common comment style is honored)
-    and the rules are intended to catch executable code, which is rarely
-    nested inside block comments.
+    Block-comment support was added specifically for Phase B.5.5's inline
+    `/* was: '<original xpath>' */` breadcrumbs — without it the rewriter's
+    own reference comments would re-trigger the `[xpath]` gate. Triple-quoted
+    Python strings are still NOT handled (rare case, and the closing `\"\"\"`
+    would require a lexer to detect reliably).
+
+    String-literal parsing is still deliberately skipped — treating
+    ``"// not a comment"`` as a comment is a missed-violation false negative
+    on a contrived snippet, while NOT doing the check causes real false
+    positives on legitimate documentation comments that mention banned APIs
+    by name (e.g. the standard header ``# never use page.content()``).
     """
     line_start = file_text.rfind("\n", 0, match_start) + 1
     prefix = file_text[line_start:match_start]
     if "#" in prefix:
         return True
-    return "//" in prefix
+    if "//" in prefix:
+        return True
+
+    # Same-line `/* … */` block comment.
+    open_star = prefix.rfind("/*")
+    if open_star != -1 and prefix.rfind("*/", open_star) == -1:
+        return True
+
+    # Multi-line block comment: the most recent `/*` before match_start
+    # not yet closed by a `*/`.
+    open_star_file = file_text.rfind("/*", 0, match_start)
+    if open_star_file != -1:
+        close_star_file = file_text.rfind("*/", open_star_file, match_start)
+        if close_star_file == -1:
+            return True
+    return False
+
+
+def _has_xpath_exempt_marker(file_text: str, match_start: int) -> bool:
+    """True when the match is covered by a ``qtea-xpath-exempt:`` marker.
+
+    Phase B.5.5's deterministic rewriter (``qtea.xpath_rewriter``) stamps
+    this marker on xpath entries it CANNOT safely translate. The marker
+    suppresses the ``[xpath]`` violation for that specific line so the
+    quality gate doesn't kill the whole step over a handful of unfixable
+    legacy predicates (``parent::``, ``ancestor::``, complex nested unions).
+
+    Coverage rules (intentionally scoped so the marker can't silence xpath
+    elsewhere in the file):
+      - the SAME line as the match carries ``qtea-xpath-exempt`` (typical for
+        the container-migration output where the marker and the offending
+        assignment share a line via inline comment), OR
+      - the immediately-PRECEDING non-blank line carries the marker.
+    """
+    # Same-line check.
+    line_start = file_text.rfind("\n", 0, match_start) + 1
+    line_end = file_text.find("\n", match_start)
+    if line_end == -1:
+        line_end = len(file_text)
+    current_line = file_text[line_start:line_end]
+    if "qtea-xpath-exempt" in current_line:
+        return True
+
+    # Preceding non-blank line check.
+    scan_end = line_start
+    while scan_end > 0:
+        prev_line_end = scan_end - 1  # the '\n' terminator of the prior line
+        prev_line_start = file_text.rfind("\n", 0, prev_line_end) + 1
+        prev = file_text[prev_line_start:prev_line_end]
+        if prev.strip():
+            return "qtea-xpath-exempt" in prev
+        scan_end = prev_line_start
+    return False
 
 
 def _scan_violations(file_text: str, rel_path: str) -> list[Violation]:
@@ -718,6 +776,8 @@ def _scan_violations(file_text: str, rel_path: str) -> list[Violation]:
     for rule, pat, severity in _VIOLATION_PATTERNS:
         for m in pat.finditer(file_text):
             if _is_in_comment(file_text, m.start()):
+                continue
+            if rule == "xpath" and _has_xpath_exempt_marker(file_text, m.start()):
                 continue
             out.append(
                 Violation(
@@ -949,6 +1009,77 @@ def _scan_interaction_patterns(
     return out
 
 
+_INVALID_ESCAPE_RE = re.compile(r"(?<!\\)\\[sdwSDWpP]")
+
+
+def _scan_invalid_escape_python(text: str, rel_path: str, framework: str) -> list[Violation]:
+    """Flag ``\\s``/``\\d``/``\\w`` etc. in non-raw Python string literals.
+
+    Uses ``tokenize`` so raw strings (``r"…"``, ``rb"…"``, ``rf"…"``) are
+    correctly exempted — the previous line-regex scan re-flagged the
+    raw-string fix as still invalid, an unsatisfiable rule that wedged the
+    codegen-violation-fixer in a retry loop. SyntaxWarning in Python 3.12+,
+    SyntaxError in 3.14+.
+    """
+    import io
+    import tokenize as _tok
+
+    if framework not in ("pytest", "playwright-py", "selenium-py"):
+        return []
+
+    out: list[Violation] = []
+    try:
+        tokens = list(_tok.generate_tokens(io.StringIO(text).readline))
+    except (_tok.TokenizeError, IndentationError, SyntaxError):
+        # Other gates (pyright, AST parse in zero-assertion check) surface
+        # the underlying syntax problem; don't double-report here.
+        return out
+
+    file_lines = text.splitlines()
+    fstart_t = getattr(_tok, "FSTRING_START", None)
+    fmid_t = getattr(_tok, "FSTRING_MIDDLE", None)
+    fend_t = getattr(_tok, "FSTRING_END", None)
+    in_raw_fstring = False
+
+    def _emit(snippet_src: str, base_line: int) -> None:
+        for hit in _INVALID_ESCAPE_RE.finditer(snippet_src):
+            line_offset = snippet_src[: hit.start()].count("\n")
+            line = base_line + line_offset
+            line_text = (
+                file_lines[line - 1]
+                if 0 < line <= len(file_lines)
+                else snippet_src
+            )
+            out.append(
+                Violation(
+                    rule="invalid-escape",
+                    file=rel_path,
+                    line=line,
+                    snippet=line_text[:120],
+                    severity="error",
+                )
+            )
+
+    for tok in tokens:
+        if fstart_t is not None and tok.type == fstart_t:
+            prefix = re.match(r"^[a-zA-Z]*", tok.string).group(0).lower()
+            in_raw_fstring = "r" in prefix
+            continue
+        if fend_t is not None and tok.type == fend_t:
+            in_raw_fstring = False
+            continue
+        if fmid_t is not None and tok.type == fmid_t:
+            if not in_raw_fstring:
+                _emit(tok.string, tok.start[0])
+            continue
+        if tok.type == _tok.STRING:
+            prefix = re.match(r"^[bBrRuUfF]*", tok.string).group(0).lower()
+            if "r" in prefix:
+                continue
+            _emit(tok.string, tok.start[0])
+    return out
+
+
 def _scan_zero_assertion_tests(
     text: str, rel_path: str, framework: str,
 ) -> list[Violation]:
@@ -1021,10 +1152,11 @@ def index_tests(tests_root: Path, *, framework: str) -> IndexResult:
         rel_files.append(rel)
 
         violations.extend(_scan_violations(text, rel))
-        # zero-assertions + interaction-pattern checks are AST-based and only
-        # meaningful for the Python family. Skipped silently on other stacks.
+        # zero-assertions + interaction-pattern + invalid-escape checks are
+        # Python-only (AST / tokenize based). Skipped silently on other stacks.
         violations.extend(_scan_zero_assertion_tests(text, rel, framework))
         violations.extend(_scan_interaction_patterns(text, rel, framework))
+        violations.extend(_scan_invalid_escape_python(text, rel, framework))
 
         blocks = _split_test_blocks(text, family)
         if not blocks:

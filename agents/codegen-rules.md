@@ -8,6 +8,35 @@
 
 `id` > `data-testid` > `role` > `label` > `text` > `placeholder` > scoped CSS. **Never XPath.** Full ranking in `codegen-violation-fixer.prompt.md` §4.
 
+### 1.a — Playwright locator API (TS/JS stacks)
+
+When the SUT uses Playwright TS/JS, express locators via the built-in API rather than raw selector strings:
+
+| Predicate | Use |
+|---|---|
+| `[@data-test="X"]` or `[@data-testid="X"]` | `page.getByTestId('X')` — requires `testIdAttribute: '<attr>'` in `playwright.config.ts` when the SUT's attribute is not the Playwright default `data-testid`. Phase B.5.5 adds this line automatically when it emits a `getByTestId` call. |
+| `<h1..h6>` with text | `page.getByRole('heading', { name: 'X' })` |
+| `<a>` / `<button>` with text | `page.getByRole('link' \| 'button', { name: 'X' })` |
+| Exact text `text()="X"` | `page.getByText('X', { exact: true })` |
+| Fuzzy text `contains(., "X")` | `page.getByText('X')` |
+| Other attribute `[@attr="X"]` | `page.locator('[attr="X"]')` — plain CSS |
+| Nested `//A//B` | `page.getByRole('...').locator('B')` (chain) |
+
+**POM container shape** — when a POM stores locators, express them as arrow-function factories returning `Locator`:
+
+```ts
+export class LoginPage {
+  page: Page;
+  constructor(p: Page) { this.page = p; }
+
+  // was: '//input[@data-test="username"]'   ← breadcrumb from Phase B.5.5
+  readonly inpUsername = () => this.page.getByTestId('username');
+  readonly btnSubmit = () => this.page.getByRole('button', { name: 'Submit' });
+}
+```
+
+Consumers call the factory directly: `await this.inpUsername().fill(user)` (never `this.page.locator(...)` on a locator string). Phase B.5.5 rewrites legacy `elements: Record<string, string>` containers into this shape and updates matching call sites automatically.
+
 ## 2. AOM Snapshot Only in Generated Test Code
 
 When generated test code inspects page state, it MUST use the accessibility tree (e.g. Playwright `Locator.aria_snapshot()` in Python, the equivalent in your target framework). **Never** raw-DOM dumps (`page.content()`, `driver.page_source`) inside tests — they waste tokens and ignore semantic structure.

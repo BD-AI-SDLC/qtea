@@ -360,7 +360,7 @@ def resolve_command(
     apply_marker = framework in _PYTEST_FRAMEWORKS
     apply_pw_filter = framework in _PW_TEST_FRAMEWORKS
     if detected and _looks_like_test_command(detected):
-        parser = _DEFAULT_COMMANDS.get(framework, ("", "auto"))[1]
+        parser = _DEFAULT_COMMANDS.get(framework, ("", "unsupported"))[1]
         if parser == "junit" and "--junitxml" not in detected:
             detected = f"{detected} --junitxml={(cwd / 'qtea-junit.xml').as_posix()}"
         if apply_marker:
@@ -391,13 +391,23 @@ def resolve_command(
             wrapped = _inject_playwright_file_filter(wrapped)
             wrapped = _inject_playwright_workers(wrapped, parallelism)
         return wrapped, parser
-    bare = _expand_command("pytest --junitxml={junit}", cwd)
-    wrapped = wrap_command(profile, bare)
-    if apply_marker:
-        wrapped = _inject_pytest_marker(wrapped, marker_filter)
-        wrapped = _inject_strict_markers(wrapped)
-        wrapped = _inject_xdist_override(wrapped, parallelism)
-    return wrapped, "junit"
+    # No default known for this framework and no usable detected command.
+    # Fail loud: silently defaulting to `pytest` for e.g. a Java or Ruby
+    # stack would run the wrong runner and report "0 tests, all passed" —
+    # the exact class of stealth failure this branch exists to prevent.
+    # `run_tests` short-circuits on an empty command and synthesises a
+    # `T-runner-failure` entry so the operator sees the failure surface.
+    log.error(
+        "test_runner.unsupported_framework",
+        framework=framework,
+        supported=sorted(_DEFAULT_COMMANDS.keys()),
+        hint=(
+            f"No default test command registered for framework={framework!r}. "
+            f"Either add an entry to _DEFAULT_COMMANDS or have the researcher "
+            f"agent supply a detected_command that starts with a known runner."
+        ),
+    )
+    return "", "unsupported"
 
 
 def _expand_command(template: str, cwd: Path) -> str:
@@ -487,10 +497,19 @@ def _split_command(command: str) -> list[str]:
         # as "match all tests". Strip surrounding double quotes from each
         # token after splitting to get the actual value.
         tokens = shlex.split(command, posix=False)
-        return [
+        tokens = [
             t[1:-1] if len(t) >= 2 and t[0] == '"' and t[-1] == '"' else t
             for t in tokens
         ]
+        # Resolve the executable via shutil.which() so .cmd/.bat wrappers
+        # (npx.cmd, yarn.cmd, etc.) are found. Without this, subprocess.run
+        # with list-form args on Windows cannot locate .cmd files — only
+        # .exe/.com are searched by CreateProcessW.
+        if tokens:
+            resolved = shutil.which(tokens[0])
+            if resolved:
+                tokens[0] = resolved
+        return tokens
     return shlex.split(command)
 
 
@@ -817,6 +836,44 @@ def run_tests(
         cwd=str(cwd),
         framework=framework,
     )
+    # Short-circuit when resolve_command signalled unsupported framework.
+    # Skips execute_command (which would blow up on an empty command with a
+    # cryptic OSError) and surfaces a clean, actionable T-runner-failure
+    # entry the operator can act on.
+    if not command or parser == "unsupported":
+        now = datetime.now(UTC).isoformat()
+        return RunResult(
+            framework=framework,
+            command=command,
+            cwd=str(cwd),
+            started_at=now,
+            finished_at=now,
+            duration_s=0.0,
+            exit_code=127,
+            results=[TestRunEntry(
+                id="T-runner-failure",
+                name="<unsupported-framework>",
+                file=str(cwd),
+                status="error",
+                message=(
+                    f"No test runner registered for framework={framework!r}. "
+                    f"Supported: {sorted(_DEFAULT_COMMANDS.keys())}. "
+                    f"Provide a detected_command or add an entry to "
+                    f"_DEFAULT_COMMANDS."
+                ),
+                runner_failure={
+                    "kind": "unsupported_framework",
+                    "module": None,
+                    "hint": (
+                        f"Add {framework!r} to test_runner._DEFAULT_COMMANDS "
+                        f"or supply a runnable command via detected_command."
+                    ),
+                    "summary": f"unsupported framework: {framework!r}",
+                },
+            )],
+            stdout="",
+            stderr="",
+        )
 
     # The CLI `--headed` flag is meant to give the user a visible browser
     # while the SUT tests run, so they can watch the test execute live.
@@ -863,6 +920,10 @@ def run_tests(
     finished = datetime.now(UTC)
 
     results: list[TestRunEntry] = []
+    _KNOWN_PARSERS = {
+        "junit", "playwright-json", "jest-json",
+        "mocha-json", "robot-xml", "surefire",
+    }
     if parser == "junit":
         results = parse_junit_xml(cwd / "qtea-junit.xml")
     elif parser == "playwright-json":
@@ -875,6 +936,40 @@ def run_tests(
         results = parse_robot_xml(cwd / "qtea-output.xml")
     elif parser == "surefire":
         results = parse_surefire_dir(cwd / "target" / "surefire-reports")
+    elif parser not in _KNOWN_PARSERS:
+        # Fail loud: silent empty results would look like "0 tests, all
+        # passed" to downstream. Emit a visible synthetic failure entry
+        # so the operator sees the actual problem.
+        log.error(
+            "test_runner.unknown_parser",
+            parser=parser,
+            framework=framework,
+            known=sorted(_KNOWN_PARSERS),
+        )
+        results = [TestRunEntry(
+            id="T-runner-failure",
+            name="<unknown-parser>",
+            file=str(cwd),
+            status="error",
+            message=(
+                f"No parser registered for parser={parser!r}. "
+                f"Supported: {sorted(_KNOWN_PARSERS)}. "
+                f"The test command ran (exit_code={exit_code}) but its "
+                f"output was NOT parsed — treat this as a failed run."
+            ),
+            stdout=stdout[-4000:],
+            stderr=stderr[-4000:],
+            runner_failure={
+                "kind": "unknown_parser",
+                "module": None,
+                "hint": (
+                    f"Register a parser for {parser!r} in run_tests() "
+                    f"or map framework={framework!r} to a supported parser "
+                    f"in test_runner._DEFAULT_COMMANDS."
+                ),
+                "summary": f"unknown parser: {parser!r}",
+            },
+        )]
 
     # Exit code 3 = pytest internal error. When partial JUnit results
     # parse but none represent actual test executions (all infrastructure

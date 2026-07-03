@@ -5,73 +5,85 @@ Restores the ``cost_usd`` field that the Agent SDK used to populate in
 a pricing table, so we maintain one here and compute cost in
 :func:`qtea.llm.reasoning.call_reasoning_llm` after each response.
 
-**Accuracy caveat.** The rates below are **Anthropic's public list
-prices**. Actual billing depends on the model provider:
+**Accuracy caveat.** The rates below are the **Bosch Agent Platform
+list prices** (see :data:`PRICING_BASIS`). Accuracy by transport:
 
-* **Direct Anthropic API** users → estimate is ~95-99% accurate (drift
-  comes from occasional Anthropic price changes)
-* **Vertex AI direct** users → ~80-90% accurate (Vertex bills slightly
-  differently than Anthropic direct; volume / committed-use discounts
-  add further drift)
-* **Custom proxy / model farm** users (e.g. Bosch's
-  ``aoai-farm.bosch-temp.com``) → **absolute number is unknowable** —
-  could be 0 (flat-rate enterprise contract) or 200% of list (proxy
-  markup). The number IS useful for relative comparisons across steps
-  and trend tracking (token counts are ground truth).
+* **Bosch model-farm proxy** (``aoai-farm.bosch-temp.com`` and similar)
+  → ~95-99% accurate. This is the transport qtea is deployed against;
+  the rates here match the platform's published price sheet.
+* **Direct Anthropic API** users → estimates are **under-reported**
+  because Anthropic's public list price for Opus is $15/$75 per MTok
+  while the Bosch platform bills at $5/$25. Multiply Opus figures by
+  ~3× for a rough Anthropic-billing estimate; Sonnet and Haiku match
+  Anthropic list closely.
+* **Vertex AI direct** users → similar to Direct Anthropic modulo
+  volume / committed-use discounts.
 
-The audit JSON labels the value as ``cost_usd_estimated`` (not
-``cost_usd``) and includes a ``cost_estimation_basis`` field so
-downstream readers can't mistake the estimate for actual billing.
+Regardless of transport, the audit JSON labels the value
+``cost_usd_estimated`` (not ``cost_usd``) and stamps the
+``cost_estimation_basis`` field with :data:`PRICING_BASIS` so downstream
+readers can't mistake the estimate for actual billing.
 """
 
 from __future__ import annotations
 
 from qtea.metrics import AgentMetrics
 
-# Pricing basis (Anthropic public list prices, USD per 1M tokens).
-# Update when Anthropic publishes new prices.
+# Pricing basis (Bosch Agent Platform list prices, USD per 1M tokens).
+# Update when the platform publishes new prices; keep the version marker
+# in the string so audit JSON consumers can detect drift.
 #
 # Sources:
-#   * https://www.anthropic.com/pricing
-#   * Claude 4.x family pricing as of 2026-Q2
+#   * Bosch inside-docupedia Agent Platform pricing page (accessed 2026-07-01)
+#   * Claude 4.x family pricing as listed for the Bosch model farm
 #
-# Cache pricing:
-#   * cache_creation (5min TTL) = 1.25 × base input rate
-#   * cache_read                = 0.10 × base input rate
-PRICING_BASIS = "anthropic-list-price-2026-q2"
+# Cache pricing: the Anthropic API does not distinguish between 5-minute and
+# 1-hour TTL cache writes in its usage response — both surface as
+# cache_creation_input_tokens. The 5-minute write rate is used here so cost
+# estimates lean conservative (1-hour writes are ~1.6× more expensive but
+# amortise over more reads).
+PRICING_BASIS = "bosch-agent-platform-price-2026-q2"
 
 
-# Per-model rates: (input_per_MTok, output_per_MTok, cache_create_per_MTok, cache_read_per_MTok)
-# Keys are the agent_models.yaml model IDs (both @-form and dash-form
-# variants are supported because qtea passes whichever form the env
-# expects).
+# Per-model rates: (input_per_MTok, output_per_MTok, cache_create_5m_per_MTok, cache_read_per_MTok)
+#
+# qtea's agent_models.yaml pins the whole pipeline to three models — Opus 4.6,
+# Sonnet 4.6, and Haiku 4.5 (dated variant). Every other Claude ID is out of
+# scope for this project. Entries kept below are exactly what agent_models.yaml
+# emits plus the un-dated family aliases the Anthropic SDK sometimes echoes
+# back in response headers (``claude-haiku-4-5``).
+#
+# Adding a new model? Also update :func:`_model_family_fallback` if the new
+# family isn't already covered (currently opus / sonnet / haiku), and the
+# ``-4-`` guard if the new family bumps the version digit (e.g. Claude 5.x).
 _MODEL_PRICING: dict[str, tuple[float, float, float, float]] = {
-    # Claude 4.x family
-    "claude-opus-4-8":              (15.00, 75.00, 18.75, 1.50),
-    "claude-opus-4-7":              (15.00, 75.00, 18.75, 1.50),
-    "claude-opus-4-6":              (15.00, 75.00, 18.75, 1.50),
+    "claude-opus-4-6":              ( 5.00, 25.00,  6.25, 0.50),
     "claude-sonnet-4-6":            ( 3.00, 15.00,  3.75, 0.30),
     "claude-haiku-4-5":             ( 1.00,  5.00,  1.25, 0.10),
-    # Date-pinned haiku (both @ and dash separators)
+    # Date-pinned Haiku (both @ and dash separators — agent_models.yaml uses
+    # @-form; some SDK response paths normalise it to dash-form).
     "claude-haiku-4-5-20251001":    ( 1.00,  5.00,  1.25, 0.10),
     "claude-haiku-4-5@20251001":    ( 1.00,  5.00,  1.25, 0.10),
-    # Claude 3.x family (kept for older agent definitions)
-    "claude-3-5-sonnet-20241022":   ( 3.00, 15.00,  3.75, 0.30),
-    "claude-3-5-haiku-20241022":    ( 0.80,  4.00,  1.00, 0.08),
-    "claude-3-opus-20240229":       (15.00, 75.00, 18.75, 1.50),
 }
 
 
 def _model_family_fallback(model: str) -> tuple[float, float, float, float] | None:
-    """Best-effort family lookup for model IDs not in the explicit table.
+    """Best-effort family lookup for Claude 4.x IDs not in the explicit table.
 
-    Catches model variants that haven't been added to :data:`_MODEL_PRICING`
-    yet (e.g. a brand-new dated revision) by matching on the model-family
-    prefix (``claude-opus``, ``claude-sonnet``, ``claude-haiku``).
-    Conservative — when in doubt, falls through to ``None`` and the cost
-    estimator returns 0.0 rather than guessing wrong.
+    **Scoped to Claude 4.x on purpose.** The model ID must contain a ``-4-``
+    segment (matching every ID in :data:`_MODEL_PRICING`) OR the fallback
+    returns None → 0.0 estimated cost. This is defensive: a Claude 3 or a
+    hypothetical Claude 5 model that slipped through agent_models.yaml would
+    be *silently mispriced* at Claude 4.x rates otherwise, and a zero-cost
+    audit entry is much easier to notice + fix than a subtly-wrong number.
+
+    When qtea adopts a new Claude family, add the version segment to the
+    guard below (e.g. ``if "-4-" not in lower and "-5-" not in lower``)
+    and add the family's rates to :data:`_MODEL_PRICING`.
     """
     lower = model.lower()
+    if "-4-" not in lower:
+        return None
     if "opus" in lower:
         return _MODEL_PRICING["claude-opus-4-6"]
     if "sonnet" in lower:
@@ -89,7 +101,7 @@ def estimate_cost(
     cache_creation_input_tokens: int = 0,
     cache_read_input_tokens: int = 0,
 ) -> float:
-    """Estimate the USD cost of an Anthropic API call from token counts.
+    """Estimate the USD cost of a Claude model call from token counts.
 
     Returns 0.0 when:
       * ``model`` is None or unknown to the pricing table (and family

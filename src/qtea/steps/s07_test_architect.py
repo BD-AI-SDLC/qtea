@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -166,6 +167,17 @@ def _inventory_symbols(active_module: dict | None) -> dict[str, set[str]]:
             if n:
                 out["fixtures"].add(f"{f}:{n}" if f else n)
                 out["fixtures"].add(n)  # also accept name-only match
+                if f:
+                    out["fixtures"].add(f)  # file-only ref
+                bare = re.sub(r"\s*\(.*?\)\s*$", "", n).strip()
+                if bare and bare != n:
+                    out["fixtures"].add(f"{f}:{bare}" if f else bare)
+                    out["fixtures"].add(bare)
+    auth_flow = active_module.get("auth_flow")
+    if isinstance(auth_flow, dict):
+        fe = (auth_flow.get("fixture_entry") or "").strip()
+        if fe:
+            out["fixtures"].add(fe)
     for entry in active_module.get("existing_page_objects") or []:
         if isinstance(entry, dict):
             f = entry.get("file") or ""
@@ -237,6 +249,19 @@ def _path_under_approved(path: str, approved: set[str]) -> bool:
     return False
 
 
+_GENERATED_PREFIXES = ("qtea_", "Qtea")
+
+
+def _is_generated_name(name: str) -> bool:
+    """Return True if the name follows the qtea pipeline naming convention."""
+    return any(name.startswith(p) for p in _GENERATED_PREFIXES)
+
+
+def _normalize_ref(ref: str) -> str:
+    """Normalise a reuse ``from`` reference to POSIX paths for matching."""
+    return ref.replace("\\", "/")
+
+
 def _validate_plan_against_inventory(
     plan: dict,
     active_module: dict | None,
@@ -283,26 +308,33 @@ def _validate_plan_against_inventory(
 
         for f in tc.get("fixtures") or []:
             src = f.get("source")
+            fname = f.get("name") or ""
             if src == "reuse":
+                if _is_generated_name(fname):
+                    violations.append(
+                        f"{tc_id}: fixture `{fname}` source=reuse but "
+                        f"name has qtea_ prefix (generated artifact). "
+                        f"Use source=create instead."
+                    )
                 ref = f.get("from")
                 if not ref:
                     violations.append(
-                        f"{tc_id}: fixture `{f.get('name')}` source=reuse "
+                        f"{tc_id}: fixture `{fname}` source=reuse "
                         f"missing `from` field"
                     )
-                elif (
-                    ref not in symbols["fixtures"]
-                    # Allow file-only references too (e.g. tests/conftest.py:auth_session
-                    # where conftest.py is listed but auth_session isn't enumerated).
-                    and not any(
-                        s == ref or s.startswith(ref + ":")
-                        for s in symbols["fixtures"]
-                    )
-                ):
-                    violations.append(
-                        f"{tc_id}: fixture `{f.get('name')}` reuse-from "
-                        f"`{ref}` not found in sut_inventory"
-                    )
+                else:
+                    nref = _normalize_ref(ref)
+                    if (
+                        nref not in symbols["fixtures"]
+                        and not any(
+                            s == nref or s.startswith(nref + ":")
+                            for s in symbols["fixtures"]
+                        )
+                    ):
+                        violations.append(
+                            f"{tc_id}: fixture `{fname}` reuse-from "
+                            f"`{ref}` not found in sut_inventory"
+                        )
                 if not (f.get("reuse_justification") or "").strip():
                     violations.append(
                         f"{tc_id}: fixture `{f.get('name')}` source=reuse "
@@ -332,16 +364,23 @@ def _validate_plan_against_inventory(
 
         for po in tc.get("page_objects") or []:
             src = po.get("source")
+            poname = po.get("name") or ""
             if src == "reuse":
+                if _is_generated_name(poname):
+                    violations.append(
+                        f"{tc_id}: page_object `{poname}` source=reuse but "
+                        f"name has Qtea/qtea_ prefix (generated artifact). "
+                        f"Use source=create instead."
+                    )
                 ref = po.get("from")
                 if not ref:
                     violations.append(
-                        f"{tc_id}: page_object `{po.get('name')}` source=reuse "
+                        f"{tc_id}: page_object `{poname}` source=reuse "
                         f"missing `from` field"
                     )
-                elif ref not in symbols["page_objects"]:
+                elif _normalize_ref(ref) not in symbols["page_objects"]:
                     violations.append(
-                        f"{tc_id}: page_object `{po.get('name')}` reuse-from "
+                        f"{tc_id}: page_object `{poname}` reuse-from "
                         f"`{ref}` not found in sut_inventory"
                     )
                 if not (po.get("reuse_justification") or "").strip():
@@ -404,7 +443,7 @@ def _validate_plan_against_inventory(
                     )
             elif src == "reuse":
                 ref = loc.get("from") or loc.get("name")
-                if ref and ref not in symbols["locators"]:
+                if ref and _normalize_ref(ref) not in symbols["locators"]:
                     # Locator reuse can reference either the constant name or
                     # the owning file. A miss here is genuinely soft: Step 6's
                     # locator enumeration is often incomplete (it can't always

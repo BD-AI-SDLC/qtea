@@ -82,13 +82,13 @@ def build_step_card(step: StepUIState, on_click=None) -> ft.Container:
     detail_parts: list[ft.Control] = []
 
     if step.status in ("in_progress", "completed", "failed", "warned"):
-        detail_parts.append(
-            ft.Text(
-                _fmt_elapsed(step.elapsed_s),
-                size=12,
-                color=ON_SURFACE_DIM,
-            )
+        elapsed_text = ft.Text(
+            _fmt_elapsed(step.elapsed_s),
+            size=12,
+            color=ON_SURFACE_DIM,
+            data="live_step_elapsed" if step.status == "in_progress" else None,
         )
+        detail_parts.append(elapsed_text)
 
     if step.attempts > 1:
         detail_parts.append(

@@ -2,7 +2,7 @@
 # Sourced by src/qtea/config.py (single source of truth).
 
 # -- Phase A: Requirements & Planning --
-jira-to-ai-spec: claude-haiku-4-5@20251001
+ticket-to-ai-spec: claude-haiku-4-5@20251001
 refine-spec: claude-sonnet-4-6
 polyglot-test-planner: claude-sonnet-4-6
 test-manager: claude-sonnet-4-6

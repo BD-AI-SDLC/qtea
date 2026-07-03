@@ -858,3 +858,264 @@ def test_asdict_strips_locator_constant_line_through_full_inventory():
                 assert "line" not in c, (
                     f"`line` leaked into {mod_d['name']}.{lc['class_name']}.{c['name']}"
                 )
+
+
+# ---------------------------------------------------------------------------
+# scan_ts_fixtures — Playwright test.extend blocks
+# ---------------------------------------------------------------------------
+
+
+def test_scan_ts_fixtures_finds_async_and_sync(tmp_path: Path):
+    """Both async and sync arrow-function fixtures are found.
+
+    Regression: the old regex required `async` and silently dropped
+    sync fixtures like ``{syncFix: ({page}, use) => {...}}``. Also
+    covers the ``baseTest.extend<T>({...})`` receiver-name variant.
+    """
+    from qtea.sut_inventory import scan_ts_fixtures
+
+    fixture_file = tmp_path / "tests" / "fixtures" / "pageFixtures.ts"
+    fixture_file.parent.mkdir(parents=True, exist_ok=True)
+    fixture_file.write_text(
+        "import { test as baseTest } from '@playwright/test';\n"
+        "\n"
+        "export const test = baseTest.extend<{"
+        "loginPage: LoginPage; basePage: BasePage;"
+        "}>({\n"
+        "  loginPage: async ({ page }, use) => {\n"
+        "    await use(new LoginPage(page));\n"
+        "  },\n"
+        "  basePage: ({ page }, use) => {\n"
+        "    use(new BasePage(page));\n"
+        "  },\n"
+        "});\n",
+        encoding="utf-8",
+    )
+    fixtures = scan_ts_fixtures(tmp_path)
+    names = sorted(f.name for f in fixtures)
+    assert names == ["basePage", "loginPage"], (
+        f"expected both async loginPage and sync basePage, got {names!r}"
+    )
+
+
+def test_scan_ts_fixtures_accepts_no_generic_param(tmp_path: Path):
+    """`.extend({...})` without a generic type param still finds fixtures."""
+    from qtea.sut_inventory import scan_ts_fixtures
+
+    fixture_file = tmp_path / "tests" / "fixtures" / "simple.ts"
+    fixture_file.parent.mkdir(parents=True, exist_ok=True)
+    fixture_file.write_text(
+        "import { test } from '@playwright/test';\n"
+        "\n"
+        "export const customTest = test.extend({\n"
+        "  myFixture: async ({ page }, use) => { await use(page); },\n"
+        "});\n",
+        encoding="utf-8",
+    )
+    fixtures = scan_ts_fixtures(tmp_path)
+    assert [f.name for f in fixtures] == ["myFixture"]
+
+
+# ---------------------------------------------------------------------------
+# Pattern-agnostic TS locator scanners — multi-convention recognition
+# ---------------------------------------------------------------------------
+#
+# The scanner must recognise any reasonable Playwright-TS convention:
+#   - separate `class *Locators*` (historical Python-Selenium style)
+#   - `export const *Locators/*Selectors/*Elements = {...}` object literal
+#   - inline `elements = {btnX: '...'}` property on a POM class
+#   - `readonly submitBtn = this.page.getByRole(...)` Locator properties
+
+
+def test_scan_ts_locators_inline_object_property(tmp_path: Path):
+    """The user's SUT convention: `class Foo { elements = {btnX: '...'} }`.
+
+    Regression: the old scanner required a separate `*Locators*` class and
+    UPPERCASE constants, silently returning zero entries for this common
+    Playwright-TS pattern.
+    """
+    from qtea.sut_inventory import scan_ts_locators
+
+    page_file = tmp_path / "src" / "pages" / "RopaEntryPage.ts"
+    page_file.parent.mkdir(parents=True, exist_ok=True)
+    page_file.write_text(
+        "import { Page } from '@playwright/test';\n"
+        "\n"
+        "export class RopaEntryPage {\n"
+        "    constructor(private page: Page) {}\n"
+        "\n"
+        "    elements: Record<string, string> = {\n"
+        "        btnCreateNewRopa: '//button[@data-test=\"create\"]',\n"
+        "        btnSubmit: '[data-testid=\"submit-btn\"]',\n"
+        "        inpName: '#name-input',\n"
+        "    };\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    results = scan_ts_locators(tmp_path)
+    assert len(results) == 1
+    lc = results[0]
+    assert lc.location_pattern == "inline_object_property"
+    assert lc.owning_pom == "RopaEntryPage"
+    assert lc.container_name == "elements"
+    assert lc.class_name == "RopaEntryPage"
+    names = sorted(c.name for c in lc.constants)
+    assert names == ["btnCreateNewRopa", "btnSubmit", "inpName"], (
+        f"camelCase properties must be found; got {names!r}"
+    )
+
+
+def test_scan_ts_locators_export_const_object(tmp_path: Path):
+    """`export const FooLocators = {EMAIL: '...'}` object-literal convention."""
+    from qtea.sut_inventory import scan_ts_locators
+
+    src = tmp_path / "src" / "pages" / "LoginPage.ts"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text(
+        "export const LoginLocators = {\n"
+        "    EMAIL_INPUT: '[data-testid=\"email\"]',\n"
+        "    PASSWORD_INPUT: '[data-testid=\"password\"]',\n"
+        "    SUBMIT_BTN: '#submit',\n"
+        "};\n",
+        encoding="utf-8",
+    )
+    results = scan_ts_locators(tmp_path)
+    assert len(results) == 1
+    lc = results[0]
+    assert lc.location_pattern == "export_const_object"
+    assert lc.class_name == "LoginLocators"
+    names = sorted(c.name for c in lc.constants)
+    assert names == ["EMAIL_INPUT", "PASSWORD_INPUT", "SUBMIT_BTN"]
+
+
+def test_scan_ts_locators_readonly_locator_props(tmp_path: Path):
+    """`readonly submitBtn = this.page.getByRole(...)` Locator properties.
+
+    Playwright-idiomatic pattern where locators ARE Locator objects, not
+    selector strings. The scanner records their existence for dedup even
+    though `selector` is empty.
+    """
+    from qtea.sut_inventory import scan_ts_locators
+
+    src = tmp_path / "src" / "pages" / "DashboardPage.ts"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text(
+        "import { Page, Locator } from '@playwright/test';\n"
+        "\n"
+        "export class DashboardPage {\n"
+        "    readonly submitBtn: Locator;\n"
+        "    readonly navMenu: Locator;\n"
+        "\n"
+        "    constructor(page: Page) {\n"
+        "        this.submitBtn = page.getByRole('button', { name: 'Submit' });\n"
+        "        this.navMenu = page.getByTestId('nav-menu');\n"
+        "    }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    # The assignment-style syntax above is inside constructor, not the
+    # class body — a more accurate test file uses inline `readonly X =`
+    # property definitions:
+    src.write_text(
+        "import { Page } from '@playwright/test';\n"
+        "\n"
+        "export class DashboardPage {\n"
+        "    constructor(private page: Page) {}\n"
+        "\n"
+        "    readonly submitBtn = this.page.getByRole('button', { name: 'Submit' });\n"
+        "    readonly navMenu = this.page.getByTestId('nav-menu');\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    results = scan_ts_locators(tmp_path)
+    assert len(results) == 1
+    lc = results[0]
+    assert lc.location_pattern == "readonly_locator_props"
+    assert lc.owning_pom == "DashboardPage"
+    names = sorted(c.name for c in lc.constants)
+    assert names == ["navMenu", "submitBtn"]
+
+
+def test_scan_ts_locators_separate_class_still_works(tmp_path: Path):
+    """The historical `class FooLocators { EMAIL = "..." }` still works —
+    the multi-pattern rewrite must not regress existing SUTs."""
+    from qtea.sut_inventory import scan_ts_locators
+
+    src = tmp_path / "src" / "locators" / "loginLocators.ts"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text(
+        "export class LoginPageLocators {\n"
+        "    static readonly EMAIL = '[data-testid=\"email\"]';\n"
+        "    static readonly PASSWORD = '[data-testid=\"password\"]';\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    results = scan_ts_locators(tmp_path)
+    assert len(results) >= 1
+    hit = next((lc for lc in results if lc.class_name == "LoginPageLocators"), None)
+    assert hit is not None
+    assert hit.location_pattern == "separate_class"
+    names = sorted(c.name for c in hit.constants)
+    assert names == ["EMAIL", "PASSWORD"]
+
+
+# ---------------------------------------------------------------------------
+# Pattern-agnostic TS POM detection — structural intent + naming
+# ---------------------------------------------------------------------------
+
+
+def test_scan_ts_page_objects_finds_extends_class(tmp_path: Path):
+    """POM class name followed by `extends` (not `{` or `<`) must be found.
+
+    Regression: the old `_TS_CLASS_RE` required `[{<]` immediately after
+    the class name, missing every subclass declaration in the wild.
+    """
+    from qtea.sut_inventory import scan_ts_page_objects
+
+    src = tmp_path / "src" / "pages" / "RopaEntryPage.ts"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text(
+        "import { BasePage } from './BasePage';\n"
+        "\n"
+        "export class RopaEntryPage extends BasePage {\n"
+        "    constructor(page) { super(page); }\n"
+        "\n"
+        "    elements = { btnX: '//button' };\n"
+        "\n"
+        "    async click() { await this.page.locator('#x').click(); }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    poms = scan_ts_page_objects(tmp_path)
+    names = sorted(p.name for p in poms)
+    assert "RopaEntryPage" in names
+    hit = next(p for p in poms if p.name == "RopaEntryPage")
+    assert hit.has_inline_locators is True
+
+
+def test_scan_ts_page_objects_structural_detection(tmp_path: Path):
+    """Class NOT named `*Page*` is still classified as POM when its body
+    contains Playwright/Selenium/Cypress API calls."""
+    from qtea.sut_inventory import scan_ts_page_objects
+
+    src = tmp_path / "src" / "screens" / "Dashboard.ts"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text(
+        "import { Page } from '@playwright/test';\n"
+        "\n"
+        "export class Dashboard {\n"
+        "    constructor(private page: Page) {}\n"
+        "\n"
+        "    async open() {\n"
+        "        await this.page.goto('/dashboard');\n"
+        "        await this.page.locator('#main').waitFor();\n"
+        "    }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    poms = scan_ts_page_objects(tmp_path)
+    names = sorted(p.name for p in poms)
+    assert "Dashboard" in names, (
+        f"Structural POM detection should find `Dashboard` "
+        f"despite non-`*Page` name; got {names!r}"
+    )

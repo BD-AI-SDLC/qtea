@@ -87,24 +87,37 @@ def test_estimate_cost_exact_at_form_matches_dash_form():
 
 
 def test_estimate_cost_opus_pricing():
-    """Opus: 1M input = $15, 1M output = $75 (5× Sonnet)."""
-    assert estimate_cost("claude-opus-4-8", input_tokens=1_000_000) == 15.0
-    assert estimate_cost("claude-opus-4-8", output_tokens=1_000_000) == 75.0
+    """Opus 4.6 on the Bosch platform: 1M input = $5, 1M output = $25."""
+    assert estimate_cost("claude-opus-4-6", input_tokens=1_000_000) == 5.0
+    assert estimate_cost("claude-opus-4-6", output_tokens=1_000_000) == 25.0
 
 
 def test_estimate_cost_unknown_model_falls_back_to_family():
-    """A brand-new model id like 'claude-sonnet-4-7-foo' falls back to Sonnet rates."""
+    """A brand-new Claude 4.x model id like 'claude-sonnet-4-7-foo' falls back
+    to Sonnet 4.6 rates via :func:`_model_family_fallback`."""
     cost = estimate_cost(
         "claude-sonnet-4-7-experimental", input_tokens=1_000_000
     )
-    assert cost == 3.0  # Sonnet family
+    assert cost == 3.0  # Sonnet family (Bosch)
 
 
 def test_estimate_cost_unknown_opus_variant_falls_back_to_opus_family():
+    """A Claude 4.x Opus variant not in the explicit table falls back to
+    Opus 4.6's Bosch rate ($5 / MTok input)."""
     cost = estimate_cost(
-        "claude-opus-9000-future", input_tokens=1_000_000
+        "claude-opus-4-9-experimental", input_tokens=1_000_000
     )
-    assert cost == 15.0  # Opus family
+    assert cost == 5.0  # Opus family (Bosch, Claude 4.x)
+
+
+def test_estimate_cost_non_claude_4x_family_returns_zero():
+    """Guard for the ``-4-`` restriction in :func:`_model_family_fallback`:
+    Claude 3 (or a hypothetical Claude 5) ID must return 0.0 rather than
+    being silently mispriced at Claude 4.x rates. Forces an explicit
+    pricing-table update when new families arrive."""
+    assert estimate_cost("claude-3-opus-20240229", input_tokens=1_000_000) == 0.0
+    assert estimate_cost("claude-3-5-sonnet-20241022", input_tokens=1_000_000) == 0.0
+    assert estimate_cost("claude-opus-5-0", input_tokens=1_000_000) == 0.0
 
 
 def test_estimate_cost_completely_unknown_returns_zero():
@@ -154,6 +167,7 @@ def test_estimate_cost_from_metrics_empty_metrics():
 
 
 def test_pricing_basis_is_versioned():
-    """The basis string must be informative — used in audit JSON for traceability."""
-    assert "anthropic" in PRICING_BASIS.lower()
+    """The basis string must identify the source and carry a version marker —
+    audit JSON consumers use it to detect table drift across runs."""
+    assert "bosch" in PRICING_BASIS.lower()
     assert any(c.isdigit() for c in PRICING_BASIS)  # has a year/version marker

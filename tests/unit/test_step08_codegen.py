@@ -20,11 +20,13 @@ from qtea.runtime.dev_locators import DevLocator
 from qtea.steps.s08_codegen import (
     CodegenStep,
     _LocatorTask,
+    _b5_filter_test_files,
     _detect_init_placement,
     _filter_index_to_qtea,
     _framework_mismatch_message,
     _match_dev_locator,
     _parse_test_command_head,
+    _run_phase_b55_xpath_normalisation,
     _strip_code_fences,
     _write_tbd_locators,
 )
@@ -421,6 +423,31 @@ def test_strip_code_fences_bare():
     assert _strip_code_fences(fenced) == "some code"
 
 
+def test_b5_filter_recognises_playwright_spec_ts_convention(tmp_path: Path):
+    """Regression guard for run 20260701-114656-9394eb: the emitted test
+    file was ``qtea_ropa_approval_test.spec.ts`` (Playwright's ``.spec.ts``
+    convention). The prior filter required ``stem.endswith("_test")``, and
+    the stem here is ``qtea_ropa_approval_test.spec`` — so the file was
+    silently skipped by B.5 (0 test files scanned).
+    """
+    files = [
+        tmp_path / "qtea_ropa_approval_test.spec.ts",       # Playwright .spec.ts
+        tmp_path / "qtea_login.spec.ts",                    # Playwright bare .spec.ts
+        tmp_path / "qtea_dashboard.spec.js",                # Playwright .spec.js
+        tmp_path / "qtea_setup_page.ts",                    # POM — must NOT be picked
+        tmp_path / "qtea_login_test.py",                    # Python — legacy _test suffix
+    ]
+    for p in files:
+        p.write_text("", encoding="utf-8")
+    picked = _b5_filter_test_files(files, language="typescript")
+    picked_names = {p.name for p in picked}
+    assert "qtea_ropa_approval_test.spec.ts" in picked_names
+    assert "qtea_login.spec.ts" in picked_names
+    assert "qtea_dashboard.spec.js" in picked_names
+    assert "qtea_setup_page.ts" not in picked_names, "POM leaked into test set"
+    assert "qtea_login_test.py" in picked_names
+
+
 def test_strip_code_fences_with_prose_preamble():
     """Run 20260611-075728 repro: LLM wrote reasoning BEFORE the fence and
     the .py file ended up with prose at line 1 → parse_error in Phase B.5."""
@@ -492,6 +519,151 @@ async def test_step08_strips_fences_from_generated_files(tmp_path: Path, monkeyp
     assert not written.startswith("```"), (
         f"Markdown fences leaked into generated file: {written[:40]!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase B.5.5 — legacy XPath normalisation
+# ---------------------------------------------------------------------------
+
+
+def test_phase_b55_normalises_legacy_xpath_in_pom(tmp_path: Path):
+    """Pre-existing POM with xpath locators is rewritten before the gate
+    sees it. Playwright config picks up testIdAttribute automatically."""
+    sut = tmp_path / "sut"
+    (sut / "src" / "pages").mkdir(parents=True)
+    pom = sut / "src" / "pages" / "BasePage.ts"
+    pom.write_text(
+        "import { Page } from '@playwright/test';\n"
+        "export class BasePage {\n"
+        "  page: Page;\n"
+        "  elements: Record<string, string> = {\n"
+        "    inpUser: '//input[@data-test=\"username-input\"]',\n"
+        "    btnGo: '//button[contains(normalize-space(.), \"Go\")]',\n"
+        "  };\n"
+        "  constructor(p: Page) { this.page = p; }\n"
+        "  async go() { await this.page.locator(this.elements.btnGo).click(); }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (sut / "playwright.config.ts").write_text(
+        "import { defineConfig } from '@playwright/test';\n"
+        "export default defineConfig({\n"
+        "  testDir: './tests',\n"
+        "  use: { baseURL: 'https://example.com' },\n"
+        "});\n",
+        encoding="utf-8",
+    )
+    reports, stragglers = _run_phase_b55_xpath_normalisation(
+        sut_root=sut,
+        candidates={pom.resolve()},
+    )
+    assert stragglers == []
+    assert len(reports) == 1
+    r = reports[0]
+    assert r.container_migrated
+    assert r.call_sites_migrated == 1
+    assert r.testid_attr_needed
+    new = pom.read_text(encoding="utf-8")
+    assert "getByTestId('username-input')" in new
+    assert "getByRole('button', { name: 'Go' })" in new
+    assert "this.elements.btnGo()" in new
+    # config touched
+    cfg = (sut / "playwright.config.ts").read_text(encoding="utf-8")
+    assert "testIdAttribute: 'data-test'" in cfg
+
+
+def test_phase_b55_collects_stragglers_for_llm(tmp_path: Path):
+    """Xpath the deterministic rewriter can't safely translate lands in
+    the straggler list and gets an exempt marker in the source."""
+    sut = tmp_path / "sut"
+    (sut / "src" / "pages").mkdir(parents=True)
+    pom = sut / "src" / "pages" / "Hairy.ts"
+    pom.write_text(
+        "export class Hairy {\n"
+        "  page: any;\n"
+        "  elements: Record<string, string> = {\n"
+        "    goodOne: '//input[@data-test=\"x\"]',\n"
+        "    axisOne: '//div[@ref=\"y\"]/parent::td',\n"
+        "  };\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    reports, stragglers = _run_phase_b55_xpath_normalisation(
+        sut_root=sut,
+        candidates={pom.resolve()},
+    )
+    assert len(stragglers) == 1
+    assert "parent::td" in stragglers[0].original
+    new = pom.read_text(encoding="utf-8")
+    # Marker present so the gate skips the surviving xpath
+    assert "qtea-xpath-exempt" in new
+    assert "getByTestId('x')" in new
+
+
+def test_phase_b55_skips_non_ts_js_files(tmp_path: Path):
+    """Python / Java files should never enter this pass."""
+    sut = tmp_path / "sut"
+    sut.mkdir()
+    py = sut / "test_x.py"
+    py.write_text("assert True\n", encoding="utf-8")
+    java = sut / "Base.java"
+    java.write_text("class Base {}\n", encoding="utf-8")
+    reports, stragglers = _run_phase_b55_xpath_normalisation(
+        sut_root=sut,
+        candidates={py.resolve(), java.resolve()},
+    )
+    assert reports == []
+    assert stragglers == []
+
+
+def test_phase_b55_gate_gets_zero_violations_after_rewrite(tmp_path: Path):
+    """End-to-end check: after Phase B.5.5 runs, the xpath quality-gate
+    reports zero violations for the modified files (except those explicitly
+    marked exempt)."""
+    from qtea.test_indexer import index_tests
+
+    sut = tmp_path / "sut"
+    tests_dir = sut / "tests"
+    pages_dir = sut / "src" / "pages"
+    tests_dir.mkdir(parents=True)
+    pages_dir.mkdir(parents=True)
+    pom = pages_dir / "LoginPage.ts"
+    pom.write_text(
+        "import { Page } from '@playwright/test';\n"
+        "export class LoginPage {\n"
+        "  page: Page;\n"
+        "  elements: Record<string, string> = {\n"
+        "    inpUser: '//input[@data-test=\"user\"]',\n"
+        "    inpPass: '//input[@data-test=\"pass\"]',\n"
+        "  };\n"
+        "  constructor(p: Page) { this.page = p; }\n"
+        "  async login(u: string, p: string) {\n"
+        "    await this.page.locator(this.elements.inpUser).fill(u);\n"
+        "    await this.page.locator(this.elements.inpPass).fill(p);\n"
+        "  }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (tests_dir / "qtea_login_test.spec.ts").write_text(
+        "import { test, expect } from '@playwright/test';\n"
+        "// @tc TC-1\n"
+        "test('login', async ({ page }) => { await expect(page).toHaveTitle(/.*/); });\n",
+        encoding="utf-8",
+    )
+
+    # Pre-normalisation: the gate WOULD flag xpath in LoginPage.ts
+    pre = index_tests(sut, framework="playwright-ts")
+    assert any(v.rule == "xpath" for v in pre.violations)
+
+    # Run Phase B.5.5
+    _run_phase_b55_xpath_normalisation(
+        sut_root=sut, candidates={pom.resolve()},
+    )
+
+    # Post-normalisation: no more xpath violations
+    post = index_tests(sut, framework="playwright-ts")
+    xpath_hits = [v for v in post.violations if v.rule == "xpath"]
+    assert xpath_hits == [], f"expected zero xpath, got: {xpath_hits}"
 
 
 # ---------------------------------------------------------------------------
@@ -709,13 +881,15 @@ async def test_step08_b5_autopatch_still_fails(tmp_path: Path, monkeypatch):
 
 
 async def test_step08_b5_skipped_for_unsupported_language(tmp_path: Path, monkeypatch):
-    """When the plan declares Java (out of B.5 v1 scope), the step must
-    complete and stamp `b5_skipped=java` on notes so a green B.5 line
-    cannot be misread as Java being covered. The default _ctx writes
-    no `sut_inventory`, so the language resolution falls through to
-    plan_data["language"] — exactly the path Java SUTs hit today."""
+    """When the plan declares a language outside `_B5_SUPPORTED_LANGUAGES`,
+    the step must complete and stamp `b5_skipped=<lang>` on notes so a
+    green B.5 line cannot be misread as "that language was covered."
+
+    Currently supported: python, typescript, javascript, java. This test
+    uses ``csharp`` as a genuinely out-of-scope example.
+    """
     plan = json.loads(json.dumps(_B5_PLAN_WITH_POM))  # deep copy
-    plan["language"] = "java"
+    plan["language"] = "csharp"
     ctx = _ctx(
         tmp_path,
         detected_stack="pytest",  # framework resolution still works
@@ -737,7 +911,7 @@ async def test_step08_b5_skipped_for_unsupported_language(tmp_path: Path, monkey
 
     result = await CodegenStep().run(ctx)
     assert result.success, result.error
-    assert "b5_skipped=java" in (result.notes or ""), (
+    assert "b5_skipped=csharp" in (result.notes or ""), (
         f"Unsupported language must be surfaced in notes; got: {result.notes!r}"
     )
     # When B.5 is skipped no auto-patch round should fire.
@@ -1016,6 +1190,141 @@ def test_write_tbd_locators_instance_placement(tmp_path: Path):
         if "NEW_FIELD" in line:
             assert "self." in line, f"must use self. prefix: {line}"
             break
+
+
+def test_write_tbd_locators_defers_inline_object_property(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When the SUT uses `inline_object_property` convention (elements
+    dict on POM class), Step 8 should DEFER the task to the POM extender
+    agent rather than mechanically writing.
+
+    Regression: the previous behaviour warned `tbd_locator_no_file` even
+    though the file exists and the convention is fully recognised.
+    """
+    import logging
+
+    pom_file = tmp_path / "src" / "pages" / "RopaEntryPage.ts"
+    pom_file.parent.mkdir(parents=True, exist_ok=True)
+    pom_file.write_text(
+        "export class RopaEntryPage {\n"
+        "    elements = { btnCreate: '//button' };\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    tasks = [_LocatorTask(
+        constant_name="btnSendForApproval",
+        intent="send for approval button",
+        owning_page="RopaEntryPage",
+        locator_file="src/pages/RopaEntryPage.ts",
+        location_pattern="inline_object_property",
+        container_name="elements",
+    )]
+    caplog.set_level(logging.INFO)
+    count = _write_tbd_locators(tasks, tmp_path, "typescript")
+    # Nothing mechanically written; POM extender handles it downstream.
+    assert count == 0
+    # Verify a DEFER log fired at INFO — NOT a warning about missing file.
+    messages = [rec.message for rec in caplog.records]
+    assert any(
+        "tbd_locator_deferred_to_extender" in m for m in messages
+    ), f"expected deferred INFO log; got {messages!r}"
+    # Old warning event MUST NOT fire when the convention is recognised.
+    assert not any(
+        "tbd_locator_no_file" in m for m in messages
+    ), "old 'no_file' warning must not fire for recognised patterns"
+
+
+def test_write_tbd_locators_defers_when_no_locator_source(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When the SUT has no locator source for a POM at all (neither
+    inline nor separate), defer to POM extender for inline method-body
+    placement instead of warning noisily."""
+    import logging
+
+    tasks = [_LocatorTask(
+        constant_name="btnSubmit",
+        intent="submit button",
+        owning_page="UnknownPage",
+        locator_file=None,
+        location_pattern=None,
+    )]
+    caplog.set_level(logging.INFO)
+    count = _write_tbd_locators(tasks, tmp_path, "typescript")
+    assert count == 0
+    messages = [rec.message for rec in caplog.records]
+    assert any(
+        "tbd_locator_no_source_defer" in m for m in messages
+    ), f"expected no-source-defer INFO log; got {messages!r}"
+
+
+def test_build_locator_tasks_matches_inline_by_owning_pom(tmp_path: Path):
+    """`_build_locator_tasks` resolves via `owning_pom` when the SUT uses
+    inline patterns — NOT just `{Page}Locators` name-lookup."""
+    from qtea.steps.s08_codegen import _build_locator_tasks
+
+    plan = {
+        "test_cases": [{
+            "id": "TC-1",
+            "locators": [{
+                "source": "create_tbd",
+                "name": "btnSendForApproval",
+                "intent": "send for approval button",
+                "owning_page": "RopaEntryPage",
+            }],
+        }],
+    }
+    inventory = {
+        "modules": [{
+            "name": "sut", "path": ".", "language": "typescript",
+            "existing_locators": [{
+                "class_name": "RopaEntryPage",
+                "file": "src/pages/RopaEntryPage.ts",
+                "location_pattern": "inline_object_property",
+                "owning_pom": "RopaEntryPage",
+                "container_name": "elements",
+            }],
+        }],
+        "active_module": "sut",
+    }
+    tasks = _build_locator_tasks(plan, inventory)
+    assert len(tasks) == 1
+    t = tasks[0]
+    assert t.location_pattern == "inline_object_property"
+    assert t.locator_file == "src/pages/RopaEntryPage.ts"
+    assert t.container_name == "elements"
+
+
+def test_build_locator_tasks_backwards_compat_separate_class(tmp_path: Path):
+    """Legacy `{Page}Locators` name-lookup still works for SUTs using the
+    Python-Selenium convention."""
+    from qtea.steps.s08_codegen import _build_locator_tasks
+
+    plan = {
+        "test_cases": [{
+            "id": "TC-1",
+            "locators": [{
+                "source": "create_tbd",
+                "name": "EMAIL_INPUT",
+                "intent": "email input",
+                "owning_page": "LoginPage",
+            }],
+        }],
+    }
+    inventory = {
+        "modules": [{
+            "name": "sut", "path": ".", "language": "python",
+            "existing_locators": [{
+                "class_name": "LoginPageLocators",
+                "file": "src/locators/login.py",
+            }],
+        }],
+        "active_module": "sut",
+    }
+    tasks = _build_locator_tasks(plan, inventory)
+    assert len(tasks) == 1
+    assert tasks[0].locator_file == "src/locators/login.py"
 
 
 # ---------------------------------------------------------------------------

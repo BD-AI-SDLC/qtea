@@ -330,6 +330,26 @@ _LIFECYCLE_NAMES: frozenset[str] = frozenset({
     "if", "for", "while", "switch", "return", "do", "catch",
 })
 
+# Java method definition HEAD: required visibility (excludes package-private,
+# which safely dodges false positives from `return foo(...)` / `throw x(...)`),
+# optional modifiers + method-level generics, return type, name, `(`.
+_JAVA_METHOD_HEAD_RE = re.compile(
+    r"^[ \t]*"
+    r"(?:(?:public|private|protected)\s+)"
+    r"(?:(?:static|final|abstract|synchronized|native|default)\s+)*"
+    r"(?:<[^<>]*>\s+)?"
+    r"(?:void|[\w$][\w$.]*(?:<[^<>]*>)?(?:\[\])*)\s+"
+    r"([\w$]+)\s*\(",
+    re.MULTILINE,
+)
+_JAVA_LIFECYCLE_NAMES: frozenset[str] = frozenset({
+    "setUp", "tearDown",
+    "setUpBeforeClass", "tearDownAfterClass",
+    "beforeEach", "afterEach", "beforeAll", "afterAll",
+    "beforeMethod", "afterMethod", "beforeClass", "afterClass",
+    "beforeTest", "afterTest", "beforeSuite", "afterSuite",
+})
+
 
 def _js_strip(src: str) -> str:
     """Blank out string literals + comments while preserving length.
@@ -449,6 +469,69 @@ def _js_pom_methods(src: str, class_name: str) -> list[_Sig]:
     return out
 
 
+def _split_java_args(blob: str) -> tuple[int, list[str], bool]:
+    """Split a Java parameter blob into (arity, [], flexible).
+
+    Params like ``int x, String y``, ``List<Map<K,V>> m``, ``String... args``.
+    ``flexible=True`` when any param uses varargs (``...``) — arity check is
+    then skipped since callers can pass 0..N values.
+    """
+    blob = blob.strip()
+    if not blob:
+        return 0, [], False
+    depth = 0
+    parts: list[str] = []
+    cur = ""
+    for ch in blob:
+        if ch in "([{<":
+            depth += 1
+        elif ch in ")]}>":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        parts.append(cur.strip())
+    flexible = any("..." in p for p in parts)
+    return len(parts), [], flexible
+
+
+def _java_pom_methods(src: str, class_name: str) -> list[_Sig]:
+    """Extract method signatures from the named class body in a .java file.
+
+    Reuses ``_js_class_body`` (brace-matching is language-neutral) after
+    stripping strings/comments with ``_js_strip``. Requires visibility
+    (public/private/protected) to skip false positives from `return foo(...)`,
+    `throw new X(...)`, and similar statements at line start.
+    """
+    body = _js_class_body(_js_strip(src), class_name)
+    if body is None:
+        return []
+    out: list[_Sig] = []
+    seen: set[str] = set()
+    for m in _JAVA_METHOD_HEAD_RE.finditer(body):
+        name = m.group(1)
+        if name in _JAVA_LIFECYCLE_NAMES or name in seen:
+            continue
+        open_paren = m.end() - 1
+        close = _find_balanced(body, open_paren)
+        if close == -1:
+            continue
+        # Java method definitions end with `{` (body), `;` (abstract /
+        # interface), or `throws ExceptionType`. Anything else means we
+        # matched a call site by accident.
+        tail = body[close + 1: close + 32].lstrip()
+        if not tail or (tail[0] not in "{;" and not tail.startswith("throws")):
+            continue
+        blob = body[m.end(): close]
+        arity, _kw, flexible = _split_java_args(blob)
+        seen.add(name)
+        out.append(_Sig(name, arity, [], flexible=flexible))
+    return out
+
+
 def _js_imports(src: str, known: set[str]) -> dict[str, str]:
     aliases: dict[str, str] = {}
     for m in _JS_IMPORT_RE.finditer(src):
@@ -532,6 +615,13 @@ def _scan_pom(
     if language == "python":
         tree = parse_file(path)
         return (path, _py_pom_methods(tree, cls) if tree is not None else [])
+    if language == "java":
+        try:
+            return path, _java_pom_methods(
+                path.read_text(encoding="utf-8", errors="replace"), cls,
+            )
+        except OSError:
+            return None, []
     try:
         return path, _js_pom_methods(
             path.read_text(encoding="utf-8", errors="replace"), cls,
@@ -554,7 +644,7 @@ def reconcile_codegen(
     to any known POM are silently ignored (likely SUT-native helpers).
     """
     lang = (language or "").lower()
-    if lang not in {"python", "typescript", "javascript"}:
+    if lang not in {"python", "typescript", "javascript", "java"}:
         log.warning("reconcile.unsupported_language", language=language)
         return ReconciliationResult(0, 0, 0, [])
 
@@ -735,11 +825,133 @@ def mismatches_to_pom_tasks(
     return out
 
 
-def _scan_fixture_symbols(path: Path) -> list[str] | None:
-    """Return the list of `@pytest.fixture`-decorated function names in a file.
+# Sentinel appended when a file exposes a fixture wrapper via `export default
+# <expr>.extend(...)` (or default `mergeTests(...)`) — the exported name is
+# arbitrary at the import site, so the reuse check must accept any `:symbol`
+# reference against a file that carries this sentinel.
+DEFAULT_EXPORT_SENTINEL = "__default_export_extend__"
 
-    Returns None when the file can't be read / parsed (treat as "file missing"
-    upstream). Empty list means the file exists but defines no fixtures.
+
+def _scan_ts_fixture_symbols(path: Path) -> list[str]:
+    """Extract Playwright fixture names from a TS/JS Playwright fixture file.
+
+    Covers the standard idioms a Playwright user would write:
+
+    - Inner `.extend<T>({ name: async ({}, use) => ... })` parameter names.
+    - Outer wrapper: `(export )?(const|let|var) NAME[:Type] = <expr>.extend(...)`
+      or `mergeTests(...)`.
+    - CommonJS: `(module.)?exports.NAME = <expr>.extend(...) | mergeTests(...)`.
+    - Separate named exports: `export { a, b as c };` (both re-exports of local
+      symbols and `export { a } from './other';` re-exports).
+    - Default export of an extend/mergeTests: emits DEFAULT_EXPORT_SENTINEL so
+      the reuse check treats any `:symbol` reference against the file as valid
+      (the consumer's `import test from '...'` name is arbitrary).
+
+    Without these, plan `reuse` references to the wrapper resolve against the
+    inner-only symbols and the reconciler falsely reports fixture_symbol_missing.
+
+    Returns an empty list when the file exists but exposes no fixture surface.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+
+    names: list[str] = []
+
+    # Inner .extend({...}) params
+    m = re.search(
+        r"\w+\.extend\s*(?:<[^>]*>\s*)?\(\s*\{(.+?)\}\s*\)",
+        text,
+        re.S,
+    )
+    if m:
+        body = m.group(1)
+        for km in re.finditer(r"^\s*(\w+)\s*:\s*(?:async\s*)?\(", body, re.M):
+            names.append(km.group(1))
+
+    # `(export )?(const|let|var) NAME[:Type] = <expr>.extend(...) | mergeTests(...)`
+    for outer in re.finditer(
+        r"(?:export\s+)?(?:const|let|var)\s+(\w+)\s*(?::[^=]+)?=\s*"
+        r"(?:\w+\.extend|mergeTests)\b",
+        text,
+    ):
+        names.append(outer.group(1))
+
+    # CommonJS: `(module.)?exports.NAME = <expr>.extend(...) | mergeTests(...)`
+    for outer in re.finditer(
+        r"(?:module\.)?exports\.(\w+)\s*=\s*(?:\w+\.extend|mergeTests)\b",
+        text,
+    ):
+        names.append(outer.group(1))
+
+    # Separate `export { a, b as c };` — also matches `export { a } from './x';`
+    # re-exports; the exposed name (post-`as`, or the identifier itself) is
+    # what a consumer's `import { … } from` would see.
+    for exp in re.finditer(r"export\s*\{([^}]+)\}", text):
+        for item in exp.group(1).split(","):
+            item = item.strip().rstrip(";").strip()
+            if not item:
+                continue
+            m2 = re.match(r"\w+\s+as\s+(\w+)$", item)
+            if m2:
+                names.append(m2.group(1))
+            else:
+                m3 = re.match(r"(\w+)$", item)
+                if m3:
+                    names.append(m3.group(1))
+
+    # `export default <expr>.extend(...) | mergeTests(...)` — arbitrary name at
+    # import site; register a sentinel and let the reuse check wildcard-match.
+    if re.search(
+        r"export\s+default\s+(?:\w+\.extend|mergeTests)\b",
+        text,
+    ):
+        names.append(DEFAULT_EXPORT_SENTINEL)
+
+    return names
+
+
+# JUnit 4/5 + TestNG lifecycle annotation → method-name regex. Neutralised
+# strings/comments via _js_strip before scanning.
+_JAVA_FIXTURE_RE = re.compile(
+    r"@Before(?:Each|All|Class|Method)?\b[^\n]*\n"
+    r"(?:\s*(?:@\w+(?:\([^)]*\))?)\s*\n?)*"
+    r"\s*(?:public|private|protected)?\s*"
+    r"(?:(?:static|final|synchronized|native)\s+)*"
+    r"(?:<[^<>]*>\s+)?"
+    r"(?:void|[\w$][\w$.]*(?:<[^<>]*>)?(?:\[\])*)\s+"
+    r"([\w$]+)\s*\(",
+)
+
+
+def _scan_java_fixture_symbols(path: Path) -> list[str]:
+    """Extract JUnit/TestNG lifecycle method names from a Java file.
+
+    Detects methods annotated with ``@Before``, ``@BeforeEach``, ``@BeforeAll``,
+    ``@BeforeClass``, ``@BeforeMethod`` (JUnit 4/5 + TestNG). Returns an empty
+    list when the file exists but defines no such methods.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    text = _js_strip(text)
+    return [m.group(1) for m in _JAVA_FIXTURE_RE.finditer(text)]
+
+
+def _scan_fixture_symbols(path: Path) -> list[str] | None:
+    """Return fixture names defined in *path*.
+
+    For ``.py`` files, scans for ``@pytest.fixture``-decorated functions.
+    For ``.ts``/``.js``/``.mts``/``.mjs`` files, scans for Playwright
+    ``*.extend<T>({...})`` blocks.
+    For ``.java`` files, scans for ``@Before*``-annotated methods
+    (JUnit 4/5 + TestNG).
+
+    Returns ``None`` when the file does not exist or cannot be read
+    (treated as "file missing" upstream).  An empty list means the file
+    exists but defines no recognisable fixtures.
     """
     if not path.is_file():
         return None
@@ -749,19 +961,30 @@ def _scan_fixture_symbols(path: Path) -> list[str] | None:
             return None
     except OSError:
         return None
-    tree = parse_file(path)
-    if tree is None:
-        return None
 
-    names: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        for dec in node.decorator_list:
-            if _decorator_is_pytest_fixture(dec):
-                names.append(node.name)
-                break
-    return names
+    suffix = path.suffix.lower()
+
+    if suffix in {".ts", ".js", ".mts", ".mjs"}:
+        return _scan_ts_fixture_symbols(path)
+
+    if suffix == ".java":
+        return _scan_java_fixture_symbols(path)
+
+    if suffix == ".py":
+        tree = parse_file(path)
+        if tree is None:
+            return None
+        names: list[str] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for dec in node.decorator_list:
+                if _decorator_is_pytest_fixture(dec):
+                    names.append(node.name)
+                    break
+        return names
+
+    return None
 
 
 def _decorator_is_pytest_fixture(dec: ast.expr) -> bool:
@@ -843,13 +1066,16 @@ def reconcile_fixtures(
             seen_names.add(name)
             if name in defined_set:
                 continue
+            # Never surface the internal sentinel in mismatch output.
             mismatches.append(FixtureMismatch(
                 kind="fixture_symbol_missing",
                 name=name,
                 expected_file=file_rel,
                 source="create",
                 referenced_by=list(refs_by_name.get((file_rel, name), [])),
-                existing_symbols=sorted(defined_set),
+                existing_symbols=sorted(
+                    s for s in defined_set if s != DEFAULT_EXPORT_SENTINEL
+                ),
             ))
 
     # ---- reuse checks ----
@@ -880,14 +1106,22 @@ def reconcile_fixtures(
             mismatches.append(mm)
             reuse_dedup[key] = mm
             continue
-        if symbol_part not in set(defined):
+        defined_set = set(defined)
+        # `export default <expr>.extend(...)` — consumer's import name is
+        # arbitrary, so any `:symbol` reference against this file is valid.
+        if DEFAULT_EXPORT_SENTINEL in defined_set:
+            reuse_dedup[key] = None
+            continue
+        if symbol_part not in defined_set:
             mm = FixtureMismatch(
                 kind="fixture_symbol_missing",
                 name=symbol_part,
                 expected_file=file_part,
                 source="reuse",
                 referenced_by=list(refs_by_name[key]),
-                existing_symbols=sorted(defined),
+                existing_symbols=sorted(
+                    s for s in defined_set if s != DEFAULT_EXPORT_SENTINEL
+                ),
             )
             mismatches.append(mm)
             reuse_dedup[key] = mm

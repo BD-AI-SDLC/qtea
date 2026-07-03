@@ -15,6 +15,21 @@ When the SUT is Python+pytest+Playwright, the Step 8-vendored runtime plugin (`t
 
 Under JIT, read `artifacts/step09/locator-cache.json` for the prior selector record. The cache file carries `selector`, `strategy`, `source`, and `confidence` per resolved TBD constant.
 
+## Overlay-intercepted failures — DO NOT locator-heal
+
+Some failures are caused by a popup/overlay (cookie consent, what's-new modal, session-extension prompt, survey) that visually covers the element you're trying to click. Playwright's error is `"element intercepts pointer events"` (modern) or `"is not clickable ... another element receives the click"` (legacy). These are NOT locator drift — the locator is fine; something ELSE is in front of it.
+
+**Detection.** When a Step 9 attempt hits this class of failure, the qtea runtime records the encounter to `<workspace>/overlay-events.jsonl` and the parent-side sweep reclassifies the affected bug candidates. Two markers appear on the bug candidate:
+
+- `_type: overlay_pending_hitl` — an overlay was detected but no interceptor is persisted yet. The operator will be prompted by the end-of-attempt HITL sweep to name a dismiss action; once persisted to `<sut>/.qtea/interceptors.json`, the runtime auto-dismisses it on every future run via Playwright's `page.add_locator_handler()`.
+- `_type: overlay_handled_next_run` — HITL already resolved this class of overlay; a persisted interceptor exists. The next run will be clean.
+
+**Your rule.** When the bug candidate for a failed test carries either marker, DO NOT propose locator changes for that test. Nothing about the locator is wrong. The overlay HITL flow is the correct place to fix this — your locator patches would be wasted (and possibly harmful, since the "correct" locator would still be intercepted by the same overlay).
+
+If you're invoked on such a test, respond with `OUT_OF_SCOPE: overlay_intercept` and a one-line note pointing the reviewer at the operator HITL flow. Do not add try/except around the click, do not add hard waits hoping the overlay disappears, do not change the selector.
+
+**Escape hatch for tests that intentionally interact with overlays.** If a test legitimately needs to see the overlay (e.g. a consent-flow regression test), the test author can call `page.remove_locator_handler(overlay_locator)` at the start of the test to opt out of the auto-dismiss. You may reference this pattern in a bug-candidate note if you diagnose that a test's failure is caused by an auto-dismiss firing when the test expected to see the overlay — but do NOT add the `remove_locator_handler` call yourself in a heal patch; that's a test-design decision, not a locator fix.
+
 ## Strict Scope
 
 ALLOWED:

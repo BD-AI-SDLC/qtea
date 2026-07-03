@@ -8,6 +8,7 @@ fake SDK Message objects. Optionally writes files into the agent's workdir
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -80,10 +81,32 @@ def install_fake_query(
             yield _make_message(spec)
 
     # Bypass the missing-binary precheck so tests don't need a real `claude`.
-    monkeypatch.setattr(
-        "qtea.claude_runner.shutil.which",
-        lambda *_a, **_kw: "/fake/claude",
-    )
+    #
+    # Selective: `monkeypatch.setattr("qtea.claude_runner.shutil.which", ...)`
+    # walks module attributes to reach `shutil.which` — and because Python
+    # caches modules, that IS the process-wide `shutil.which`. A blanket
+    # replacement broke `qtea.test_runner._split_command`, which calls
+    # `shutil.which(tokens[0])` to resolve the test-run executable (e.g.
+    # `python.exe`): the mock returned `/fake/claude` for python.exe too,
+    # and subprocess.run failed with WinError 2 / exit code 127 (regression
+    # in `test_step09_self_heal_repairs_and_passes` and
+    # `test_step09_failures_without_heal_yield_warned_and_bugs`). Only
+    # intercept lookups whose basename matches the claude binary; delegate
+    # everything else to the real `which`.
+    _real_which = shutil.which
+
+    def _selective_which(cmd, *args, **kwargs):
+        if cmd is None:
+            return None
+        # `shutil.which("claude")` (default), or a full path like
+        # `.../claude.exe`. Anything else — python, pytest, git, npx,
+        # ... — falls through so the real resolver runs.
+        base = Path(str(cmd)).name.lower()
+        if base in {"claude", "claude.exe"}:
+            return "/fake/claude"
+        return _real_which(cmd, *args, **kwargs)
+
+    monkeypatch.setattr("qtea.claude_runner.shutil.which", _selective_which)
     monkeypatch.setattr("qtea.claude_runner.query", _fake_query)
 
 

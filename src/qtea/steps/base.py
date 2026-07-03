@@ -17,7 +17,13 @@ from rich.prompt import Prompt
 
 from qtea.checkpoints import RunState, StepRecord, hash_paths
 from qtea.claude_runner import AgentResult, run_agent
-from qtea.config import package_resource_root
+from qtea.config import (
+    DEBUG_AGENT_MAX_TURNS,
+    DEBUG_AGENT_TIMEOUT_S,
+    FIX_AGENT_MAX_TURNS,
+    FIX_AGENT_TIMEOUT_S,
+    package_resource_root,
+)
 from qtea.hitl import (
     RESOLUTION_SKIPPED_DROP,
     HitlDecision,
@@ -159,12 +165,72 @@ def _build_failure_context(
     )
 
 
+def _agent_failure_placeholder(
+    *,
+    agent_label: str,
+    result: AgentResult,
+    failure_context: str,
+) -> str:
+    """Diagnostic placeholder for a debug/fix agent that never wrote its file.
+
+    The previous fallback (``out_path.write_text(result.final_text, ...)``)
+    treated the SDK's last ``AssistantMessage`` block as the agent's final
+    answer, which promoted pre-tool-call thinking prose (\"Let me check
+    X...\") to disk as if it were the RCA / strategy / proposal — and the
+    downstream fix chain then ran on 150 bytes of half-a-sentence
+    (regression: run 20260701-114656-9394eb, both debug.agent and
+    principal-software-engineer hit ``max_turns`` mid-investigation).
+
+    Instead, when the SDK returned ``success=False`` we make the failure
+    loud: header names the agent, error line surfaces the SDK reason
+    (turn cap / timeout / api storm), the truncated ``final_text`` is
+    embedded as a *thinking snippet* (blockquoted so downstream agents
+    don't mistake it for a heading), and the raw failure_context is
+    inlined so consumers still have concrete material to reason about
+    (the fix chain won't fall through to ``failure_context`` on its own
+    because the placeholder is non-empty).
+    """
+    lines = [
+        f"# {agent_label} — agent failed to produce artifact",
+        "",
+        f"**Error:** {result.error or 'unknown'}",
+    ]
+    transcript = getattr(result, "transcript_path", None)
+    if transcript is not None:
+        lines.append(f"**Transcript:** `{transcript}`")
+    lines.append("")
+    if result.final_text:
+        snippet = result.final_text.strip()
+        # Keep the placeholder scannable — the transcript link above lets
+        # the operator dig into the full final message if needed.
+        if len(snippet) > 2000:
+            snippet = snippet[:2000] + " ...[truncated]"
+        quoted = "> " + snippet.replace("\n", "\n> ")
+        lines.extend([
+            "## Last agent message (pre-truncation)",
+            "",
+            "> _The SDK cut the agent off before it wrote its output file._",
+            "> _The text below is the last ``AssistantMessage`` block —",
+            "> _typically pre-tool-call thinking, not the agent's actual answer._",
+            "",
+            quoted,
+            "",
+        ])
+    lines.extend([
+        "## Raw failure context",
+        "",
+        failure_context.rstrip(),
+        "",
+    ])
+    return "\n".join(lines)
+
+
 def _should_run_debug_rca(ctx: StepContext, has_more_attempts: bool) -> bool:
     """Gate the debug-RCA invocation.
 
     - Always fires on a FINAL failure (last attempt or no retry available):
-      gives the user a diagnosis artifact and supplies the ``--fix`` flow
-      with structured RCA input.
+      gives the user a diagnosis artifact and supplies the auto-firing
+      fix-proposal chain with structured RCA input.
     - On non-final failures (the retry will run regardless), only fires when
       ``--debug`` is set. Keeps token cost at zero for the common case where
       attempt 2 succeeds and the user never needs the intermediate RCA.
@@ -196,11 +262,25 @@ async def _run_debug_rca(
     context_file = rca_workdir / "failure-context.md"
     context_file.write_text(failure_context, encoding="utf-8")
 
-    # Grant read access to the failing step's workdir (transcripts, stderr,
-    # metrics under <workdir>/logs/) without copying. The agent decides
-    # what to ingest based on what its agent.md prompt tells it to read.
+    # Grant read access to (a) the failing step's agent scratchpad
+    # `<workspace>/step-NN/` (transcripts, stderr, metrics), (b) the step's
+    # artefact directory `<workspace>/artifacts/stepNN/` (run-results.json,
+    # bug-candidates.json, install.log — the real evidence for Step 9 and
+    # other pure-code steps that have no scratchpad), and (c) the workspace
+    # root so the agent can cross-reference earlier steps' artefacts if its
+    # agent.md prompt tells it to.
+    #
+    # Prior to run 20260701-114656-9394eb only `step_workdir` was granted.
+    # Step 9 has no agent scratchpad (no `step-09/` dir), so add_dirs
+    # collapsed to None and the debug agent could not read
+    # `artifacts/step09/run-results.json` — where Playwright's real error
+    # lived. The agent's own prompt already tells it to read
+    # `artifacts/stepNN/`; widening add_dirs to include it makes that
+    # instruction actually possible to execute.
     step_workdir = ctx.workspace.step_workdir(step_num)
-    add_dirs = [step_workdir] if step_workdir.exists() else None
+    step_artifacts = ctx.workspace.step_dir_path(step_num)
+    _dir_candidates = [step_workdir, step_artifacts, ctx.workspace.root]
+    add_dirs = [d for d in _dir_candidates if d.exists()] or None
 
     out_path = ctx.workspace.debug / f"step-{step_num:02d}-attempt{attempt}-debug-rca.md"
 
@@ -211,22 +291,27 @@ async def _run_debug_rca(
             inputs={"failure-context.md": context_file},
             user_prompt=(
                 f"Step {step_num} attempt {attempt} failed. Read "
-                f"`./failure-context.md` plus any transcripts under "
-                f"`{step_workdir / 'logs'}/` you need. Produce a structured "
-                f"root-cause analysis at `./debug-rca.md` following the "
-                f"Phase 1-3 protocol in your agent.md. Diagnosis only — "
-                f"do NOT edit source, fixtures, or env."
+                f"`./failure-context.md` first, then the step's artefacts "
+                f"under `{step_artifacts}/` "
+                f"(look for `run-results.json`, `test-output.log`, "
+                f"`install.log`, `bug-candidates.json`; for Playwright "
+                f"failures inspect `results[i].stdout` — the JSON reporter "
+                f"emits its structured errors there, NOT to stderr) and any "
+                f"transcripts under `{step_workdir / 'logs'}/`. Produce a "
+                f"structured root-cause analysis at `./debug-rca.md` "
+                f"following the Phase 1-3 protocol in your agent.md. "
+                f"Diagnosis only — do NOT edit source, fixtures, or env."
             ),
             add_dirs=add_dirs,
-            timeout_s=300,
-            max_turns=10,
+            timeout_s=DEBUG_AGENT_TIMEOUT_S,
+            max_turns=DEBUG_AGENT_MAX_TURNS,
         )
     except Exception as e:
         log.warning("debug.rca_failed", step=step_num, error=str(e))
         return None
 
     produced = rca_workdir / "debug-rca.md"
-    if result.success and produced.exists():
+    if produced.exists():
         shutil.copy2(produced, out_path)
         log.info(
             "debug.rca_written",
@@ -235,7 +320,15 @@ async def _run_debug_rca(
             path=str(out_path),
         )
         return out_path
-    if result.final_text:
+    # Agent didn't write ./debug-rca.md. Two paths:
+    #   * success=True + final_text present → the agent inlined the RCA in
+    #     its final message instead of writing the file. Trust it.
+    #   * success=False → SDK cut off (turn cap, timeout, storm, ...).
+    #     Do NOT promote final_text — it's almost always pre-tool-call
+    #     thinking ("Let me check X..."), not the real RCA. Write a
+    #     labelled placeholder so the operator sees the failure clearly
+    #     and the downstream fix chain has structured input.
+    if result.success and result.final_text:
         out_path.write_text(result.final_text, encoding="utf-8")
         log.info(
             "debug.rca_final_text",
@@ -244,16 +337,38 @@ async def _run_debug_rca(
             path=str(out_path),
         )
         return out_path
+    placeholder = _agent_failure_placeholder(
+        agent_label="debug.agent",
+        result=result,
+        failure_context=failure_context,
+    )
+    out_path.write_text(placeholder, encoding="utf-8")
     log.warning(
-        "debug.rca_empty",
+        "debug.rca_placeholder_written",
         step=step_num,
         attempt=attempt,
         agent_error=result.error,
+        path=str(out_path),
     )
-    return None
+    return out_path
 
 
-async def _run_fix_proposal(step_num: int, ctx: StepContext, failure_context: str) -> Path | None:
+async def _run_fix_proposal(
+    step_num: int,
+    ctx: StepContext,
+    failure_context: str,
+    debug_rca_path: Path | None = None,
+) -> Path | None:
+    """Auto-fires on retry exhaustion (unless ``--no-fix``).
+
+    Chain: consumes the debug agent's RCA (already written on final-failure
+    via ``_run_debug_rca``) → critical-thinking agent reasons about fix
+    approach → principal-software-engineer produces concrete fix proposal.
+
+    ``debug_rca_path`` should point at ``<ws>/debug/step-NN-attemptM-debug-rca.md``
+    (path stashed on ``ctx.extras[f"step{n}_rca_path"]``). If ``None`` /
+    unreadable, falls back to ``failure_context`` so the chain still runs.
+    """
     agents_root = package_resource_root() / "agents"
     fix_workdir = ctx.workspace.debug / f"step-{step_num:02d}-fix"
     fix_workdir.mkdir(parents=True, exist_ok=True)
@@ -261,38 +376,98 @@ async def _run_fix_proposal(step_num: int, ctx: StepContext, failure_context: st
     context_file = fix_workdir / "failure-context.md"
     context_file.write_text(failure_context, encoding="utf-8")
 
-    rca_agent = agents_root / "critical-thinking.agent.md"
-    rca_text = ""
-    if rca_agent.exists():
-        rca_workdir = fix_workdir / "rca"
-        rca_workdir.mkdir(parents=True, exist_ok=True)
+    debug_rca_text = ""
+    if debug_rca_path is not None:
         try:
-            rca_result = await run_agent(
-                rca_agent,
-                workdir=rca_workdir,
-                inputs={"failure-context.md": context_file},
-                user_prompt=(
-                    "Analyze the following test/step failure. "
-                    "Identify the root cause and challenge assumptions. "
-                    "Write your analysis to ./rca.md"
-                ),
-                timeout_s=300,
-                max_turns=10,
+            debug_rca_text = debug_rca_path.read_text(encoding="utf-8")
+        except OSError as e:
+            log.warning(
+                "fix.debug_rca_read_failed",
+                step=step_num,
+                path=str(debug_rca_path),
+                error=str(e),
             )
-            rca_file = rca_workdir / "rca.md"
-            if rca_result.success and rca_file.exists():
-                rca_text = rca_file.read_text(encoding="utf-8")
-            elif rca_result.final_text:
-                rca_text = rca_result.final_text
-        except Exception as e:
-            log.warning("fix.rca_failed", step=step_num, error=str(e))
-            rca_text = f"RCA agent failed: {e}\n\nOriginal failure:\n{failure_context}"
 
-    if not rca_text:
-        rca_text = failure_context
+    if not debug_rca_text:
+        debug_rca_text = failure_context
 
+    # Aggregated final RCA (CLAUDE.md:115 contract) = debug agent's RCA.
+    # Belt-and-braces guard: don't clobber a substantive prior artifact
+    # with a shorter one — a shorter payload here is almost always a
+    # placeholder from a truncated debug run, and a well-formed prior RCA
+    # (from a previous invocation of the same workspace) is more useful
+    # to the operator than the placeholder that replaces it. Same-size /
+    # larger content overwrites unchanged.
     rca_output = ctx.workspace.debug / f"step-{step_num:02d}-rca.md"
-    rca_output.write_text(rca_text, encoding="utf-8")
+    new_bytes = len(debug_rca_text.encode("utf-8"))
+    if rca_output.exists() and rca_output.stat().st_size > new_bytes:
+        log.info(
+            "fix.aggregated_rca_kept_prior",
+            step=step_num,
+            existing_bytes=rca_output.stat().st_size,
+            new_bytes=new_bytes,
+        )
+    else:
+        rca_output.write_text(debug_rca_text, encoding="utf-8")
+
+    # Step 1: critical-thinking reasons about HOW to fix, given the RCA
+    ct_agent = agents_root / "critical-thinking.agent.md"
+    strategy_text = ""
+    if ct_agent.exists():
+        thinking_workdir = fix_workdir / "thinking"
+        thinking_workdir.mkdir(parents=True, exist_ok=True)
+        ct_debug_rca = thinking_workdir / "debug-rca.md"
+        ct_debug_rca.write_text(debug_rca_text, encoding="utf-8")
+        try:
+            ct_result = await run_agent(
+                ct_agent,
+                workdir=thinking_workdir,
+                inputs={
+                    "debug-rca.md": ct_debug_rca,
+                    "failure-context.md": context_file,
+                },
+                user_prompt=(
+                    "The debug agent has identified the root cause of a "
+                    "test/step failure in ./debug-rca.md (raw failure context "
+                    "in ./failure-context.md). Think critically about HOW to "
+                    "fix this problem: challenge assumptions about the fix "
+                    "approach, consider alternative fixes and their tradeoffs, "
+                    "and identify risks. Write your fix-strategy to "
+                    "./fix-strategy.md"
+                ),
+                timeout_s=FIX_AGENT_TIMEOUT_S,
+                max_turns=FIX_AGENT_MAX_TURNS,
+            )
+            strategy_file = thinking_workdir / "fix-strategy.md"
+            if strategy_file.exists():
+                strategy_text = strategy_file.read_text(encoding="utf-8")
+            elif ct_result.success and ct_result.final_text:
+                strategy_text = ct_result.final_text
+            else:
+                # Turn cap / timeout / storm on the CT agent: don't promote
+                # pre-tool thinking as strategy. Emit a labelled placeholder
+                # so the eng agent sees a real diagnosis of the CT failure
+                # rather than a "Let me check X..." stub masquerading as
+                # analysis.
+                log.warning(
+                    "fix.strategy_placeholder_written",
+                    step=step_num,
+                    agent_error=ct_result.error,
+                )
+                strategy_text = _agent_failure_placeholder(
+                    agent_label="critical-thinking.agent",
+                    result=ct_result,
+                    failure_context=failure_context,
+                )
+        except Exception as e:
+            log.warning("fix.strategy_failed", step=step_num, error=str(e))
+            strategy_text = (
+                f"Critical-thinking agent failed: {e}\n\n"
+                f"Debug RCA:\n{debug_rca_text}"
+            )
+
+    if not strategy_text:
+        strategy_text = debug_rca_text
 
     fix_agent = agents_root / "principal-software-engineer.agent.md"
     proposal_path = ctx.workspace.debug / f"step-{step_num:02d}-fix-proposal.md"
@@ -301,45 +476,80 @@ async def _run_fix_proposal(step_num: int, ctx: StepContext, failure_context: st
         eng_workdir = fix_workdir / "eng"
         eng_workdir.mkdir(parents=True, exist_ok=True)
 
-        rca_staged = eng_workdir / "rca.md"
-        rca_staged.write_text(rca_text, encoding="utf-8")
+        eng_debug_rca = eng_workdir / "debug-rca.md"
+        eng_debug_rca.write_text(debug_rca_text, encoding="utf-8")
+        eng_strategy = eng_workdir / "fix-strategy.md"
+        eng_strategy.write_text(strategy_text, encoding="utf-8")
 
         try:
             eng_result = await run_agent(
                 fix_agent,
                 workdir=eng_workdir,
-                inputs={"rca.md": rca_staged},
+                inputs={
+                    "debug-rca.md": eng_debug_rca,
+                    "fix-strategy.md": eng_strategy,
+                },
                 user_prompt=(
-                    "Based on the root cause analysis in ./rca.md, "
-                    "propose a fix. Write your proposal to ./fix-proposal.md. "
-                    "Do NOT edit any source code directly."
+                    "The debug agent's root-cause analysis is in "
+                    "./debug-rca.md. The critical-thinking analysis of fix "
+                    "approaches is in ./fix-strategy.md. Produce a concrete "
+                    "fix proposal at ./fix-proposal.md. Do NOT edit any "
+                    "source code directly."
                 ),
-                timeout_s=300,
-                max_turns=10,
+                timeout_s=FIX_AGENT_TIMEOUT_S,
+                max_turns=FIX_AGENT_MAX_TURNS,
             )
             produced = eng_workdir / "fix-proposal.md"
-            if eng_result.success and produced.exists():
+            if produced.exists():
                 shutil.copy2(produced, proposal_path)
-            elif eng_result.final_text:
+            elif eng_result.success and eng_result.final_text:
+                # Agent finished cleanly but inlined the proposal in its
+                # final message instead of writing the file. Trust it.
                 proposal_path.write_text(eng_result.final_text, encoding="utf-8")
+            elif not eng_result.success:
+                # Agent hit turn cap / timeout / storm before writing.
+                # `final_text` is almost always pre-tool thinking here —
+                # don't ship it as the "proposal". Emit a labelled
+                # placeholder with the upstream RCA + strategy inlined so
+                # the operator can still take the hand-off manually.
+                log.warning(
+                    "fix.eng_placeholder_written",
+                    step=step_num,
+                    agent_error=eng_result.error,
+                )
+                header = _agent_failure_placeholder(
+                    agent_label="principal-software-engineer.agent",
+                    result=eng_result,
+                    failure_context=failure_context,
+                )
+                proposal_path.write_text(
+                    f"{header}\n\n## Upstream Debug RCA\n\n{debug_rca_text}\n\n"
+                    f"## Upstream Fix Strategy\n\n{strategy_text}\n",
+                    encoding="utf-8",
+                )
             else:
                 proposal_path.write_text(
                     f"# Fix Proposal (auto-generated)\n\n"
                     f"Engineering agent did not produce a proposal.\n\n"
-                    f"## RCA\n\n{rca_text}",
+                    f"## RCA\n\n{debug_rca_text}\n\n"
+                    f"## Fix Strategy\n\n{strategy_text}",
                     encoding="utf-8",
                 )
         except Exception as e:
             log.warning("fix.eng_failed", step=step_num, error=str(e))
             proposal_path.write_text(
                 f"# Fix Proposal (auto-generated)\n\n"
-                f"Engineering agent failed: {e}\n\n## RCA\n\n{rca_text}",
+                f"Engineering agent failed: {e}\n\n"
+                f"## RCA\n\n{debug_rca_text}\n\n"
+                f"## Fix Strategy\n\n{strategy_text}",
                 encoding="utf-8",
             )
     else:
         proposal_path.write_text(
             f"# Fix Proposal (auto-generated)\n\n"
-            f"No engineering agent available.\n\n## RCA\n\n{rca_text}",
+            f"No engineering agent available.\n\n"
+            f"## RCA\n\n{debug_rca_text}\n\n"
+            f"## Fix Strategy\n\n{strategy_text}",
             encoding="utf-8",
         )
 
@@ -732,8 +942,8 @@ class Step(ABC):
                     step=self.number,
                     hint_keys=list(classification.fix_hint.keys()),
                 )
-            # Stash the classification for downstream consumers (pipeline.py
-            # uses it to gate the fix-proposal chain on the final failure).
+            # Stash the classification for downstream consumers and
+            # audit-log inspection on the final-failure path.
             ctx.extras[f"step{self.number}_failure_category"] = (
                 classification.category.value
             )
@@ -868,11 +1078,18 @@ class Step(ABC):
                 record.status = "warned"
                 record.notes = f"succeeded on retry (attempt {record.attempts})"
 
-        if not result.success and getattr(ctx.options, "fix", False):
+        # Fix-proposal chain auto-fires on final failure (chain: debug RCA
+        # from the just-completed _run_debug_rca → critical-thinking →
+        # principal-software-engineer). Suppressed by ``--no-fix``.
+        if not result.success and not getattr(ctx.options, "no_fix", False):
             failure_context = _build_failure_context(
                 self.number, self.name, record, result
             )
-            await _run_fix_proposal(self.number, ctx, failure_context)
+            rca_path_str = ctx.extras.get(f"step{self.number}_rca_path")
+            debug_rca_path = Path(rca_path_str) if rca_path_str else None
+            await _run_fix_proposal(
+                self.number, ctx, failure_context, debug_rca_path=debug_rca_path
+            )
 
         return result
 
@@ -900,6 +1117,19 @@ class Step(ABC):
                 record.notes = f"unhandled exception: {e}"
                 _accumulate_metrics_into_record(record, accumulator)
                 log.exception("step.exception", step=self.number, error=str(e))
+                log.info(
+                    "step.end",
+                    step=self.number,
+                    name=self.name,
+                    status="failed",
+                    sub_status=None,
+                    duration_s=record.duration_s,
+                    outputs=[],
+                    tokens_input=record.tokens_input,
+                    tokens_output=record.tokens_output,
+                    agent_calls=record.agent_calls,
+                    error=str(e),
+                )
                 return StepResult(success=False, status="failed", outputs=[], error=str(e))
 
             duration = time.monotonic() - started

@@ -5,7 +5,7 @@ Analyze a markdown requirement specification and enrich it so it is **test-plan 
 ## Input
 
 A markdown requirement file. Sources:
-- Output from `jira-to-ai-spec.agent.md` (Jira intake)
+- Output from `ticket-to-ai-spec.agent.md` (Jira / Azure DevOps intake)
 - User-provided file path (local requirement document)
 - Attached file in chat context
 
@@ -189,7 +189,7 @@ is not promoted.)
   - Test data shape, environment URL, or credentials path is not stated.
   - A risk/edge-case is tagged `[NEEDS INVESTIGATION]`.
 - Flag ambiguities with `[CLARIFICATION NEEDED]` tag for upstream resolution. Involve user to answer if needed.
-- **Question form is mandatory.** Every entry in the Blockers `Question` column and every bullet under Open Questions MUST be phrased as an actionable interrogative ending in `?` — something the user can directly answer. Examples: ✅ "Which GA SDK should we intercept — `gtag.js`, `@google-analytics/ga4`, or a custom wrapper?" / ❌ "GA integration detail unconfirmed." Statements describing the gap belong in the `Description` column or context, never as the prompt to the user.
+- **Question form is mandatory.** Every entry in the Blockers `Question` column, every bullet under Open Questions, and every `[CLARIFICATION NEEDED: ...]` inline tag MUST be phrased as an actionable interrogative ending in `?` — something the user can directly answer. Examples: ✅ "Which GA SDK should we intercept — `gtag.js`, `@google-analytics/ga4`, or a custom wrapper?" / ❌ "GA integration detail unconfirmed." / ❌ "per BLOCK-005" / ❌ "exact copy per BLOCK-001". Statements describing the gap belong in the `Description` column or context, never as the prompt to the user. Cross-references to other blocker IDs are never valid question text.
 - All acceptance criteria must use Given/When/Then and be tagged with automation feasibility.
 - Each AC must trace back to a user flow.
 - Requirement ID (`REQ-<slug>`) is mandatory — generate one if the source spec lacks it.
@@ -197,7 +197,7 @@ is not promoted.)
 - **Automation tag on every AC and EC.** One of `[AUTOMATABLE]`, `[MANUAL ONLY]`, `[NEEDS INVESTIGATION]`. The audit fails when the tag is missing. `[NEEDS INVESTIGATION]` is a valid terminal state — it signals a clarification gap to track, not silent acceptance.
 - **Promote threshold-bearing NFRs to ACs.** Any NFR with a numeric or objective bound (perf budget, throughput, contrast ratio, browser matrix) MUST carry a `[hard threshold]` marker AND be promoted to a numbered AC. Cite the promoted AC inline as `→ promoted to AC-...`. The audit fails when a threshold-bearing NFR has no `promoted_to_ac` target.
 - Emit `READY` verdict only when all Definition-of-Ready items pass AND the Blockers table is empty AND the Open Questions section is empty AND no `[CLARIFICATION NEEDED]` tags remain. Otherwise emit `NOT READY` with the blocker list.
-- **Single canonical location per item.** Each unresolved item must appear in exactly ONE of: Blockers table, Open Questions bullets, or inline `[CLARIFICATION NEEDED]` tag. Priority order when classifying a new item: (1) if it blocks at least one specific AC or TC → Blockers; (2) if it is a general product/PO question not tied to a specific AC → Open Questions; (3) inline `[CLARIFICATION NEEDED]` only for ambiguity that is purely local to one sentence and not worth a top-level entry. Do NOT restate the same concern across two locations even with different wording. If you find yourself writing the same gap in two places, delete the lower-priority duplicate.
+- **Single canonical location per item.** Each unresolved item must appear in exactly ONE of: Blockers table, Open Questions bullets, or inline `[CLARIFICATION NEEDED]` tag. Priority order when classifying a new item: (1) if it blocks at least one specific AC or TC → Blockers; (2) if it is a general product/PO question not tied to a specific AC → Open Questions; (3) inline `[CLARIFICATION NEEDED]` only for ambiguity that is purely local to one sentence and not worth a top-level entry. Do NOT restate the same concern across two locations even with different wording. If you find yourself writing the same gap in two places, delete the lower-priority duplicate. **Never use `[CLARIFICATION NEEDED]` as a cross-reference** — writing `[CLARIFICATION NEEDED: per BLOCK-001]` or `[CLARIFICATION NEEDED: exact copy per BLOCK-003]` is forbidden. If a gap is already in the Blockers table, do NOT add a `[CLARIFICATION NEEDED]` tag for it anywhere in the document. The inline tag must contain a self-contained, actionable question ending in `?`, or it must not exist.
 - No GitHub/Jira API calls — this agent works on local markdown files only.
 - The refined spec has to be unique and not contain any duplicate content.
 - If there are any Blockers, Open Questions, or `[CLARIFICATION NEEDED]` tags, the agent must ask the user to resolve them before finalizing the refined spec.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from qtea.checkpoints import RunState
@@ -15,6 +16,7 @@ from qtea.steps.s06_research import (
     _discover_sut_env_keys,
     _extract_commands,
     _materialize_sut,
+    _persist_resolved_env,
     _project_research,
 )
 from qtea.workspace import create_workspace
@@ -372,6 +374,136 @@ def test_discover_sut_env_keys_excludes_secrets(tmp_path: Path):
     for key in SECRET_ENV_KEYS:
         assert key not in keys, f"SECRET_ENV_KEY {key} leaked through discovery"
     assert "LEGITIMATE_APP_KEY" in keys
+
+
+def test_discover_sut_env_keys_preserves_username_keys(tmp_path: Path):
+    """USERNAME_* keys must not be filtered by the USER internal-prefix."""
+    sut = tmp_path / "sut"
+    sut.mkdir()
+    (sut / "app.ts").write_text(
+        'const u = process.env.USERNAME_ISP_OFFICE_BD;\n'
+        'const p = process.env.PASSWORD_ISP_OFFICE_BD;\n',
+        encoding="utf-8",
+    )
+    keys = _discover_sut_env_keys(sut)
+    assert "USERNAME_ISP_OFFICE_BD" in keys
+    assert "PASSWORD_ISP_OFFICE_BD" in keys
+
+
+def test_discover_sut_env_keys_excludes_exact_os_vars(tmp_path: Path):
+    """Exact OS vars (USER, HOME, PATH) must still be excluded, but
+    prefixed app vars (USERNAME_*, HOME_PAGE_URL) must survive."""
+    sut = tmp_path / "sut"
+    sut.mkdir()
+    (sut / "app.py").write_text(
+        'import os\n'
+        'x = os.getenv("USER")\n'
+        'y = os.getenv("HOME")\n'
+        'z = os.getenv("USERNAME_APP")\n'
+        'w = os.getenv("MY_APP_KEY")\n',
+        encoding="utf-8",
+    )
+    keys = _discover_sut_env_keys(sut)
+    assert "USER" not in keys
+    assert "HOME" not in keys
+    assert "USERNAME_APP" in keys
+    assert "MY_APP_KEY" in keys
+
+
+def test_persist_resolved_env_writes_dotenv_file(tmp_path: Path):
+    """_persist_resolved_env must write KEY=value lines to .env.qtea."""
+    from dataclasses import dataclass, field
+
+    @dataclass
+    class _FakeResolved:
+        values: dict[str, str] = field(default_factory=dict)
+
+    resolved = _FakeResolved(values={"QA_URL": "https://qa.example.com", "PASSWORD": "s3cret"})
+    _persist_resolved_env(tmp_path, resolved)
+
+    env_file = tmp_path / ".env.qtea"
+    assert env_file.exists()
+    content = env_file.read_text(encoding="utf-8")
+    assert "PASSWORD=s3cret\n" in content
+    assert "QA_URL=https://qa.example.com\n" in content
+
+
+def test_persist_resolved_env_does_not_write_when_empty(tmp_path: Path):
+    """No .env.qtea file should be created when nothing was resolved."""
+    from dataclasses import dataclass, field
+
+    @dataclass
+    class _FakeResolved:
+        values: dict[str, str] = field(default_factory=dict)
+
+    _persist_resolved_env(tmp_path, _FakeResolved(values={}))
+    assert not (tmp_path / ".env.qtea").exists()
+
+
+async def test_research_step_rerun_loads_workspace_env_qtea_fallback(
+    tmp_path: Path, monkeypatch
+):
+    """Step 6 re-runs must load `<workspace>/.env.qtea` so previously
+    HITL-provided values are not re-prompted.
+
+    Regression for the bug where every Step 6 re-run re-prompted for the
+    same essentials — because the resolver was invoked with
+    `env_file=options.env_file` only, ignoring the workspace .env.qtea
+    that a prior Step 6 attempt had persisted.
+    """
+    sut = tmp_path / "my-sut"
+    sut.mkdir()
+    (sut / "package.json").write_text('{"name":"x"}', encoding="utf-8")
+    # Source that references credential env vars so _discover_sut_env_keys
+    # includes them in sut_env_keys.
+    (sut / "app.ts").write_text(
+        "const u = process.env.USERNAME_APP;\n"
+        "const p = process.env.PASSWORD_APP;\n",
+        encoding="utf-8",
+    )
+
+    install_fake_query(
+        monkeypatch,
+        messages=[{"type": "result", "result": "ok"}],
+        files={"research.md": RESEARCH_MD},
+    )
+
+    ctx = _ctx(tmp_path, sut)
+    # Pre-populate .env.qtea in the workspace root as a prior Step 6
+    # attempt would have — the resolver must find these on this re-run.
+    (ctx.workspace.root / ".env.qtea").write_text(
+        "USERNAME_APP=cached_user\nPASSWORD_APP=cached_pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("USERNAME_APP", raising=False)
+    monkeypatch.delenv("PASSWORD_APP", raising=False)
+
+    # Spy on EnvResolverConfig so we can assert Step 6 wired env_file
+    # to the workspace .env.qtea (not just None).
+    import qtea.env_resolver as env_resolver_mod
+    from qtea.env_resolver import EnvResolverConfig as _RealConfig
+
+    seen: list[EnvResolverConfig] = []
+    orig_init = _RealConfig.__init__
+
+    def spy_init(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        seen.append(self)
+
+    monkeypatch.setattr(env_resolver_mod.EnvResolverConfig, "__init__", spy_init)
+
+    result = await ResearchStep().run(ctx)
+    assert result.success, result.error
+
+    # The resolver picked up the cached credentials, so downstream steps
+    # would see them in os.environ without any HITL prompt.
+    assert os.environ.get("USERNAME_APP") == "cached_user"
+    assert os.environ.get("PASSWORD_APP") == "cached_pass"
+
+    # And Step 6's config wired the workspace .env.qtea as env_file.
+    step6_configs = [c for c in seen if c.sut_path == ctx.workspace.sut]
+    assert step6_configs, "expected EnvResolverConfig built by Step 6"
+    assert step6_configs[-1].env_file == ctx.workspace.root / ".env.qtea"
 
 
 def test_materialize_sut_git_clone_uses_double_dash(tmp_path: Path, monkeypatch):

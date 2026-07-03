@@ -2,10 +2,264 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+from typing import Callable
+
 import flet as ft
 
+from qtea.hitl import (
+    RESOLUTION_ANSWERED,
+    RESOLUTION_OVERLAY_BUG,
+    RESOLUTION_OVERLAY_ONCE,
+    RESOLUTION_OVERLAY_PERSIST,
+)
 from qtea.ui.state import AppState, HitlRequest, ReviewGateRequest
-from qtea.ui.theme import CARD_BG, DIVIDER, ON_SURFACE, ON_SURFACE_DIM, PRIMARY, SECONDARY
+from qtea.ui.theme import (
+    BACKGROUND,
+    CARD_BG,
+    DIVIDER,
+    ON_SURFACE,
+    ON_SURFACE_DIM,
+    PRIMARY,
+    SECONDARY,
+)
+
+# Callback signature for per-row Edit submits. The dialog passes a closure
+# that scopes ``instructions`` to the named row id and closes the modal —
+# the existing edit_instructions / decision="edit" plumbing carries the
+# scoped text through to the matching ``*-editor`` agent.
+PerRowEditCallback = Callable[[str, str, str], None]
+# ^ args: (row_id, row_title_or_label, raw_instructions)
+
+
+def _build_overlay_dismiss_widget(
+    q_id: str, metadata: dict,
+) -> tuple[ft.Control, Callable[[], tuple[str, str] | None]]:
+    """Build the overlay-dismiss widget group and a collector closure.
+
+    The widget shows: (1) header with test id + overlay role/name, (2) the
+    cropped screenshot inline via ``ft.Image``, (3) a radio group of
+    candidate dismiss actions (AOM-extracted buttons + press-Escape + custom
+    + "real bug"), and (4) a persist checkbox.
+
+    Returns ``(widget, collector)``. ``collector()`` returns the
+    ``(resolution, json_answer)`` tuple the parent expects, or ``None`` if
+    the user hasn't picked anything (no-op on submit).
+    """
+    test_id = metadata.get("test_id") or "(unknown test)"
+    overlay_role = metadata.get("overlay_role") or "?"
+    overlay_name = metadata.get("overlay_name") or "?"
+    page_url = metadata.get("page_url") or ""
+    target_intent = metadata.get("target_intent") or "(unknown target)"
+    screenshot_path = metadata.get("screenshot_path") or ""
+    candidates = list(metadata.get("candidates") or [])
+
+    # Image widget — file:// scheme so Flet reads from local disk. Missing
+    # file falls back to a placeholder text so the dialog still renders.
+    image_widget: ft.Control
+    if screenshot_path and Path(screenshot_path).exists():
+        image_widget = ft.Container(
+            content=ft.Image(
+                src=screenshot_path,
+                fit=ft.ImageFit.CONTAIN,
+                width=680,
+                height=280,
+                error_content=ft.Text(
+                    f"(screenshot failed to load: {screenshot_path})",
+                    size=11, color=ON_SURFACE_DIM, italic=True,
+                ),
+            ),
+            padding=6,
+            border=ft.Border.all(1, DIVIDER),
+            border_radius=6,
+            bgcolor=BACKGROUND,
+        )
+    else:
+        image_widget = ft.Container(
+            content=ft.Text(
+                "(no screenshot captured)" if not screenshot_path
+                else f"(screenshot missing on disk: {screenshot_path})",
+                size=12, color=ON_SURFACE_DIM, italic=True,
+            ),
+            padding=12,
+            border=ft.Border.all(1, DIVIDER),
+            border_radius=6,
+            bgcolor=BACKGROUND,
+        )
+
+    # Radio values are namespaced so we can decode intent + index on submit.
+    # "cand:<idx>" for AOM candidates, "esc" for Escape, "custom" for custom,
+    # "bug" for real-bug. Empty selection → collector returns None.
+    radios: list[ft.Control] = []
+    for idx, c in enumerate(candidates):
+        role = c.get("role") or "?"
+        name = c.get("name") or "?"
+        safe = bool(c.get("safe"))
+        safe_tag = "" if safe else "  [risky — verify]"
+        color = ON_SURFACE if safe else "#FFB74D"
+        radios.append(
+            ft.Radio(
+                value=f"cand:{idx}",
+                label=f"Click {role} '{name}'{safe_tag}",
+                fill_color=color,
+                label_style=ft.TextStyle(color=color, size=13),
+            )
+        )
+    radios.extend([
+        ft.Radio(
+            value="esc",
+            label="Press Escape key",
+            label_style=ft.TextStyle(color=ON_SURFACE, size=13),
+        ),
+        ft.Radio(
+            value="custom",
+            label="Custom locator (role + accessible name below)",
+            label_style=ft.TextStyle(color=ON_SURFACE, size=13),
+        ),
+        ft.Radio(
+            value="bug",
+            label="This is a real bug — fail the test",
+            label_style=ft.TextStyle(color="#FF5252", size=13),
+        ),
+    ])
+    radio_group = ft.RadioGroup(
+        value="",
+        content=ft.Column(controls=radios, spacing=4, tight=True),
+    )
+
+    # Custom locator inputs (visible only when the "custom" radio is picked
+    # — we don't wire the reveal here to keep the widget stateless; the
+    # collector treats empty custom fields as an invalid submission).
+    custom_role_dropdown = ft.Dropdown(
+        value="button",
+        options=[
+            ft.dropdown.Option("button"),
+            ft.dropdown.Option("link"),
+            ft.dropdown.Option("menuitem"),
+        ],
+        width=160,
+        text_size=13,
+        border_color=DIVIDER,
+    )
+    custom_name_field = ft.TextField(
+        hint_text="Accessible name of dismiss control (leave blank if not using 'custom')",
+        text_size=13,
+        border_color=DIVIDER,
+        expand=True,
+    )
+    custom_row = ft.Row(
+        controls=[
+            ft.Text("Custom:", size=12, color=ON_SURFACE_DIM, width=64),
+            custom_role_dropdown,
+            custom_name_field,
+        ],
+        spacing=8,
+    )
+
+    persist_checkbox = ft.Checkbox(
+        value=True,
+        label="Persist to interceptors.json so future runs are clean",
+        fill_color=SECONDARY,
+        label_style=ft.TextStyle(color=ON_SURFACE, size=12),
+    )
+
+    header = ft.Column(
+        controls=[
+            ft.Row(
+                controls=[
+                    ft.Container(
+                        content=ft.Text(
+                            "OVERLAY", size=10, weight=ft.FontWeight.BOLD,
+                            color="#FFFFFF",
+                        ),
+                        bgcolor="#FFB74D",
+                        border_radius=4,
+                        padding=ft.Padding.symmetric(horizontal=6, vertical=2),
+                    ),
+                    ft.Text(q_id, size=11, color=ON_SURFACE_DIM),
+                ],
+                spacing=8,
+            ),
+            ft.Text(
+                f"Overlay blocked action: {target_intent}",
+                size=14, weight=ft.FontWeight.W_500, color=ON_SURFACE,
+            ),
+            ft.Text(
+                f"role={overlay_role!r}  name={overlay_name!r}",
+                size=11, color=ON_SURFACE_DIM,
+                selectable=True, font_family="Courier New",
+            ),
+            ft.Text(
+                f"test:  {test_id}",
+                size=11, color=ON_SURFACE_DIM,
+                selectable=True, font_family="Courier New",
+            ),
+            ft.Text(
+                f"page:  {page_url}",
+                size=11, color=ON_SURFACE_DIM,
+                selectable=True, font_family="Courier New",
+                max_lines=1, overflow=ft.TextOverflow.ELLIPSIS,
+            ),
+        ],
+        spacing=3,
+        tight=True,
+    )
+
+    widget = ft.Container(
+        content=ft.Column(
+            controls=[
+                header,
+                ft.Container(height=6),
+                image_widget,
+                ft.Container(height=6),
+                ft.Text(
+                    "Dismiss action:", size=12, weight=ft.FontWeight.W_500,
+                    color=ON_SURFACE,
+                ),
+                radio_group,
+                custom_row,
+                ft.Container(height=6),
+                persist_checkbox,
+            ],
+            spacing=6,
+            tight=True,
+        ),
+        padding=12,
+        border=ft.Border.all(1, DIVIDER),
+        border_radius=8,
+    )
+
+    def collector() -> tuple[str, str] | None:
+        choice = radio_group.value or ""
+        if not choice:
+            return None
+        if choice == "bug":
+            return RESOLUTION_OVERLAY_BUG, json.dumps({"kind": "bug"})
+        persist = bool(persist_checkbox.value)
+        resolution = (
+            RESOLUTION_OVERLAY_PERSIST if persist else RESOLUTION_OVERLAY_ONCE
+        )
+        if choice == "esc":
+            return resolution, json.dumps({"kind": "press_escape"})
+        if choice == "custom":
+            name = (custom_name_field.value or "").strip()
+            if not name:
+                # Custom picked but no name → treat as no-op skip.
+                return None
+            role = (custom_role_dropdown.value or "button").strip()
+            return resolution, json.dumps({"kind": "custom", "role": role, "name": name})
+        if choice.startswith("cand:"):
+            try:
+                idx = int(choice.split(":", 1)[1])
+            except (IndexError, ValueError):
+                return None
+            return resolution, json.dumps({
+                "kind": "click_candidate", "candidate_index": idx,
+            })
+        return None
+
+    return widget, collector
 
 
 def show_hitl_dialog(page: ft.Page, state: AppState) -> None:
@@ -27,6 +281,12 @@ def show_hitl_dialog(page: ft.Page, state: AppState) -> None:
         return
 
     answer_fields: dict[str, ft.TextField] = {}
+    # Per-question collectors that override the default text-field read.
+    # An overlay_dismiss question registers a closure here that maps the
+    # user's radio selection (+ optional custom-name text + persist checkbox)
+    # into the (resolution, json_answer) tuple the parent handler expects.
+    answer_collectors: dict[str, Callable[[], tuple[str, str] | None]] = {}
+    has_overlay_question = False
 
     # Build question widgets
     question_controls: list[ft.Control] = []
@@ -39,6 +299,19 @@ def show_hitl_dialog(page: ft.Page, state: AppState) -> None:
         # ``user-answers.md`` ledger if anyone needs to trace it later.
         q_context = ""
         q_type = q.get("type", "blocker")
+        q_metadata = q.get("metadata") or {}
+
+        # Overlay-dismiss questions get a bespoke widget: screenshot on
+        # top + radio candidates + persist checkbox. Bypasses the default
+        # TextField loop entirely. First image widget in the qtea UI.
+        if q_metadata.get("type") == "overlay_dismiss":
+            has_overlay_question = True
+            overlay_widget, collector = _build_overlay_dismiss_widget(
+                q_id, q_metadata,
+            )
+            answer_collectors[q_id] = collector
+            question_controls.append(overlay_widget)
+            continue
 
         type_color = "#FF5252" if q_type == "blocker" else "#FFB74D"
         type_label = q_type.upper()
@@ -106,9 +379,18 @@ def show_hitl_dialog(page: ft.Page, state: AppState) -> None:
         )
 
     def on_submit(e: ft.ControlEvent) -> None:
+        # Per-question collectors first — overlay dialogs return the full
+        # (resolution, json_answer) tuple directly. Fall back to text
+        # fields for the default clarification / blocker case.
+        for q_id, collect in answer_collectors.items():
+            result = collect()
+            if result is not None:
+                req.answers[q_id] = result
         for q_id, field in answer_fields.items():
+            if q_id in answer_collectors:
+                continue
             if field.value:
-                req.answers[q_id] = ("user", field.value)
+                req.answers[q_id] = (RESOLUTION_ANSWERED, field.value)
         try:
             req._dialog_open = False  # type: ignore[attr-defined]
         except Exception:
@@ -148,8 +430,11 @@ def show_hitl_dialog(page: ft.Page, state: AppState) -> None:
                 spacing=8,
                 scroll=ft.ScrollMode.AUTO,
             ),
-            width=600,
-            height=min(500, 120 + len(req.questions) * 160),
+            width=760 if has_overlay_question else 600,
+            height=(
+                720 if has_overlay_question
+                else min(500, 120 + len(req.questions) * 160)
+            ),
         ),
         actions=[
             ft.TextButton("Skip All", on_click=on_skip),
@@ -178,6 +463,15 @@ _PRI_BADGE_COLORS: dict[str, str] = {
     "P1": "#FFB74D",
     "P2": "#66BB6A",
     "P3": "#7E57C2",
+}
+
+# Step 7 plan source tags. Green = reusing existing SUT code (safe, no
+# new surface). Yellow = creating new code or a TBD intent (review-worthy).
+_SOURCE_BADGE_COLORS: dict[str, str] = {
+    "reuse": "#66BB6A",
+    "create": "#FFB74D",
+    "create_tbd": "#FFB74D",
+    "tbd": "#FFB74D",
 }
 
 
@@ -264,21 +558,68 @@ def _parse_raw_tc_markdown(raw: str) -> dict[str, list[str] | str]:
     return out
 
 
-def _tc_details_panel(tc: dict) -> ft.Control:
-    """Build the right-hand details panel for one test case."""
-    if not tc:
+def _render_tc_section(
+    title: str, items: list[str], numbered: bool = False,
+) -> ft.Control:
+    """One Preconditions/Steps/Expected sub-section.
+
+    Module-level so the strategy accordion and any future renderer can share it.
+    """
+    if not items:
         return ft.Container(
             content=ft.Text(
-                "Select a test case from the table to see its steps,\n"
-                "preconditions, and expected result here.",
-                size=12,
+                f"{title}: —",
+                size=11,
                 color=ON_SURFACE_DIM,
-                text_align=ft.TextAlign.CENTER,
+                italic=True,
             ),
-            alignment=ft.Alignment.CENTER,
-            expand=True,
+            padding=ft.Padding.symmetric(vertical=2),
         )
+    bullets: list[ft.Control] = []
+    for i, it in enumerate(items, start=1):
+        marker = f"{i}." if numbered else "•"
+        bullets.append(
+            ft.Row(
+                controls=[
+                    ft.Text(
+                        marker,
+                        size=12,
+                        color=ON_SURFACE_DIM,
+                        width=22,
+                    ),
+                    ft.Text(
+                        it,
+                        size=12,
+                        color=ON_SURFACE,
+                        selectable=True,
+                        expand=True,
+                    ),
+                ],
+                spacing=4,
+                vertical_alignment=ft.CrossAxisAlignment.START,
+            )
+        )
+    return ft.Column(
+        controls=[
+            ft.Text(
+                title.upper(),
+                size=10,
+                weight=ft.FontWeight.BOLD,
+                color=ON_SURFACE_DIM,
+            ),
+            *bullets,
+        ],
+        spacing=3,
+        tight=True,
+    )
 
+
+def _tc_details_body(tc: dict) -> ft.Control:
+    """Body shown when an accordion TC row is expanded.
+
+    Header (id, priority, title) lives on the row itself — only the
+    Preconditions / Steps / Expected Result sections go here.
+    """
     parsed_raw = _parse_raw_tc_markdown(tc.get("raw") or "")
     preconditions = list(tc.get("preconditions") or []) or list(
         parsed_raw.get("preconditions") or []  # type: ignore[arg-type]
@@ -288,122 +629,276 @@ def _tc_details_panel(tc: dict) -> ft.Control:
     )
     expected = tc.get("expected") or parsed_raw.get("expected") or ""
 
+    return ft.Column(
+        controls=[
+            _render_tc_section("Preconditions", preconditions),
+            ft.Container(height=6),
+            _render_tc_section("Steps", steps, numbered=True),
+            ft.Container(height=6),
+            _render_tc_section(
+                "Expected Result",
+                [expected] if expected else [],
+            ),
+        ],
+        spacing=4,
+        tight=True,
+    )
+
+
+def _make_per_row_edit_panel(
+    row_id: str,
+    row_label: str,
+    on_submit: PerRowEditCallback,
+    *,
+    hint: str | None = None,
+) -> tuple[ft.Container, Callable[[], None]]:
+    """Build an inline edit panel scoped to one accordion row / plan card.
+
+    Returns ``(panel, toggle)`` — ``panel`` is the visible=False container
+    holding caption + text field + Cancel/Submit buttons; ``toggle`` flips
+    its visibility. ``on_submit`` receives ``(row_id, row_label, text)``
+    when the user clicks Submit with non-empty input.
+    """
+    caption_default = (
+        f"Edit instructions for {row_id} "
+        "(sent to the editor agent, scoped to this row)"
+    )
+    edit_field = ft.TextField(
+        multiline=True,
+        min_lines=2,
+        max_lines=4,
+        border_color=DIVIDER,
+        text_size=12,
+        hint_text=hint or f"What should change about {row_id}?",
+    )
+    edit_caption = ft.Text(
+        caption_default,
+        size=11,
+        weight=ft.FontWeight.W_500,
+        color=ON_SURFACE_DIM,
+    )
+
+    open_state = {"v": False}
+
+    def _do_submit(_e: ft.ControlEvent) -> None:
+        text = (edit_field.value or "").strip()
+        if not text:
+            edit_field.border_color = "#FFB74D"
+            edit_caption.value = (
+                f"Type your edit instructions for {row_id}, then click Submit."
+            )
+            edit_caption.color = "#FFB74D"
+            try:
+                edit_field.update()
+                edit_caption.update()
+            except Exception:
+                pass
+            return
+        on_submit(row_id, row_label, text)
+
+    def _do_cancel(_e: ft.ControlEvent) -> None:
+        open_state["v"] = False
+        panel.visible = False
+        edit_field.value = ""
+        edit_field.border_color = DIVIDER
+        edit_caption.value = caption_default
+        edit_caption.color = ON_SURFACE_DIM
+        try:
+            panel.update()
+        except Exception:
+            pass
+
+    panel = ft.Container(
+        content=ft.Column(
+            controls=[
+                edit_caption,
+                edit_field,
+                ft.Row(
+                    controls=[
+                        ft.TextButton("Cancel", on_click=_do_cancel),
+                        ft.ElevatedButton(
+                            "Submit edit",
+                            icon=ft.Icons.SEND,
+                            bgcolor=SECONDARY,
+                            color="#FFFFFF",
+                            on_click=_do_submit,
+                        ),
+                    ],
+                    alignment=ft.MainAxisAlignment.END,
+                    spacing=8,
+                ),
+            ],
+            spacing=6,
+            tight=True,
+        ),
+        visible=False,
+        padding=ft.Padding.only(left=46, right=14, top=8, bottom=10),
+        bgcolor=BACKGROUND,
+    )
+
+    def toggle() -> None:
+        open_state["v"] = not open_state["v"]
+        panel.visible = open_state["v"]
+        try:
+            panel.update()
+        except Exception:
+            pass
+
+    return panel, toggle
+
+
+def _make_tc_accordion_row(
+    tc: dict,
+    on_edit_submit: PerRowEditCallback | None = None,
+) -> ft.Control:
+    """One test case row: a clickable header bar that expands inline to
+    reveal preconditions / steps / expected result.
+
+    Single-column layout — no master/detail split, no horizontal scroll,
+    no width-clipping of the title. The body is built lazily on first
+    expand so opening the dialog with N test cases stays cheap.
+
+    When *on_edit_submit* is provided, an edit icon is added to the header
+    bar; clicking it expands an inline panel where the user can type
+    instructions scoped to this TC.
+    """
+    tc_id = tc.get("id") or "?"
+    title = tc.get("title") or ""
     pri = tc.get("priority") or "?"
     atype = tc.get("automation_type") or tc.get("type") or "?"
     acs = ", ".join(tc.get("ac_ids") or []) or "—"
 
-    parts: list[ft.Control] = [
-        ft.Row(
-            controls=[
-                _badge(pri, _PRI_BADGE_COLORS.get(pri, ON_SURFACE_DIM)),
-                ft.Text(
-                    tc.get("id") or "?",
-                    size=13,
-                    weight=ft.FontWeight.BOLD,
-                    color=PRIMARY,
-                    font_family="Courier New",
-                    selectable=True,
-                ),
-            ],
-            spacing=8,
-        ),
-        ft.Text(
-            tc.get("title") or "",
-            size=13,
-            color=ON_SURFACE,
-            weight=ft.FontWeight.W_500,
-            selectable=True,
-        ),
-        ft.Row(
-            controls=[
-                ft.Text(f"type: {atype}", size=11, color=ON_SURFACE_DIM),
-                ft.Text(f"acs: {acs}", size=11, color=ON_SURFACE_DIM),
-            ],
-            spacing=12,
-            wrap=True,
-        ),
-        ft.Divider(height=12, color=DIVIDER),
-    ]
+    expanded = {"v": False}
 
-    def _section(title: str, items: list[str], numbered: bool = False) -> ft.Control:
-        if not items:
-            return ft.Container(
-                content=ft.Text(
-                    f"{title}: —",
-                    size=11,
-                    color=ON_SURFACE_DIM,
-                    italic=True,
-                ),
-                padding=ft.Padding.symmetric(vertical=2),
-            )
-        bullets: list[ft.Control] = []
-        for i, it in enumerate(items, start=1):
-            marker = f"{i}." if numbered else "•"
-            bullets.append(
-                ft.Row(
-                    controls=[
-                        ft.Text(
-                            marker,
-                            size=12,
-                            color=ON_SURFACE_DIM,
-                            width=22,
-                        ),
-                        ft.Text(
-                            it,
-                            size=12,
-                            color=ON_SURFACE,
-                            selectable=True,
-                            expand=True,
-                        ),
-                    ],
-                    spacing=4,
-                    vertical_alignment=ft.CrossAxisAlignment.START,
-                )
-            )
-        return ft.Column(
-            controls=[
-                ft.Text(
-                    title.upper(),
-                    size=10,
-                    weight=ft.FontWeight.BOLD,
-                    color=ON_SURFACE_DIM,
-                ),
-                *bullets,
-            ],
-            spacing=3,
-            tight=True,
-        )
-
-    parts.append(_section("Preconditions", preconditions))
-    parts.append(ft.Container(height=8))
-    parts.append(_section("Steps", steps, numbered=True))
-    parts.append(ft.Container(height=8))
-    parts.append(
-        _section(
-            "Expected Result",
-            [expected] if expected else [],
-        )
+    body_container = ft.Container(
+        content=None,
+        visible=False,
+        padding=ft.Padding.only(left=46, right=14, top=2, bottom=12),
+        bgcolor=BACKGROUND,
     )
+    chevron = ft.Icon(
+        ft.Icons.CHEVRON_RIGHT, color=ON_SURFACE_DIM, size=20,
+    )
+
+    def _toggle(_e: ft.ControlEvent) -> None:
+        expanded["v"] = not expanded["v"]
+        if expanded["v"] and body_container.content is None:
+            body_container.content = _tc_details_body(tc)
+        body_container.visible = expanded["v"]
+        chevron.name = (
+            ft.Icons.KEYBOARD_ARROW_DOWN if expanded["v"]
+            else ft.Icons.CHEVRON_RIGHT
+        )
+        try:
+            body_container.update()
+            chevron.update()
+        except Exception:
+            pass
+
+    # Optional per-row edit panel + icon button. The IconButton stops click
+    # propagation on its own (Flet wraps the inkwell), so the header_bar's
+    # ``on_click=_toggle`` body-expand handler doesn't fire when the icon
+    # is tapped — chevron and edit icon act independently.
+    edit_panel: ft.Container | None = None
+    edit_icon: ft.Control = ft.Container(width=0)  # placeholder, no width
+    if on_edit_submit is not None:
+        edit_panel, _toggle_edit_panel = _make_per_row_edit_panel(
+            tc_id, title, on_edit_submit,
+        )
+        edit_icon = ft.IconButton(
+            icon=ft.Icons.EDIT,
+            icon_size=14,
+            tooltip=f"Edit {tc_id}",
+            on_click=lambda _e: _toggle_edit_panel(),
+        )
+
+    header_bar = ft.Container(
+        content=ft.Row(
+            controls=[
+                chevron,
+                edit_icon,
+                _badge(pri, _PRI_BADGE_COLORS.get(pri, ON_SURFACE_DIM)),
+                ft.Container(
+                    content=ft.Text(
+                        tc_id,
+                        size=12,
+                        weight=ft.FontWeight.BOLD,
+                        color=PRIMARY,
+                        font_family="Courier New",
+                        no_wrap=True,
+                    ),
+                    width=140,
+                ),
+                ft.Container(
+                    content=ft.Text(
+                        title,
+                        size=13,
+                        color=ON_SURFACE,
+                        max_lines=2,
+                        overflow=ft.TextOverflow.ELLIPSIS,
+                    ),
+                    expand=True,
+                ),
+                ft.Container(
+                    content=ft.Text(
+                        atype,
+                        size=10,
+                        color=ON_SURFACE_DIM,
+                        text_align=ft.TextAlign.RIGHT,
+                        no_wrap=True,
+                    ),
+                    width=90,
+                ),
+                ft.Container(
+                    content=ft.Text(
+                        acs,
+                        size=10,
+                        color=ON_SURFACE_DIM,
+                        text_align=ft.TextAlign.RIGHT,
+                        max_lines=1,
+                        overflow=ft.TextOverflow.ELLIPSIS,
+                    ),
+                    width=110,
+                ),
+            ],
+            spacing=10,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        ),
+        padding=ft.Padding.symmetric(horizontal=12, vertical=8),
+        on_click=_toggle,
+        ink=True,
+        bgcolor=CARD_BG,
+    )
+
+    children: list[ft.Control] = [header_bar]
+    if edit_panel is not None:
+        children.append(edit_panel)
+    children.extend([
+        body_container,
+        ft.Divider(height=1, color=DIVIDER, thickness=0.5),
+    ])
 
     return ft.Column(
-        controls=parts,
-        spacing=4,
-        scroll=ft.ScrollMode.AUTO,
+        controls=children,
+        spacing=0,
         tight=True,
-        expand=True,
     )
 
 
-def _render_strategy_table(strategy: dict) -> ft.Control:
-    """Render a Step 4 test-strategy with master/detail.
+def _render_strategy_table(
+    strategy: dict,
+    on_edit_submit: PerRowEditCallback | None = None,
+) -> ft.Control:
+    """Render a Step 4 test strategy as an inline-expandable accordion.
 
-    Left: condensed DataTable of all test cases (TC ID, Title, Pri, Type, ACs).
-    Right: a details panel that shows the SELECTED TC's preconditions, steps,
-    and expected result. Each row is click-selectable.
+    One row per test case showing ID + priority + title + type + ACs. Click
+    a row to reveal its preconditions, steps, and expected result inline.
+    Single-column — fixes the master/detail width-collapse glitch where
+    the right-hand panel was getting pushed off-screen and only TC ID /
+    Title were visible.
 
-    The "Steps" count column is dropped — the inline number was always 0
-    when the planner emits markdown-only content, and the steps live in
-    the right-hand panel now anyway.
+    When *on_edit_submit* is provided, each TC row carries an edit icon
+    that opens an inline panel for instructions scoped to that TC.
     """
     test_cases = list(strategy.get("test_cases") or [])
     strat_title = strategy.get("title") or "Test Strategy"
@@ -420,7 +915,8 @@ def _render_strategy_table(strategy: dict) -> ft.Control:
         ft.Text(
             f"{len(test_cases)} test cases",
             size=12,
-            color=ON_SURFACE_DIM,
+            weight=ft.FontWeight.W_500,
+            color=ON_SURFACE,
         ),
     ]
     for pri in sorted(pri_counts):
@@ -445,110 +941,75 @@ def _render_strategy_table(strategy: dict) -> ft.Control:
             )
         )
 
-    # Details panel: mutable Container whose .content is swapped on row click.
-    details_box = ft.Container(
-        content=_tc_details_panel(test_cases[0] if test_cases else {}),
-        padding=12,
-        bgcolor=CARD_BG,
-        border_radius=8,
+    # Column-header strip (mirrors the accordion row layout for alignment).
+    col_header = ft.Container(
+        content=ft.Row(
+            controls=[
+                ft.Container(width=20),  # chevron spacer
+                ft.Container(width=28),  # priority badge spacer
+                ft.Container(
+                    content=ft.Text(
+                        "TC ID",
+                        size=10,
+                        weight=ft.FontWeight.BOLD,
+                        color=ON_SURFACE_DIM,
+                    ),
+                    width=140,
+                ),
+                ft.Container(
+                    content=ft.Text(
+                        "TITLE",
+                        size=10,
+                        weight=ft.FontWeight.BOLD,
+                        color=ON_SURFACE_DIM,
+                    ),
+                    expand=True,
+                ),
+                ft.Container(
+                    content=ft.Text(
+                        "TYPE",
+                        size=10,
+                        weight=ft.FontWeight.BOLD,
+                        color=ON_SURFACE_DIM,
+                        text_align=ft.TextAlign.RIGHT,
+                    ),
+                    width=90,
+                ),
+                ft.Container(
+                    content=ft.Text(
+                        "ACs",
+                        size=10,
+                        weight=ft.FontWeight.BOLD,
+                        color=ON_SURFACE_DIM,
+                        text_align=ft.TextAlign.RIGHT,
+                    ),
+                    width=110,
+                ),
+            ],
+            spacing=10,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        ),
+        padding=ft.Padding.symmetric(horizontal=12, vertical=6),
+        bgcolor=BACKGROUND,
+    )
+
+    accordion_rows: list[ft.Control] = [
+        _make_tc_accordion_row(tc, on_edit_submit=on_edit_submit)
+        for tc in test_cases
+    ]
+
+    accordion = ft.Container(
+        content=ft.Column(
+            controls=[col_header, *accordion_rows],
+            spacing=0,
+            scroll=ft.ScrollMode.AUTO,
+            tight=True,
+        ),
         border=ft.Border.all(1, DIVIDER),
-        width=360,
+        border_radius=6,
         expand=True,
     )
 
-    selected_id: dict[str, str | None] = {
-        "id": (test_cases[0].get("id") if test_cases else None),
-    }
-
-    def _on_row_select(tc_id: str) -> None:
-        tc = next(
-            (t for t in test_cases if t.get("id") == tc_id),
-            None,
-        )
-        if tc is None:
-            return
-        selected_id["id"] = tc_id
-        details_box.content = _tc_details_panel(tc)
-        try:
-            details_box.update()
-        except Exception:
-            pass
-
-    rows: list[ft.DataRow] = []
-    for tc in test_cases:
-        tc_id = tc.get("id") or "?"
-        title = tc.get("title") or ""
-        pri = tc.get("priority") or "?"
-        atype = tc.get("automation_type") or tc.get("type") or "?"
-        acs = ", ".join(tc.get("ac_ids") or []) or "—"
-        rows.append(
-            ft.DataRow(
-                # Flet 0.85 spells it `on_select_change` (singular).
-                on_select_change=(
-                    lambda e, _id=tc_id: _on_row_select(_id)
-                ),
-                cells=[
-                    ft.DataCell(
-                        ft.Text(
-                            tc_id,
-                            size=12,
-                            weight=ft.FontWeight.BOLD,
-                            color=PRIMARY,
-                            font_family="Courier New",
-                            selectable=True,
-                        ),
-                        on_tap=lambda e, _id=tc_id: _on_row_select(_id),
-                    ),
-                    ft.DataCell(
-                        ft.Text(
-                            title,
-                            size=12,
-                            color=ON_SURFACE,
-                            selectable=True,
-                        ),
-                        on_tap=lambda e, _id=tc_id: _on_row_select(_id),
-                    ),
-                    ft.DataCell(
-                        _badge(
-                            pri,
-                            _PRI_BADGE_COLORS.get(pri, ON_SURFACE_DIM),
-                        ),
-                        on_tap=lambda e, _id=tc_id: _on_row_select(_id),
-                    ),
-                    ft.DataCell(
-                        ft.Text(atype, size=12, color=ON_SURFACE),
-                        on_tap=lambda e, _id=tc_id: _on_row_select(_id),
-                    ),
-                    ft.DataCell(
-                        ft.Text(
-                            acs,
-                            size=11,
-                            color=ON_SURFACE_DIM,
-                            selectable=True,
-                        ),
-                        on_tap=lambda e, _id=tc_id: _on_row_select(_id),
-                    ),
-                ],
-            )
-        )
-
-    table = ft.DataTable(
-        columns=[
-            ft.DataColumn(ft.Text("TC ID", weight=ft.FontWeight.BOLD, size=11)),
-            ft.DataColumn(ft.Text("Title", weight=ft.FontWeight.BOLD, size=11)),
-            ft.DataColumn(ft.Text("Pri", weight=ft.FontWeight.BOLD, size=11)),
-            ft.DataColumn(ft.Text("Type", weight=ft.FontWeight.BOLD, size=11)),
-            ft.DataColumn(ft.Text("ACs", weight=ft.FontWeight.BOLD, size=11)),
-        ],
-        rows=rows,
-        column_spacing=18,
-        heading_row_color=CARD_BG,
-        divider_thickness=0.5,
-        horizontal_lines=ft.BorderSide(0.5, DIVIDER),
-        show_bottom_border=True,
-    )
-
-    # Header
     header = ft.Column(
         controls=[
             ft.Text(
@@ -558,9 +1019,8 @@ def _render_strategy_table(strategy: dict) -> ft.Control:
                 color=ON_SURFACE,
             ),
             ft.Row(controls=summary_chips, spacing=6, wrap=True),
-            ft.Container(height=4),
             ft.Text(
-                "Click a row to see preconditions, steps, "
+                "Click any test case to expand its preconditions, steps, "
                 "and expected result.",
                 size=11,
                 color=ON_SURFACE_DIM,
@@ -571,145 +1031,675 @@ def _render_strategy_table(strategy: dict) -> ft.Control:
         tight=True,
     )
 
-    # Master/detail split row
-    body_row = ft.Row(
-        controls=[
-            # Table scrolls vertically inside a sized Container so the
-            # right-hand details panel stays put as the user scrolls.
-            ft.Container(
-                content=ft.Column(
-                    controls=[
-                        ft.Row(
-                            controls=[table],
-                            scroll=ft.ScrollMode.AUTO,
-                            tight=True,
-                        ),
-                    ],
-                    scroll=ft.ScrollMode.AUTO,
-                    tight=True,
-                ),
-                expand=True,
-            ),
-            details_box,
-        ],
-        spacing=12,
-        vertical_alignment=ft.CrossAxisAlignment.STRETCH,
-        expand=True,
-    )
-
     return ft.Column(
-        controls=[header, ft.Container(height=6), body_row],
+        controls=[header, ft.Container(height=6), accordion],
         spacing=4,
-        tight=True,
+        tight=False,
         expand=True,
     )
 
 
-def _render_plan_summary(plan: dict) -> ft.Control:
-    """Render a Step 7 code-modification plan as a list of TC cards."""
+def _plan_section_header(title: str, count: int | None = None) -> ft.Control:
+    label = title.upper() if count is None else f"{title.upper()} ({count})"
+    return ft.Text(
+        label, size=10, weight=ft.FontWeight.BOLD, color=ON_SURFACE_DIM,
+    )
+
+
+def _plan_inline_chip(text: str) -> ft.Container:
+    """Small outlined chip — used for markers like @qtea_smoke and key/value
+    metadata (scope, yields) under a fixture / function bullet."""
+    return ft.Container(
+        content=ft.Text(text, size=10, color=ON_SURFACE),
+        bgcolor=CARD_BG,
+        border=ft.Border.all(1, DIVIDER),
+        border_radius=4,
+        padding=ft.Padding.symmetric(horizontal=5, vertical=1),
+    )
+
+
+def _plan_meta_line(text: str) -> ft.Text:
+    return ft.Text(
+        text, size=11, color=ON_SURFACE_DIM,
+        selectable=True, font_family="Courier New",
+    )
+
+
+def _render_plan_test_functions(fns: list[dict]) -> ft.Control:
+    if not fns:
+        return ft.Text(
+            "test functions: —", size=11, color=ON_SURFACE_DIM, italic=True,
+        )
+    rows: list[ft.Control] = [_plan_section_header("Test functions", len(fns))]
+    for fn in fns:
+        name = fn.get("name") or "?"
+        markers = list(fn.get("markers") or [])
+        uses = list(fn.get("uses_fixtures") or [])
+        head_children: list[ft.Control] = [
+            ft.Text("•", size=12, color=ON_SURFACE_DIM, width=14),
+            ft.Text(
+                name, size=12, color=ON_SURFACE, selectable=True,
+                font_family="Courier New",
+            ),
+        ]
+        for m in markers:
+            head_children.append(_plan_inline_chip(m))
+        rows.append(ft.Row(
+            controls=head_children, spacing=6,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            wrap=True,
+        ))
+        if uses:
+            rows.append(ft.Container(
+                content=_plan_meta_line(f"fixtures: {', '.join(uses)}"),
+                padding=ft.Padding.only(left=20),
+            ))
+    return ft.Column(controls=rows, spacing=3, tight=True)
+
+
+def _source_badge(src: str) -> ft.Container:
+    label = "TBD" if src in ("create_tbd", "tbd") else src
+    color = _SOURCE_BADGE_COLORS.get(src, ON_SURFACE_DIM)
+    return _badge(label, color)
+
+
+def _render_plan_fixtures(fixtures: list[dict]) -> ft.Control:
+    if not fixtures:
+        return ft.Text(
+            "fixtures: —", size=11, color=ON_SURFACE_DIM, italic=True,
+        )
+    rows: list[ft.Control] = [_plan_section_header("Fixtures", len(fixtures))]
+    for f in fixtures:
+        src = f.get("source", "?")
+        name = f.get("name") or "?"
+        ref = f.get("from") or f.get("at") or "?"
+        arrow = "←" if src == "reuse" else "→"
+        head = ft.Row(
+            controls=[
+                ft.Text("•", size=12, color=ON_SURFACE_DIM, width=14),
+                _source_badge(src),
+                ft.Text(
+                    name, size=12, color=ON_SURFACE, selectable=True,
+                    font_family="Courier New",
+                ),
+                ft.Text(f"{arrow} {ref}", size=11, color=ON_SURFACE_DIM,
+                        selectable=True),
+            ],
+            spacing=6,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            wrap=True,
+        )
+        rows.append(head)
+        meta_parts: list[str] = []
+        if f.get("yields"):
+            meta_parts.append(f"yields: {f['yields']}")
+        if f.get("scope"):
+            meta_parts.append(f"scope: {f['scope']}")
+        if f.get("depends_on"):
+            meta_parts.append(f"depends_on: {', '.join(f['depends_on'])}")
+        if meta_parts:
+            rows.append(ft.Container(
+                content=_plan_meta_line(" · ".join(meta_parts)),
+                padding=ft.Padding.only(left=20),
+            ))
+        if f.get("reuse_justification"):
+            rows.append(ft.Container(
+                content=ft.Text(
+                    f"why reuse: {f['reuse_justification']}",
+                    size=11, color=ON_SURFACE_DIM, italic=True,
+                    selectable=True,
+                ),
+                padding=ft.Padding.only(left=20),
+            ))
+    return ft.Column(controls=rows, spacing=3, tight=True)
+
+
+def _render_plan_page_objects(poms: list[dict]) -> ft.Control:
+    if not poms:
+        return ft.Text(
+            "page objects: —", size=11, color=ON_SURFACE_DIM, italic=True,
+        )
+    rows: list[ft.Control] = [_plan_section_header("Page objects", len(poms))]
+    for p in poms:
+        src = p.get("source", "?")
+        name = p.get("name") or "?"
+        ref = p.get("from") or p.get("at") or "?"
+        arrow = "←" if src == "reuse" else "→"
+        mm = list(p.get("missing_methods") or [])
+        head_children: list[ft.Control] = [
+            ft.Text("•", size=12, color=ON_SURFACE_DIM, width=14),
+            _source_badge(src),
+            ft.Text(
+                name, size=12, color=ON_SURFACE, selectable=True,
+                font_family="Courier New",
+            ),
+            ft.Text(f"{arrow} {ref}", size=11, color=ON_SURFACE_DIM,
+                    selectable=True),
+        ]
+        if mm:
+            head_children.append(_plan_inline_chip(f"+{len(mm)} methods"))
+        rows.append(ft.Row(
+            controls=head_children, spacing=6,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            wrap=True,
+        ))
+        for m in mm:
+            sig = m.get("signature") or m.get("name") or "?"
+            rows.append(ft.Container(
+                content=_plan_meta_line(f"+ {sig}"),
+                padding=ft.Padding.only(left=20),
+            ))
+            if m.get("purpose"):
+                rows.append(ft.Container(
+                    content=ft.Text(
+                        f"  purpose: {m['purpose']}",
+                        size=11, color=ON_SURFACE_DIM, italic=True,
+                        selectable=True,
+                    ),
+                    padding=ft.Padding.only(left=20),
+                ))
+        if p.get("reuse_justification"):
+            rows.append(ft.Container(
+                content=ft.Text(
+                    f"why reuse: {p['reuse_justification']}",
+                    size=11, color=ON_SURFACE_DIM, italic=True,
+                    selectable=True,
+                ),
+                padding=ft.Padding.only(left=20),
+            ))
+    return ft.Column(controls=rows, spacing=3, tight=True)
+
+
+def _render_plan_helpers(helpers: list[dict]) -> ft.Control:
+    if not helpers:
+        # Helpers are optional in the plan schema; collapse silently.
+        return ft.Container(visible=False)
+    rows: list[ft.Control] = [_plan_section_header("Helpers", len(helpers))]
+    for h in helpers:
+        src = h.get("source", "?")
+        name = h.get("name") or "?"
+        ref = h.get("from") or h.get("at") or "?"
+        arrow = "←" if src == "reuse" else "→"
+        rows.append(ft.Row(
+            controls=[
+                ft.Text("•", size=12, color=ON_SURFACE_DIM, width=14),
+                _source_badge(src),
+                ft.Text(
+                    name, size=12, color=ON_SURFACE, selectable=True,
+                    font_family="Courier New",
+                ),
+                ft.Text(f"{arrow} {ref}", size=11, color=ON_SURFACE_DIM,
+                        selectable=True),
+            ],
+            spacing=6,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            wrap=True,
+        ))
+        if h.get("signature"):
+            rows.append(ft.Container(
+                content=_plan_meta_line(h["signature"]),
+                padding=ft.Padding.only(left=20),
+            ))
+    return ft.Column(controls=rows, spacing=3, tight=True)
+
+
+def _render_plan_locators(locators: list[dict]) -> ft.Control:
+    if not locators:
+        return ft.Text(
+            "locators: —", size=11, color=ON_SURFACE_DIM, italic=True,
+        )
+    rows: list[ft.Control] = [_plan_section_header("Locators", len(locators))]
+    for loc in locators:
+        src = loc.get("source", "?")
+        name = loc.get("name") or "?"
+        owner = loc.get("owning_page") or "?"
+        head_children: list[ft.Control] = [
+            ft.Text("•", size=12, color=ON_SURFACE_DIM, width=14),
+            _source_badge(src),
+            ft.Text(
+                name, size=12, color=ON_SURFACE, selectable=True,
+                font_family="Courier New",
+            ),
+            ft.Text(
+                f"(owning: {owner})", size=11, color=ON_SURFACE_DIM,
+            ),
+        ]
+        if src == "create_tbd":
+            intent = loc.get("intent") or "?"
+            head_children.append(
+                ft.Text(
+                    f'intent: "{intent}"', size=11, color="#FFB74D",
+                    selectable=True, italic=True,
+                ),
+            )
+        else:
+            ref = loc.get("from") or "?"
+            head_children.append(
+                ft.Text(
+                    f"← {ref}", size=11, color=ON_SURFACE_DIM,
+                    selectable=True,
+                ),
+            )
+        rows.append(ft.Row(
+            controls=head_children, spacing=6,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            wrap=True,
+        ))
+        if loc.get("reuse_justification"):
+            rows.append(ft.Container(
+                content=ft.Text(
+                    f"why reuse: {loc['reuse_justification']}",
+                    size=11, color=ON_SURFACE_DIM, italic=True,
+                    selectable=True,
+                ),
+                padding=ft.Padding.only(left=20),
+            ))
+    return ft.Column(controls=rows, spacing=3, tight=True)
+
+
+def _plan_tc_details_body(tc: dict) -> ft.Control:
+    """All five plan sections for one TC. Built lazily on first expand."""
+    fns = list(tc.get("test_functions") or tc.get("tests") or [])
+    fixtures = list(tc.get("fixtures") or [])
+    poms = list(tc.get("page_objects") or [])
+    helpers = list(tc.get("helpers") or [])
+    locators = list(tc.get("locators") or [])
+    children: list[ft.Control] = [
+        _render_plan_test_functions(fns),
+        ft.Container(height=6),
+        _render_plan_fixtures(fixtures),
+        ft.Container(height=6),
+        _render_plan_page_objects(poms),
+    ]
+    if helpers:
+        children.extend([
+            ft.Container(height=6),
+            _render_plan_helpers(helpers),
+        ])
+    children.extend([
+        ft.Container(height=6),
+        _render_plan_locators(locators),
+    ])
+    return ft.Column(controls=children, spacing=4, tight=True)
+
+
+def _summarise_plan_tc(tc: dict) -> str:
+    """Compact one-line counts string for the collapsed accordion header."""
+    fns = list(tc.get("test_functions") or tc.get("tests") or [])
+    fixtures = list(tc.get("fixtures") or [])
+    poms = list(tc.get("page_objects") or [])
+    helpers = list(tc.get("helpers") or [])
+    locators = list(tc.get("locators") or [])
+    fix_r = sum(1 for f in fixtures if f.get("source") == "reuse")
+    fix_c = sum(1 for f in fixtures if f.get("source") == "create")
+    pom_r = sum(1 for p in poms if p.get("source") == "reuse")
+    pom_c = sum(1 for p in poms if p.get("source") == "create")
+    pom_m = sum(len(p.get("missing_methods") or []) for p in poms)
+    loc_r = sum(1 for x in locators if x.get("source") == "reuse")
+    loc_t = sum(1 for x in locators if x.get("source") == "create_tbd")
+    parts = [
+        f"fns: {len(fns)}",
+        f"fix: {fix_r}r/{fix_c}c",
+        f"pom: {pom_r}r+{pom_m}m" if pom_c == 0
+        else f"pom: {pom_r}r/{pom_c}c+{pom_m}m",
+        f"loc: {loc_r}r/{loc_t}t",
+    ]
+    if helpers:
+        parts.append(f"helpers: {len(helpers)}")
+    return " · ".join(parts)
+
+
+def _make_plan_accordion_row(
+    tc: dict,
+    on_edit_submit: PerRowEditCallback | None = None,
+) -> ft.Control:
+    """One plan TC row: clickable header that expands inline to reveal all
+    test_functions / fixtures / page_objects / helpers / locators.
+
+    Mirrors `_make_tc_accordion_row` (Step 4) so the two review dialogs
+    share visual language. Per-row Edit icon scopes instructions to this TC.
+    """
+    tc_id = tc.get("id") or tc.get("tc_id") or "?"
+    fn_names = [
+        (fn.get("name") or "").strip()
+        for fn in (tc.get("test_functions") or [])
+        if isinstance(fn, dict) and (fn.get("name") or "").strip()
+    ]
+    target = (
+        ", ".join(fn_names)
+        or tc.get("test_file_target")
+        or tc.get("target")
+        or tc.get("file")
+        or "?"
+    )
+
+    expanded = {"v": False}
+
+    body_container = ft.Container(
+        content=None,
+        visible=False,
+        padding=ft.Padding.only(left=46, right=14, top=2, bottom=12),
+        bgcolor=BACKGROUND,
+    )
+    chevron = ft.Icon(
+        ft.Icons.CHEVRON_RIGHT, color=ON_SURFACE_DIM, size=20,
+    )
+
+    def _toggle(_e: ft.ControlEvent) -> None:
+        expanded["v"] = not expanded["v"]
+        if expanded["v"] and body_container.content is None:
+            body_container.content = _plan_tc_details_body(tc)
+        body_container.visible = expanded["v"]
+        chevron.name = (
+            ft.Icons.KEYBOARD_ARROW_DOWN if expanded["v"]
+            else ft.Icons.CHEVRON_RIGHT
+        )
+        try:
+            body_container.update()
+            chevron.update()
+        except Exception:
+            pass
+
+    edit_panel: ft.Container | None = None
+    edit_icon: ft.Control = ft.Container(width=0)
+    if on_edit_submit is not None:
+        edit_panel, _toggle_edit_panel = _make_per_row_edit_panel(
+            tc_id, str(target) or tc_id, on_edit_submit,
+            hint=(
+                f"What should change for {tc_id}? "
+                "(e.g. 'create fixture X instead of reuse')"
+            ),
+        )
+        edit_icon = ft.IconButton(
+            icon=ft.Icons.EDIT,
+            icon_size=14,
+            tooltip=f"Edit {tc_id}",
+            on_click=lambda _e: _toggle_edit_panel(),
+        )
+
+    header_bar = ft.Container(
+        content=ft.Row(
+            controls=[
+                chevron,
+                edit_icon,
+                ft.Container(
+                    content=ft.Text(
+                        tc_id,
+                        size=12,
+                        weight=ft.FontWeight.BOLD,
+                        color=PRIMARY,
+                        font_family="Courier New",
+                        no_wrap=True,
+                    ),
+                    width=140,
+                ),
+                ft.Container(
+                    content=ft.Text(
+                        str(target),
+                        size=11,
+                        color=ON_SURFACE_DIM,
+                        selectable=True,
+                        max_lines=1,
+                        overflow=ft.TextOverflow.ELLIPSIS,
+                    ),
+                    expand=True,
+                ),
+                ft.Container(
+                    content=ft.Text(
+                        _summarise_plan_tc(tc),
+                        size=10,
+                        color=ON_SURFACE,
+                        text_align=ft.TextAlign.RIGHT,
+                        no_wrap=True,
+                        font_family="Courier New",
+                    ),
+                ),
+            ],
+            spacing=10,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        ),
+        padding=ft.Padding.symmetric(horizontal=12, vertical=8),
+        on_click=_toggle,
+        ink=True,
+        bgcolor=CARD_BG,
+    )
+
+    children: list[ft.Control] = [header_bar]
+    if edit_panel is not None:
+        children.append(edit_panel)
+    children.extend([
+        body_container,
+        ft.Divider(height=1, color=DIVIDER, thickness=0.5),
+    ])
+
+    return ft.Column(controls=children, spacing=0, tight=True)
+
+
+def _render_plan_summary(
+    plan: dict,
+    on_edit_submit: PerRowEditCallback | None = None,
+) -> ft.Control:
+    """Render a Step 7 code-modification plan as an inline-expandable
+    accordion. Each row expands to show all test functions, fixtures,
+    POMs, helpers, and locators belonging to that TC — matching what the
+    CLI gate's Rich table shows.
+
+    When *on_edit_submit* is provided, each row carries an edit icon that
+    opens an inline panel for instructions scoped to that TC.
+    """
     test_cases = list(plan.get("test_cases") or [])
+
+    # Top-level chips: module / language / framework + TC count.
     chips: list[ft.Control] = [
         ft.Text(
             f"{plan.get('active_module', '?')} · "
-            f"{plan.get('language', '?')} · "
-            f"{plan.get('framework', '?')}",
+            f"{plan.get('language') or '?'} · "
+            f"{plan.get('framework') or '?'}",
             size=12,
             color=ON_SURFACE_DIM,
         ),
         ft.Text(
             f"{len(test_cases)} test cases",
             size=12,
-            color=ON_SURFACE_DIM,
+            weight=ft.FontWeight.W_500,
+            color=ON_SURFACE,
         ),
     ]
 
-    cards: list[ft.Control] = []
+    # Totals across all TCs — mirrors the CLI `_render_plan` footer.
+    totals = {
+        "fns": 0,
+        "fix_r": 0, "fix_c": 0,
+        "pom_r": 0, "pom_c": 0, "pom_m": 0,
+        "loc_r": 0, "loc_t": 0,
+        "helpers": 0,
+    }
     for tc in test_cases:
-        tc_id = tc.get("id") or tc.get("tc_id") or "?"
-        target = tc.get("target") or tc.get("file") or ""
-        tests = tc.get("tests") or tc.get("test_functions") or []
-        loc_count = len(tc.get("locators") or [])
-        pom_count = len(tc.get("page_objects") or [])
-        cards.append(
-            ft.Container(
-                content=ft.Column(
-                    controls=[
-                        ft.Row(
-                            controls=[
-                                ft.Text(
-                                    tc_id,
-                                    size=12,
-                                    weight=ft.FontWeight.BOLD,
-                                    color=PRIMARY,
-                                    font_family="Courier New",
-                                ),
-                                ft.Text(
-                                    str(target),
-                                    size=11,
-                                    color=ON_SURFACE_DIM,
-                                    selectable=True,
-                                ),
-                            ],
-                            spacing=10,
-                        ),
-                        ft.Text(
-                            f"tests: {len(tests)} · locators: {loc_count} · poms: {pom_count}",
-                            size=11,
-                            color=ON_SURFACE_DIM,
-                        ),
-                    ],
-                    spacing=2,
-                ),
-                padding=8,
-                border=ft.Border.all(1, DIVIDER),
-                border_radius=6,
-            )
-        )
+        totals["fns"] += len(tc.get("test_functions") or tc.get("tests") or [])
+        for f in tc.get("fixtures") or []:
+            if f.get("source") == "reuse":
+                totals["fix_r"] += 1
+            elif f.get("source") == "create":
+                totals["fix_c"] += 1
+        for p in tc.get("page_objects") or []:
+            if p.get("source") == "reuse":
+                totals["pom_r"] += 1
+            elif p.get("source") == "create":
+                totals["pom_c"] += 1
+            totals["pom_m"] += len(p.get("missing_methods") or [])
+        for x in tc.get("locators") or []:
+            if x.get("source") == "reuse":
+                totals["loc_r"] += 1
+            elif x.get("source") == "create_tbd":
+                totals["loc_t"] += 1
+        totals["helpers"] += len(tc.get("helpers") or [])
 
-    return ft.Column(
+    totals_chips: list[ft.Control] = [
+        _plan_inline_chip(f"test functions · {totals['fns']}"),
+        _plan_inline_chip(
+            f"fixtures · {totals['fix_r']} reuse / {totals['fix_c']} create"
+        ),
+        _plan_inline_chip(
+            f"POMs · {totals['pom_r']} reuse / {totals['pom_c']} create "
+            f"· +{totals['pom_m']} methods"
+        ),
+        _plan_inline_chip(
+            f"locators · {totals['loc_r']} reuse / {totals['loc_t']} TBD"
+        ),
+    ]
+    if totals["helpers"]:
+        totals_chips.append(_plan_inline_chip(f"helpers · {totals['helpers']}"))
+
+    accordion_rows: list[ft.Control] = [
+        _make_plan_accordion_row(tc, on_edit_submit=on_edit_submit)
+        for tc in test_cases
+    ]
+    accordion = ft.Container(
+        content=ft.Column(
+            controls=accordion_rows,
+            spacing=0,
+            scroll=ft.ScrollMode.AUTO,
+            tight=True,
+        ),
+        border=ft.Border.all(1, DIVIDER),
+        border_radius=6,
+        expand=True,
+    )
+
+    header = ft.Column(
         controls=[
             ft.Row(controls=chips, spacing=12, wrap=True),
-            ft.Container(height=6),
-            *cards,
+            ft.Row(controls=totals_chips, spacing=6, wrap=True),
+            ft.Text(
+                "Click any test case to expand its test functions, "
+                "fixtures, page objects, and locators.",
+                size=11,
+                color=ON_SURFACE_DIM,
+                italic=True,
+            ),
         ],
-        spacing=6,
+        spacing=4,
         tight=True,
     )
 
+    return ft.Column(
+        controls=[header, ft.Container(height=6), accordion],
+        spacing=4,
+        tight=False,
+        expand=True,
+    )
+
+
+_INTENT_SCORE_COLORS: dict[str, str] = {
+    "FAIL": "#FF5252",
+    "WARN": "#FFB74D",
+    "PASS": "#66BB6A",
+    "EDITED": "#42A5F5",
+}
+
 
 def _render_intents_list(warnings: list) -> ft.Control:
-    """Render Step 8 TBD-intent warnings as a list of severity-coded cards."""
+    """Render Step 8 TBD-intent warnings as a list of score-coded cards.
+
+    Mirrors the CLI Rich table (`review_gate.py:_render_intent_warnings`)
+    column-for-column: Score / File:line / Constant / Intent / Why, plus
+    the ``(was <X>)`` edited-status suffix when the user has rewritten the
+    intent through the gate.
+    """
     items: list[ft.Control] = []
     for w in warnings or []:
-        sev = (w.get("severity") or w.get("level") or "warn").upper()
-        sev_color = "#FF5252" if sev == "FAIL" else "#FFB74D"
-        file = w.get("file") or ""
+        # Schema field is ``score`` (PASS / WARN / FAIL / EDITED). The old
+        # ``severity`` / ``level`` lookups were stale leftovers that meant
+        # every card rendered yellow regardless of FAIL status.
+        score = (w.get("score") or "WARN").upper()
+        score_color = _INTENT_SCORE_COLORS.get(score, "#FFB74D")
+        original_score = w.get("original_score")
+        file_ = w.get("file") or ""
         line = w.get("line")
-        loc_str = f"{file}:{line}" if line else file
+        loc_str = f"{file_}:{line}" if line else file_
+        constant = w.get("constant_name") or ""
         intent = w.get("intent") or w.get("message") or ""
+        rationale = w.get("rationale") or ""
+
+        header_children: list[ft.Control] = [_badge(score, score_color)]
+        if original_score and original_score != score:
+            header_children.append(
+                ft.Text(
+                    f"(was {original_score})",
+                    size=10,
+                    color=ON_SURFACE_DIM,
+                    italic=True,
+                )
+            )
+        if loc_str:
+            header_children.append(
+                ft.Text(
+                    loc_str,
+                    size=11,
+                    color=ON_SURFACE_DIM,
+                    selectable=True,
+                    font_family="Courier New",
+                )
+            )
+        if constant:
+            header_children.append(
+                ft.Text(
+                    constant,
+                    size=11,
+                    weight=ft.FontWeight.BOLD,
+                    color=PRIMARY,
+                    selectable=True,
+                    font_family="Courier New",
+                )
+            )
+
+        body_children: list[ft.Control] = [
+            ft.Text(
+                intent or "(no intent)",
+                size=12,
+                color=ON_SURFACE,
+                selectable=True,
+            ),
+        ]
+        if rationale:
+            body_children.append(
+                ft.Text(
+                    f"why: {rationale}",
+                    size=11,
+                    color=ON_SURFACE_DIM,
+                    selectable=True,
+                    italic=True,
+                )
+            )
+        code_ctx = w.get("code_context") or ""
+        if code_ctx:
+            body_children.append(
+                ft.Container(
+                    content=ft.Text(
+                        code_ctx,
+                        size=11,
+                        font_family="Courier New",
+                        color="#D4D4D4",
+                        selectable=True,
+                    ),
+                    bgcolor="#1E1E1E",
+                    border_radius=4,
+                    padding=8,
+                    margin=ft.Margin(top=4, bottom=0, left=0, right=0),
+                )
+            )
+
         items.append(
             ft.Container(
                 content=ft.Column(
                     controls=[
                         ft.Row(
-                            controls=[
-                                _badge(sev, sev_color),
-                                ft.Text(
-                                    loc_str,
-                                    size=11,
-                                    color=ON_SURFACE_DIM,
-                                    selectable=True,
-                                    font_family="Courier New",
-                                ),
-                            ],
+                            controls=header_children,
                             spacing=8,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                            wrap=True,
                         ),
-                        ft.Text(
-                            intent,
-                            size=12,
-                            color=ON_SURFACE,
-                            selectable=True,
-                        ),
+                        *body_children,
                     ],
                     spacing=4,
                 ),
@@ -718,13 +1708,30 @@ def _render_intents_list(warnings: list) -> ft.Control:
                 border_radius=6,
             )
         )
+
+    # Header summary chips: total + per-score counts (so the user can see
+    # at a glance how many FAIL vs WARN entries are in the list).
+    score_counts: dict[str, int] = {}
+    for w in warnings or []:
+        s = (w.get("score") or "WARN").upper()
+        score_counts[s] = score_counts.get(s, 0) + 1
+    chip_row: list[ft.Control] = [
+        ft.Text(
+            f"{len(warnings or [])} flagged intent(s)",
+            size=12,
+            weight=ft.FontWeight.W_500,
+            color=ON_SURFACE,
+        ),
+    ]
+    for score in ("FAIL", "WARN", "EDITED", "PASS"):
+        n = score_counts.get(score, 0)
+        if n:
+            chip_row.append(_badge(f"{score} · {n}",
+                                   _INTENT_SCORE_COLORS.get(score, "#FFB74D")))
+
     return ft.Column(
         controls=[
-            ft.Text(
-                f"{len(warnings or [])} flagged intent(s)",
-                size=12,
-                color=ON_SURFACE_DIM,
-            ),
+            ft.Row(controls=chip_row, spacing=8, wrap=True),
             ft.Container(height=6),
             *items,
         ],
@@ -733,14 +1740,22 @@ def _render_intents_list(warnings: list) -> ft.Control:
     )
 
 
-def _build_review_body(req: ReviewGateRequest) -> ft.Control:
-    """Dispatch on req.kind; fall back to monospace text for unknown kinds."""
+def _build_review_body(
+    req: ReviewGateRequest,
+    on_edit_submit: PerRowEditCallback | None = None,
+) -> ft.Control:
+    """Dispatch on req.kind; fall back to monospace text for unknown kinds.
+
+    When *on_edit_submit* is provided, the strategy (Step 4) and plan
+    (Step 7) renderers add per-row Edit affordances. Intent reviews
+    (Step 8) don't currently support per-row edit — global Edit only.
+    """
     kind = (req.kind or "").lower()
     try:
         if kind == "strategy" and isinstance(req.data, dict):
-            return _render_strategy_table(req.data)
+            return _render_strategy_table(req.data, on_edit_submit=on_edit_submit)
         if kind == "plan" and isinstance(req.data, dict):
-            return _render_plan_summary(req.data)
+            return _render_plan_summary(req.data, on_edit_submit=on_edit_submit)
         if kind == "intents" and isinstance(req.data, list):
             return _render_intents_list(req.data)
     except Exception as e:  # noqa: BLE001
@@ -775,17 +1790,28 @@ def show_review_gate_dialog(page: ft.Page, state: AppState) -> None:
     # users couldn't actually type. Showing it up front also doubles as a
     # discovery affordance: the user immediately sees that Edit takes
     # natural-language instructions.
+    #
+    # We deliberately do NOT use the Flet ``label`` property here — the
+    # floating Material label was z-ordering on top of the strategy
+    # title in the review body, producing a glitchy text-overlap. The
+    # field's purpose is signalled by the explicit caption above it
+    # instead.
     edit_field = ft.TextField(
         multiline=True,
         min_lines=2,
-        max_lines=6,
+        max_lines=4,
         border_color=DIVIDER,
         text_size=12,
-        label="Optional edit instructions",
         hint_text=(
             "Describe what to change in plain English — "
             "leave blank to just Approve."
         ),
+    )
+    edit_caption = ft.Text(
+        "Edit instructions (optional)",
+        size=11,
+        weight=ft.FontWeight.W_500,
+        color=ON_SURFACE_DIM,
     )
 
     def _close_dialog() -> None:
@@ -798,18 +1824,48 @@ def show_review_gate_dialog(page: ft.Page, state: AppState) -> None:
         page.pop_dialog()
 
     def on_approve(e: ft.ControlEvent) -> None:
-        req.decision = "approve"
+        text = (edit_field.value or "").strip()
+        if text:
+            req.decision = "edit"
+            req.edit_instructions = text
+        else:
+            req.decision = "approve"
+        _close_dialog()
+
+    def on_per_row_edit_submit(
+        row_id: str, row_label: str, instructions: str,
+    ) -> None:
+        """Scope a per-row edit to one TC / plan entry and close the dialog.
+
+        The scoped prompt nudges the ``strategy-editor`` / ``plan-editor``
+        agent to only modify the named row. The agents already handle
+        scoped edits well — examples like ``"remove TC-03"`` are in their
+        built-in prompt — so no agent-side change is needed.
+        """
+        scoped = (
+            f"Modify only {row_id}"
+            + (f" ({row_label})" if row_label and row_label != row_id else "")
+            + f": {instructions}"
+        )
+        req.decision = "edit"
+        req.edit_instructions = scoped
         _close_dialog()
 
     def on_edit(e: ft.ControlEvent) -> None:
         text = (edit_field.value or "").strip()
         if not text:
-            # No instructions provided — surface a tooltip-like hint via
-            # the label so the user knows what to do, then bail.
-            edit_field.label = "Type your edit instructions first"
+            # No instructions yet — focus the field and make it visibly
+            # demand input so the user sees what Edit actually wants. The
+            # caption above the field doubles as the prompt; tint it +
+            # the border orange and focus.
             edit_field.border_color = "#FFB74D"
+            edit_caption.value = (
+                "Type your edit instructions below, then click Edit again."
+            )
+            edit_caption.color = "#FFB74D"
             try:
                 edit_field.update()
+                edit_caption.update()
             except Exception:
                 pass
             return
@@ -831,14 +1887,31 @@ def show_review_gate_dialog(page: ft.Page, state: AppState) -> None:
         content=ft.Container(
             content=ft.Column(
                 controls=[
-                    _build_review_body(req),
-                    edit_field,
+                    # Review body fills remaining vertical space.
+                    ft.Container(
+                        content=_build_review_body(
+                            req, on_edit_submit=on_per_row_edit_submit,
+                        ),
+                        expand=True,
+                    ),
+                    # Clear divider between body and edit zone — prevents
+                    # the previous title/label overlap glitch.
+                    ft.Divider(height=1, color=DIVIDER, thickness=0.5),
+                    # Dedicated edit zone, visually distinct from the body.
+                    ft.Container(
+                        content=ft.Column(
+                            controls=[edit_caption, edit_field],
+                            spacing=4,
+                            tight=True,
+                        ),
+                        padding=ft.Padding.symmetric(horizontal=4, vertical=4),
+                    ),
                 ],
                 spacing=8,
-                scroll=ft.ScrollMode.AUTO,
+                tight=False,
             ),
-            width=900,
-            height=540,
+            width=980,
+            height=620,
         ),
         actions=[
             ft.TextButton(

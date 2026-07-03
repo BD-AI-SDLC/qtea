@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from qtea.checkpoints import RunState, save_state
+from qtea.checkpoints import RunState, StepRecord, save_state
 from qtea.pipeline import PipelineOptions, _select_workspace, run_pipeline
 from qtea.steps.base import Step, StepContext, StepResult
 from qtea.workspace import create_workspace
@@ -300,3 +300,52 @@ def test_auth_kwargs_no_custom_headers(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
     kwargs = anthropic_auth_kwargs()
     assert "default_headers" not in kwargs
+
+
+async def test_from_step_cleanup_no_flags_non_tty(tmp_path: Path, monkeypatch):
+    # Regression guard for the 2026-06-18 ruff sweep that removed `import sys`
+    # from pipeline.py and silently broke the `--from-step` cleanup branch.
+    # The bug only surfaced on CLI invocations where ui_mode/no_hitl/yes were
+    # all False (so the `or` chain didn't short-circuit before
+    # `sys.stdin.isatty()`) and stdin was non-interactive. This test exercises
+    # exactly that path; a missing `sys` import re-raises NameError here.
+    monkeypatch.setattr("qtea.pipeline.STEP_REGISTRY", {})
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    def _fake_materialize(src, dest, run_id):
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / ".git").mkdir(exist_ok=True)
+    monkeypatch.setattr("qtea.steps.s06_research._materialize_sut", _fake_materialize)
+    monkeypatch.setattr("qtea._sut_git.current_branch", lambda root: "stub")
+    monkeypatch.setattr("qtea._sut_git.branch_name", lambda rid: "stub")
+
+    spec_file = tmp_path / "spec.md"
+    spec_file.write_text("# spec")
+    sut_dir = tmp_path / "sut"
+    sut_dir.mkdir()
+
+    ws_prior = create_workspace(tmp_path)
+    state = RunState(
+        run_id=ws_prior.run_id,
+        workspace=str(ws_prior.root),
+        spec_source=str(spec_file),
+        sut_source=str(sut_dir),
+    )
+    for n in range(1, 8):
+        state.steps[n] = StepRecord(step=n, name=f"s{n:02d}", status="completed")
+    save_state(state, ws_prior.state_file)
+
+    opts = PipelineOptions(
+        spec=str(spec_file),
+        sut=str(sut_dir),
+        workspace_base=tmp_path,
+        run_id=ws_prior.run_id,
+        from_step=8,
+    )
+    assert opts.ui_mode is False
+    assert opts.no_hitl is False
+    assert opts.yes is False
+    assert opts.no_cleanup is False
+
+    rc = await run_pipeline(opts)
+    assert rc == 0

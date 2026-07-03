@@ -21,6 +21,7 @@ Self-heal budget is capped (default 5 tests) to bound runtime.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import os
@@ -46,7 +47,26 @@ from qtea.config import (
     package_resource_root,
     step_timeout,
 )
+from qtea.hitl import (
+    RESOLUTION_OVERLAY_BUG,
+    RESOLUTION_OVERLAY_ONCE,
+    RESOLUTION_OVERLAY_PERSIST,
+    Question,
+    prompt_user,
+)
 from qtea.logging_setup import get_logger
+from qtea.overlay_handling import (
+    OverlayEvent,
+    append_interceptor,
+    build_overlay_question_metadata,
+    dedup_overlay_events,
+    delete_screenshot,
+    filter_already_registered,
+    load_interceptors,
+    load_overlay_events,
+    parse_overlay_answer,
+    reclassify_bug_candidates,
+)
 from qtea.proxy import safe_subprocess_env
 from qtea.resolver_server import ResolverServer
 from qtea.schemas import is_valid
@@ -90,1770 +110,239 @@ _QTEA_PYTEST_MARKER_FILTER = os.environ.get(
     "qtea_smoke or qtea_regression or qtea_e2e or qtea_exploratory",
 )
 
-# Patterns that mark an XPath selector. Used by `_patch_introduces_xpath` to
-# reject heal patches that quietly downgrade to XPath in violation of the
-# Step 9 quality gate (see docs/qa-orchestrator.instructions.md §6).
-_XPATH_PATTERNS: tuple[str, ...] = (
-    "By.XPATH",
-    "xpath=",
-    "getByXPath(",
-    ".xpath(",
-    "By.xpath(",
-    "XPATH:",
+# Patch-content quality gates (XPath / assertion-immutability / anti-patterns)
+# live in a dedicated submodule. Re-exported here so external callers and the
+# test suite keep resolving `qtea.steps.s09_execute._foo` at the historical
+# dotted path (test files pin these names via `from qtea.steps.s09_execute
+# import _foo` and monkeypatch targets like `qtea.steps.s09_execute._foo`).
+from qtea.steps.s09.patch_gates import (  # noqa: E402
+    _ASSERTION_LINE_PATTERNS,
+    _EMPTY_HANDLER_PATTERNS,
+    _XPATH_PATTERNS,
+    _count_empty_handlers,
+    _count_xpath_markers,
+    _extract_assertion_lines,
+    _patch_has_anti_patterns,
+    _patch_introduces_xpath,
+    _patch_modifies_assertions,
 )
 
 
-def _count_xpath_markers(source: str) -> int:
-    """Count XPath-marker occurrences in a source blob. Combines literal-pattern
-    matches with a regex that catches string literals beginning with `//` (the
-    raw XPath shorthand)."""
-    import re as _re
-
-    count = sum(source.count(p) for p in _XPATH_PATTERNS)
-    # String literals starting with // — Selenium's `By.XPATH, '//x'` and the
-    # bare `'//div'` form. Counts both single- and double-quoted variants.
-    count += len(_re.findall(r"""['"]//[^'"\n]+['"]""", source))
-    return count
-
-
-def _patch_introduces_xpath(pre: bytes | None, post: bytes | None) -> bool:
-    """True iff the post-heal source contains MORE XPath markers than the
-    pre-heal source. We count rather than detect-any so an existing XPath in
-    the SUT (legitimate or grandfathered) doesn't false-trigger the gate; only
-    a NEW introduction is rejected.
-
-    When ``pre is None`` the heal CREATED a new file — any XPath in the new
-    file is by definition introduced."""
-    if post is None:
-        return False
-    try:
-        post_src = post.decode("utf-8", errors="replace")
-    except Exception:
-        return False
-    post_count = _count_xpath_markers(post_src)
-    if pre is None:
-        return post_count > 0
-    try:
-        pre_src = pre.decode("utf-8", errors="replace")
-    except Exception:
-        return False
-    return post_count > _count_xpath_markers(pre_src)
-
-
-# ---------------------------------------------------------------------------
-# Assertion-immutability gate (mirrors XPath gate above)
-# ---------------------------------------------------------------------------
-
-import contextlib
-import re as _re_module
-
-_ASSERTION_LINE_PATTERNS: tuple[_re_module.Pattern, ...] = (
-    _re_module.compile(r"^\s*assert\b"),
-    _re_module.compile(r"^\s*expect\s*\("),
-    _re_module.compile(r"^\s*with\s+pytest\.raises\b"),
-    _re_module.compile(r"\.should\s*\("),
-    _re_module.compile(
-        r"^\s*assert(?:Equals|True|False|Null|NotNull|That|Same|Throws)\s*\(",
-        _re_module.IGNORECASE,
-    ),
-    _re_module.compile(r"^\s*Should\s+(?:Be|Contain|Match|Not)", _re_module.IGNORECASE),
+# Heal-scope predicates + git revert helpers live in a dedicated submodule.
+# Re-exported here so tests using `monkeypatch.setattr("qtea.steps.s09_execute._foo", ...)`
+# and callers using `from qtea.steps.s09_execute import _foo` keep working.
+from qtea.steps.s09.heal_scope import (  # noqa: E402
+    _git_revert_path,
+    _git_status_porcelain,
+    _heal_allowlist_dirs,
+    _heal_path_in_scope,
+    _heal_path_is_forbidden,
+    _heal_revert_all_uncommitted,
+    _heal_scope_check_and_revert,
+)
+# Dep-recovery HITL + package-manager install shim live in a dedicated
+# submodule. Re-exported here to preserve the historical dotted path.
+from qtea.steps.s09.dep_install import (  # noqa: E402
+    _POETRY_NOOP_MARKERS,
+    _hitl_confirm_dep_install,
+    _run_dep_install,
 )
 
 
-def _extract_assertion_lines(source: str) -> list[str]:
-    """Extract normalised assertion lines from source (stripped + lowered)."""
-    out: list[str] = []
-    for line in source.splitlines():
-        stripped = line.strip()
-        if any(p.search(stripped) for p in _ASSERTION_LINE_PATTERNS):
-            out.append(stripped.lower())
-    return out
-
-
-def _patch_modifies_assertions(pre: bytes | None, post: bytes | None) -> bool:
-    """True iff the post-heal source REMOVED or ALTERED any assertion line
-    that existed in the pre-heal source.
-
-    Adding new assertions is allowed. When *pre* is ``None`` the file was
-    created by the heal, so there were no prior assertions to protect."""
-    if pre is None or post is None:
-        return False
-    try:
-        pre_src = pre.decode("utf-8", errors="replace")
-        post_src = post.decode("utf-8", errors="replace")
-    except Exception:
-        return False
-    pre_assertions = _extract_assertion_lines(pre_src)
-    if not pre_assertions:
-        return False
-    post_assertions = _extract_assertion_lines(post_src)
-    from collections import Counter
-
-    pre_counts = Counter(pre_assertions)
-    post_counts = Counter(post_assertions)
-    return any(post_counts.get(assertion, 0) < count for assertion, count in pre_counts.items())
-
-
-# ---------------------------------------------------------------------------
-# Anti-pattern gate — rejects heals that introduce exception-swallowing
-# ---------------------------------------------------------------------------
-
-_EMPTY_HANDLER_PATTERNS: tuple[_re_module.Pattern, ...] = (
-    # Python: except ...: pass / except: pass (single or multi-line)
-    _re_module.compile(
-        r"except\b[^:]*:\s*(?:#[^\n]*)?\n\s*pass\b",
-        _re_module.MULTILINE,
-    ),
-    # JS/TS: catch (...) { } or catch { } with empty/whitespace-only body
-    _re_module.compile(
-        r"catch\s*(?:\([^)]*\))?\s*\{\s*\}",
-    ),
-    # Java/C#: catch (...) { } with empty/whitespace-only body
-    _re_module.compile(
-        r"catch\s*\([^)]+\)\s*\{\s*\}",
-    ),
+# Read-side helpers that load prior-step artifacts + resolve SUT tests dir
+# live in a dedicated submodule. Re-exported here to preserve dotted paths.
+from qtea.steps.s09.context_loaders import (  # noqa: E402
+    _ISOLATED_TESTS_DIR_NAME,
+    _active_module,
+    _attachment_glob,
+    _clean_sut_artifacts,
+    _detected_command,
+    _framework,
+    _load_generated_files,
+    _load_index,
+    _load_stack_profile,
+    _research_payload,
+    _sut_tests_dir,
 )
 
 
-def _count_empty_handlers(source: str) -> int:
-    """Count exception handlers with empty/no-op bodies across stacks."""
-    return sum(len(p.findall(source)) for p in _EMPTY_HANDLER_PATTERNS)
-
-
-def _patch_has_anti_patterns(pre: bytes | None, post: bytes | None) -> list[str]:
-    """Return a list of anti-pattern violations INTRODUCED by the heal.
-
-    Only flags patterns that are NEW (post count > pre count) so
-    pre-existing SUT code doesn't trigger false positives.
-    Returns an empty list when clean."""
-    if post is None:
-        return []
-    try:
-        post_src = post.decode("utf-8", errors="replace")
-    except Exception:
-        return []
-    post_count = _count_empty_handlers(post_src)
-    if post_count == 0:
-        return []
-    pre_count = 0
-    if pre is not None:
-        try:
-            pre_src = pre.decode("utf-8", errors="replace")
-            pre_count = _count_empty_handlers(pre_src)
-        except Exception:
-            pass
-    if post_count > pre_count:
-        return [
-            f"exception swallowing: {post_count - pre_count} new empty "
-            f"exception handler(s) (except/catch with no-op body)"
-        ]
-    return []
-
-
-# File-shape predicates that heal is forbidden to touch. Mirrors the
-# FORBIDDEN block in `agents/polyglot-test-fixer.agent.md`. A heal that
-# modifies any file matching one of these (and not also matching the
-# POM allowlist) is reverted and reported as scope_violation. Catches
-# the run 20260611-184450 incident where the heal agent edited
-# `tests/fixtures/qtea_gemini_nav_*` instead of staying inside POM/
-# locator source. Implemented as predicates rather than glob patterns
-# because `fnmatch` does not handle `**`-recursive semantics portably.
-
-
-def _heal_path_is_forbidden(rel_posix: str) -> bool:
-    """True iff the path matches a FORBIDDEN file shape (basename + segments)."""
-    p = rel_posix
-    basename = p.rsplit("/", 1)[-1] if "/" in p else p
-    segments = p.split("/")
-    if basename == "conftest.py":
-        return True
-    if "__tests__" in segments:
-        return True
-    if "tests" in segments and "fixtures" in segments:
-        # Forbidden when 'fixtures' sits directly under any 'tests/' segment.
-        for i, seg in enumerate(segments[:-1]):
-            if seg == "tests" and i + 1 < len(segments) and segments[i + 1] == "fixtures":
-                return True
-    if "tests" in segments:
-        if basename.startswith("test_") and basename.endswith(".py"):
-            return True
-        if basename.endswith("_test.py"):
-            return True
-    if basename.endswith((".spec.ts", ".spec.js", ".test.ts", ".test.js")):
-        return True
-    return bool(basename.endswith("Test.java"))
-
-
-def _heal_allowlist_dirs(active_module: dict | None) -> set[str]:
-    """POM/locator directories (SUT-relative, posix-style) heal may touch.
-
-    Derived from `sut_inventory.json` → `modules[active].existing_page_objects`
-    + `existing_locators`. Empty set means "no allowlist information" — in
-    that case we fall back to permissive behaviour (only the FORBIDDEN globs
-    are enforced).
-    """
-    if not isinstance(active_module, dict):
-        return set()
-    dirs: set[str] = set()
-    for key in ("existing_page_objects", "existing_locators"):
-        for entry in active_module.get(key) or []:
-            file_rel = (entry.get("file") if isinstance(entry, dict) else "") or ""
-            file_rel = file_rel.replace("\\", "/")
-            if not file_rel:
-                continue
-            parent = file_rel.rsplit("/", 1)[0] if "/" in file_rel else ""
-            if parent:
-                dirs.add(parent)
-    return dirs
-
-
-def _heal_path_in_scope(
-    rel_path: str,
-    allowlist_dirs: set[str],
-    generated_files: set[str] | None = None,
-) -> bool:
-    """True iff a heal-modified path is in-scope.
-
-    Logic:
-      0. If the path is a codegen-generated file → always in-scope
-         (the heal agent is fixing codegen's own mistakes).
-      1. If the path is FORBIDDEN (fixture / test / conftest shape) → out.
-      2. If ``allowlist_dirs`` is non-empty, the path's parent must START WITH
-         one of those dirs. Empty allowlist → only rule (1) applies.
-    """
-    p = rel_path.replace("\\", "/")
-    if generated_files and p in generated_files:
-        return True
-    if _heal_path_is_forbidden(p):
-        return False
-    if not allowlist_dirs:
-        return True
-    return any(p == d or p.startswith(d + "/") for d in allowlist_dirs)
-
-
-def _git_revert_path(sut_root: Path, rel_path: str, status_code: str) -> bool:
-    """Revert a single uncommitted change. Returns True on success."""
-    import subprocess
-    try:
-        if status_code.strip() == "??":
-            (sut_root / rel_path).unlink(missing_ok=True)
-        else:
-            subprocess.run(
-                ["git", "checkout", "HEAD", "--", rel_path],
-                cwd=sut_root, capture_output=True, text=True,
-                check=False, timeout=10,
-            )
-        return True
-    except (OSError, subprocess.TimeoutExpired) as e:
-        log.error("step09.git_revert_failed", path=rel_path, error=str(e))
-        return False
-
-
-def _git_status_porcelain(sut_root: Path) -> list[tuple[str, str]]:
-    """Return [(status_code, path), …] from `git status --porcelain`.
-
-    Uses `--untracked-files=all` so new files inside a previously-untracked
-    directory are listed individually (default porcelain collapses them to
-    the directory path, which breaks per-file revert). Empty list on
-    git-missing / error. Handles rename entries by taking the destination
-    path.
-    """
-    import subprocess
-    if not (sut_root / ".git").exists():
-        return []
-    try:
-        res = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=all"],
-            cwd=sut_root, capture_output=True, text=True, check=False,
-            timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired) as e:
-        log.warning("step09.git_status_failed", error=str(e))
-        return []
-    out: list[tuple[str, str]] = []
-    for line in (res.stdout or "").splitlines():
-        if len(line) < 4:
-            continue
-        status_code = line[:2]
-        path_part = line[3:].strip().strip('"')
-        if " -> " in path_part:
-            path_part = path_part.split(" -> ", 1)[1].strip().strip('"')
-        if path_part:
-            out.append((status_code, path_part))
-    return out
-
-
-def _heal_scope_check_and_revert(
-    sut_root: Path,
-    base_sha: str | None,
-    allowlist_dirs: set[str],
-    generated_files: set[str] | None = None,
-    pre_heal_dirty: set[str] | None = None,
-) -> list[str]:
-    """Inspect ``git status --porcelain`` for files the heal touched.
-
-    Reverts any out-of-scope modifications (``git checkout HEAD -- <file>``
-    for modified/deleted, ``rm`` for newly added). Returns the list of paths
-    that were reverted — empty when every touched file was in-scope.
-    Caller maps a non-empty return to ``applied=false, reason=scope_violation``.
-
-    *pre_heal_dirty*: files already dirty before the heal agent ran (e.g.
-    ``qtea-junit.xml`` from pytest). These are skipped — the heal agent
-    did not create them.
-    """
-    reverted: list[str] = []
-    for status_code, path_part in _git_status_porcelain(sut_root):
-        if pre_heal_dirty and path_part in pre_heal_dirty:
-            continue
-        if _heal_path_in_scope(path_part, allowlist_dirs, generated_files=generated_files):
-            continue
-        if _git_revert_path(sut_root, path_part, status_code):
-            reverted.append(path_part)
-            log.warning(
-                "step09.heal_out_of_scope_reverted",
-                path=path_part,
-                base_sha=base_sha,
-            )
-    return reverted
-
-
-def _heal_revert_all_uncommitted(
-    sut_root: Path,
-    base_sha: str | None,
-) -> list[str]:
-    """Revert EVERY uncommitted change in the SUT working tree.
-
-    Called when the heal agent failed outright (timeout, transport error)
-    to ensure no in-flight edits — even ones inside the POM allowlist —
-    survive on disk. Without this, run 20260611-184450 left 5 in-progress
-    fixture edits on the qtea branch after the 150s timeout, and the
-    `applied=false` log conflicted with the on-disk reality.
-    """
-    reverted: list[str] = []
-    for status_code, path_part in _git_status_porcelain(sut_root):
-        if _git_revert_path(sut_root, path_part, status_code):
-            reverted.append(path_part)
-    if reverted:
-        log.warning(
-            "step09.heal_full_revert",
-            base_sha=base_sha,
-            paths=reverted,
-        )
-    return reverted
-# Fallback tests subdirectory used when:
-#   - --isolated-tests is set (explicit user opt-in to today's behavior), OR
-#   - sut_inventory has no test_directory_layout for the active module.
-# When isolated, the dir lives under the active module's path so monorepos
-# don't clobber sibling modules.
-_ISOLATED_TESTS_DIR_NAME = "qteaests"
-
-
-# Poetry stdout phrases that indicate `poetry add` was a no-op because the
-# package is already declared in pyproject.toml. Exit code is 0 in that case
-# even though NOTHING was installed — treat as failure so the caller doesn't
-# claim victory and re-run the same broken tests. See the run forensics in
-# the bug that introduced this check: the package was declared but never
-# installed in the resolved venv (because qtea's parent venv was being
-# reused — see proxy.safe_subprocess_env's isolate_venv flag).
-_POETRY_NOOP_MARKERS: tuple[str, ...] = (
-    "already present in the pyproject.toml",
-    "Nothing to add",
+# Fixer-agent prompt builder, patch application, and runner-narrowing helpers
+# live in a dedicated submodule. Re-exported here to preserve the historical
+# dotted path. `_NO_PATCH_SUMMARY` (the summary_text sentinel that gates the
+# real-bug classification on the ExecuteStep side) also lives there.
+from qtea.steps.s09.fixer_prompt import (  # noqa: E402
+    _NO_PATCH_SUMMARY,
+    _apply_fixer_outputs,
+    _build_fixer_prompt,
+    _filter_command_for_tests,
+    _narrow_command_to_ids,
 )
 
 
-def _run_dep_install(
-    package_manager: str | None,
-    package: str,
-    sut_root: Path,
-    install_log_path: Path,
-    *,
-    timeout_s: int = 600,
-    profile: StackProfile | None = None,
-) -> tuple[bool, str]:
-    """Install a single missing test dependency. Append outcome to install.log.
-
-    `profile` is consulted for two reasons: (1) pip needs the SUT's venv-bin
-    directory to build a path-prefixed install argv, and (2) Python managers
-    that own a venv (poetry, uv, pdm, pipenv) need `VIRTUAL_ENV` stripped
-    from the subprocess env so they don't reuse qtea's parent venv as
-    the SUT's venv. Falls back to bare argv when `profile` is None — same
-    behavior as pre-fix runs for callers that don't have a profile handy.
-
-    Returns ``(success, summary)`` where ``summary`` is the command line on
-    success or a one-line error on failure. Never raises — package-manager
-    timeouts / OS errors become structured failures.
-    """
-    pm = (package_manager or "").lower()
-    # pip needs the SUT's venv bin dir to install into the venv the tests
-    # actually use; for poetry/uv/pdm/pipenv venv_bin is unused.
-    venv_bin = None
-    if pm == "pip" and profile and profile.wrapper_prefix:
-        venv_bin = profile.wrapper_prefix
-    argv = install_command_for(package_manager, package, venv_bin=venv_bin)
-    if argv is None:
-        if pm == "pip":
-            return False, (
-                f"pip auto-install requires the SUT to have a .venv "
-                f"(profile.wrapper_prefix). None detected for "
-                f"package_manager={package_manager!r}."
-            )
-        return False, f"no install argv for package_manager={package_manager!r}"
-
-    cmd_line = " ".join(argv)
-    try:
-        proc = subprocess.run(
-            argv,
-            cwd=sut_root,
-            env=safe_subprocess_env(isolate_venv=pm in PYTHON_VENV_MANAGERS),
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as e:
-        with install_log_path.open("a", encoding="utf-8") as fh:
-            fh.write(f"\n\n$ {cmd_line}  # auto-install\n# error: {e}\n")
-        return False, f"{cmd_line}: {e}"
-
-    with install_log_path.open("a", encoding="utf-8") as fh:
-        fh.write(
-            f"\n\n$ {cmd_line}  # auto-install missing dep\n"
-            f"# exit_code: {proc.returncode}\n"
-            f"# STDOUT\n{proc.stdout}\n"
-            f"# STDERR\n{proc.stderr}\n"
-        )
-
-    if proc.returncode != 0:
-        tail = (proc.stderr or proc.stdout).strip().splitlines()
-        snippet = tail[-1] if tail else ""
-        return False, f"`{cmd_line}` exited {proc.returncode}: {snippet[:200]}"
-
-    if pm == "poetry" and any(m in (proc.stdout or "") for m in _POETRY_NOOP_MARKERS):
-        return False, (
-            f"`{cmd_line}` was a no-op: package already declared in pyproject.toml "
-            f"but not installed in the resolved venv. Run `poetry install` against "
-            f"a clean SUT-specific venv, or delete the active venv and re-run."
-        )
-    return True, cmd_line
+# Attempt-N state persistence + install-signature fingerprinting live in a
+# dedicated submodule. Re-exported here to preserve the historical dotted path.
+from qtea.steps.s09.attempt_state import (  # noqa: E402
+    _attempt_state_path,
+    _compute_install_sig,
+    _load_attempt_state,
+    _save_attempt_state,
+)
 
 
-def _research_payload(ctx: StepContext) -> dict:
-    p = ctx.workspace.step_dir(6) / "research.json"
-    if not p.exists():
-        return {}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+# Failure classification + _failing_tests / _build_bug_candidates live in a
+# dedicated submodule (failure_class heuristics, real-bug bucketing).
+# Re-exported here to preserve the historical dotted path used by tests
+# (`from qtea.steps.s09_execute import _failing_tests`, etc.).
+from qtea.steps.s09.failure_class import (  # noqa: E402
+    _CLASSIFY_PATTERNS,
+    _FAILURE_CLASS_HEALABLE,
+    _build_bug_candidates,
+    _classify_failure,
+    _failing_tests,
+    _partition_failures,
+)
+
+# JIT locator-cache dev-pool prewarm + resolver-spend telemetry summarizer
+# live in a dedicated submodule. Re-exported here to preserve dotted paths.
+from qtea.steps.s09.jit_prewarm import (  # noqa: E402
+    _prewarm_jit_cache_dev_pool,
+    _summarize_resolver_spend,
+)
 
 
-def _load_stack_profile(ctx: StepContext) -> StackProfile | None:
-    """Load Step 6's stack_profile.json into a `StackProfile` dataclass.
-
-    Returns None when the artifact is missing (older workspaces re-run from
-    Step 8+) or when the JSON is unparseable. Step 9 falls back to bare
-    framework commands in that case.
-    """
-    p = ctx.workspace.step_dir(6) / "stack_profile.json"
-    if not p.exists():
-        return None
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    # Tolerate extra keys; only consume known dataclass fields.
-    allowed = {
-        "language", "package_manager", "wrapper_prefix",
-        "pre_install_command", "install_command",
-        "test_command", "start_command", "env_file_path", "venv_path",
-        "detection_signal", "notes",
-    }
-    return StackProfile(**{k: data.get(k) for k in allowed})
+# JIT resolver HITL escalation for unresolvable TBD sentinels lives in a
+# dedicated submodule. Re-exported here to preserve the historical dotted path.
+from qtea.steps.s09.jit_hitl import (  # noqa: E402
+    _append_resolved_to_dev_locators,
+    _collect_hitl_pending,
+    _hitl_resolve_unresolvable,
+)
 
 
-def _detected_command(research: dict) -> str | None:
-    cmds = research.get("commands") or {}
-    return cmds.get("test")
+# End-of-attempt overlay-event sweep + HITL persistence lives in a dedicated
+# submodule. Re-exported here to preserve the historical dotted path.
+from qtea.steps.s09.overlay_sweep import (  # noqa: E402
+    _hitl_overlay_sweep,
+    _interceptors_path,
+    _overlay_events_path,
+)
 
 
-def _active_module(sut_inventory: dict) -> dict | None:
-    """Pull the active module entry out of a raw `sut_inventory` dict.
-
-    Returns None when no `active_module` is set or the name doesn't match.
-    Older runs (no `sut_inventory` field) get None and fall through to the
-    isolated-tests fallback.
-    """
-    active = sut_inventory.get("active_module")
-    if not active:
-        return None
-    for mod in sut_inventory.get("modules") or []:
-        if isinstance(mod, dict) and mod.get("name") == active:
-            return mod
-    return None
+# TBD-sentinel promotion (rewrites tbd("intent") calls end-of-attempt) lives
+# in a dedicated submodule. Re-exported here to preserve the historical
+# dotted path used by tests (test_promote_tbd_gating imports these via
+# `from qtea.steps.s09_execute import _promote_resolved_tbds`).
+from qtea.steps.s09.tbd_promotion import (  # noqa: E402
+    _ensure_runtime_imports,
+    _format_promoted_substitution,
+    _promote_resolved_tbds,
+)
 
 
-def _framework(research: dict, index: dict) -> str:
-    return research.get("detected_stack") or index.get("framework") or "unknown"
+# JIT-resolver bug-candidate emitters (dev-pool drift + unresolvable TBDs)
+# live in a dedicated submodule. Re-exported here to preserve the historical
+# dotted path used by tests (test_dev_pool_quarantine imports these via
+# `from qtea.steps.s09_execute import _bug_candidates_for_dev_pool_drift`).
+from qtea.steps.s09.bug_candidates_ext import (  # noqa: E402
+    _bug_candidates_for_dev_pool_drift,
+    _bug_candidates_for_unresolvable_tbds,
+)
 
 
-def _load_index(ctx: StepContext) -> dict:
-    p = ctx.workspace.step_dir(8) / "tbd-index.json"
-    if not p.exists():
-        return {}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+# Playwright MCP server lazy-probe (warms npx cache before first heal)
+# lives in a dedicated submodule. Re-exported here to preserve the
+# monkey-patch path used by tests/unit/test_mcp_preflight_lazy.py, which
+# patches `qtea.steps.s09_execute._lazy_probe_heal_mcp` directly.
+from qtea.steps.s09.mcp_probe import _lazy_probe_heal_mcp  # noqa: E402
 
 
-def _load_generated_files(ctx: StepContext) -> set[str]:
-    """Load Step 8's ``generated-files.json`` and return SUT-relative posix paths.
-
-    These are the files codegen produced this run.  The heal agent is allowed
-    to edit them even when they match a test-file FORBIDDEN pattern, because
-    the heal agent is fixing codegen's own mistakes (interaction patterns,
-    locator usage) — NOT pre-existing SUT test code.
-    """
-    p = ctx.workspace.step_dir(8) / "generated-files.json"
-    if not p.exists():
-        return set()
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return set()
-    files = data.get("files") or []
-    return {f.replace("\\", "/") for f in files if isinstance(f, str)}
-
-
-def _sut_tests_dir(
-    sut_root: Path,
-    *,
-    active_module: dict | None,
-    isolated: bool,
-) -> Path:
-    """Resolve the directory inside the SUT where qtea-generated tests live.
-
-    Steps 7 & 8 write tests there directly (on the qtea branch); this
-    function only computes the path — nothing is copied or wiped.
-
-    Resolution mirrors the active module's layout:
-      - `--isolated-tests` → `<sut>/<module.path>/qteaests/`
-      - Active module's `test_directory_layout.base_dir` (the SUT's own
-        convention, e.g. `tests/` or `e2e/`) → `<sut>/<module.path>/<base_dir>/`
-      - Fallback when nothing is known: `<sut>/<module.path>/qteaests/`
-    """
-    module_path = "."
-    base_dir = _ISOLATED_TESTS_DIR_NAME
-    if active_module:
-        module_path = str(active_module.get("path") or ".")
-        if not isolated:
-            layout = active_module.get("test_directory_layout") or {}
-            candidate = layout.get("base_dir")
-            if candidate:
-                base_dir = str(candidate)
-    module_root = sut_root if module_path == "." else (sut_root / module_path)
-    return module_root / base_dir
-
-
-def _attachment_glob(sut_root: Path) -> list[dict]:
-    """Best-effort discovery of common test-result artifacts in the SUT root."""
-    out: list[dict] = []
-    patterns: list[tuple[str, str]] = [
-        ("test-results/**/trace.zip", "trace"),
-        ("test-results/**/*.png", "screenshot"),
-        ("test-results/**/*.webm", "video"),
-        ("screenshots/**/*.png", "screenshot"),
-        ("screenshots/**/*.jpg", "screenshot"),
-        ("reports/screenshots/**/*.png", "screenshot"),
-        ("playwright-report/**/*", "other"),
-        ("allure-results/**/*.png", "screenshot"),
-        ("allure-results/**/*.json", "other"),
-    ]
-    for pattern, kind in patterns:
-        for p in sut_root.glob(pattern):
-            if p.is_file():
-                out.append({"path": str(p), "type": kind})
-    return out
-
-
-def _clean_sut_artifacts(sut_root: Path) -> None:
-    """Remove prior-attempt screenshots/traces so only the last run's artifacts survive."""
-    import contextlib
-
-    patterns = [
-        "test-results/**/*.png",
-        "test-results/**/*.webm",
-        "screenshots/**/*.png",
-        "screenshots/**/*.jpg",
-        "reports/screenshots/**/*.png",
-    ]
-    for pattern in patterns:
-        for p in sut_root.glob(pattern):
-            with contextlib.suppress(OSError):
-                p.unlink()
-
-
-def _failing_tests(run: RunResult) -> list[TestRunEntry]:
-    return [r for r in run.results if r.status in ("failed", "error")]
-
-
-def _build_fixer_prompt(
-    entry: TestRunEntry,
-    tests_root_in_sut: Path,
-    *,
-    sut_root: Path | None = None,
-    sut_base_url: str | None = None,
-    active_module: dict | None = None,
-    staged_files: list[str] | None = None,
-    storage_state_path: Path | None = None,
-    generated_files: set[str] | None = None,
-    failure_class: str | None = None,
+def _compose_runner_stream_diagnostics(
+    stderr: str | None, stdout: str | None,
 ) -> str:
-    snippet = (entry.traceback or entry.message or "(no traceback)")[-3000:]
+    """Compose the stderr/stdout appendix for `result.error` on a
+    runner-only failure.
 
-    live_block = ""
-    if sut_base_url:
-        auth_summary = _auth_summary_for_prompt(active_module) if active_module else ""
-        if sut_root is None:
-            files_str = "\n".join(f"  - `{p}`" for p in (staged_files or [])) \
-                or "  (none discovered)"
+    Both streams are surfaced (not `if stderr elif stdout` — Playwright's
+    JSON reporter writes diagnostics to stdout, and the runtime's benign
+    `qtea {"event":"installed"}` marker can fill stderr and mask stdout).
+    Long streams get HEAD + TAIL slices because parse errors
+    (`Unexpected token (1:0)`) and module-not-found errors surface at the
+    head, not the tail — the prior tail-only truncation dropped exactly
+    the line the debug agent needed.
+
+    See run 20260701-114656-9394eb for the incident.
+    """
+    parts: list[str] = []
+    stderr_s = (stderr or "").strip()
+    stdout_s = (stdout or "").strip()
+    if stderr_s:
+        if len(stderr_s) <= 3000:
+            parts.append(f"\n\n--- stderr ---\n{stderr_s}")
         else:
-            files_str = "\n".join(f"  - `{sut_root / p}`" for p in (staged_files or [])) \
-                or "  (none discovered)"
-        language = (active_module or {}).get("language") or "unknown"
-        # Storage-state pre-load directive (empty string when no state
-        # was resolved by Step 9). When set, instructs the agent to skip
-        # the auth-replay step entirely; when unset, the auth-replay
-        # workflow remains.
-        from qtea import storage_state as _storage_state_mod
-        storage_state_block = _storage_state_mod.summary_for_prompt(storage_state_path)
-        # Step (1) of the workflow varies based on storage-state availability.
-        # When pre-loaded, the agent skips the sign-in helper outright.
-        # When absent, the agent follows the SUT's auth flow as before.
-        if storage_state_path is not None:
-            step_one = (
-                "(1) The browser is already authenticated via the pre-loaded "
-                "storage state described above. Call `mcp__playwright__browser_navigate` "
-                "to go directly to the failing page URL — do NOT call the SUT's "
-                "sign-in helper. (If the page redirects to login, the state "
-                "is stale: log a note and fall back to the auth-replay path "
-                "via the helpers below.) "
-            )
+            parts.append(f"\n\n--- stderr HEAD (first 1500) ---\n{stderr_s[:1500]}")
+            parts.append(f"\n\n--- stderr TAIL (last 1500) ---\n{stderr_s[-1500:]}")
+    if stdout_s:
+        if len(stdout_s) <= 3000:
+            parts.append(f"\n\n--- stdout ---\n{stdout_s}")
         else:
-            step_one = (
-                f"(1) Call `mcp__playwright__browser_navigate` to open "
-                f"`{sut_base_url}` and follow the SUT's auth flow via the "
-                f"existing sign-in helper above. "
-            )
-        live_block = (
-            f"\n--- LIVE DIAGNOSIS ---\n"
-            f"SUT base URL: `{sut_base_url}`. Active module language: `{language}`.\n"
-            f"{auth_summary}\n"
-            f"{storage_state_block}\n"
-            + (f"\nSUT clone root (you have add_dirs access — read + edit "
-               f"these files directly): `{sut_root}`\n" if sut_root else "\n")
-            + (f"\nKey SUT files for this active module — call these instead "
-               f"of reimplementing auth or navigation:\n{files_str}\n\n"
-               f"Playwright MCP is pre-warmed and ready — its tools are exposed "
-               f"as `mcp__playwright__<name>` (e.g. `mcp__playwright__browser_navigate`, "
-               f"`mcp__playwright__browser_snapshot`). Use the exact prefixed name; "
-               f"bare `browser_navigate` will not resolve.\n\n"
-               f"Workflow: {step_one}"
-               f"(2) Take a `mcp__playwright__browser_snapshot` of the page "
-               f"the failing test targets and compare it to what the traceback "
-               f"says the test expected. (3) Patch the test based on what you "
-               f"observe live, NOT just from the traceback text. Match the "
-               f"active module's language: `{language}`. Never rewrite a Python "
-               f"test in TypeScript or vice versa.\n")
-        )
-
-    # Absolute path of the failing test inside the SUT. The fixer must edit
-    # THIS exact file (on the qtea branch) — no per-step workdir copy.
-    failing_test_abs = (
-        (tests_root_in_sut / Path(entry.file).name).as_posix()
-        if entry.file else "(unknown — see `entry.file`)"
-    )
-
-    gen_block = ""
-    if generated_files:
-        _test_suffixes = (
-            "_test.py", ".spec.ts", ".spec.js", ".test.ts", ".test.js",
-            "Test.java",
-        )
-        gen_test_files = sorted(
-            f for f in generated_files
-            if f.endswith(_test_suffixes)
-            or (f.split("/")[-1].startswith("test_") and f.endswith(".py"))
-        )
-        if gen_test_files:
-            files_list = "\n".join(f"  - `{f}`" for f in gen_test_files)
-            gen_block = (
-                f"\n--- GENERATED TEST FILES (EDITABLE) ---\n"
-                f"The following test files were generated by codegen (Step 8) "
-                f"this run. You MAY edit interaction patterns in these files "
-                f"(method calls, locator usage, navigation sequences, API "
-                f"usage like switching from `.click()` to `page.select_option()`). "
-                f"You MUST NOT modify assertions (`assert`, `expect`, `.should()`). "
-                f"Pre-existing test files NOT listed here remain FORBIDDEN.\n"
-                f"{files_list}\n"
-            )
-
-    class_block = ""
-    if failure_class:
-        class_block = f"\nFailure class: `{failure_class}`\n"
-        if failure_class == "assertion_value":
-            class_block += (
-                "Strategy hint: this failure was classified as `assertion_value` — "
-                "the traceback shows an assertion mismatch (e.g. `assert None == "
-                "'true'`). This is SOMETIMES downstream of locator drift (wrong "
-                "element found -> wrong attribute value) and SOMETIMES a genuine "
-                "app defect that heal cannot fix.\n\n"
-                "**Diagnose from the traceback first.** Read the assertion line, "
-                "the expected vs actual values, and the locator used. If the "
-                "mismatch clearly indicates a wrong-element problem (e.g. "
-                "`get_attribute` returned `None` because the locator resolved to "
-                "a different element), proceed with live browser navigation to "
-                "find the correct locator.\n\n"
-                "If the mismatch indicates a genuine attribute/content defect in "
-                "the app (e.g. the correct element was found but it genuinely "
-                "lacks the expected attribute, or returns a different value), "
-                "this is an app bug — not locator drift. Emit "
-                "`OUT_OF_SCOPE: assertion-attribute-defect` and stop. Do NOT "
-                "spend turns navigating the browser to confirm what the "
-                "traceback already tells you.\n"
-            )
-
-    return (
-        "A single test failed. Apply the smallest possible patch to make it "
-        "pass without modifying assertions, business logic, or test_ids, and "
-        "without adding hard waits. Locator priority: id > data-testid > role > "
-        "label > text > placeholder > scoped css. NEVER XPath.\n\n"
-        f"Test id: {entry.id}\n"
-        f"Test file (relative to repo root): {entry.file}\n"
-        f"Tests directory in SUT: {tests_root_in_sut.as_posix()}\n"
-        f"Failing test absolute path (edit this file in place): {failing_test_abs}\n"
-        f"Status: {entry.status}\n"
-        f"Message: {entry.message or '(none)'}\n\n"
-        f"Traceback:\n{snippet}\n"
-        f"{class_block}"
-        f"{gen_block}"
-        f"{live_block}\n"
-        f"Edit the failing test file at its absolute path above using the "
-        f"Edit tool. The pipeline does NOT copy your changes anywhere — the "
-        f"SUT clone IS the deliverable, on a qtea-owned git branch. Only "
-        f"edit files that already exist under the tests directory."
-    )
+            parts.append(f"\n\n--- stdout HEAD (first 1500) ---\n{stdout_s[:1500]}")
+            parts.append(f"\n\n--- stdout TAIL (last 1500) ---\n{stdout_s[-1500:]}")
+    return "".join(parts)
 
 
-def _apply_fixer_outputs(
-    workdir: Path,
-    sut_tests_dir: Path,
-    target_file_rel: str,
-    *,
-    ignore_paths: set[Path] | None = None,
-) -> bool:
-    """Copy any test-file edits produced by the fixer back into sut_tests_dir.
+@dataclasses.dataclass
+class _PostRunState:
+    """State handed from Step 9's heal-loop phase to ``_finalize_and_report``.
 
-    Only files matching the target test's relative path (or any sibling under
-    the same tests dir layout) are accepted; everything else is ignored.
-    `ignore_paths` should contain absolute paths the caller staged BEFORE the
-    agent ran (e.g. the original test file copy); those are filtered out so
-    they are not mis-detected as a "patch".
-
-    Returns True if anything was applied.
+    Groups the ~11 locals the finalization phase reads so the call site is a
+    single argument. All fields are read-only from ``_finalize_and_report``'s
+    perspective except ``first.results``, which the attachment-glob step
+    mutates in-place before the payload snapshot.
     """
-    if not target_file_rel:
-        return False
-    ignore = {p.resolve() for p in (ignore_paths or set())}
-    basename = Path(target_file_rel).name
-    target_abs = sut_tests_dir / basename
-    # Find every matching file under workdir; exclude ignored stage copies.
-    candidates = [p for p in workdir.rglob(basename) if p.is_file() and p.resolve() not in ignore]
-    if not candidates:
-        return False
-    # Pick latest-modified candidate.
-    chosen = max(candidates, key=lambda p: p.stat().st_mtime)
-    new_text = chosen.read_text(encoding="utf-8", errors="replace")
-    if target_abs.exists():
-        old_text = target_abs.read_text(encoding="utf-8", errors="replace")
-        if old_text == new_text:
-            return False
-    target_abs.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(chosen, target_abs)
-    return True
+    first: RunResult
+    self_heal_meta: dict[str, dict]
+    test_runner_invocations: int
+    patches_applied: int
+    patches_rejected: int
+    framework: str
+    jit_cache_dir: Path
+    install_sig: str | None
+    prior_state: dict | None
+    current_attempt: int
+    runtime_env: dict
 
 
-def _filter_command_for_tests(command: str, failing: list[TestRunEntry]) -> str:
-    """Narrow a re-run command to only the healed tests.
+@dataclasses.dataclass
+class _BootstrapResult:
+    """State produced by :meth:`ExecuteStep._bootstrap` and consumed by the
+    rest of ``run()``.
 
-    pytest: ``-k "name1 or name2"``
-    Playwright Test: ``--grep "name1|name2"``
-
-    Parametrization suffixes (``test_x[case]``) are stripped to the base
-    name so every parametrization of a healed test is re-run.
-
-    No-op when there are no failing tests, no usable names could be
-    extracted, or the command already carries an explicit filter.
+    Most fields are read-only from the caller's perspective, but a few
+    (``stack_profile``, ``install_sig``, ``runtime_env``) get updated later
+    by dep-recovery and the post-run storage-state re-resolve, so the
+    caller reassigns via ``boot.<field> = ...`` at those spots.
     """
-    if not failing:
-        return command
-    names: list[str] = []
-    for e in failing:
-        name = (e.name or "").split("[", 1)[0].strip()
-        if name and name not in names:
-            names.append(name)
-    if not names:
-        return command
-
-    tokens = command.lower().split()
-
-    # Playwright Test: --grep "name1|name2"
-    if "playwright" in tokens and "test" in tokens:
-        if re.search(r"(?:^|\s)--grep(?:\s|=)", command):
-            return command
-        escaped = [re.escape(n) for n in names]
-        return f'{command} --grep "{"|".join(escaped)}"'
-
-    # pytest: -k "name1 or name2"
-    if "pytest" not in tokens:
-        return command
-    if re.search(r"(?:^|\s)-k(?:\s|=)", command):
-        return command
-    expr = " or ".join(names)
-    return f'{command} -k "{expr}"'
-
-
-def _narrow_command_to_ids(
-    command: str, all_results: list, allow_ids: set[str],
-) -> str:
-    """Restrict ``command`` to tests whose id is in ``allow_ids``. Wraps
-    :func:`_filter_command_for_tests` so the same -k / --grep narrowing
-    logic applies to attempt-2's initial test run, not just the post-heal
-    re-run."""
-    keep = [e for e in all_results if e.id in allow_ids]
-    return _filter_command_for_tests(command, keep)
-
-
-# ----------------------------------------------------------------------------
-# Cross-attempt state (Tasks 2 + 4 + 5)
-#
-# Persisted per attempt under ``artifacts/step09/attempt-N-state.json`` so the
-# retry path can:
-#   - skip the SUT install when nothing the package manager cares about
-#     changed (Task 4 — saves ~10–30 s);
-#   - narrow attempt 2's initial test run to the subset that failed in
-#     attempt 1, MINUS tests the heal agent classified as real bugs
-#     (Tasks 2 + 5 — saves ~150–300 s plus the LLM cost of re-healing
-#     tests we already know we can't fix);
-#   - skip the heal call for those same real-bug tests on attempt 2.
-# ----------------------------------------------------------------------------
-
-# Heal `summary_text` value that signals "agent ran, found no fixable
-# defect" — i.e. very likely a real product bug, not a flaky selector.
-# Other summary strings ("rejected: heal introduced XPath", scope violation,
-# agent error) are NOT classified as real bug — they mean the heal needs
-# another try with different prompt / scope, not that there's nothing to fix.
-_NO_PATCH_SUMMARY = "no usable patch produced"
-
-
-def _attempt_state_path(out_dir: Path, attempt: int) -> Path:
-    return out_dir / f"attempt-{attempt}-state.json"
-
-
-def _save_attempt_state(
-    out_dir: Path,
-    attempt: int,
-    *,
-    failing: list[tuple[str, str]],
-    no_patch_ids: list[str],
-    install_sig: str | None,
-) -> None:
-    """Persist attempt N outcomes for attempt N+1's pre-run narrowing.
-
-    ``failing`` is a list of ``(id, name)`` tuples — ``id`` for set
-    membership in the heal-skip filter; ``name`` is what
-    :func:`_filter_command_for_tests` needs to build the ``-k`` /
-    ``--grep`` expression for the narrowed test run.
-
-    Best-effort: IO errors log and swallow so an artifact-write failure
-    cannot poison the retry path itself.
-    """
-    path = _attempt_state_path(out_dir, attempt)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps({
-                "attempt": attempt,
-                "failing": [{"id": i, "name": n} for i, n in failing],
-                "no_patch_ids": list(no_patch_ids),
-                "install_sig": install_sig,
-                "saved_at": datetime.now(UTC).isoformat(),
-            }, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-    except OSError as e:
-        log.warning(
-            "step09.attempt_state_save_failed", attempt=attempt, error=str(e),
-        )
-
-
-def _load_attempt_state(out_dir: Path, attempt: int) -> dict | None:
-    """Read attempt-N state. None when missing or corrupt — callers MUST
-    handle None by treating the attempt as cold (no narrowing, no skips)."""
-    path = _attempt_state_path(out_dir, attempt)
-    if not path.is_file():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        log.warning(
-            "step09.attempt_state_load_failed", attempt=attempt, error=str(e),
-        )
-        return None
-
-
-def _compute_install_sig(sut_root: Path, stack_profile) -> str | None:
-    """Stable signature of the SUT's dependency state. Two attempts of the
-    same step in the same workspace will see identical sig (heal commits
-    touch SUT source but NOT lockfiles) → install skip is safe.
-
-    Returns None when no lockfile is found — caller MUST treat as
-    "don't skip install" (better to re-install than risk a stale env)."""
-    if stack_profile is None:
-        return None
-    import hashlib
-
-    lock_candidates = (
-        "poetry.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
-        "uv.lock", "Pipfile.lock", "Gemfile.lock", "go.sum", "Cargo.lock",
-    )
-    parts: list[str] = [stack_profile.package_manager or ""]
-    found_any = False
-    for name in lock_candidates:
-        p = sut_root / name
-        if p.is_file():
-            try:
-                st = p.stat()
-                parts.append(f"{name}:{st.st_size}:{int(st.st_mtime)}")
-                found_any = True
-            except OSError:
-                continue
-    if not found_any:
-        return None
-    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
-
-
-def _prewarm_jit_cache_dev_pool(
-    *,
-    ctx: StepContext,
-    jit_cache_dir: Path,
-    dev_locators_path: Path,
-) -> int:
-    """Pre-populate the locator cache with tier-1b dev-pool matches for
-    every TBD sentinel currently in the SUT source tree. Returns count.
-
-    Source of truth: the live SUT — scanned via
-    :func:`qtea.tbd_scanner.scan_tbd_intents`. That guarantees we
-    prewarm the intents the next test run will actually request, even
-    if step 8's archived ``tbd-index.json`` has gone stale (heal
-    agent rewrote a constant, manual edit between steps, etc.).
-    No-op when no TBDs are present or no dev-locator pool is supplied.
-    """
-    from qtea import jit_resolver
-    from qtea.runtime.dev_locators import load_dev_locators
-    from qtea.tbd_scanner import scan_tbd_intents
-
-    sut_root = ctx.workspace.sut
-    scan_roots = [p for p in (sut_root / d for d in ("src", "tests", "pages")) if p.is_dir()]
-    if not scan_roots:
-        scan_roots = [sut_root]
-    hits = scan_tbd_intents(scan_roots, sut_root=sut_root)
-    if not hits:
-        return 0
-
-    # Dedupe by (intent, constant_name) — same intent referenced by
-    # multiple constants or files still needs one prewarm per cache key,
-    # which the resolver will dedupe internally via cache_key().
-    intents_payload: list[dict] = []
-    seen: set[tuple[str, str | None]] = set()
-    for h in hits:
-        intent = (h.intent or "").strip()
-        const = (h.constant_name or "").strip() or intent  # bare tbd() → intent as const
-        dedupe_key = (intent, h.constant_name)
-        if not intent or dedupe_key in seen:
-            continue
-        seen.add(dedupe_key)
-        intents_payload.append({
-            "intent": intent,
-            "constant_name": const,
-            "test_file": str(h.file).replace("\\", "/"),
-        })
-
-    if not intents_payload:
-        return 0
-
-    locators, _src, _warnings = load_dev_locators(cli_path=dev_locators_path)
-    if not locators:
-        return 0
-    return jit_resolver.prewarm_dev_pool_cache(
-        tbd_intents=intents_payload,
-        dev_locators=locators,
-        cache_path=jit_cache_dir / "locator-cache.json",
-        run_id=ctx.workspace.run_id,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Failure classification (used by the heal-gate to skip un-healable rows)
-# ---------------------------------------------------------------------------
-#
-# Run 20260621-213751-ee0fef hit the canonical recurring failure: 11/13 tests
-# failed, the heal-skip cap (`len(failing) > _MAX_HEAL_TESTS`) blocked the
-# entire heal flow, and TBD-promotion stayed blocked on `no_passing_witness`
-# — so the user saw 11 mixed failures with no recovery path. Decomposition
-# of the 11:
-#   - 7 locator/timeout issues (Playwright TimeoutError, action-mediated
-#     assertion-on-None) — heal can fix these via live MCP browser inspection
-#   - 3 real bugs (WCAG violations, TTI budget, DOM-order assertion) — heal
-#     cannot fix these; they are app-behaviour defects
-#   - 1 codegen bug (`fixture 'snapshot' not found`) — needs Step 8 retry,
-#     not heal
-#
-# The classifier below splits a `TestRunEntry` into one of:
-#   - locator_timeout    — Playwright TimeoutError on locator action
-#   - tbd_unresolvable   — JIT runtime exhausted bundle + LLM and gave up
-#   - assertion_value    — bare assertion mismatch (e.g. `assert None == 'x'`,
-#                          typically downstream of a locator finding the wrong
-#                          element); treated as healable because the cause is
-#                          usually upstream locator drift
-#   - wcag_violation     — axe-core / WCAG audit reported issues
-#   - tti_budget         — performance budget assertion
-#   - fixture_missing    — pytest fixture lookup failure (codegen drift)
-#   - import_error       — ModuleNotFoundError / ImportError at collection
-#   - dom_order          — order-sensitive DOM assertion (e.g. `is_above is True`)
-#   - unknown            — defaults to healable so we never lose a fix
-#                          opportunity to a classifier gap
-#
-# The classifier is a PURE FUNCTION over `entry.message` + `entry.traceback`
-# strings. No side effects, easy to unit-test. Anything classified as
-# locator_timeout / tbd_unresolvable / assertion_value / unknown counts
-# toward the heal queue; everything else flows directly to bug-candidates
-# as a "real bug" without consuming heal budget.
-#
-# Operator escape: set `QTEA_HEAL_ALL=1` to bypass the classifier and
-# heal every failure (useful for debugging the classifier itself).
-
-_FAILURE_CLASS_HEALABLE = frozenset({
-    "locator_timeout", "tbd_unresolvable", "assertion_value", "unknown",
-})
-
-_CLASSIFY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    # JIT runtime fail-fast — the bundle was exhausted, LLM re-resolve gave
-    # up. Heal with MCP can interact (hover/click) then snapshot to find the
-    # right selector for elements not visible in initial AOM.
-    ("tbd_unresolvable", re.compile(
-        r"qtea JIT runtime: could not resolve locator", re.I,
-    )),
-    # Playwright TimeoutError on any Locator action (get_attribute, click,
-    # select_option, etc.). The runtime template's bundle-fallback already
-    # tried alternatives + re-resolved; reaching this stage means we need
-    # MCP-driven live inspection.
-    ("locator_timeout", re.compile(
-        r"playwright[\._]+_impl[\._]+_errors\.TimeoutError"
-        r"|TimeoutError:\s*Locator\.",
-        re.I,
-    )),
-    ("locator_timeout", re.compile(
-        r"Timeout\s+\d+ms\s+exceeded.*while\s+waiting", re.I,
-    )),
-    # Pytest fixture lookup failure — codegen referenced a fixture that
-    # isn't available (e.g. pytest-snapshot not installed). Heal cannot
-    # fix this; needs a Step 8 codegen retry with a corrected test.
-    ("fixture_missing", re.compile(
-        r"fixture '[^']+' not found|fixture \".+?\" not found", re.I,
-    )),
-    # Import errors at collection time. Heal scope forbids touching
-    # imports / fixtures / conftest. Word boundaries guard against false
-    # positives in AOM snapshots that might quote module names verbatim.
-    ("import_error", re.compile(
-        r"\bModuleNotFoundError\b|\bImportError\b|\bNo module named\b", re.I,
-    )),
-    # WCAG / accessibility audit. axe-core results are app behaviour;
-    # rewriting the test won't change the violation count.
-    ("wcag_violation", re.compile(
-        r"WCAG\s*[\d\.]+|wcag\d|axe-core|accessibility violation",
-        re.I,
-    )),
-    # Performance budget. A heal pass can't make the SUT faster.
-    # `\bTTI\b` requires word boundaries — bare `TTI` matched inside
-    # words like "settings" (seTTIngs) and false-flagged any test whose
-    # AOM dump contained UI text with that substring.
-    ("tti_budget", re.compile(
-        r"\bTTI\b|exceeds budget of \d+ms|p9[05] (?:latency|tti|response)",
-        re.I,
-    )),
-    # Order-sensitive DOM assertion (typically `is_above`, `is_before`).
-    # These are app-behaviour assertions — heal cannot reorder the DOM.
-    ("dom_order", re.compile(
-        r"(?:appear\s+(?:before|above)|DOM\s+order|is_above|is_before)",
-        re.I,
-    )),
-    # Bare assertion mismatch — usually a downstream symptom of locator
-    # drift (wrong element found → wrong value). Treat as healable: if
-    # heal can re-target the locator, the assertion will pass.
-    ("assertion_value", re.compile(
-        r"^\s*AssertionError|assert\s+\S+\s*(?:==|is|!=)",
-        re.I | re.MULTILINE,
-    )),
-)
-
-
-def _classify_failure(entry: TestRunEntry) -> str:
-    """Return one of the classes above based on entry.message + entry.traceback.
-
-    First matching pattern wins. Order matters — more-specific patterns
-    (e.g. `qtea JIT runtime`) come before more-general ones (e.g. bare
-    AssertionError). Returns ``"unknown"`` when nothing matches; the heal
-    gate treats unknown as healable so a classifier gap never blocks a
-    fix opportunity.
-    """
-    haystack = "\n".join(filter(None, (entry.message, entry.traceback)))
-    if not haystack:
-        return "unknown"
-    for label, pat in _CLASSIFY_PATTERNS:
-        if pat.search(haystack):
-            return label
-    return "unknown"
-
-
-def _partition_failures(
-    failing: list[TestRunEntry],
-) -> tuple[list[TestRunEntry], list[tuple[TestRunEntry, str]]]:
-    """Split ``failing`` into (healable, real_bugs).
-
-    ``real_bugs`` carries (entry, class_label) so the caller can record
-    the rationale in heal-log.jsonl without re-classifying.
-
-    Operator escape: ``QTEA_HEAL_ALL=1`` returns ``(failing, [])`` —
-    skips classification and heals everything. Use when the classifier
-    itself is suspected of false-positively excluding a real heal target.
-    """
-    if os.environ.get("QTEA_HEAL_ALL") == "1":
-        return list(failing), []
-    healable: list[TestRunEntry] = []
-    real_bugs: list[tuple[TestRunEntry, str]] = []
-    for entry in failing:
-        cls = _classify_failure(entry)
-        if cls in _FAILURE_CLASS_HEALABLE:
-            healable.append(entry)
-        else:
-            real_bugs.append((entry, cls))
-    return healable, real_bugs
-
-
-def _build_bug_candidates(failing: list[TestRunEntry]) -> dict:
-    now = datetime.now(UTC).isoformat()
-    out = {"candidates": []}
-    for f in failing:
-        out["candidates"].append({
-            "id": f"BC-{f.id}",
-            "test_id": f.id,
-            "title": f.name,
-            "file": f.file,
-            "status": f.status,
-            "message": f.message,
-            "traceback": f.traceback,
-            "tc_refs": [],
-            "attachments": f.attachments,
-            "first_seen": now,
-        })
-    return out
-
-
-def _summarize_resolver_spend(jit_cache_dir: Path) -> dict | None:
-    """Read ``<jit_cache_dir>/resolver-spend.jsonl`` and build a summary
-    block for ``run-results.json``. Returns None when no spend file was
-    produced (no JIT runtime ran, or no resolution events fired).
-
-    Telemetry shape kept narrow on purpose — counts, totals, and hits per
-    tier. No selectors, page URLs, or snapshot bodies (privacy + size).
-    """
-    p = jit_cache_dir / "resolver-spend.jsonl"
-    if not p.is_file():
-        return None
-    tier_hits = {1: 0, 2: 0, 3: 0, 4: 0}
-    total_input = 0
-    total_output = 0
-    unresolvable = 0
-    fallback_promoted_count = 0
-    durations_ms: list[int] = []
-    models: set[str] = set()
-    count = 0
-    try:
-        with p.open(encoding="utf-8") as f:
-            for line in f:
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                try:
-                    entry = json.loads(stripped)
-                except json.JSONDecodeError:
-                    continue
-                count += 1
-                tier = entry.get("tier")
-                if tier in tier_hits:
-                    tier_hits[tier] += 1
-                total_input += int(entry.get("input_tokens") or 0)
-                total_output += int(entry.get("output_tokens") or 0)
-                if entry.get("model"):
-                    models.add(entry["model"])
-                if entry.get("duration_ms") is not None:
-                    durations_ms.append(int(entry["duration_ms"]))
-                if entry.get("success") is False:
-                    unresolvable += 1
-                if entry.get("fallback_promoted"):
-                    fallback_promoted_count += 1
-    except OSError:
-        return None
-    if count == 0:
-        return None
-    # Cost estimation reuses the existing pricing table if available;
-    # otherwise the consumer can compute it from input/output tokens.
-    est_cost_usd: float | None = None
-    try:
-        from qtea.llm.cost import estimate_cost  # type: ignore[import-not-found]
-        for m in (models or {""}):
-            est_cost_usd = (est_cost_usd or 0.0) + estimate_cost(
-                m, total_input, total_output,
-            )
-    except Exception:
-        est_cost_usd = None
-    return {
-        "total_resolutions": count,
-        "total_input_tokens": total_input,
-        "total_output_tokens": total_output,
-        "tier_1_hits": tier_hits[1],
-        "tier_2_hits": tier_hits[2],
-        "tier_3_hits": tier_hits[3],
-        "tier_4_hits": tier_hits[4],
-        "unresolvable_count": unresolvable,
-        "fallback_promoted_count": fallback_promoted_count,
-        "models": sorted(models) or None,
-        "median_duration_ms": (
-            sorted(durations_ms)[len(durations_ms) // 2] if durations_ms else None
-        ),
-        "est_cost_usd": est_cost_usd,
-    }
-
-
-def _collect_hitl_pending(jit_cache_dir: Path) -> list[dict]:
-    """Read every ``hitl-pending-*.json`` file the JIT runtime dropped during
-    test execution. Each file represents an unresolvable TBD that needs a
-    human-in-the-loop selector OR a structured bug candidate.
-
-    Returns the parsed dicts (one per TBD); files that fail to parse are
-    skipped with a warning. The files are NOT deleted here — Phase 4's
-    HITL prompt deletes the ones that get answered; the rest persist for
-    the bug-candidates emission downstream.
-    """
-    if not jit_cache_dir.is_dir():
-        return []
-    out: list[dict] = []
-    for p in sorted(jit_cache_dir.glob("hitl-pending-*.json")):
-        try:
-            entry = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as e:
-            log.warning("step09.hitl_pending_unreadable", path=str(p), error=str(e))
-            continue
-        entry["_pending_path"] = str(p)
-        out.append(entry)
-    return out
-
-
-def _hitl_resolve_unresolvable(
-    pendings: list[dict], *,
-    dev_locators_path: Path | None,
-    no_hitl: bool = False,
-) -> tuple[list[dict], list[dict]]:
-    """Surface each unresolved TBD to the user on a TTY, write their
-    answer to ``dev-locators.json`` (next run uses it as Tier 1), and
-    delete the pending file. Non-TTY / ``no_hitl=True`` runs leave every
-    pending in place — caller emits them as structured bug candidates.
-
-    Returns ``(resolved, remaining)`` — ``resolved`` were answered by the
-    user, ``remaining`` are still unresolved and flow into bug-candidates.
-    """
-    import sys
-
-    import os
-    is_tty = (sys.stdin is not None and sys.stdin.isatty()) or os.environ.get("QTEA_UI_MODE")
-    if not is_tty or no_hitl or not pendings:
-        return [], pendings
-
-    resolved: list[dict] = []
-    remaining: list[dict] = []
-    log.info("step09.hitl_pending_count", count=len(pendings))
-    print(
-        f"\n[qtea] {len(pendings)} locator(s) the JIT runtime could not "
-        f"resolve. You can supply a selector for each, or press ENTER to skip "
-        f"(skipped TBDs become bug-candidate entries for Step 9).\n",
-        flush=True,
-    )
-    for entry in pendings:
-        intent = entry.get("intent") or "(no intent)"
-        constant = entry.get("constant_name") or "(unknown)"
-        page_url = entry.get("page_url") or "(unknown)"
-        print(f"  TBD: {constant} — {intent}")
-        print(f"       page: {page_url}")
-        try:
-            answer = input("       selector (or ENTER to skip): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            answer = ""
-        if not answer:
-            remaining.append(entry)
-            continue
-        if answer.startswith("//") or answer.startswith("xpath=") or "By.XPATH" in answer:
-            print("       [rejected] XPath selectors are forbidden by qtea.")
-            remaining.append(entry)
-            continue
-        entry["_user_selector"] = answer
-        resolved.append(entry)
-        # Best-effort: also remove the pending file so next runs don't re-prompt.
-        with contextlib.suppress(OSError):
-            Path(entry.get("_pending_path", "")).unlink(missing_ok=True)
-
-    if resolved and dev_locators_path is not None:
-        _append_resolved_to_dev_locators(resolved, dev_locators_path)
-    return resolved, remaining
-
-
-def _append_resolved_to_dev_locators(
-    resolved: list[dict], dev_locators_path: Path,
-) -> None:
-    """Merge HITL answers into dev-locators.json so the next run's
-    Tier 1 picks them up without re-prompting. File schema:
-    ``{"locators": {"CONST_NAME": {"selector": "...", "source": "hitl"}}}``."""
-    try:
-        if dev_locators_path.exists():
-            raw = json.loads(dev_locators_path.read_text(encoding="utf-8"))
-        else:
-            raw = {}
-    except (OSError, json.JSONDecodeError):
-        raw = {}
-    if not isinstance(raw, dict):
-        raw = {}
-    locators = raw.get("locators")
-    if not isinstance(locators, dict):
-        locators = {}
-        raw["locators"] = locators
-    for entry in resolved:
-        const = entry.get("constant_name")
-        sel = entry.get("_user_selector")
-        if not const or not sel:
-            continue
-        locators[const] = {
-            "selector": sel,
-            "source": "hitl",
-            "intent": entry.get("intent"),
-            "page_url": entry.get("page_url"),
-        }
-    try:
-        dev_locators_path.parent.mkdir(parents=True, exist_ok=True)
-        dev_locators_path.write_text(
-            json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8",
-        )
-        log.info(
-            "step09.hitl_dev_locators_updated",
-            path=str(dev_locators_path), added=len(resolved),
-        )
-    except OSError as e:
-        log.warning("step09.hitl_dev_locators_write_failed", error=str(e))
-
-
-def _format_promoted_substitution(payload: dict | None, selector: str | None) -> str | None:
-    """Render a cache entry as the Python expression to substitute for `tbd(...)`.
-
-    Returns the substitution string (a `json.dumps`'d CSS string OR a call
-    like `role_locator("link", name="...")`), or None when the entry has no
-    representable form. None means "leave the tbd() in place" — the caller
-    emits a promotion-blocked bug-candidate.
-
-    For structured payloads, we emit calls to the runtime helpers
-    (`role_locator`, `text_locator`, …) defined in
-    ``src/qtea/_resources/runtime/qtea_runtime.py.tpl``. The
-    codegen-pom-extender ensures the runtime import is already present in
-    the POM file (`from tests.qtea_runtime import tbd`); the new
-    helpers live in the same module, so we may need to extend that import.
-    """
-    if isinstance(payload, dict):
-        kind = payload.get("kind")
-        if kind == "css":
-            sel = payload.get("selector") or selector
-            if not sel:
-                return None
-            return json.dumps(sel)
-        if kind == "role":
-            role = payload.get("role")
-            if not role:
-                return None
-            parts = [f"role_locator({json.dumps(role)}"]
-            if payload.get("name"):
-                parts.append(f", name={json.dumps(payload['name'])}")
-            if payload.get("exact") is True:
-                parts.append(", exact=True")
-            parts.append(")")
-            return "".join(parts)
-        if kind in ("text", "label", "placeholder"):
-            text = payload.get("text")
-            if not text:
-                return None
-            fn = f"{kind}_locator"
-            parts = [f"{fn}({json.dumps(text)}"]
-            if payload.get("exact") is True:
-                parts.append(", exact=True")
-            parts.append(")")
-            return "".join(parts)
-        if kind == "test_id":
-            value = payload.get("value")
-            if not value:
-                return None
-            return f"test_id_locator({json.dumps(value)})"
-        return None
-    # No payload — fall back to the legacy CSS-string path.
-    if not selector:
-        return None
-    return json.dumps(selector)
-
-
-def _ensure_runtime_imports(text: str, needed_names: set[str]) -> str:
-    """Extend `from tests.qtea_runtime import …` to include `needed_names`.
-
-    No-op when no such import line exists (caller's POM doesn't follow the
-    convention; promotion still works for CSS-string substitutions because
-    those don't need extra symbols).
-    """
-    import re as _re
-
-    if not needed_names:
-        return text
-    pat = _re.compile(
-        r"^(from\s+tests\.qtea_runtime\s+import\s+)([^\n]+)$",
-        _re.MULTILINE,
-    )
-    m = pat.search(text)
-    if not m:
-        return text
-    existing = {n.strip() for n in m.group(2).split(",") if n.strip()}
-    missing = needed_names - existing
-    if not missing:
-        return text
-    new_imports = ", ".join(sorted(existing | needed_names))
-    return text[:m.start()] + m.group(1) + new_imports + text[m.end():]
-
-
-def _promote_resolved_tbds(
-    sut_root: Path, cache_path: Path,
-) -> tuple[list[str], list[dict]]:
-    """Replace tbd("intent") sentinels with their resolved selectors in-place.
-
-    Returns ``(modified_files, blocked_candidates)``:
-      - ``modified_files`` — SUT-relative paths of files actually rewritten.
-      - ``blocked_candidates`` — bug-candidate dicts for entries the promoter
-        REFUSED to substitute (no passing witness OR fails validation OR
-        unrepresentable payload). The caller appends these to bug-candidates.json.
-
-    Gating (the safety net added after the run-20260621 regression):
-      1. ``passing_witnesses`` must be non-empty — the selector has been used
-         by at least one test that PASSED in this attempt. Selectors that
-         only failing tests touched never reach SUT source.
-      2. ``validate_selector_payload(payload, selector)`` must return ok —
-         catches Playwright debug-print syntax (`link "..."`), unbalanced
-         brackets, injection markers, and structurally-malformed payloads.
-      3. ``_format_promoted_substitution`` must yield a valid Python
-         expression for the substitution. Structured payloads emit
-         `role_locator(...)` / `text_locator(...)` / etc.; the runtime
-         import line is extended to include the needed helpers.
-    """
-    import re as _re
-
-    from qtea.jit_resolver import validate_selector_payload
-    from qtea.tbd_scanner import scan_tbd_intents
-
-    blocked: list[dict] = []
-    if not cache_path.exists():
-        return [], blocked
-    try:
-        data = json.loads(cache_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return [], blocked
-
-    intent_to_entry: dict[str, dict] = {}
-    for e in (data.get("entries") or []):
-        intent = e.get("intent")
-        if not intent:
-            continue
-        if e.get("source", "none") == "none":
-            continue
-        # Gate 1: passing-test witness required. The cache file may carry
-        # entries with no witnesses yet (resolved + used in a failing test);
-        # those stay as tbd() this round but may earn witnesses on a later run.
-        witnesses = e.get("passing_witnesses")
-        if not isinstance(witnesses, list) or not witnesses:
-            blocked.append({
-                "id": f"BC-promotion-blocked-{e.get('constant_name', 'unknown')}",
-                "kind": "promotion-blocked",
-                "reason": "no_passing_witness",
-                "intent": intent,
-                "constant_name": e.get("constant_name"),
-                "cached_selector": e.get("selector"),
-                "cached_payload": e.get("payload"),
-                "remediation": (
-                    "No passing test has used this resolution yet. The "
-                    "selector stays as tbd() so the JIT runtime keeps "
-                    "resolving it. Add a test that exercises it OR fix the "
-                    "test that triggered the resolution."
-                ),
-            })
-            continue
-        # Gate 2: structural validation.
-        payload = e.get("payload") if isinstance(e.get("payload"), dict) else None
-        ok, why = validate_selector_payload(payload, e.get("selector"))
-        if not ok:
-            blocked.append({
-                "id": f"BC-promotion-blocked-{e.get('constant_name', 'unknown')}",
-                "kind": "promotion-blocked",
-                "reason": "invalid_selector_form",
-                "intent": intent,
-                "constant_name": e.get("constant_name"),
-                "cached_selector": e.get("selector"),
-                "cached_payload": payload,
-                "validation_reason": why,
-                "remediation": (
-                    "The cached selector failed validate_selector_payload. "
-                    "Drop the bad cache entry (rm locator-cache.json) and "
-                    "re-run; the resolver will try again with the updated "
-                    "prompt that demands structured payloads."
-                ),
-            })
-            continue
-        intent_to_entry[intent] = e
-
-    if not intent_to_entry:
-        return [], blocked
-
-    scan_roots = [p for p in (sut_root / d for d in ("src", "tests", "pages")) if p.is_dir()]
-    if not scan_roots:
-        scan_roots = [sut_root]
-    hits = scan_tbd_intents(scan_roots, sut_root=sut_root)
-
-    by_file: dict[Path, list] = {}
-    for hit in hits:
-        if hit.intent in intent_to_entry:
-            by_file.setdefault(hit.file, []).append(hit)
-
-    # Map runtime helper kinds to import names — added to the POM's
-    # `from tests.qtea_runtime import ...` line when the substitution
-    # uses them. CSS / no-payload substitutions don't need any extra imports.
-    _KIND_TO_HELPER = {
-        "role": "role_locator",
-        "text": "text_locator",
-        "label": "label_locator",
-        "placeholder": "placeholder_locator",
-        "test_id": "test_id_locator",
-    }
-
-    modified: list[str] = []
-    for file_path, file_hits in by_file.items():
-        abs_path = (sut_root / file_path) if not file_path.is_absolute() else file_path
-        rel_str = str(file_path) if not file_path.is_absolute() else str(file_path.relative_to(sut_root))
-        text = abs_path.read_text(encoding="utf-8")
-        new_text = text
-        helper_imports: set[str] = set()
-        for hit in file_hits:
-            entry = intent_to_entry[hit.intent]
-            payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else None
-            substitution = _format_promoted_substitution(payload, entry.get("selector"))
-            if substitution is None:
-                blocked.append({
-                    "id": f"BC-promotion-blocked-{entry.get('constant_name', 'unknown')}",
-                    "kind": "promotion-blocked",
-                    "reason": "unrepresentable_payload",
-                    "intent": hit.intent,
-                    "constant_name": entry.get("constant_name"),
-                    "cached_selector": entry.get("selector"),
-                    "cached_payload": payload,
-                    "remediation": "Payload could not be rendered; investigate jit_resolver / cache state.",
-                })
-                continue
-            if isinstance(payload, dict):
-                helper = _KIND_TO_HELPER.get(payload.get("kind"))
-                if helper:
-                    helper_imports.add(helper)
-            escaped = _re.escape(hit.intent)
-            new_text = _re.sub(
-                rf'tbd\((?P<q>["\']){escaped}(?P=q)\)',
-                lambda _m, _r=substitution: _r,
-                new_text,
-            )
-        # Add any new helper imports BEFORE writing back.
-        if helper_imports:
-            new_text = _ensure_runtime_imports(new_text, helper_imports)
-        if new_text != text:
-            abs_path.write_text(new_text, encoding="utf-8")
-            modified.append(rel_str)
-    return modified, blocked
-
-
-def _bug_candidates_for_dev_pool_drift(quarantine_log: Path) -> list[dict]:
-    """Read ``dev-pool-quarantine.jsonl`` and emit one bug-candidate per
-    dev-pool selector that failed at action time.
-
-    The JIT runtime writes one JSONL record per quarantine event. Each
-    candidate guides the user to update the dev-locators file OR let
-    qtea re-resolve fresh (delete the entry from dev-locators.json).
-    """
-    if not quarantine_log.exists():
-        return []
-    try:
-        lines = quarantine_log.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return []
-    out: list[dict] = []
-    seen: set[str] = set()
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        const = record.get("constant_name") or "unknown"
-        matched = record.get("matched_constant")
-        # Dedupe within a single run: many tests may hit the same drift.
-        key = f"{const}::{matched or ''}::{record.get('intent', '')}"
-        if key in seen:
-            continue
-        seen.add(key)
-        intent = record.get("intent") or ""
-        stale = record.get("stale_selector")
-        out.append({
-            "id": f"BC-dev-locator-drifted-{matched or const}",
-            "test_id": f"dev-locator-drifted:{matched or const}",
-            "title": (
-                f"Dev locator {(matched or const)!r} drifted at runtime"
-            ),
-            "file": record.get("test_file"),
-            "status": "error",
-            "kind": "dev-locator-drifted",
-            "message": (
-                f"Tier 1b dev-pool selector for intent {intent!r} "
-                f"({stale!r}) failed at action time on "
-                f"{record.get('page_url') or '(unknown URL)'}: "
-                f"{record.get('exception') or 'TimeoutError'}. "
-                f"The JIT runtime fell back to the LLM resolver under a "
-                f"shadow cache key; the dev-locators entry was NOT "
-                f"overwritten. Update the selector for "
-                f"{(matched or const)!r} in dev-locators.json, OR remove "
-                f"that entry so qtea resolves fresh on the next run."
-            ),
-            "traceback": None,
-            "tc_refs": [],
-            "attachments": [],
-            "first_seen": record.get("ts"),
-            "constant_name": const,
-            "matched_constant": matched,
-            "intent": intent,
-            "page_url": record.get("page_url"),
-            "stale_selector": stale,
-            "pool_score": record.get("pool_score"),
-        })
-    return out
-
-
-def _bug_candidates_for_unresolvable_tbds(
-    remaining: list[dict], dev_locators_path: Path | None = None,
-) -> list[dict]:
-    """Emit a ``locator-unresolvable`` bug-candidate per HITL-unanswered
-    TBD. Step 9's classifier sees these alongside test failures.
-    """
-    now = datetime.now(UTC).isoformat()
-    out: list[dict] = []
-    for entry in remaining:
-        const = entry.get("constant_name") or "unknown"
-        intent = entry.get("intent") or ""
-        locators_hint = (
-            f"Provide a selector via {str(dev_locators_path)!r}"
-            if dev_locators_path
-            else "Provide a selector via --dev-locators or QTEA_DEV_LOCATORS"
-        )
-        out.append({
-            "id": f"BC-locator-unresolvable-{const}",
-            "test_id": f"locator-unresolvable:{const}",
-            "title": f"Locator could not be resolved: {const}",
-            "file": entry.get("test_file"),
-            "status": "error",
-            "kind": "locator-unresolvable",
-            "message": (
-                f"The JIT runtime could not find any element matching "
-                f"intent {intent!r} on {entry.get('page_url') or '(unknown URL)'}. "
-                f"{locators_hint} under "
-                f"key {const!r}, or update the test to remove the TBD."
-            ),
-            "traceback": None,
-            "tc_refs": [],
-            "attachments": [],
-            "first_seen": now,
-            "constant_name": const,
-            "intent": intent,
-            "page_url": entry.get("page_url"),
-        })
-    return out
-
-
-def _lazy_probe_heal_mcp(
-    server_name: str,
-    env: dict[str, str] | None = None,
-) -> tuple[bool, str, float]:
-    """Warm + probe one MCP server just before the first heal-agent invocation.
-
-    ``probe_server`` spawns the server and lets it run for ~30 s, then kills
-    it. The side effect is a warm npx cache and a completed Playwright
-    binary check, so when the Agent SDK later spawns its own copy of the
-    server it reaches `connected` faster — eliminating the race where the
-    heal agent burns turns calling ``WaitForMcpServers`` before MCP is up.
-
-    ``env`` is an optional per-call MCP env overlay (e.g.
-    ``{"QTEA_STORAGE_STATE_ARG": "--storage-state=/abs/path"}``).
-    Threaded through to ``load_mcp_config`` so the rendered MCP server
-    args reflect per-run substitutions (e.g. the storage-state file path
-    Step 9 just resolved) without mutating ``os.environ``.
-
-    Returns ``(ok, detail, elapsed_s)``. On failure the caller logs + skips
-    the heal loop (heal is best-effort — a missing Playwright MCP shouldn't
-    fail the whole Step 9 run; the failing tests still flow to Step 10 as
-    bug candidates).
-
-    Centralised in a module-level helper so unit tests can monkey-patch
-    ``s09_execute._lazy_probe_heal_mcp`` without touching the MCP plumbing.
-    """
-    import time as _time
-
-    from qtea.mcp_manager import load_mcp_config, probe_server
-
-    started = _time.monotonic()
-    try:
-        all_servers = load_mcp_config(env=env)
-    except (FileNotFoundError, OSError, ValueError) as e:
-        return False, f"could not load .mcp.json: {e}", 0.0
-
-    server = all_servers.get(server_name)
-    if server is None:
-        return False, f"{server_name!r} not declared in .mcp.json", 0.0
-
-    ok, detail = probe_server(server)
-    elapsed = round(_time.monotonic() - started, 2)
-    return ok, detail or "", elapsed
+    out_dir: Path
+    heal_log_path: Path
+    current_attempt: int
+    prior_state: dict | None
+    research: dict
+    framework: str
+    detected_cmd: str | None
+    sut_tests: Path
+    active_module: dict | None
+    runtime_env: dict
+    jit_cache_dir: Path
+    jit_runtime_vendored: bool
+    resolver_server: object | None  # ResolverServer | None
+    heal_mcp_env: dict
+    storage_state_mod: object  # the qtea.storage_state module
+    storage_state_path: Path | None
+    install_log_path: Path
+    stack_profile: StackProfile | None
+    install_sig: str | None
+    skip_install: bool
+    no_auto_deps: bool
 
 
 class ExecuteStep(Step):
@@ -1895,7 +384,349 @@ class ExecuteStep(Step):
             except OSError as e:
                 log.warning("step09.heal_log_rotate_failed", error=str(e))
 
-    async def run(self, ctx: StepContext) -> StepResult:
+    def _finalize_and_report(
+        self, ctx: StepContext, out_dir: Path, state: _PostRunState,
+    ) -> StepResult:
+        """Post-run pipeline: attach late artifacts, assemble payload, write
+        artifacts, run TBD promotion + HITL sweeps + bug-candidate build,
+        then determine status.
+
+        Extracted from :meth:`run` (Tier 2) so the finalization phase is
+        legible as a single call site instead of ~320 inline lines. Every
+        branch preserves the original behaviour byte-for-byte.
+        """
+        # Attach SUT-side artifacts discovered post-run to entries without any.
+        # Keep only the newest file per artifact type so each failed test
+        # gets at most one screenshot, one trace, one video.
+        extra_attachments = _attachment_glob(ctx.workspace.sut)
+        if extra_attachments:
+            newest_by_type: dict[str, dict] = {}
+            for a in extra_attachments:
+                kind = a.get("type", "other")
+                prev = newest_by_type.get(kind)
+                if prev is None:
+                    newest_by_type[kind] = a
+                    continue
+                try:
+                    if Path(a["path"]).stat().st_mtime > Path(prev["path"]).stat().st_mtime:
+                        newest_by_type[kind] = a
+                except OSError:
+                    pass
+            deduped = list(newest_by_type.values())
+            for r in state.first.results:
+                if r.status in ("failed", "error") and not r.attachments:
+                    r.attachments = deduped
+
+        # Annotate self-heal metadata into per-entry dicts via the serializer.
+        payload = state.first.as_dict()
+        for entry_dict in payload["results"]:
+            meta = state.self_heal_meta.get(entry_dict["id"])
+            if meta:
+                entry_dict["self_heal"] = meta
+        payload["self_heal"] = {
+            # Historical key name — external consumers (Step 10, Step
+            # 11, report renderer) depend on this. Populated from the
+            # renamed local `test_runner_invocations` for clarity in
+            # this file.
+            "attempts": state.test_runner_invocations,
+            "patches_applied": state.patches_applied,
+            "patches_rejected": state.patches_rejected,
+        }
+
+        # Resolver telemetry (Phase 6). Per-run only — no global
+        # aggregator. Absent for non-JIT stacks (no spend file).
+        resolver_spend = _summarize_resolver_spend(state.jit_cache_dir)
+        if resolver_spend is not None:
+            payload["resolver_spend"] = resolver_spend
+            log.info(
+                "step09.resolver_spend_summarised",
+                total_resolutions=resolver_spend["total_resolutions"],
+                total_input_tokens=resolver_spend["total_input_tokens"],
+                total_output_tokens=resolver_spend["total_output_tokens"],
+            )
+
+        run_results_path = out_dir / "run-results.json"
+        run_results_path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+        ok_schema, schema_err = is_valid(payload, "run-results")
+        if not ok_schema:
+            log.warning("step09.schema_invalid", error=schema_err)
+
+        # Tasks 2 + 4 + 5: persist this attempt's outcomes for any
+        # subsequent retry. ``no_patch_ids`` is the running union with
+        # the prior attempt's so multi-attempt convergence works: once
+        # a test is classified as a real bug it stays skipped on every
+        # later attempt without needing each attempt to rediscover it.
+        _now_failing = [
+            (r.id, r.name) for r in state.first.results
+            if r.status in ("failed", "error")
+        ]
+        _now_no_patch = {
+            tid for tid, meta in state.self_heal_meta.items()
+            if not meta.get("applied")
+            and meta.get("summary") == _NO_PATCH_SUMMARY
+        }
+        if state.prior_state:
+            _now_no_patch |= set(state.prior_state.get("no_patch_ids", []) or [])
+        _save_attempt_state(
+            out_dir, state.current_attempt,
+            failing=_now_failing,
+            no_patch_ids=sorted(_now_no_patch),
+            install_sig=state.install_sig,
+        )
+
+        # TBD promotion: any tbd("intent") sentinels whose intent now has a
+        # cached selector get replaced in-place in the SUT source files and
+        # committed, so the code is self-sufficient without the JIT plugin.
+        _promoted, _promotion_blocked = _promote_resolved_tbds(
+            ctx.workspace.sut,
+            state.jit_cache_dir / "locator-cache.json",
+        )
+        if _promoted:
+            log.info("step09.tbd_promoted", count=len(_promoted), files=_promoted)
+            commit_step(ctx.workspace.sut, 9, self.name, "tbd-promotion")
+        if _promotion_blocked:
+            log.info(
+                "step09.tbd_promotion_blocked",
+                count=len(_promotion_blocked),
+                reasons=sorted({b["reason"] for b in _promotion_blocked}),
+            )
+
+        # HITL escalation pass. The JIT runtime drops `hitl-pending-*.json`
+        # files in the cache dir whenever it could not resolve a TBD.
+        # On a TTY (and unless --no-hitl) we prompt for a selector and
+        # write it to dev-locators.json so the next run skips Tier 4 for
+        # that key; otherwise the unresolved TBDs flow into the bug
+        # candidates as `locator-unresolvable` entries for Step 9.
+        hitl_pendings = _collect_hitl_pending(state.jit_cache_dir)
+        hitl_dev_locators_path = Path(state.runtime_env["QTEA_DEV_LOCATORS"])
+        _, hitl_remaining = _hitl_resolve_unresolvable(
+            hitl_pendings,
+            dev_locators_path=hitl_dev_locators_path,
+            no_hitl=bool(getattr(ctx.options, "no_hitl", False)),
+        )
+
+        # Overlay auto-dismiss sweep (Layer 3). Runtime dropped events
+        # to <workspace>/overlay-events.jsonl for popups it couldn't
+        # safely auto-dismiss. Prompt the operator; persist chosen
+        # dismiss actions to <sut>/.qtea/interceptors.json so future
+        # runs are clean. Best-effort — never blocks Step 9.
+        _overlay_events, _overlay_persisted = _hitl_overlay_sweep(
+            ctx.workspace.root,
+            ctx.workspace.sut,
+            no_hitl=bool(getattr(ctx.options, "no_hitl", False)),
+        )
+
+        # bug-candidates.json: emitted regardless (empty list when no failures).
+        final_failing = _failing_tests(state.first)
+        bug_payload = _build_bug_candidates(final_failing)
+        # Layer 4 — reclassify overlay-caused failures so Step 10's
+        # bug-classifier doesn't file them as defects. Entries with
+        # a persisted interceptor are marked overlay_handled_next_run
+        # (next run is clean); the rest are overlay_pending_hitl.
+        if _overlay_events:
+            # First pass: mark PERSISTED as handled_next_run.
+            if _overlay_persisted:
+                persisted_events = [
+                    ev for ev in _overlay_events
+                    if (ev.overlay_role, ev.overlay_name) in _overlay_persisted
+                ]
+                bug_payload["candidates"] = reclassify_bug_candidates(
+                    bug_payload["candidates"],
+                    persisted_events,
+                    persisted_after_hitl=True,
+                )
+            # Second pass: mark UNPERSISTED as pending_hitl.
+            unpersisted_events = [
+                ev for ev in _overlay_events
+                if (ev.overlay_role, ev.overlay_name) not in _overlay_persisted
+            ]
+            if unpersisted_events:
+                bug_payload["candidates"] = reclassify_bug_candidates(
+                    bug_payload["candidates"],
+                    unpersisted_events,
+                    persisted_after_hitl=False,
+                )
+        bug_payload["candidates"].extend(
+            _bug_candidates_for_unresolvable_tbds(
+                hitl_remaining, dev_locators_path=hitl_dev_locators_path,
+            )
+        )
+        # Promotion gate emits structured candidates for entries that
+        # had a cached resolution but couldn't be safely frozen into
+        # source (no passing-test witness, malformed selector, or
+        # unrepresentable payload). Surface them so reviewers see what
+        # the JIT runtime is still chewing on between runs.
+        if _promotion_blocked:
+            bug_payload["candidates"].extend(_promotion_blocked)
+        # Dev-pool drift candidates: one per dev-locators entry whose
+        # selector failed at action time this run. The JIT runtime
+        # quarantined them and stored an LLM fallback under a shadow
+        # cache key; the user owns updating the dev file.
+        _drift_candidates = _bug_candidates_for_dev_pool_drift(
+            state.jit_cache_dir / "dev-pool-quarantine.jsonl",
+        )
+        if _drift_candidates:
+            bug_payload["candidates"].extend(_drift_candidates)
+        bug_path = out_dir / "bug-candidates.json"
+        bug_path.write_text(
+            json.dumps(bug_payload, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+        # JIT cache publish — if the runtime plugin populated locator-cache.json
+        # during the test run, copy it into artifacts/step09 so step 11 can
+        # surface per-TBD resolution sources in the report. Best-effort; absence
+        # is normal for non-JIT stacks.
+        jit_cache_src = ctx.workspace.root / "locator-cache" / "locator-cache.json"
+        if jit_cache_src.exists():
+            try:
+                jit_cache_dst = out_dir / "locator-cache.json"
+                jit_cache_dst.write_text(
+                    jit_cache_src.read_text(encoding="utf-8"), encoding="utf-8"
+                )
+                log.info("step09.jit_cache_published", entries_path=str(jit_cache_dst))
+            except OSError as e:
+                log.warning("step09.jit_cache_publish_failed", error=str(e))
+
+        # Counts come from `totals` (Fix 7): `tests` excludes synthetic
+        # T-runner-failure entries; `infrastructure_errors` is reported
+        # separately so a green-looking `tests=N` cannot conceal a run
+        # that never executed a single real test.
+        totals = payload["totals"]
+        notes_parts = [
+            f"framework={state.framework}",
+            f"tests={totals['tests']}",
+            f"failed={totals['failed']}",
+            f"errors={totals['errors']}",
+            f"infra_errors={totals.get('infrastructure_errors', 0)}",
+            f"attempts={state.test_runner_invocations}",
+            f"healed={state.patches_applied}",
+        ]
+        notes = " ".join(notes_parts)
+
+        # Status semantics:
+        #   - `completed` when nothing failed.
+        #   - `failed` when EVERY result is a synthesised `T-runner-failure`
+        #     (the test runner didn't even produce parseable output — typically
+        #     a conftest import error, missing dep, exit code 4, etc.). The
+        #     prior "warned" status hid this and Step 9/11 ran on garbage;
+        #     Step 10 then crashed rendering an environment-bug card.
+        #     This is an environment failure, not a real test failure.
+        #   - `failed` when ALL tests errored/failed and NONE passed — no
+        #     assertion was ever evaluated, so there is nothing to classify.
+        #   - `warned` when some tests passed and some failed/errored —
+        #     Step 10 will classify the failures as bug candidates.
+        runner_only_failure = (
+            len(state.first.results) > 0
+            and all(r.id == "T-runner-failure" for r in state.first.results)
+        )
+        # Defensive: exit code 3 (pytest internal error) with no
+        # passed/failed tests is also an environment failure, even
+        # if the JUnit entries don't all carry T-runner-failure IDs.
+        if not runner_only_failure and state.first.exit_code == 3:
+            real_passed_or_failed = any(
+                r.status in ("passed", "failed")
+                and r.id != "T-runner-failure"
+                for r in state.first.results
+            )
+            if not real_passed_or_failed:
+                runner_only_failure = True
+        if runner_only_failure:
+            first_entry = state.first.results[0]
+            first_msg = (first_entry.message or "").strip() or "test runner failed"
+            rf = first_entry.runner_failure or {}
+            # When the classifier identified a specific failure mode
+            # (missing module, collection error), lead the error with the
+            # actionable fix command. Otherwise fall through to the raw
+            # message tail — at least the operator gets the stderr summary.
+            if rf:
+                error = (
+                    f"test runner failed before any test could run: "
+                    f"{rf.get('summary', 'collection / import error')}. "
+                    f"To fix: {rf.get('hint', 'see stderr in run-results.json')}. "
+                    f"(exit_code={state.first.exit_code})"
+                )
+            else:
+                error = (
+                    f"test runner produced no parseable test results "
+                    f"(exit_code={state.first.exit_code}). This is an environment "
+                    f"failure, not a real test failure. {first_msg[:300]}"
+                )
+            error += _compose_runner_stream_diagnostics(
+                first_entry.stderr, first_entry.stdout,
+            )
+            return StepResult(
+                success=False,
+                status="failed",
+                outputs=[run_results_path, bug_path],
+                error=error,
+                notes=notes,
+            )
+
+        # All-tests-errored gate: when every test errored/failed and
+        # none passed, no assertion was evaluated. This is functionally
+        # equivalent to a runner failure (e.g. DNS unreachable, auth
+        # fixture crash, SUT down) and should not be masked as "warned".
+        any_passed = any(
+            r.status == "passed" for r in state.first.results
+        )
+        if final_failing and not any_passed:
+            first_entry = final_failing[0]
+            msg_snippet = (first_entry.message or "").strip()[:300]
+            error_counts: dict[str, int] = {}
+            for r in state.first.results:
+                error_counts[r.status] = error_counts.get(r.status, 0) + 1
+            status_breakdown = ", ".join(
+                f"{v} {k}" for k, v in sorted(error_counts.items())
+            )
+            setup_failures = [
+                r for r in state.first.results
+                if r.message and "failed on setup" in r.message
+            ]
+            hint = ""
+            if setup_failures:
+                hint = (
+                    " Likely cause: shared fixture/setup failure blocking "
+                    "all tests — check conftest.py and fixture code."
+                )
+            return StepResult(
+                success=False,
+                status="failed",
+                outputs=[run_results_path, bug_path],
+                error=(
+                    f"all {len(state.first.results)} test(s) errored with zero "
+                    f"passing ({status_breakdown}) — no assertion was "
+                    f"evaluated.{hint} First error: {msg_snippet}"
+                ),
+                notes=notes,
+            )
+
+        sub_status = "all_passed" if not final_failing else "bugs_found"
+        return StepResult(
+            success=True,
+            status="completed",
+            sub_status=sub_status,
+            outputs=[run_results_path, bug_path],
+            notes=notes,
+        )
+
+    def _bootstrap(self, ctx: StepContext) -> _BootstrapResult | StepResult:
+        """Preflight guards, workspace/artifact setup, prior-attempt load,
+        research load, runtime-env assembly, storage-state resolution,
+        install (``prepare_sut``), venv detection, Playwright browser
+        install, pre-install of known-safe missing deps, resolver-server
+        startup, and JIT cache dev-pool prewarm.
+
+        Returns a :class:`_BootstrapResult` on success, or a :class:`StepResult`
+        when the run must abort early: SUT missing, .git missing, step-8
+        manifest missing, or the SUT install command fails.
+
+        Extracted from :meth:`run` (Tier 2) so the phased contract between
+        bootstrap → heal-loop → finalize is legible. Every branch preserves
+        the original behaviour byte-for-byte.
+        """
         out_dir = self.out_dir(ctx.workspace)
         out_dir.mkdir(parents=True, exist_ok=True)
         heal_log_path = out_dir / "self-heal" / "heal-log.jsonl"
@@ -2045,6 +876,21 @@ class ExecuteStep(Step):
         # capture (Use case B in storage_state.py). The plugin reads this on
         # first passing test to know where to write storage-state.json.
         runtime_env["QTEA_WORKSPACE_DIR"] = str(ctx.workspace.root)
+
+        # Overlay auto-dismiss registry. Runtime consults this file at
+        # BrowserContext creation and registers `page.add_locator_handler()`
+        # for every entry — known popups become invisible on every run
+        # without HITL after first encounter. Location is per-SUT so the
+        # dismissal patterns are shared across the team. See
+        # docs/qa-orchestrator.instructions.md and
+        # `<sut>/.qtea/interceptors.json` schema.
+        runtime_env["QTEA_INTERCEPTORS"] = str(_interceptors_path(ctx.workspace.sut))
+        # Feature-flag pass-through — QTEA_OVERLAY_HANDLING=0 disables all
+        # overlay code paths (detection, heuristic, JSONL writes,
+        # add_locator_handler registration, sweep).
+        _overlay_flag = os.environ.get("QTEA_OVERLAY_HANDLING")
+        if _overlay_flag is not None:
+            runtime_env["QTEA_OVERLAY_HANDLING"] = _overlay_flag
 
         # Storage state for Playwright MCP injection. Resolved against the
         # 4-tier precedence (CLI flag > env > SUT convention path > workspace
@@ -2301,6 +1147,69 @@ class ExecuteStep(Step):
             except Exception as _e:  # noqa: BLE001 — best-effort, never poison run
                 log.warning("step09.jit_cache_prewarm_failed", error=str(_e))
 
+        return _BootstrapResult(
+            out_dir=out_dir,
+            heal_log_path=heal_log_path,
+            current_attempt=_current_attempt,
+            prior_state=_prior_state,
+            research=research,
+            framework=framework,
+            detected_cmd=detected_cmd,
+            sut_tests=sut_tests,
+            active_module=active_module,
+            runtime_env=runtime_env,
+            jit_cache_dir=jit_cache_dir,
+            jit_runtime_vendored=jit_runtime_vendored,
+            resolver_server=_resolver_server,
+            heal_mcp_env=_heal_mcp_env,
+            storage_state_mod=_storage_state_mod,
+            storage_state_path=_storage_state_path,
+            install_log_path=install_log_path,
+            stack_profile=stack_profile,
+            install_sig=install_sig,
+            skip_install=_skip_install,
+            no_auto_deps=no_auto_deps,
+        )
+
+    async def run(self, ctx: StepContext) -> StepResult:
+        # Bootstrap phase (Tier 2): preflight guards + workspace/artifact
+        # setup + install + resolver-server startup. Returns _BootstrapResult
+        # on success, or a StepResult when the run must abort early.
+        boot = self._bootstrap(ctx)
+        if isinstance(boot, StepResult):
+            return boot
+
+        # Unpack the fields the middle phase reads directly. Fields that
+        # get MUTATED downstream (stack_profile via venv swap already done
+        # in bootstrap; install_sig refreshed by dep-recovery; runtime_env
+        # mutated by post-run storage-state re-resolve) stay accessed via
+        # ``boot.<field>`` so the mutations land back on the shared record.
+        out_dir = boot.out_dir
+        heal_log_path = boot.heal_log_path
+        _current_attempt = boot.current_attempt
+        _prior_state = boot.prior_state
+        research = boot.research
+        framework = boot.framework
+        detected_cmd = boot.detected_cmd
+        sut_tests = boot.sut_tests
+        active_module = boot.active_module
+        runtime_env = boot.runtime_env
+        jit_cache_dir = boot.jit_cache_dir
+        _heal_mcp_env = boot.heal_mcp_env
+        _storage_state_mod = boot.storage_state_mod
+        _storage_state_path = boot.storage_state_path
+        install_log_path = boot.install_log_path
+        stack_profile = boot.stack_profile
+        install_sig = boot.install_sig
+        no_auto_deps = boot.no_auto_deps
+        _resolver_server = boot.resolver_server
+
+        # Preserve the pre-narrowing command so dep-recovery (which fires on
+        # a missing_module runner failure) re-runs the FULL test suite, not
+        # the retry-narrowed subset. Without this, `_save_attempt_state`
+        # would persist a `failing_ids` computed only over the narrowed
+        # subset and forget previously-passing tests across attempts.
+        _orig_cmd = detected_cmd
         # Task 5: narrow attempt 2's initial test run to the subset that
         # failed in attempt 1 minus tests flagged as real bugs (Task 2).
         # Saves the bulk of the previously-passing tests' wall time —
@@ -2313,6 +1222,7 @@ class ExecuteStep(Step):
                 (e["id"], e["name"]) for e in _prior_failing
                 if isinstance(e, dict) and e.get("id") and e.get("name")
                 and e["id"] not in _prior_no_patch
+                and e["id"] != "T-runner-failure"
             ]
             if _rerun_pairs:
                 from types import SimpleNamespace
@@ -2320,7 +1230,6 @@ class ExecuteStep(Step):
                     SimpleNamespace(id=tid, name=tname)
                     for tid, tname in _rerun_pairs
                 ]
-                _orig_cmd = detected_cmd
                 # Resolve the framework default when codegen didn't pin one,
                 # so the narrowing can append a -k / --grep to a real cmd.
                 _base_cmd, _ = resolve_command(
@@ -2374,7 +1283,7 @@ class ExecuteStep(Step):
                 or (
                     framework in _PW_TEST_FRAMEWORKS
                     and first.exit_code == 1
-                    and first.total == 0
+                    and first.totals.get("tests", 0) == 0
                 )
             )
             if _is_empty_collection and _applied_marker_filter:
@@ -2417,7 +1326,13 @@ class ExecuteStep(Step):
                     encoding="utf-8",
                 )
 
-            attempts = 1
+            # `test_runner_invocations` counts calls to run_tests within a
+            # single Step 9 attempt (initial → optional dep-recovery →
+            # optional post-heal re-run). Distinct from `_current_attempt`
+            # (the pipeline-level retry counter owned by base.py). Surfaced
+            # to consumers under the historical key "attempts" for artifact
+            # schema stability.
+            test_runner_invocations = 1
             patches_applied = 0
             patches_rejected = 0
 
@@ -2503,20 +1418,22 @@ class ExecuteStep(Step):
                     pkg_mgr = stack_profile.package_manager if stack_profile else None
                     proceed = confidence == "known"
                     if confidence == "guessed":
-                        interactive = (
+                        # HITL is available when we can reach a real operator —
+                        # a TTY (CLI mode) or the Flet UI. --no-hitl and --yes
+                        # both bypass HITL; --yes historically defaults to
+                        # "skip install" here (matches prior semantics), so
+                        # both flags leave proceed=False.
+                        hitl_available = (
                             (sys.stdin.isatty() or getattr(ctx.options, "ui_mode", False))
                             and not getattr(ctx.options, "no_hitl", False)
                             and not getattr(ctx.options, "yes", False)
                         )
-                        if interactive:
-                            from rich.console import Console
-                            from rich.prompt import Confirm
-                            proceed = Confirm.ask(
-                                f"Missing test dependency `{module}` detected. "
-                                f"Install `{package}` (`{rf.get('hint') or ''}`) "
-                                f"and retry?",
+                        if hitl_available:
+                            proceed = _hitl_confirm_dep_install(
+                                module=module,
+                                package=package,
+                                hint=rf.get("hint") or "",
                                 default=True,
-                                console=Console(),
                             )
                         else:
                             log.warning(
@@ -2556,10 +1473,14 @@ class ExecuteStep(Step):
                                 "step09.auto_install_commit",
                                 phase="runtime", package=package, sha=sha,
                             )
+                            # Use _orig_cmd (unnarrowed): the missing dep is
+                            # an import-time failure — subsetting by test id
+                            # is meaningless and would drop previously-passing
+                            # tests from the persisted attempt state.
                             first = run_tests(
                                 framework,
                                 cwd=ctx.workspace.sut,
-                                detected_command=detected_cmd,
+                                detected_command=_orig_cmd,
                                 timeout_s=min(self.timeout_s or 1800, 1800),
                                 env_extra=runtime_env,
                                 profile=stack_profile,
@@ -2567,7 +1488,17 @@ class ExecuteStep(Step):
                                 marker_filter=_QTEA_PYTEST_MARKER_FILTER,
                                 parallelism=getattr(ctx.options, "parallelism", 0),
                             )
-                            attempts = 2
+                            test_runner_invocations = 2
+                            # Refresh install_sig: the auto-install just wrote
+                            # to the lockfile, so the pre-recovery signature
+                            # captured at step start is stale. Without this,
+                            # the value persisted to attempt state (below)
+                            # would misrepresent the post-recovery dep state
+                            # and a subsequent attempt could false-skip
+                            # `prepare_sut`.
+                            install_sig = _compute_install_sig(
+                                ctx.workspace.sut, stack_profile,
+                            )
                             failing = _failing_tests(first)
                             runner_only = (
                                 len(failing) > 0
@@ -3161,7 +2092,7 @@ class ExecuteStep(Step):
                         marker_filter=_QTEA_PYTEST_MARKER_FILTER,
                         parallelism=getattr(ctx.options, "parallelism", 0),
                     )
-                    attempts = 2
+                    test_runner_invocations = 2
                     # The narrowed re-run only reports the healed subset, so
                     # MERGE its outcomes into the full first-run result set
                     # (override the healed entries by id, keep everyone else).
@@ -3181,284 +2112,26 @@ class ExecuteStep(Step):
                     cap=_MAX_HEAL_TESTS,
                 )
 
-            # Attach SUT-side artifacts discovered post-run to entries without any.
-            # Keep only the newest file per artifact type so each failed test
-            # gets at most one screenshot, one trace, one video.
-            extra_attachments = _attachment_glob(ctx.workspace.sut)
-            if extra_attachments:
-                newest_by_type: dict[str, dict] = {}
-                for a in extra_attachments:
-                    kind = a.get("type", "other")
-                    prev = newest_by_type.get(kind)
-                    if prev is None:
-                        newest_by_type[kind] = a
-                        continue
-                    try:
-                        if Path(a["path"]).stat().st_mtime > Path(prev["path"]).stat().st_mtime:
-                            newest_by_type[kind] = a
-                    except OSError:
-                        pass
-                deduped = list(newest_by_type.values())
-                for r in first.results:
-                    if r.status in ("failed", "error") and not r.attachments:
-                        r.attachments = deduped
-
-            # Annotate self-heal metadata into per-entry dicts via the serializer.
-            payload = first.as_dict()
-            for entry_dict in payload["results"]:
-                meta = self_heal_meta.get(entry_dict["id"])
-                if meta:
-                    entry_dict["self_heal"] = meta
-            payload["self_heal"] = {
-                "attempts": attempts,
-                "patches_applied": patches_applied,
-                "patches_rejected": patches_rejected,
-            }
-
-            # Resolver telemetry (Phase 6). Per-run only — no global
-            # aggregator. Absent for non-JIT stacks (no spend file).
-            resolver_spend = _summarize_resolver_spend(jit_cache_dir)
-            if resolver_spend is not None:
-                payload["resolver_spend"] = resolver_spend
-                log.info(
-                    "step09.resolver_spend_summarised",
-                    total_resolutions=resolver_spend["total_resolutions"],
-                    total_input_tokens=resolver_spend["total_input_tokens"],
-                    total_output_tokens=resolver_spend["total_output_tokens"],
-                )
-
-            run_results_path = out_dir / "run-results.json"
-            run_results_path.write_text(
-                json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
-            )
-
-            ok_schema, schema_err = is_valid(payload, "run-results")
-            if not ok_schema:
-                log.warning("step09.schema_invalid", error=schema_err)
-
-            # Tasks 2 + 4 + 5: persist this attempt's outcomes for any
-            # subsequent retry. ``no_patch_ids`` is the running union with
-            # the prior attempt's so multi-attempt convergence works: once
-            # a test is classified as a real bug it stays skipped on every
-            # later attempt without needing each attempt to rediscover it.
-            _now_failing = [
-                (r.id, r.name) for r in first.results
-                if r.status in ("failed", "error")
-            ]
-            _now_no_patch = {
-                tid for tid, meta in self_heal_meta.items()
-                if not meta.get("applied")
-                and meta.get("summary") == _NO_PATCH_SUMMARY
-            }
-            if _prior_state:
-                _now_no_patch |= set(_prior_state.get("no_patch_ids", []) or [])
-            _save_attempt_state(
-                out_dir, _current_attempt,
-                failing=_now_failing,
-                no_patch_ids=sorted(_now_no_patch),
-                install_sig=install_sig,
-            )
-
-            # TBD promotion: any tbd("intent") sentinels whose intent now has a
-            # cached selector get replaced in-place in the SUT source files and
-            # committed, so the code is self-sufficient without the JIT plugin.
-            _promoted, _promotion_blocked = _promote_resolved_tbds(
-                ctx.workspace.sut,
-                jit_cache_dir / "locator-cache.json",
-            )
-            if _promoted:
-                log.info("step09.tbd_promoted", count=len(_promoted), files=_promoted)
-                commit_step(ctx.workspace.sut, 9, self.name, "tbd-promotion")
-            if _promotion_blocked:
-                log.info(
-                    "step09.tbd_promotion_blocked",
-                    count=len(_promotion_blocked),
-                    reasons=sorted({b["reason"] for b in _promotion_blocked}),
-                )
-
-            # HITL escalation pass. The JIT runtime drops `hitl-pending-*.json`
-            # files in the cache dir whenever it could not resolve a TBD.
-            # On a TTY (and unless --no-hitl) we prompt for a selector and
-            # write it to dev-locators.json so the next run skips Tier 4 for
-            # that key; otherwise the unresolved TBDs flow into the bug
-            # candidates as `locator-unresolvable` entries for Step 9.
-            hitl_pendings = _collect_hitl_pending(jit_cache_dir)
-            hitl_dev_locators_path = Path(runtime_env["QTEA_DEV_LOCATORS"])
-            _, hitl_remaining = _hitl_resolve_unresolvable(
-                hitl_pendings,
-                dev_locators_path=hitl_dev_locators_path,
-                no_hitl=bool(getattr(ctx.options, "no_hitl", False)),
-            )
-
-            # bug-candidates.json: emitted regardless (empty list when no failures).
-            final_failing = _failing_tests(first)
-            bug_payload = _build_bug_candidates(final_failing)
-            bug_payload["candidates"].extend(
-                _bug_candidates_for_unresolvable_tbds(
-                    hitl_remaining, dev_locators_path=hitl_dev_locators_path,
-                )
-            )
-            # Promotion gate emits structured candidates for entries that
-            # had a cached resolution but couldn't be safely frozen into
-            # source (no passing-test witness, malformed selector, or
-            # unrepresentable payload). Surface them so reviewers see what
-            # the JIT runtime is still chewing on between runs.
-            if _promotion_blocked:
-                bug_payload["candidates"].extend(_promotion_blocked)
-            # Dev-pool drift candidates: one per dev-locators entry whose
-            # selector failed at action time this run. The JIT runtime
-            # quarantined them and stored an LLM fallback under a shadow
-            # cache key; the user owns updating the dev file.
-            _drift_candidates = _bug_candidates_for_dev_pool_drift(
-                jit_cache_dir / "dev-pool-quarantine.jsonl",
-            )
-            if _drift_candidates:
-                bug_payload["candidates"].extend(_drift_candidates)
-            bug_path = out_dir / "bug-candidates.json"
-            bug_path.write_text(
-                json.dumps(bug_payload, indent=2, ensure_ascii=False), encoding="utf-8"
-            )
-
-            # JIT cache publish — if the runtime plugin populated locator-cache.json
-            # during the test run, copy it into artifacts/step09 so step 11 can
-            # surface per-TBD resolution sources in the report. Best-effort; absence
-            # is normal for non-JIT stacks.
-            jit_cache_src = ctx.workspace.root / "locator-cache" / "locator-cache.json"
-            if jit_cache_src.exists():
-                try:
-                    jit_cache_dst = out_dir / "locator-cache.json"
-                    jit_cache_dst.write_text(
-                        jit_cache_src.read_text(encoding="utf-8"), encoding="utf-8"
-                    )
-                    log.info("step09.jit_cache_published", entries_path=str(jit_cache_dst))
-                except OSError as e:
-                    log.warning("step09.jit_cache_publish_failed", error=str(e))
-
-            # Counts come from `totals` (Fix 7): `tests` excludes synthetic
-            # T-runner-failure entries; `infrastructure_errors` is reported
-            # separately so a green-looking `tests=N` cannot conceal a run
-            # that never executed a single real test.
-            totals = payload["totals"]
-            notes_parts = [
-                f"framework={framework}",
-                f"tests={totals['tests']}",
-                f"failed={totals['failed']}",
-                f"errors={totals['errors']}",
-                f"infra_errors={totals.get('infrastructure_errors', 0)}",
-                f"attempts={attempts}",
-                f"healed={patches_applied}",
-            ]
-            notes = " ".join(notes_parts)
-
-            # Status semantics:
-            #   - `completed` when nothing failed.
-            #   - `failed` when EVERY result is a synthesised `T-runner-failure`
-            #     (the test runner didn't even produce parseable output — typically
-            #     a conftest import error, missing dep, exit code 4, etc.). The
-            #     prior "warned" status hid this and Step 9/11 ran on garbage;
-            #     Step 10 then crashed rendering an environment-bug card.
-            #     This is an environment failure, not a real test failure.
-            #   - `failed` when ALL tests errored/failed and NONE passed — no
-            #     assertion was ever evaluated, so there is nothing to classify.
-            #   - `warned` when some tests passed and some failed/errored —
-            #     Step 10 will classify the failures as bug candidates.
-            runner_only_failure = (
-                len(first.results) > 0
-                and all(r.id == "T-runner-failure" for r in first.results)
-            )
-            # Defensive: exit code 3 (pytest internal error) with no
-            # passed/failed tests is also an environment failure, even
-            # if the JUnit entries don't all carry T-runner-failure IDs.
-            if not runner_only_failure and first.exit_code == 3:
-                real_passed_or_failed = any(
-                    r.status in ("passed", "failed")
-                    and r.id != "T-runner-failure"
-                    for r in first.results
-                )
-                if not real_passed_or_failed:
-                    runner_only_failure = True
-            if runner_only_failure:
-                first_entry = first.results[0]
-                first_msg = (first_entry.message or "").strip() or "test runner failed"
-                rf = first_entry.runner_failure or {}
-                # When the classifier identified a specific failure mode
-                # (missing module, collection error), lead the error with the
-                # actionable fix command. Otherwise fall through to the raw
-                # message tail — at least the operator gets the stderr summary.
-                if rf:
-                    error = (
-                        f"test runner failed before any test could run: "
-                        f"{rf.get('summary', 'collection / import error')}. "
-                        f"To fix: {rf.get('hint', 'see stderr in run-results.json')}. "
-                        f"(exit_code={first.exit_code})"
-                    )
-                else:
-                    error = (
-                        f"test runner produced no parseable test results "
-                        f"(exit_code={first.exit_code}). This is an environment "
-                        f"failure, not a real test failure. {first_msg[:300]}"
-                    )
-                # Surface stderr/stdout so the user can diagnose without
-                # opening run-results.json.
-                runner_stderr = (first_entry.stderr or "").strip()
-                runner_stdout = (first_entry.stdout or "").strip()
-                if runner_stderr:
-                    error += f"\n\n--- stderr (last 1500 chars) ---\n{runner_stderr[-1500:]}"
-                elif runner_stdout:
-                    error += f"\n\n--- stdout (last 1500 chars) ---\n{runner_stdout[-1500:]}"
-                return StepResult(
-                    success=False,
-                    status="failed",
-                    outputs=[run_results_path, bug_path],
-                    error=error,
-                    notes=notes,
-                )
-
-            # All-tests-errored gate: when every test errored/failed and
-            # none passed, no assertion was evaluated. This is functionally
-            # equivalent to a runner failure (e.g. DNS unreachable, auth
-            # fixture crash, SUT down) and should not be masked as "warned".
-            any_passed = any(
-                r.status == "passed" for r in first.results
-            )
-            if final_failing and not any_passed:
-                first_entry = final_failing[0]
-                msg_snippet = (first_entry.message or "").strip()[:300]
-                error_counts: dict[str, int] = {}
-                for r in first.results:
-                    error_counts[r.status] = error_counts.get(r.status, 0) + 1
-                status_breakdown = ", ".join(
-                    f"{v} {k}" for k, v in sorted(error_counts.items())
-                )
-                setup_failures = [
-                    r for r in first.results
-                    if r.message and "failed on setup" in r.message
-                ]
-                hint = ""
-                if setup_failures:
-                    hint = (
-                        " Likely cause: shared fixture/setup failure blocking "
-                        "all tests — check conftest.py and fixture code."
-                    )
-                return StepResult(
-                    success=False,
-                    status="failed",
-                    outputs=[run_results_path, bug_path],
-                    error=(
-                        f"all {len(first.results)} test(s) errored with zero "
-                        f"passing ({status_breakdown}) — no assertion was "
-                        f"evaluated.{hint} First error: {msg_snippet}"
-                    ),
-                    notes=notes,
-                )
-
-            sub_status = "all_passed" if not final_failing else "bugs_found"
-            return StepResult(
-                success=True,
-                status="completed",
-                sub_status=sub_status,
-                outputs=[run_results_path, bug_path],
-                notes=notes,
+            # Post-run pipeline (payload assembly + artifacts + TBD promotion
+            # + HITL sweeps + bug candidates + status determination) lives in
+            # ``_finalize_and_report`` for legibility. Pure code motion —
+            # zero behaviour change.
+            return self._finalize_and_report(
+                ctx,
+                out_dir,
+                _PostRunState(
+                    first=first,
+                    self_heal_meta=self_heal_meta,
+                    test_runner_invocations=test_runner_invocations,
+                    patches_applied=patches_applied,
+                    patches_rejected=patches_rejected,
+                    framework=framework,
+                    jit_cache_dir=jit_cache_dir,
+                    install_sig=install_sig,
+                    prior_state=_prior_state,
+                    current_attempt=_current_attempt,
+                    runtime_env=runtime_env,
+                ),
             )
 
         finally:

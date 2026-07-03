@@ -1026,3 +1026,606 @@ def test_reconcile_fixtures_handles_async_fixture(tmp_path: Path):
     plan = _plan_with_create_fixtures(file_rel, ["async_fix"])
     _, mismatches = reconcile_fixtures(plan, tmp_path)
     assert mismatches == []
+
+
+# ---------------------------------------------------------------------------
+# TypeScript / JavaScript fixture scanning
+# ---------------------------------------------------------------------------
+
+_TS_FIXTURE_TEST_EXTEND = """\
+import { test as baseTest } from '@playwright/test';
+import { LoginPage } from './pages/loginPage';
+import { BasePage } from './pages/basePage';
+
+type MyFixtures = {
+  loginPage: LoginPage;
+  basePage: BasePage;
+};
+
+export const test = baseTest.extend<MyFixtures>({
+  loginPage: async ({ page }, use) => {
+    const loginPage = new LoginPage(page);
+    await use(loginPage);
+  },
+  basePage: async ({ page }, use) => {
+    const basePage = new BasePage(page);
+    await use(basePage);
+  },
+});
+"""
+
+_TS_FIXTURE_NO_GENERIC = """\
+import { test } from '@playwright/test';
+
+export const customTest = test.extend({
+  myFixture: async ({ page }, use) => {
+    await use(page);
+  },
+});
+"""
+
+_TS_FIXTURE_MIXED_ASYNC = """\
+import { test } from '@playwright/test';
+
+export const test2 = test.extend<{
+  asyncFix: string;
+  syncFix: number;
+}>({
+  asyncFix: async ({ page }, use) => {
+    await use('hello');
+  },
+  syncFix: ({}, use) => {
+    use(42);
+  },
+});
+"""
+
+_TS_NO_EXTEND_BLOCK = """\
+import { test, expect } from '@playwright/test';
+
+test('simple test', async ({ page }) => {
+  await page.goto('/');
+  await expect(page).toHaveTitle('Hello');
+});
+"""
+
+
+def test_reconcile_fixtures_ts_extend_with_generic(tmp_path: Path):
+    """TS `baseTest.extend<T>({...})` fixtures are recognised."""
+    file_rel = "src/fixtures/pageFixtures.ts"
+    _touch(tmp_path / file_rel, _TS_FIXTURE_TEST_EXTEND)
+    plan = _plan_with_create_fixtures(file_rel, ["loginPage", "basePage"])
+    scanned, mismatches = reconcile_fixtures(plan, tmp_path)
+    assert scanned == 1
+    assert mismatches == []
+
+
+def test_reconcile_fixtures_ts_extend_no_generic(tmp_path: Path):
+    """.extend({...}) without a generic type param still finds fixtures."""
+    file_rel = "tests/fixtures/custom.ts"
+    _touch(tmp_path / file_rel, _TS_FIXTURE_NO_GENERIC)
+    plan = _plan_with_create_fixtures(file_rel, ["myFixture"])
+    scanned, mismatches = reconcile_fixtures(plan, tmp_path)
+    assert scanned == 1
+    assert mismatches == []
+
+
+def test_reconcile_fixtures_ts_mixed_async_sync(tmp_path: Path):
+    """Both async and non-async fixture bodies are found."""
+    file_rel = "tests/fixtures/mixed.ts"
+    _touch(tmp_path / file_rel, _TS_FIXTURE_MIXED_ASYNC)
+    plan = _plan_with_create_fixtures(file_rel, ["asyncFix", "syncFix"])
+    scanned, mismatches = reconcile_fixtures(plan, tmp_path)
+    assert scanned == 1
+    assert mismatches == []
+
+
+def test_reconcile_fixtures_ts_no_extend_block_symbol_missing(tmp_path: Path):
+    """TS file with no .extend block: fixture_symbol_missing, NOT file_missing."""
+    file_rel = "tests/fixtures/noExtend.ts"
+    _touch(tmp_path / file_rel, _TS_NO_EXTEND_BLOCK)
+    plan = _plan_with_create_fixtures(file_rel, ["myFixture"])
+    scanned, mismatches = reconcile_fixtures(plan, tmp_path)
+    assert scanned == 1
+    assert len(mismatches) == 1
+    assert mismatches[0].kind == "fixture_symbol_missing"
+    assert mismatches[0].existing_symbols == []
+
+
+def test_reconcile_fixtures_js_extend(tmp_path: Path):
+    """JavaScript .js fixtures use the same TS scanner path."""
+    file_rel = "tests/fixtures/setup.js"
+    js_content = (
+        "const { test } = require('@playwright/test');\n\n"
+        "exports.test = test.extend({\n"
+        "  authPage: async ({ page }, use) => {\n"
+        "    await use(page);\n"
+        "  },\n"
+        "});\n"
+    )
+    _touch(tmp_path / file_rel, js_content)
+    plan = _plan_with_create_fixtures(file_rel, ["authPage"])
+    scanned, mismatches = reconcile_fixtures(plan, tmp_path)
+    assert scanned == 1
+    assert mismatches == []
+
+
+def test_reconcile_fixtures_ts_symbol_missing_but_others_present(tmp_path: Path):
+    """TS file defines some fixtures but not all requested ones."""
+    file_rel = "src/fixtures/pageFixtures.ts"
+    _touch(tmp_path / file_rel, _TS_FIXTURE_TEST_EXTEND)
+    plan = _plan_with_create_fixtures(
+        file_rel, ["loginPage", "basePage", "dashboardPage"],
+    )
+    scanned, mismatches = reconcile_fixtures(plan, tmp_path)
+    assert scanned == 1
+    assert len(mismatches) == 1
+    m = mismatches[0]
+    assert m.kind == "fixture_symbol_missing"
+    assert m.name == "dashboardPage"
+    # existing_symbols now includes the outer `test` wrapper alongside the
+    # inner fixture params (basePage, loginPage) — see the reuse_test_wrapper
+    # regression tests below.
+    assert sorted(m.existing_symbols) == ["basePage", "loginPage", "test"]
+
+
+def test_reconcile_fixtures_ts_reuse_found(tmp_path: Path):
+    """source=reuse with from: 'file.ts:symbol' resolves correctly for TS."""
+    file_rel = "src/fixtures/pageFixtures.ts"
+    _touch(tmp_path / file_rel, _TS_FIXTURE_TEST_EXTEND)
+    plan = {
+        "test_cases": [{
+            "id": "TC-1",
+            "fixtures": [{
+                "name": "loginPage",
+                "source": "reuse",
+                "from": f"{file_rel}:loginPage",
+            }],
+        }],
+    }
+    _, mismatches = reconcile_fixtures(plan, tmp_path)
+    assert mismatches == []
+
+
+def test_reconcile_fixtures_ts_reuse_test_wrapper_export(tmp_path: Path):
+    """`reuse from pageFixtures.ts:test` resolves against `export const test = ...extend(...)`.
+
+    Regression: previously the TS scanner only extracted inner extend params
+    (basePage, loginPage, …) and reported the outer `test` re-export as
+    fixture_symbol_missing.
+    """
+    file_rel = "src/fixtures/pageFixtures.ts"
+    _touch(tmp_path / file_rel, _TS_FIXTURE_TEST_EXTEND)
+    plan = {
+        "test_cases": [{
+            "id": "TC-ROPA-001",
+            "fixtures": [{
+                "name": "test (extended)",
+                "source": "reuse",
+                "from": f"{file_rel}:test",
+            }],
+        }],
+    }
+    _, mismatches = reconcile_fixtures(plan, tmp_path)
+    assert mismatches == []
+
+
+def test_reconcile_fixtures_ts_reuse_typed_wrapper_export(tmp_path: Path):
+    """`export const test: Something = base.extend(...)` (typed LHS) is captured."""
+    file_rel = "tests/fixtures/typed.ts"
+    _touch(
+        tmp_path / file_rel,
+        "import { test as baseTest } from '@playwright/test';\n"
+        "type Fx = { foo: string };\n"
+        "export const test: import('@playwright/test').TestType<Fx, {}> = "
+        "baseTest.extend<Fx>({\n"
+        "  foo: async ({}, use) => { await use('x'); },\n"
+        "});\n",
+    )
+    plan = {
+        "test_cases": [{
+            "id": "TC-1",
+            "fixtures": [{
+                "name": "wrapper",
+                "source": "reuse",
+                "from": f"{file_rel}:test",
+            }],
+        }],
+    }
+    _, mismatches = reconcile_fixtures(plan, tmp_path)
+    assert mismatches == []
+
+
+def test_reconcile_fixtures_js_reuse_exports_wrapper(tmp_path: Path):
+    """`exports.test = test.extend(...)` (CommonJS) is captured as a defined symbol."""
+    file_rel = "tests/fixtures/setup.js"
+    _touch(
+        tmp_path / file_rel,
+        "const { test } = require('@playwright/test');\n"
+        "exports.test = test.extend({\n"
+        "  authPage: async ({ page }, use) => { await use(page); },\n"
+        "});\n",
+    )
+    plan = {
+        "test_cases": [{
+            "id": "TC-1",
+            "fixtures": [{
+                "name": "wrapper",
+                "source": "reuse",
+                "from": f"{file_rel}:test",
+            }],
+        }],
+    }
+    _, mismatches = reconcile_fixtures(plan, tmp_path)
+    assert mismatches == []
+
+
+def test_reconcile_fixtures_ts_reuse_separate_export_statement(tmp_path: Path):
+    """`const test = base.extend(...); export { test };` — LHS captured via const
+    regex AND via the standalone `export { … }` statement.
+    """
+    file_rel = "tests/fixtures/twostep.ts"
+    _touch(
+        tmp_path / file_rel,
+        "import { test as baseTest } from '@playwright/test';\n"
+        "const test = baseTest.extend<{ foo: string }>({\n"
+        "  foo: async ({}, use) => { await use('x'); },\n"
+        "});\n"
+        "export { test };\n",
+    )
+    plan = {
+        "test_cases": [{
+            "id": "TC-1",
+            "fixtures": [{
+                "name": "wrapper",
+                "source": "reuse",
+                "from": f"{file_rel}:test",
+            }],
+        }],
+    }
+    _, mismatches = reconcile_fixtures(plan, tmp_path)
+    assert mismatches == []
+
+
+def test_reconcile_fixtures_ts_reuse_export_alias(tmp_path: Path):
+    """`export { test as customTest };` exposes the alias, not the local name."""
+    file_rel = "tests/fixtures/aliased.ts"
+    _touch(
+        tmp_path / file_rel,
+        "import { test as baseTest } from '@playwright/test';\n"
+        "const localTest = baseTest.extend<{ foo: string }>({\n"
+        "  foo: async ({}, use) => { await use('x'); },\n"
+        "});\n"
+        "export { localTest as customTest };\n",
+    )
+    plan = {
+        "test_cases": [{
+            "id": "TC-1",
+            "fixtures": [{
+                "name": "wrapper",
+                "source": "reuse",
+                "from": f"{file_rel}:customTest",
+            }],
+        }],
+    }
+    _, mismatches = reconcile_fixtures(plan, tmp_path)
+    assert mismatches == []
+
+
+def test_reconcile_fixtures_ts_reuse_reexport_from_other_file(tmp_path: Path):
+    """`export { test } from './other';` — the exposed name is recorded even
+    though the definition lives elsewhere. Reuse against this file is valid
+    because a consumer's `import { test } from 'thisfile'` would work.
+    """
+    file_rel = "tests/fixtures/barrel.ts"
+    _touch(
+        tmp_path / file_rel,
+        "export { test } from './inner-fixtures';\n"
+        "export { expect } from '@playwright/test';\n",
+    )
+    plan = {
+        "test_cases": [{
+            "id": "TC-1",
+            "fixtures": [{
+                "name": "wrapper",
+                "source": "reuse",
+                "from": f"{file_rel}:test",
+            }],
+        }],
+    }
+    _, mismatches = reconcile_fixtures(plan, tmp_path)
+    assert mismatches == []
+
+
+def test_reconcile_fixtures_ts_reuse_default_export_wildcards(tmp_path: Path):
+    """`export default base.extend(...)` — arbitrary import name at consumer;
+    reuse against this file resolves for ANY `:symbol` reference.
+    """
+    file_rel = "tests/fixtures/defaulted.ts"
+    _touch(
+        tmp_path / file_rel,
+        "import { test as baseTest } from '@playwright/test';\n"
+        "export default baseTest.extend<{ foo: string }>({\n"
+        "  foo: async ({}, use) => { await use('x'); },\n"
+        "});\n",
+    )
+    plan = {
+        "test_cases": [{
+            "id": "TC-A",
+            "fixtures": [{
+                "name": "wrapper",
+                "source": "reuse",
+                "from": f"{file_rel}:test",
+            }],
+        }, {
+            "id": "TC-B",
+            "fixtures": [{
+                "name": "wrapper",
+                "source": "reuse",
+                "from": f"{file_rel}:someOtherName",
+            }],
+        }],
+    }
+    _, mismatches = reconcile_fixtures(plan, tmp_path)
+    assert mismatches == []
+
+
+def test_reconcile_fixtures_ts_reuse_mergetests_wrapper(tmp_path: Path):
+    """`export const test = mergeTests(a, b);` — Playwright's fixture-composition
+    API. LHS is captured just like an `.extend(...)` assignment.
+    """
+    file_rel = "tests/fixtures/merged.ts"
+    _touch(
+        tmp_path / file_rel,
+        "import { mergeTests } from '@playwright/test';\n"
+        "import { test as authTest } from './auth-fixtures';\n"
+        "import { test as apiTest } from './api-fixtures';\n"
+        "export const test = mergeTests(authTest, apiTest);\n",
+    )
+    plan = {
+        "test_cases": [{
+            "id": "TC-1",
+            "fixtures": [{
+                "name": "wrapper",
+                "source": "reuse",
+                "from": f"{file_rel}:test",
+            }],
+        }],
+    }
+    _, mismatches = reconcile_fixtures(plan, tmp_path)
+    assert mismatches == []
+
+
+def test_reconcile_fixtures_ts_reuse_let_and_var_declarations(tmp_path: Path):
+    """`let` / `var` bindings are accepted alongside `const` on the LHS."""
+    file_rel = "tests/fixtures/letvar.ts"
+    _touch(
+        tmp_path / file_rel,
+        "import { test as baseTest } from '@playwright/test';\n"
+        "export let letTest = baseTest.extend({\n"
+        "  a: async ({}, use) => { await use(1); },\n"
+        "});\n"
+        "export var varTest = baseTest.extend({\n"
+        "  b: async ({}, use) => { await use(2); },\n"
+        "});\n",
+    )
+    plan = {
+        "test_cases": [{
+            "id": "TC-1",
+            "fixtures": [
+                {"name": "w1", "source": "reuse",
+                 "from": f"{file_rel}:letTest"},
+                {"name": "w2", "source": "reuse",
+                 "from": f"{file_rel}:varTest"},
+            ],
+        }],
+    }
+    _, mismatches = reconcile_fixtures(plan, tmp_path)
+    assert mismatches == []
+
+
+def test_reconcile_fixtures_default_export_sentinel_hidden_from_mismatch(
+    tmp_path: Path,
+):
+    """When a `create` fixture is missing from a file that ALSO has a default
+    extend export, the mismatch's `existing_symbols` must not leak the internal
+    sentinel string to the human-facing output.
+    """
+    file_rel = "tests/fixtures/mixed_default.ts"
+    _touch(
+        tmp_path / file_rel,
+        "import { test as baseTest } from '@playwright/test';\n"
+        "export default baseTest.extend<{ foo: string }>({\n"
+        "  foo: async ({}, use) => { await use('x'); },\n"
+        "});\n",
+    )
+    plan = {
+        "test_cases": [{
+            "id": "TC-1",
+            "fixtures": [{
+                "name": "missingFixture",
+                "source": "create",
+                "at": file_rel,
+            }],
+        }],
+    }
+    _, mismatches = reconcile_fixtures(plan, tmp_path)
+    assert len(mismatches) == 1
+    # `foo` is the only real symbol; the sentinel must be filtered out.
+    assert "__default_export_extend__" not in mismatches[0].existing_symbols
+    assert mismatches[0].existing_symbols == ["foo"]
+
+
+# ---------------------------------------------------------------------------
+# Java scanners — JUnit/TestNG fixtures + POM method signatures
+# ---------------------------------------------------------------------------
+
+_JAVA_FIXTURE_FILE = """\
+package com.example.fixtures;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.BeforeAll;
+
+public class TestBase {
+
+    @BeforeAll
+    public static void setUpClass() {
+        // one-time setup
+    }
+
+    @BeforeEach
+    public void setUp() {
+        // per-test setup
+    }
+
+    @BeforeEach
+    void packagePrivateSetUp() {
+        // JUnit accepts package-private lifecycle methods too
+    }
+}
+"""
+
+_JAVA_POM_FILE = """\
+package com.example.pages;
+
+import org.openqa.selenium.WebDriver;
+import java.util.List;
+import java.util.Map;
+
+public class LoginPage {
+
+    private final WebDriver driver;
+
+    public LoginPage(WebDriver driver) {
+        this.driver = driver;
+    }
+
+    public void enterUsername(String username) {
+        // fill username
+    }
+
+    public LoginPage clickLogin() {
+        return this;
+    }
+
+    public String getErrorMessage() {
+        return "";
+    }
+
+    public <T> List<T> getItems(Class<T> type) {
+        return List.of();
+    }
+
+    public Map<String, Integer> counters() {
+        return Map.of();
+    }
+
+    private void internalHelper() {
+        // don't call from tests
+    }
+}
+"""
+
+
+def test_reconcile_fixtures_java_before_annotations(tmp_path: Path):
+    """@BeforeEach / @BeforeAll methods in a Java fixture file are detected."""
+    file_rel = "src/test/java/com/example/fixtures/TestBase.java"
+    _touch(tmp_path / file_rel, _JAVA_FIXTURE_FILE)
+    plan = _plan_with_create_fixtures(file_rel, ["setUp", "setUpClass"])
+    scanned, mismatches = reconcile_fixtures(plan, tmp_path)
+    assert scanned == 1
+    assert mismatches == [], (
+        f"@Before-annotated methods must be found; got {mismatches!r}"
+    )
+
+
+def test_reconcile_fixtures_java_missing_symbol_carries_existing(tmp_path: Path):
+    """When a fixture is missing, existing_symbols reports the ones found."""
+    file_rel = "src/test/java/com/example/fixtures/TestBase.java"
+    _touch(tmp_path / file_rel, _JAVA_FIXTURE_FILE)
+    plan = _plan_with_create_fixtures(file_rel, ["notThere"])
+    _, mismatches = reconcile_fixtures(plan, tmp_path)
+    assert len(mismatches) == 1
+    m = mismatches[0]
+    assert m.kind == "fixture_symbol_missing"
+    assert m.name == "notThere"
+    assert "setUp" in m.existing_symbols
+    assert "setUpClass" in m.existing_symbols
+
+
+def test_reconcile_codegen_java_no_mismatches(tmp_path: Path):
+    """End-to-end Java reconciliation: test file calls POM methods that exist."""
+    pom_rel = "src/main/java/com/example/pages/LoginPage.java"
+    test_rel = "src/test/java/com/example/LoginTest.java"
+    _touch(tmp_path / pom_rel, _JAVA_POM_FILE)
+    _touch(
+        tmp_path / test_rel,
+        "package com.example;\n"
+        "import com.example.pages.LoginPage;\n"
+        "public class LoginTest {\n"
+        "  public void loginSucceeds() {\n"
+        "    LoginPage loginPage = new LoginPage(null);\n"
+        "    loginPage.enterUsername(\"bob\");\n"
+        "    loginPage.clickLogin();\n"
+        "    loginPage.getErrorMessage();\n"
+        "  }\n"
+        "}\n",
+    )
+    pom_files = [{"class_name": "LoginPage", "file": pom_rel}]
+    result = reconcile_codegen(
+        test_files=[tmp_path / test_rel],
+        pom_files=pom_files,
+        sut_root=tmp_path,
+        language="java",
+    )
+    assert result.pom_files_scanned == 1
+    assert result.mismatches == [], (
+        f"expected no mismatches; got {result.mismatches!r}"
+    )
+
+
+def test_reconcile_codegen_java_method_not_found(tmp_path: Path):
+    """A call to a POM method that doesn't exist surfaces as a mismatch."""
+    pom_rel = "src/main/java/com/example/pages/LoginPage.java"
+    test_rel = "src/test/java/com/example/LoginTest.java"
+    _touch(tmp_path / pom_rel, _JAVA_POM_FILE)
+    _touch(
+        tmp_path / test_rel,
+        "package com.example;\n"
+        "public class LoginTest {\n"
+        "  public void x() {\n"
+        "    loginPage.clickForgotPassword();\n"  # doesn't exist on LoginPage
+        "  }\n"
+        "}\n",
+    )
+    pom_files = [{"class_name": "LoginPage", "file": pom_rel}]
+    result = reconcile_codegen(
+        test_files=[tmp_path / test_rel],
+        pom_files=pom_files,
+        sut_root=tmp_path,
+        language="java",
+    )
+    kinds = sorted({m.kind for m in result.mismatches})
+    assert "method_not_found" in kinds or "likely_typo" in kinds, (
+        f"expected a mismatch on clickForgotPassword; got {result.mismatches!r}"
+    )
+
+
+def test_reconcile_codegen_java_private_methods_still_visible(tmp_path: Path):
+    """Private methods DO count as existing — reconciler is about existence,
+    not visibility. If a test somehow calls them, it should find them."""
+    pom_rel = "src/main/java/com/example/pages/LoginPage.java"
+    _touch(tmp_path / pom_rel, _JAVA_POM_FILE)
+    # internalHelper is `private` — reconciler should still record it as
+    # existing so a call to it doesn't false-positive as method_not_found.
+    from qtea.codegen_reconcile import _java_pom_methods
+    sigs = _java_pom_methods(_JAVA_POM_FILE, "LoginPage")
+    names = {s.name for s in sigs}
+    assert "enterUsername" in names
+    assert "clickLogin" in names
+    assert "getErrorMessage" in names
+    assert "getItems" in names          # generic method: `<T> List<T> getItems(...)`
+    assert "counters" in names          # generic return: `Map<String, Integer>`
+    assert "internalHelper" in names    # private but present
+    # Constructor and lifecycle should NOT appear in the POM method list.
+    assert "LoginPage" not in names

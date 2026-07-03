@@ -1,5 +1,6 @@
-"""Step 1 intake tests — JIRA paths invoke jira-to-ai-spec agent; local
-files and generic URLs are literal passthrough (no LLM call)."""
+"""Step 1 intake tests — JIRA / Azure DevOps paths invoke the
+ticket-to-ai-spec agent; local files and generic URLs are literal passthrough
+(no LLM call)."""
 
 from __future__ import annotations
 
@@ -118,7 +119,7 @@ async def test_intake_url_passthrough(tmp_path: Path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# JIRA path: jira:KEY shorthand → REST + jira-to-ai-spec agent
+# JIRA path: jira:KEY shorthand → REST + ticket-to-ai-spec agent
 # ---------------------------------------------------------------------------
 
 
@@ -273,7 +274,7 @@ async def test_intake_agent_no_output_fails(tmp_path: Path, monkeypatch):
     ctx = _ctx(tmp_path, "jira:PROJ-2")
     result = await IntakeStep().run(ctx)
     assert not result.success
-    assert "jira-to-ai-spec failed" in (result.error or "") or "no output" in (result.error or "")
+    assert "ticket-to-ai-spec failed" in (result.error or "") or "no output" in (result.error or "")
 
 
 async def test_intake_url_download_failure_propagates(tmp_path: Path, monkeypatch):
@@ -291,3 +292,181 @@ async def test_intake_url_download_failure_propagates(tmp_path: Path, monkeypatc
     result = await IntakeStep().run(ctx)
     assert not result.success
     assert "download failed" in (result.error or "").lower()
+
+
+# ---------------------------------------------------------------------------
+# Azure DevOps path: ado:ID shorthand → REST + ticket-to-ai-spec agent
+# ---------------------------------------------------------------------------
+
+def _fake_ado_payload() -> dict:
+    """Minimal Azure DevOps REST v7.1 work item payload shape."""
+    return {
+        "id": 9370,
+        "url": "https://dev.azure.com/BoschGPT/BoschGPT/_apis/wit/workitems/9370",
+        "rev": 3,
+        "fields": {
+            "System.Title": "Sample ADO work item",
+            "System.Description": "<p>Sample description body.</p>",
+            "System.State": "Active",
+            "System.WorkItemType": "User Story",
+            "Microsoft.VSTS.Common.Priority": 2,
+        },
+    }
+
+
+async def test_intake_ado_via_rest_shorthand(tmp_path: Path, monkeypatch):
+    """ado:ID shorthand uses AZDO_ORG + AZDO_PROJECT, fetches via REST, enriches via agent."""
+    monkeypatch.setenv("AZDO_ORG", "BoschGPT")
+    monkeypatch.setenv("AZDO_PROJECT", "BoschGPT")
+    monkeypatch.setenv("AZDO_PAT", "fake-pat")
+    monkeypatch.setattr("qtea.ado_client._az_cli_token", lambda: None)
+
+    monkeypatch.setattr(
+        "qtea.steps.s01_intake.fetch_work_item",
+        lambda org, project, item_id: _fake_ado_payload(),
+    )
+    install_fake_anthropic(monkeypatch, text=_AGENT_SPEC_MD)
+
+    ctx = _ctx(tmp_path, "ado:9370")
+    result = await IntakeStep().run(ctx)
+
+    assert result.success, result.error
+    spec = ctx.workspace.step_dir(1) / "spec.md"
+    jira = ctx.workspace.step_dir(1) / "jira-spec.md"
+    assert "Enriched by agent" in spec.read_text(encoding="utf-8")
+    jira_text = jira.read_text(encoding="utf-8")
+    assert "9370" in jira_text
+    assert "not retained" in jira_text
+
+
+async def test_intake_ado_via_rest_full_prefix(tmp_path: Path, monkeypatch):
+    """ado:ORG/PROJECT/ID form doesn't need env vars."""
+    monkeypatch.delenv("AZDO_ORG", raising=False)
+    monkeypatch.delenv("AZDO_PROJECT", raising=False)
+    monkeypatch.setenv("AZDO_PAT", "fake-pat")
+
+    captured_args = {}
+
+    def _fake_fetch(org, project, item_id):
+        captured_args["org"] = org
+        captured_args["project"] = project
+        captured_args["item_id"] = item_id
+        return _fake_ado_payload()
+
+    monkeypatch.setattr("qtea.steps.s01_intake.fetch_work_item", _fake_fetch)
+    install_fake_anthropic(monkeypatch, text=_AGENT_SPEC_MD)
+
+    ctx = _ctx(tmp_path, "ado:Contoso/WebApp/42")
+    result = await IntakeStep().run(ctx)
+
+    assert result.success, result.error
+    assert captured_args["org"] == "Contoso"
+    assert captured_args["project"] == "WebApp"
+    assert captured_args["item_id"] == 42
+
+
+async def test_intake_ado_via_rest_url_form(tmp_path: Path, monkeypatch):
+    """Full Azure DevOps URL extracts org/project/id from the URL itself."""
+    monkeypatch.setenv("AZDO_PAT", "fake-pat")
+
+    captured_args = {}
+
+    def _fake_fetch(org, project, item_id):
+        captured_args["org"] = org
+        captured_args["project"] = project
+        captured_args["item_id"] = item_id
+        return _fake_ado_payload()
+
+    monkeypatch.setattr("qtea.steps.s01_intake.fetch_work_item", _fake_fetch)
+    install_fake_anthropic(monkeypatch, text=_AGENT_SPEC_MD)
+
+    ctx = _ctx(tmp_path, "https://dev.azure.com/BoschGPT/BoschGPT/_workitems/edit/9370")
+    result = await IntakeStep().run(ctx)
+
+    assert result.success, result.error
+    assert captured_args["org"] == "BoschGPT"
+    assert captured_args["project"] == "BoschGPT"
+    assert captured_args["item_id"] == 9370
+
+
+async def test_intake_ado_inlines_payload_with_ado_header(
+    tmp_path: Path, monkeypatch
+):
+    """ADO payload reaches the LLM under the `ado-workitem.json` header."""
+    monkeypatch.setenv("AZDO_ORG", "Org")
+    monkeypatch.setenv("AZDO_PROJECT", "Proj")
+    monkeypatch.setenv("AZDO_PAT", "fake-pat")
+
+    payload = _fake_ado_payload()
+    payload["fields"]["System.Title"] = "PAYLOAD_INLINE_MARKER_ADO"
+    monkeypatch.setattr(
+        "qtea.steps.s01_intake.fetch_work_item",
+        lambda org, project, item_id: payload,
+    )
+
+    captured: dict = {}
+    install_fake_anthropic(monkeypatch, text=_AGENT_SPEC_MD, on_call=captured.update)
+
+    ctx = _ctx(tmp_path, "ado:9370")
+    result = await IntakeStep().run(ctx)
+    assert result.success
+
+    user_content = captured["messages"][-1]["content"]
+    assert "PAYLOAD_INLINE_MARKER_ADO" in user_content
+    # ADO header — distinguishes from Jira paths.
+    assert "ado-workitem.json" in user_content
+    # Jira header must NOT appear.
+    assert "jira-issue.json" not in user_content
+
+
+# ---------------------------------------------------------------------------
+# ADO error paths
+# ---------------------------------------------------------------------------
+
+
+async def test_intake_ado_shorthand_without_env_fails(tmp_path: Path, monkeypatch):
+    """ado:ID without AZDO_ORG/AZDO_PROJECT set raises a helpful error."""
+    monkeypatch.delenv("AZDO_ORG", raising=False)
+    monkeypatch.delenv("AZDO_PROJECT", raising=False)
+
+    ctx = _ctx(tmp_path, "ado:9370")
+    result = await IntakeStep().run(ctx)
+    assert not result.success
+    assert "AZDO_ORG" in (result.error or "")
+
+
+async def test_intake_ado_fetch_failure_propagates(tmp_path: Path, monkeypatch):
+    """An AdoFetchError is surfaced as step failure."""
+    from qtea.ado_client import AdoFetchError
+    monkeypatch.setenv("AZDO_ORG", "Org")
+    monkeypatch.setenv("AZDO_PROJECT", "Proj")
+    monkeypatch.setenv("AZDO_PAT", "fake-pat")
+
+    def _raise(*_a, **_kw):
+        raise AdoFetchError("PAT expired", status_code=401)
+
+    monkeypatch.setattr("qtea.steps.s01_intake.fetch_work_item", _raise)
+
+    ctx = _ctx(tmp_path, "ado:9370")
+    result = await IntakeStep().run(ctx)
+    assert not result.success
+    assert "PAT expired" in (result.error or "")
+
+
+async def test_intake_ado_url_not_captured_as_generic(tmp_path: Path, monkeypatch):
+    """Azure DevOps URLs must NOT fall through to _url_passthrough."""
+    monkeypatch.setenv("AZDO_PAT", "fake-pat")
+
+    monkeypatch.setattr(
+        "qtea.steps.s01_intake.fetch_work_item",
+        lambda org, project, item_id: _fake_ado_payload(),
+    )
+    install_fake_anthropic(monkeypatch, text=_AGENT_SPEC_MD)
+
+    ctx = _ctx(tmp_path, "https://dev.azure.com/Org/Proj/_workitems/edit/123")
+    result = await IntakeStep().run(ctx)
+
+    assert result.success, result.error
+    spec_text = (ctx.workspace.step_dir(1) / "spec.md").read_text(encoding="utf-8")
+    # Should be enriched by agent, not raw URL download.
+    assert "Enriched by agent" in spec_text

@@ -25,7 +25,8 @@ Two layers cooperate to run the pipeline:
   - **`claude_runner.py`** (`run_agent`) — agent executor via Claude Agent SDK. Multi-turn with tool access (Read/Write/Grep/Glob). Used by steps 6, 9, and step 8's violation-fix phase. Context grows with each turn.
   - **`llm/reasoning.py`** (`call_reasoning_llm`) — direct Anthropic SDK. Single API call, inputs inlined into prompt. Used by steps 2-4, 7, 10, and step 8's codegen phases (A/B). Bounded context, no growth.
 - **This agent (QA Orchestrator)** — semantic reasoning only. Decides what inputs to
-  pass, interprets failures, and drives the fix-proposal flow on persistent failure.
+  pass, interprets failures, and hands the persistent-failure path off to the
+  auto-firing fix-proposal chain.
 
 **The boundary is clean: `pipeline.py` never reasons. This agent never checkpoints.**
 
@@ -109,26 +110,33 @@ For each step in `_select_steps()` (respecting `--from-step`, `--only-step`, `--
 
 ```
 Attempt 1 fails  (steps/base.py MAX_ATTEMPTS=2)
-  --> Attempt 2: re-run same inputs + co-run debug.agent.md
-        --> Attempt 2 fails:
-              if --fix: invoke critical-thinking for RCA
-                        --> feed analysis to principal-software-engineer
-                        --> produce fix-proposal.md and auto-edit code (no auto-edits if --fix not set)
-              else: ABORT pipeline, mark step "failed" in state.json
+  --> --debug set? co-run debug.agent.md for attempt-1 RCA (observability only)
+  --> Attempt 2: re-run same inputs
+        --> Attempt 2 fails (retry exhaustion):
+              1. debug.agent.md runs — writes step-NN-attempt2-debug-rca.md
+              2. --no-fix set? SKIP the rest and abort with the RCA.
+              3. otherwise auto-fire the fix-proposal chain:
+                   critical-thinking (given the debug RCA) -> fix-strategy.md
+                   principal-software-engineer (given RCA + strategy) -> fix-proposal.md
+              4. mark step "failed", surface aggregated step-NN-rca.md +
+                 step-NN-fix-proposal.md, abort pipeline.
 ```
 
-(Models for `debug`, `critical-thinking`, and `principal-software-engineer`
-live in `src/qtea/agent_models.yaml`.)
+Nothing auto-edits — `fix-proposal.md` is a hand-off to the operator.
+Models for `debug`, `critical-thinking`, and `principal-software-engineer`
+live in `src/qtea/agent_models.yaml`.
 
 1. On first failure, increment `attempts` to 2, set `status: "in_progress"`.
-2. Re-invoke the same agent with the same inputs, but also co-run
-   `debug.agent.md` for verbose diagnostics.
-   If `--debug` was set, `debug.agent.md` was already running from attempt 1.
-3. If attempt 2 also fails and `--fix` is set:
-   a. Invoke `critical-thinking` with the failure context.
-   b. Feed the critical-thinking output to `principal-software-engineer`.
-   c. Write `fix-proposal.md` to `artifacts/stepNN/`and auto-edit code.
-4. If attempt 2 fails and `--fix` is NOT set: mark step `"failed"`, abort.
+2. Re-invoke the same agent with the same inputs. If `--debug` was set, an
+   attempt-1 debug RCA was already written.
+3. If attempt 2 also fails, `debug.agent.md` runs unconditionally and its RCA
+   is stashed on `ctx.extras[f"step{n}_rca_path"]`.
+4. Unless `--no-fix` is set, `_run_fix_proposal` auto-fires: promotes the debug
+   RCA into the aggregated `<ws>/debug/step-NN-rca.md` slot, calls
+   `critical-thinking` to produce `fix-strategy.md`, then calls
+   `principal-software-engineer` to produce `<ws>/debug/step-NN-fix-proposal.md`.
+5. Mark step `"failed"` and abort the pipeline (or `"warned"` if attempt 2
+   succeeded — no fix chain fires in that case).
 
 ---
 
@@ -140,21 +148,24 @@ live in `src/qtea/agent_models.yaml`.)
 
 | Field | Value |
 |---|---|
-| Agent | `jira-to-ai-spec`, or pure file copy |
-| Input | `--spec` flag (Jira ticket ID/URL or local markdown path) |
-| Output | `artifacts/step01/spec.md` (required), `jira-spec.md` (if Jira) |
+| Agent | `ticket-to-ai-spec`, or pure file copy |
+| Input | `--spec` flag (Jira ticket, Azure DevOps work item, or local markdown path) |
+| Output | `artifacts/step01/spec.md` (required), `jira-spec.md` (provenance stub) |
 | Schema | n/a (non-empty file check only) |
 
 **Procedure:**
 1. If `--spec` starts with `jira:` or is a full `https://.../browse/KEY` URL,
-   fetch the issue via direct Jira REST (`qtea.jira_client.fetch_issue` —
-   the Atlassian MCP was retired in commit `a36dbbe`), slim the payload, and
-   invoke `jira-to-ai-spec` with the JSON inlined under the `jira-issue.json`
-   header. Output both `jira-spec.md` (provenance stub) and `spec.md` (the
-   agent's enriched 10-section output).
-2. If `--spec` is a local file, copy its content verbatim to
+   fetch the issue via direct Jira REST (`qtea.jira_client.fetch_issue`),
+   slim the payload, and invoke `ticket-to-ai-spec` with the JSON inlined
+   under the `jira-issue.json` header.
+2. If `--spec` starts with `ado:` or is a full
+   `https://dev.azure.com/{org}/{project}/_workitems/edit/{id}` URL, fetch
+   the work item via Azure DevOps REST (`qtea.ado_client.fetch_work_item`),
+   slim the payload, and invoke `ticket-to-ai-spec` with the JSON inlined
+   under the `ado-workitem.json` header.
+3. If `--spec` is a local file, copy its content verbatim to
    `artifacts/step01/spec.md` (no LLM call at step 1).
-3. If `--spec` is a non-JIRA URL, download its body and write it verbatim to
+4. If `--spec` is a non-ticket URL, download its body and write it verbatim to
    `artifacts/step01/spec.md` (no LLM call at step 1).
 
 **Phase gate:** `spec.md` exists and is non-empty.

@@ -230,9 +230,12 @@ _ENV_REF_PATTERNS = [
 _SUT_SOURCE_GLOBS = ("**/*.ts", "**/*.js", "**/*.tsx", "**/*.jsx",
                      "**/*.py", "**/*.java", "**/*.rb", "**/*.cs")
 
-_INTERNAL_PREFIXES = ("QTEA_", "ANTHROPIC_", "CLAUDE", "NODE_", "npm_",
-                      "PATH", "HOME", "USER", "SHELL", "TERM", "LANG",
-                      "HOSTNAME", "PWD", "OLDPWD", "SHLVL", "TMPDIR")
+_INTERNAL_PREFIXES = ("QTEA_", "ANTHROPIC_", "CLAUDE", "NODE_", "npm_")
+
+_INTERNAL_EXACT = frozenset({
+    "PATH", "HOME", "USER", "SHELL", "TERM", "LANG",
+    "HOSTNAME", "PWD", "OLDPWD", "SHLVL", "TMPDIR",
+})
 
 # Pydantic BaseSettings discovery — keep AST work to files that mention it.
 _BASESETTINGS_HINT = re.compile(rb"\bBaseSettings\b")
@@ -511,7 +514,32 @@ def _discover_sut_env_keys(sut_path: Path) -> list[str]:
 
     return sorted(k for k in keys
                   if k not in SECRET_ENV_KEYS
+                  and k not in _INTERNAL_EXACT
                   and not any(k.startswith(p) for p in _INTERNAL_PREFIXES))
+
+
+_ENV_QTEA_FILENAME = ".env.qtea"
+
+
+def _persist_resolved_env(workspace_root: Path, resolved: Any) -> None:
+    """Write resolved env var values to ``<workspace>/.env.qtea``.
+
+    Enables ``replay_env_from_artifacts`` to recover HITL-provided values
+    on ``--from-step`` restarts without re-prompting. The workspace already
+    contains credential-equivalent files (``storage-state.json``), so this
+    is not a new risk class.  File mode is set to 600 on non-Windows.
+    """
+    if not resolved.values:
+        return
+    dst = workspace_root / _ENV_QTEA_FILENAME
+    try:
+        lines = [f"{k}={v}\n" for k, v in sorted(resolved.values.items())]
+        dst.write_text("".join(lines), encoding="utf-8")
+        if sys.platform != "win32":
+            dst.chmod(0o600)
+        log.info("env_resolver.persisted", count=len(lines), path=str(dst))
+    except OSError as exc:
+        log.warning("env_resolver.persist_failed", error=str(exc))
 
 
 _FRAMEWORK_HINTS = (
@@ -876,8 +904,17 @@ class ResearchStep(Step):
         if sut_env_keys:
             from qtea.env_resolver import EnvResolverConfig, resolve_sut_env
 
+            # On Step 6 re-runs (resume, --from-step 6, retry after abort)
+            # the values a previous attempt persisted to <workspace>/.env.qtea
+            # would otherwise be invisible to the resolver, so every essential
+            # would be re-prompted. Mirror the same fallback replay uses.
+            user_env_file = getattr(ctx.options, "env_file", None)
+            ws_env_file = ctx.workspace.root / _ENV_QTEA_FILENAME
+            env_file = user_env_file or (
+                ws_env_file if ws_env_file.exists() else None
+            )
             resolver_config = EnvResolverConfig(
-                env_file=getattr(ctx.options, "env_file", None),
+                env_file=env_file,
                 sut_path=ctx.workspace.sut,
                 no_hitl=getattr(ctx.options, "no_hitl", False),
                 azdo_org=os.environ.get("AZDO_ORG"),
@@ -889,6 +926,7 @@ class ResearchStep(Step):
                 resolver_config, sut_env_keys, ctx.workspace.sut,
                 extra_required=pyd_required,
             )
+            _persist_resolved_env(ctx.workspace.root, resolved)
             env_resolution_audit = {
                 "resolved": list(resolved.values.keys()),
                 "sources": resolved.sources,
@@ -966,21 +1004,22 @@ class ResearchStep(Step):
 
 
 def replay_env_from_artifacts(workspace: Any, options: Any) -> bool:
-    """Re-populate `os.environ` from existing Step 6 artifacts.
+    """Re-populate ``os.environ`` from existing Step 6 artifacts.
 
-    Step 6's `resolve_sut_env()` call loads the SUT's `.env` file into
-    `os.environ` and mirrors the canonical URL key (e.g. `QA_URL`) into
-    `SUT_BASE_URL`. Those injections are **in-process only** — they vanish
-    on process restart. When the user re-runs `qtea run --from-step 7+`,
-    Step 6 doesn't fire, so downstream steps that depend on `SUT_BASE_URL`
-    (8, 9) see it as unset and abort or warn.
+    Step 6's ``resolve_sut_env()`` call injects resolved values into
+    ``os.environ`` and persists them to ``<workspace>/.env.qtea``.  On
+    process restart (``--from-step 7+``), this helper reads the persisted
+    file (via ``DotenvFileStrategy``) together with the SUT's own ``.env``
+    and re-runs the silent resolver cascade — recovering HITL-provided
+    values without re-prompting.
 
-    This helper replays only the env-resolution slice of Step 6 (no LLM, no
-    new discovery) by reading the persisted `research.json` and
-    `url_resolution.json` and rerunning the same env resolver cascade.
+    Fallback priority for ``env_file``:
+      1. User-supplied ``--env-file`` (highest)
+      2. ``<workspace>/.env.qtea`` (Step 6 persisted cache)
+      3. ``None`` — cascade relies on process env + SUT ``.env`` only
 
     Returns True when at least one env var was re-injected, False otherwise
-    (no artifacts on disk or nothing to resolve). Never raises; logs errors
+    (no artifacts on disk or nothing to resolve).  Never raises; logs errors
     and continues.
     """
     # Use the read-only path helper here — replay runs at pipeline preflight
@@ -1015,8 +1054,11 @@ def replay_env_from_artifacts(workspace: Any, options: Any) -> bool:
     if needed:
         from qtea.env_resolver import EnvResolverConfig, resolve_sut_env
 
+        user_env_file = getattr(options, "env_file", None)
+        ws_env_file = workspace.root / _ENV_QTEA_FILENAME
+        env_file = user_env_file or (ws_env_file if ws_env_file.exists() else None)
         resolver_config = EnvResolverConfig(
-            env_file=getattr(options, "env_file", None),
+            env_file=env_file,
             sut_path=workspace.sut,
             no_hitl=True,  # never prompt during replay; Step 6 already did that
             azdo_org=os.environ.get("AZDO_ORG"),

@@ -42,11 +42,16 @@ Create a `.env` file in your working directory with your values:
 # Required — Anthropic API key for Claude agents
 ANTHROPIC_API_KEY=sk-ant-api03-...
 
-# Required if your spec comes from Jira (step 1) — also used by the
-# Atlassian MCP server that .mcp.json spawns
+# Jira (needed when --spec is jira:KEY or a Jira URL)
 JIRA_BASE_URL=https://yourcompany.atlassian.net
 JIRA_EMAIL=you@company.com
 JIRA_API_TOKEN=your-jira-api-token
+
+# Azure DevOps (needed when --spec is ado:ID shorthand; not needed for
+# full URLs or ado:ORG/PROJECT/ID form).  Auth: AZDO_PAT or `az login`.
+AZDO_ORG=MyOrg
+AZDO_PROJECT=MyProject
+AZDO_PAT=your-personal-access-token    # optional if logged in via `az login`
 
 # Optional — Xray Cloud (step 5 auto-skips if unset)
 JIRA_XRAY_CLIENT_ID=
@@ -60,8 +65,8 @@ HTTPS_PROXY=http://proxy:3128
 SUT_BASE_URL=http://localhost:3000
 ```
 
-**Minimum for a local run:** only `ANTHROPIC_API_KEY` is required. Jira
-and Xray credentials are optional — steps 1 and 5 auto-adapt.
+**Minimum for a local run:** only `ANTHROPIC_API_KEY` is required. Jira,
+Azure DevOps, and Xray credentials are optional — steps 1 and 5 auto-adapt.
 
 ### Prompt caching (BMF sticky sessions) — IMPORTANT, set this first
 
@@ -125,18 +130,18 @@ qtea run --spec ./spec.md --sut git@ssh.dev.azure.com:v3/org/project/repo       
 
 `.env` files are gitignored so won't be cloned — use `--env-file` or the interactive prompt for missing values.
 
-### Azure DevOps Variable Groups
+### Azure DevOps integration
 
-In an Azure DevOps pipeline (or any env with REST access), qtea can pull SUT env vars directly from a Variable Group. Set these:
+`AZDO_PAT` is shared across two features: **work item intake** (Step 1) and **Variable Group env resolution** (Step 6). If you're logged in via `az login`, the PAT is optional — qtea falls back to Azure CLI OAuth tokens automatically.
 
-| Env Var | Purpose |
-| --- | --- |
-| `AZDO_ORG` | Azure DevOps organization name |
-| `AZDO_PROJECT` | Azure DevOps project name |
-| `AZDO_VARIABLE_GROUP` | Variable Group name to read from |
-| `AZDO_PAT` | PAT with **Variable Groups (Read)** scope |
+| Env Var | Used by | Purpose |
+| --- | --- | --- |
+| `AZDO_ORG` | Step 1 (`ado:ID` shorthand), Step 6 | Azure DevOps organization name |
+| `AZDO_PROJECT` | Step 1 (`ado:ID` shorthand), Step 6 | Azure DevOps project name |
+| `AZDO_PAT` | Step 1 (work item fetch), Step 6 | PAT with **Work Items (Read)** + **Variable Groups (Read)** scopes. Optional if `az login` is active. |
+| `AZDO_VARIABLE_GROUP` | Step 6 only | Variable Group name to read from |
 
-When all four are set, Step 6 queries the Variable Group and resolves matching SUT keys.
+When `AZDO_ORG`, `AZDO_PROJECT`, `AZDO_VARIABLE_GROUP`, and a valid auth (PAT or `az login`) are present, Step 6 queries the Variable Group and resolves matching SUT keys.
 
 ```yaml
 variables:
@@ -175,7 +180,7 @@ Doctor flags:
 | `--probe-mcp` | Smoke-spawn each MCP server to verify they start |
 | `--json` | Emit results as JSON (useful for CI integration) |
 
-## 4. Write your spec (or use Jira)
+## 4. Write your spec (or use Jira / Azure DevOps)
 
 Create a markdown file describing the feature to test:
 
@@ -206,6 +211,14 @@ qtea run --spec ./feature-spec.md --sut ./path-to-your-app
 
 ```bash
 qtea run --spec jira:PROJ-123 --sut https://github.com/org/app.git
+```
+
+**With an Azure DevOps work item:**
+
+```bash
+qtea run --spec ado:9370 --sut ./path-to-your-app                            # shorthand (needs AZDO_ORG + AZDO_PROJECT)
+qtea run --spec ado:MyOrg/MyProject/9370 --sut ./path-to-your-app            # self-contained
+qtea run --spec "https://dev.azure.com/Org/Proj/_workitems/edit/9370" --sut ./app   # full URL
 ```
 
 **With an Azure DevOps repo and a separate env file:**
@@ -240,7 +253,7 @@ All `run` flags:
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
-| `--spec` | required | `jira:KEY-123`, path to spec file, or URL |
+| `--spec` | required | `jira:KEY-123`, `ado:ID`, `ado:ORG/PROJECT/ID`, Azure DevOps URL, path to spec file, or URL |
 | `--sut` | required | Local path or git URL of the System Under Test |
 | `--run-id` | auto | Resume an existing workspace by its run-id |
 | `--from-step N` | — | Start from step N (skips already-completed steps) |
@@ -249,8 +262,8 @@ All `run` flags:
 | `--force` | false | Ignore checkpoints and re-run everything |
 | `--parallel-run N` | 2 | Number of parallel test workers (0 = in-process, 1–16) |
 | `--headless / --headed` | headless | Run browser tests headless or with a visible window |
-| `--debug` | false | Run with debug agent live from step 1 |
-| `--fix` | false | Generate a fix proposal after retry exhaustion |
+| `--debug` | false | Run the debug agent on attempt-1 failures too (attempt-2 failure always gets RCA) |
+| `--no-fix` | false | Suppress the auto fix-proposal chain that fires after retry exhaustion (debug RCA still writes) |
 | `--strict-xray` | false | Fail the pipeline if Xray upload doesn't succeed |
 | `--report MODE` | auto | `auto \| builtin \| allure \| both` |
 | `--report-inline-images` | false | Embed screenshots as base64 in the HTML report |
@@ -340,14 +353,14 @@ qtea run --spec ./spec.md --sut ./app --force
 # Re-run from a specific step
 qtea run --spec ./spec.md --sut ./app --from-step 7
 
-# Debug a failing step — verbose debug agent from step 1
+# Also produce debug RCA on attempt-1 failures (attempt-2 always gets it)
 qtea run --spec ./spec.md --sut ./app --debug
 
-# Fix proposal when a step fails twice (suggestions only — never auto-edits)
-qtea run --spec ./spec.md --sut ./app --fix
+# Suppress the auto fix-proposal chain (RCA still writes; use for cost-sensitive CI)
+qtea run --spec ./spec.md --sut ./app --no-fix
 ```
 
-Debug artifacts land in `.qtea/<run-id>/debug/`.
+Debug artifacts land in `.qtea/<run-id>/debug/`. When a step fails twice, the fix-proposal chain (`debug` → `critical-thinking` → `principal-software-engineer`) auto-fires and writes `step-NN-fix-proposal.md` alongside the aggregated `step-NN-rca.md` — suggestions only, never auto-edits.
 
 ### Review gates (interactive)
 
@@ -397,7 +410,7 @@ qtea run --spec ./feature-spec.md --sut ./path-to-your-app   # subsequent runs r
 
 | # | Step | What it does |
 | --- | --- | --- |
-| 1 | **Intake** | Fetches the spec from Jira, URL, or local file |
+| 1 | **Intake** | Fetches the spec from Jira, Azure DevOps, URL, or local file |
 | 2 | **Refine** | AI refines the spec into structured requirements |
 | 3 | **Plan** | AI creates a test plan with phases and success criteria |
 | 4 | **Strategy** | AI generates test cases (TC-IDs) with steps and priorities |

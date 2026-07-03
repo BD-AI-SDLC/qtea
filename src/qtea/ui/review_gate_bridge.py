@@ -49,25 +49,30 @@ class ReviewGateBridge:
         summary_text: str,
         kind: str = "",
         data: Any = None,
-    ) -> str:
-        """Return ``"approve"`` or ``"reject"`` (blocks worker thread)."""
+    ) -> tuple[str, str]:
+        """Return ``(decision, edit_instructions)`` (blocks worker thread).
+
+        *decision* is ``"approve"`` / ``"reject"`` / ``"edit"``;
+        *edit_instructions* is the user-typed text for ``"edit"`` and
+        ``""`` otherwise.
+        """
         if self._loop is None:
             # Bridge uninstalled mid-flight — fail safe by approving so
             # the pipeline doesn't deadlock.
-            return "approve"
+            return ("approve", "")
 
-        decision: dict[str, str] = {"value": "approve"}
+        payload: dict[str, str] = {"decision": "approve", "edit_instructions": ""}
         done = threading.Event()
 
         self._loop.call_soon_threadsafe(
             asyncio.create_task,
-            self._show_in_ui(step, title, summary_text, kind, data, decision, done),
+            self._show_in_ui(step, title, summary_text, kind, data, payload, done),
         )
 
         # 1-hour ceiling matches HitlBridge; review gates can sit for a
         # while if the user steps away.
         done.wait(timeout=3600)
-        return decision["value"]
+        return (payload["decision"], payload["edit_instructions"])
 
     # ── Main-thread side (runs on Flet event loop) ──────────────────────
 
@@ -78,7 +83,7 @@ class ReviewGateBridge:
         summary_text: str,
         kind: str,
         data: Any,
-        decision: dict[str, str],
+        payload: dict[str, str],
         done: threading.Event,
     ) -> None:
         completion_event = asyncio.Event()
@@ -105,18 +110,18 @@ class ReviewGateBridge:
 
             await completion_event.wait()
 
-            # Map UI dialog decision -> worker-side response.
+            # Map UI dialog decision -> worker-side response. Edit-by-text
+            # is wired through review_gate.review_step_* via the second
+            # tuple element; the worker re-invokes us after applying the
+            # LLM edit so the user can approve / re-edit / reject again.
             raw = req.decision or "approve"
             if raw == "reject":
-                decision["value"] = "reject"
+                payload["decision"] = "reject"
             elif raw == "edit":
-                # Edit-by-text in UI not yet supported end-to-end (the
-                # terminal flow asks for instructions and applies via LLM
-                # in a multi-step sub-prompt). Treat as approve so the
-                # pipeline progresses; review_gate logs a warning.
-                decision["value"] = "edit"
+                payload["decision"] = "edit"
+                payload["edit_instructions"] = req.edit_instructions or ""
             else:
-                decision["value"] = "approve"
+                payload["decision"] = "approve"
         finally:
             try:
                 req._dialog_open = False  # type: ignore[attr-defined]

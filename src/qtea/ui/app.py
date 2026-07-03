@@ -54,8 +54,10 @@ def main(page: ft.Page):
         while _state.run_status == "running":
             _state.update_elapsed()
             widget = None
+            step_widget = None
             if isinstance(page.data, dict):
                 widget = page.data.get("live_elapsed")
+                step_widget = page.data.get("live_step_elapsed")
             if widget is not None:
                 widget.value = fmt_elapsed(_state.elapsed_s)
                 try:
@@ -63,6 +65,14 @@ def main(page: ft.Page):
                 except Exception:
                     try:
                         page.update()
+                    except Exception:
+                        pass
+            if step_widget is not None and _state.current_step:
+                s = _state.steps.get(_state.current_step)
+                if s:
+                    step_widget.value = fmt_elapsed(s.elapsed_s)
+                    try:
+                        step_widget.update()
                     except Exception:
                         pass
             await asyncio.sleep(1)
@@ -93,8 +103,6 @@ def main(page: ft.Page):
             spec=_state.spec or None,
             sut=_state.sut or None,
             headless=_state.headless,
-            debug=_state.debug,
-            fix=_state.fix,
             parallelism=_state.parallel_run,
             report=_state.report,
             log_level=_state.log_level,

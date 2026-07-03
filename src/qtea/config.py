@@ -54,6 +54,26 @@ AUTOFIX_MAX_TURNS: int = int(os.environ.get("QTEA_AUTOFIX_MAX_TURNS", "40"))
 # heal budget bump are independent knobs.
 HEAL_AGENT_TIMEOUT_S = 600
 
+# Debug/fix chain budgets (used by qtea.steps.base._run_debug_rca and
+# _run_fix_proposal). The debug agent does fresh investigation of a failed
+# step (reads transcripts, source, POM, fixtures) before writing its RCA;
+# the principal-software-engineer does the same before writing the fix
+# proposal. The previous 10-turn / 5-min cap truncated both agents mid-
+# investigation on complex failures (run 20260701-114656-9394eb hit
+# "Reached maximum number of turns (10)" for debug AND principal-eng —
+# each agent's last pre-tool-call thinking prose ended up written to disk
+# as if it were the "RCA" / "fix proposal", turning the operator-facing
+# artifacts into 150-byte "Let me check X..." stubs). Aligned with
+# HEAL_AGENT_MAX_TURNS for the investigation-heavy debug agent; the fix
+# chain gets a smaller cap because critical-thinking + principal-eng
+# consume prior artifacts rather than doing fresh discovery. Overridable
+# via QTEA_DEBUG_AGENT_{MAX_TURNS,TIMEOUT_S} and
+# QTEA_FIX_AGENT_{MAX_TURNS,TIMEOUT_S}.
+DEBUG_AGENT_MAX_TURNS: int = int(os.environ.get("QTEA_DEBUG_AGENT_MAX_TURNS", "40"))
+DEBUG_AGENT_TIMEOUT_S: int = int(os.environ.get("QTEA_DEBUG_AGENT_TIMEOUT_S", "900"))
+FIX_AGENT_MAX_TURNS: int = int(os.environ.get("QTEA_FIX_AGENT_MAX_TURNS", "25"))
+FIX_AGENT_TIMEOUT_S: int = int(os.environ.get("QTEA_FIX_AGENT_TIMEOUT_S", "600"))
+
 # Markdown size enforcement.
 MD_SOFT_LIMIT_LINES = 200
 MD_HARD_LIMIT_LINES = 500
