@@ -43,13 +43,35 @@ from qtea._sut_git import commit_step
 from qtea.config import package_resource_root, step_timeout
 from qtea.llm.reasoning import call_reasoning_llm
 from qtea.logging_setup import get_logger
-from qtea.schemas import is_valid, load_schema
+from qtea.schemas import is_valid, load_schema, normalize_arrays
 from qtea.steps.base import Step, StepContext, StepResult
+from qtea.steps.s07_live_explore import (
+    explore_strategy_routes,
+    render_live_map_for_prompt,
+)
 
 log = get_logger(__name__)
 
 
 _VALID_MARKERS = {"qtea_smoke", "qtea_regression", "qtea_e2e", "qtea_exploratory"}
+
+# Arrange-coverage gate: a page object whose name looks like a login/auth page
+# exists to be driven by an explicit login call. If one is planned but no step
+# invokes a login method, the generated test starts unauthenticated — the
+# "missing login" defect. `switchUser`/`switchRole` are identity SWITCHES, not
+# the initial login, so they deliberately do NOT match the method pattern.
+# The POM pattern is token-boundary anchored so `AuthorPage` / `AuthorityPage`
+# (which merely contain "auth") do NOT false-match — only login/signin/auth(n).
+# Token match is case-insensitive (scoped `(?i:...)`), but the trailing
+# boundary is case-SENSITIVE: a following lowercase letter means the token is
+# part of a larger word ("auth" in "Author") → no match; a following uppercase
+# letter is a CamelCase segment break ("Login" in "LoginPage") → match.
+_LOGIN_POM_RE = re.compile(
+    r"(?i:log[_-]?in|sign[_-]?in|auth(?:n|entication)?)(?![a-z])"
+)
+_LOGIN_METHOD_RE = re.compile(
+    r"log[_-]?in|sign[_-]?in|log[_-]?on|authenticate", re.IGNORECASE
+)
 
 # Default budget (chars) for inlined POM/fixture/helper source. Sonnet 4.7 has a
 # 200K window; we leave headroom for sut_inventory (30-80K typical), strategy,
@@ -464,6 +486,114 @@ def _validate_plan_against_inventory(
                         f"missing `reuse_justification` (one-sentence fit rationale)"
                     )
 
+        # Choreography gate: every steps[] entry must reference a POM and
+        # (optionally) a locator planned within the SAME test case. `pom` +
+        # `locator` are hard-checked against the TC's own page_objects /
+        # locators (a mismatch means the writer would emit a call on a class
+        # or constant that doesn't exist in this file). `method` is soft-
+        # checked: it may be an existing reused method (not enumerated in the
+        # plan) OR a missing_methods entry — so a miss only logs a warning.
+        tc_pom_names = {
+            po.get("name") for po in (tc.get("page_objects") or [])
+            if isinstance(po, dict) and po.get("name")
+        }
+        tc_locator_names = {
+            lc.get("name") for lc in (tc.get("locators") or [])
+            if isinstance(lc, dict) and lc.get("name")
+        }
+        tc_missing_methods: dict[str, set[str]] = {}
+        for po in tc.get("page_objects") or []:
+            if not isinstance(po, dict) or not po.get("name"):
+                continue
+            tc_missing_methods[po["name"]] = {
+                mm.get("name") for mm in (po.get("missing_methods") or [])
+                if isinstance(mm, dict) and mm.get("name")
+            }
+        for fn in tc.get("test_functions") or []:
+            for st in fn.get("steps") or []:
+                if not isinstance(st, dict):
+                    continue
+                pom = st.get("pom")
+                if pom and pom not in tc_pom_names:
+                    violations.append(
+                        f"{tc_id}: choreography step order={st.get('order')} "
+                        f"references pom `{pom}` not planned in this test case "
+                        f"(planned: {sorted(n for n in tc_pom_names if n) or 'none'})"
+                    )
+                loc_ref = st.get("locator")
+                if loc_ref and loc_ref not in tc_locator_names:
+                    violations.append(
+                        f"{tc_id}: choreography step order={st.get('order')} "
+                        f"references locator `{loc_ref}` not planned in this "
+                        f"test case"
+                    )
+                method = st.get("method")
+                if (
+                    method and pom in tc_missing_methods
+                    and method not in tc_missing_methods[pom]
+                ):
+                    # Soft: could be an existing reused method (plan doesn't
+                    # enumerate those). Codegen fails loudly if the method
+                    # truly doesn't resolve on the POM.
+                    log.warning(
+                        "step07.choreography_method_not_in_missing",
+                        tc_id=tc_id,
+                        pom=pom,
+                        method=method,
+                    )
+
+        # Arrange-coverage gate (the "missing login" defect). When a test case
+        # plans a login/auth PAGE OBJECT but the choreography drives OTHER pages
+        # without ever invoking a login method, the generated test runs
+        # unauthenticated. Only fires when: (a) a login POM is planned, (b) at
+        # least one Act step targets a non-login page (so the test genuinely
+        # needs a session), and (c) no step invokes a login method. Tests whose
+        # steps stay entirely on the login page (e.g. an invalid-login case) are
+        # exempt. Skipped when the TC has no choreography (can't introspect).
+        login_pom_names = {
+            po.get("name") for po in (tc.get("page_objects") or [])
+            if isinstance(po, dict) and po.get("name")
+            and _LOGIN_POM_RE.search(po["name"])
+        }
+        if login_pom_names:
+            all_steps = [
+                st
+                for fn in (tc.get("test_functions") or [])
+                for st in (fn.get("steps") or [])
+                if isinstance(st, dict)
+            ]
+            # Exempt tests whose session is established by a reused auto-auth
+            # fixture (the auth_flow fixture): they legitimately need no login
+            # step even when they plan a login POM (e.g. to assert a redirect
+            # back to the login screen after logout).
+            tc_fixture_names: set[str] = set()
+            for fn in tc.get("test_functions") or []:
+                tc_fixture_names.update(fn.get("uses_fixtures") or [])
+            for fx in tc.get("fixtures") or []:
+                if isinstance(fx, dict) and fx.get("name"):
+                    tc_fixture_names.add(fx["name"])
+            fixture_authed = bool(
+                _auth_fixture_name and _auth_fixture_name in tc_fixture_names
+            )
+            if all_steps and not fixture_authed:
+                login_invoked = any(
+                    st.get("method") and _LOGIN_METHOD_RE.search(st["method"])
+                    for st in all_steps
+                )
+                acts_on_other_page = any(
+                    st.get("pom") and st["pom"] not in login_pom_names
+                    for st in all_steps
+                )
+                if acts_on_other_page and not login_invoked:
+                    violations.append(
+                        f"{tc_id}: plans login page object(s) "
+                        f"{sorted(login_pom_names)} and drives other pages, but "
+                        f"no choreography step invokes a login method — the "
+                        f"generated test would run unauthenticated. Add an "
+                        f"Arrange login step (phase='arrange') or drop the "
+                        f"unused login page object."
+                    )
+
     return violations
 
 
@@ -506,6 +636,18 @@ def _render_plan_markdown(plan: dict) -> str:
                 lines.append(
                     f"  - `{name}` markers=[{markers}] fixtures=[{uses}]"
                 )
+                steps = sorted(
+                    (s for s in (fn.get("steps") or []) if isinstance(s, dict)),
+                    key=lambda s: s.get("order") or 0,
+                )
+                for st in steps:
+                    pom = st.get("pom") or "?"
+                    method = st.get("method") or "?"
+                    loc = st.get("locator")
+                    loc_s = f" via `{loc}`" if loc else ""
+                    lines.append(
+                        f"    {st.get('order', '?')}. `{pom}.{method}(...)`{loc_s}"
+                    )
 
         for label, key in (
             ("Fixtures", "fixtures"),
@@ -611,6 +753,35 @@ class TestArchitectStep(Step):
         if research_md.exists():
             inputs["research.md"] = research_md.read_text(encoding="utf-8")
 
+        # --- Pre-codegen live exploration (Gap A) ---
+        # Before the architect plans, open the SUT and confirm the routes named
+        # in the strategy actually exist + capture a light structural digest.
+        # Best-effort + gated (QTEA_LIVE_EXPLORE); on skip/failure live_map is
+        # None and planning proceeds from the static inventory as before.
+        research_dict: dict | None = None
+        research_json = ctx.workspace.step_dir(6) / "research.json"
+        if research_json.exists():
+            try:
+                research_dict = json.loads(research_json.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                research_dict = None
+        live_map = None
+        try:
+            live_map = await explore_strategy_routes(
+                strategy_text=inputs["test-strategy.md"],
+                research=research_dict,
+                sut_root=sut_root,
+                workspace_root=ctx.workspace.root,
+                out_dir=out_dir,
+                workdir=wd / "live-explore",
+                cli_storage_state=getattr(ctx.options, "storage_state", None),
+            )
+        except Exception as e:  # never let exploration break Step 7
+            log.warning("step07.live_explore_unexpected_error", error=str(e))
+        live_map_clause = render_live_map_for_prompt(live_map)
+        if live_map is not None:
+            inputs["live-map.json"] = json.dumps(live_map, indent=2, ensure_ascii=False)
+
         skill_path = (
             package_resource_root() / "skills"
             / "analyze-sut-structure" / "SKILL.md"
@@ -687,6 +858,7 @@ class TestArchitectStep(Step):
             f"field (one sentence, ≤200 chars) that names the concrete "
             f"matching dimension you observed in the source. If you cannot "
             f"name one, emit `source: create` instead. {skipped_clause}"
+            f"{live_map_clause}"
         )
 
         result = await call_reasoning_llm(
@@ -697,6 +869,7 @@ class TestArchitectStep(Step):
             output_schema=load_schema("code-modification-plan"),
             timeout_s=self.timeout_s,
             step=7,
+            max_tokens=32000,
         )
 
         if not result.success or not result.final_text:
@@ -737,10 +910,8 @@ class TestArchitectStep(Step):
                 error=f"plan JSON unparseable: {e}",
             )
 
-        # Belt-and-suspenders: structured outputs enforces the schema
-        # server-side, but we re-validate locally so a misconfigured
-        # mock or a future SDK regression can't slip a bad plan through
-        # into Step 8.
+        plan = normalize_arrays(plan, "code-modification-plan")
+
         ok_schema, schema_err = is_valid(plan, "code-modification-plan")
         if not ok_schema:
             # Also persist the PARSED plan so the human can diff against

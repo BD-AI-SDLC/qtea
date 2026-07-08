@@ -44,6 +44,7 @@ from qtea.claude_runner import run_agent
 from qtea.codegen_reconcile import (
     fixture_mismatches_to_fixture_tasks,
     mismatches_to_pom_tasks,
+    pom_method_signatures,
     reconcile_codegen,
     reconcile_fixtures,
 )
@@ -788,9 +789,7 @@ def _filter_index_to_qtea(
             return False
         if _is_qtea_file(rel_path):
             return True
-        if abs_resolved and abs_resolved in include_set:
-            return True
-        return False
+        return bool(abs_resolved and abs_resolved in include_set)
 
     files = [f for f in index.files if _keep(f)]
     tests = [t for t in index.tests if _keep(t.file)]
@@ -1463,23 +1462,20 @@ def _detect_init_placement(lines: list[str]) -> tuple[bool, str, int]:
     init_indent = ""
     body_indent = ""
     last_self_line = -1
-    init_start = -1
 
     for i, line in enumerate(lines):
         stripped = line.strip()
         if stripped.startswith("def __init__"):
             in_init = True
             init_indent = line[: len(line) - len(line.lstrip())]
-            init_start = i
             continue
-        if in_init:
-            if stripped and not stripped.startswith("#"):
-                cur_indent = line[: len(line) - len(line.lstrip())]
-                if len(cur_indent) <= len(init_indent) and stripped.startswith(("def ", "class ", "@")):
-                    break
-                if _SELF_ATTR_RE.match(line):
-                    body_indent = cur_indent
-                    last_self_line = i
+        if in_init and stripped and not stripped.startswith("#"):
+            cur_indent = line[: len(line) - len(line.lstrip())]
+            if len(cur_indent) <= len(init_indent) and stripped.startswith(("def ", "class ", "@")):
+                break
+            if _SELF_ATTR_RE.match(line):
+                body_indent = cur_indent
+                last_self_line = i
 
     if last_self_line < 0:
         return False, "", -1
@@ -1631,10 +1627,7 @@ def _write_tbd_locators(
                         init_insert_idx += 1
 
         # Determine the indentation new constants should carry.
-        if use_self:
-            const_indent = self_indent
-        else:
-            const_indent = _detect_const_indent(lines, is_java)
+        const_indent = self_indent if use_self else _detect_const_indent(lines, is_java)
 
         new_lines: list[str] = []
         for task in tasks:
@@ -1834,7 +1827,7 @@ def _scan_and_convert_hardcoded_locators(
         diff_result = _sp.run(
             ["git", "diff", "HEAD", "--", str(rel.as_posix())],
             cwd=str(sut_root), capture_output=True, text=True,
-            timeout=15,
+            timeout=15, check=False,
         )
         if diff_result.returncode != 0:
             continue
@@ -2135,6 +2128,26 @@ async def _create_fixtures(
     return results
 
 
+def _collect_referenced_methods(plan: dict[str, Any]) -> dict[str, set[str]]:
+    """Map each POM class name → set of method names its choreography calls.
+
+    Sourced from every ``test_functions[].steps[]`` entry (``pom`` + ``method``)
+    across all test cases. Used to decide which PRE-EXISTING POM methods the
+    writer needs real signatures for.
+    """
+    refs: dict[str, set[str]] = {}
+    for tc in plan.get("test_cases") or []:
+        for fn in tc.get("test_functions") or []:
+            for st in fn.get("steps") or []:
+                if not isinstance(st, dict):
+                    continue
+                pom = st.get("pom")
+                method = st.get("method")
+                if pom and method:
+                    refs.setdefault(pom, set()).add(method)
+    return refs
+
+
 def _build_imports_manifest(
     plan: dict[str, Any],
     pom_tasks: dict[str, _PomTask],
@@ -2142,15 +2155,58 @@ def _build_imports_manifest(
     fixture_tasks: list[_FixtureTask],
     helper_tasks: list[_HelperTask],
     sut_root: Path,
+    active_module: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Phase B1: build the imports manifest for the test writer."""
+    # Resolve the POM-parser language the same way the B.5 arity gate does —
+    # active-module first (authoritative), plan.language second (often null),
+    # python last — so the manifest's signature extractor and the reconciler
+    # never parse the SUT with different language assumptions.
+    language = (
+        (active_module or {}).get("language")
+        or plan.get("language")
+        or "python"
+    )
+    referenced = _collect_referenced_methods(plan)
     pom_files = []
     for fp, task in pom_tasks.items():
+        added_names = {m["name"] for m in task.missing_methods}
+        # Give the writer real signatures for PRE-EXISTING POM methods the
+        # choreography references. Without this the writer only sees signatures
+        # for NEWLY-CREATED methods (methods_added_detail) and defaults to
+        # zero-arg stub calls for reused methods — the exact defect that made
+        # switchUser()/approveReview()/assertRopaStatus() fail reconciliation.
+        existing_methods_detail: list[dict[str, str]] = []
+        wanted = referenced.get(task.pom_name, set()) - added_names
+        if wanted:
+            pom_abs = sut_root / fp
+            try:
+                if pom_abs.is_file() and pom_abs.stat().st_size <= 2_000_000:
+                    text = pom_abs.read_text(encoding="utf-8", errors="replace")
+                    sigs = pom_method_signatures(text, task.pom_name, language)
+                    existing_methods_detail = [
+                        {"name": n, "signature": sigs[n]}
+                        for n in sorted(wanted)
+                        if n in sigs
+                    ]
+            except OSError as e:
+                log.warning(
+                    "step08.manifest_pom_read_failed", file=fp, error=str(e),
+                )
         pom_files.append({
             "class_name": task.pom_name,
             "file": fp,
             "import_path": fp.replace("/", ".").replace("\\", ".").removesuffix(".py"),
             "methods_added": [m["name"] for m in task.missing_methods],
+            # Full signatures so the writer knows arity/params when
+            # transpiling the choreography (steps[]) into POM calls — the
+            # bare names above are insufficient to emit a correct call site.
+            "methods_added_detail": [
+                {"name": m["name"], "signature": m.get("signature")}
+                for m in task.missing_methods
+            ],
+            # Signatures for PRE-EXISTING referenced methods, read from disk.
+            "existing_methods_detail": existing_methods_detail,
             "locator_class": task.locator_class,
             "locator_file": task.locator_file,
         })
@@ -2275,7 +2331,16 @@ async def _generate_test_files(
             f"and `strategy.md` for assertion values (expected strings, URLs, "
             f"counts — lift them VERBATIM into equality assertions). "
             f"Use `imports.json` to know what POM classes, locators, and "
-            f"fixtures are available to import."
+            f"fixtures are available to import (see `pom_files[].methods_added_detail` "
+            f"for method signatures). "
+            f"When a test_function in `plan.json` carries a `steps[]` array, "
+            f"transpile those entries IN ASCENDING `order` into the test body — "
+            f"one POM method call per entry (`<pom>.<method>(...)`), sourcing "
+            f"exact argument values from `strategy.md`. Do NOT re-derive the "
+            f"action sequence from prose when `steps[]` is present. Only fall "
+            f"back to inferring the sequence from `strategy.md` when a "
+            f"test_function has no `steps[]`. Assertions are always lifted from "
+            f"`strategy.md`, appended after the choreographed actions."
             f"{env_hint}{runtime_hint}{reuse_hint}"
         )
 
@@ -3433,8 +3498,31 @@ class CodegenStep(Step):
         # Phase B1: build imports manifest
         manifest = _build_imports_manifest(
             plan_data, pom_tasks, locator_tasks, fixture_tasks,
-            helper_tasks, sut_root,
+            helper_tasks, sut_root, active_module=active_module_dict,
         )
+
+        # Step 9->8 back-edge (Gap C): when Step 9 rejected the previous
+        # codegen output as a structural defect (e.g. zero tests collected —
+        # missing qtea markers / filename prefix, or an unresolved import to a
+        # module codegen should have emitted), it re-queues Step 8 with a
+        # reason on ctx.extras. Prepend that reason so this regeneration fixes
+        # the specific gap rather than blindly reproducing it.
+        _defect_feedback = ctx.extras.pop("step8_defect_feedback", None)
+        if _defect_feedback:
+            reuse_hint = (
+                f"\n\n--- REGENERATION FEEDBACK (Step 9 rejected the previous "
+                f"codegen output — fix THIS specifically) ---\n"
+                f"{_defect_feedback}\n"
+                f"Every generated test function MUST carry a "
+                f"`@pytest.mark.qtea_<phase>` marker (pytest) or its file MUST "
+                f"use the `qtea_` filename prefix (Playwright Test), or Step 9's "
+                f"marker filter collects zero tests. Emit every import target "
+                f"the tests reference.\n"
+            ) + reuse_hint
+            log.info(
+                "step08.regen_with_defect_feedback",
+                feedback=str(_defect_feedback)[:200],
+            )
 
         # Phase B2: generate test files
         test_results = await _generate_test_files(
@@ -3709,7 +3797,7 @@ class CodegenStep(Step):
         _diff_result = _sp.run(
             ["git", "diff", "--name-only", "HEAD"],
             cwd=str(sut_root), capture_output=True, text=True,
-            timeout=30,
+            timeout=30, check=False,
         )
         codegen_modified: set[Path] = set()
         if _diff_result.returncode == 0 and _diff_result.stdout.strip():
@@ -3741,7 +3829,7 @@ class CodegenStep(Step):
         # rewriter can't safely translate is kept in-place with a
         # `// qtea-xpath-exempt:` marker (test_indexer honours the marker)
         # AND collected as a straggler bundle for the LLM violation-fixer.
-        xpath_reports, xpath_stragglers = _run_phase_b55_xpath_normalisation(
+        _xpath_reports, _xpath_stragglers = _run_phase_b55_xpath_normalisation(
             sut_root=sut_root,
             candidates=codegen_modified,
         )

@@ -391,7 +391,7 @@ async def _run_fix_proposal(
     if not debug_rca_text:
         debug_rca_text = failure_context
 
-    # Aggregated final RCA (CLAUDE.md:115 contract) = debug agent's RCA.
+    # Aggregated final RCA (CLAUDE.md § Guardrails: debug-directory reads) = debug agent's RCA.
     # Belt-and-braces guard: don't clobber a substantive prior artifact
     # with a shorter one — a shorter payload here is almost always a
     # placeholder from a truncated debug run, and a well-formed prior RCA

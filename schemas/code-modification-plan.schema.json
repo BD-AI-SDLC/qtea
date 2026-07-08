@@ -69,6 +69,56 @@
         "uses_fixtures": {
           "type": "array",
           "items": { "type": "string" }
+        },
+        "steps": {
+          "type": "array",
+          "description": "Ordered method-call choreography for this test function. Includes BOTH the Arrange steps that satisfy the strategy's Preconditions (phase='arrange': authentication such as logIn, entity creation, navigation to the entity under test) AND one entry per manual test-case action step (phase='act'). The Step 8 writer transpiles these in order into sequential POM method calls instead of re-deriving the sequence from the strategy prose — so if the login/setup is not represented here, the generated test will have no login/setup. Optional (fallback to strategy prose when absent), but strongly preferred for any multi-step flow.",
+          "items": { "$ref": "#/$defs/choreography_step" }
+        }
+      }
+    },
+    "choreography_step": {
+      "type": "object",
+      "required": ["order", "pom", "method"],
+      "additionalProperties": true,
+      "properties": {
+        "order": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "1-based execution order within the test function."
+        },
+        "manual_step_ref": {
+          "type": ["string", "null"],
+          "description": "Short reference to the originating manual step in test-strategy.md (e.g. 'step 2: click sign-in')."
+        },
+        "pom": {
+          "type": "string",
+          "minLength": 1,
+          "description": "POM class that owns the method — must match a page_objects[].name in the same test case."
+        },
+        "method": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Method to call on the POM — must be a reused method or a missing_methods[].name on the referenced pom."
+        },
+        "phase": {
+          "type": ["string", "null"],
+          "enum": ["arrange", "act", "assert", null],
+          "description": "Which phase of the test this step belongs to. 'arrange' = precondition setup the strategy's Preconditions require (authentication / entity creation / navigation to the entity under test); 'act' = the manual-step actions; 'assert' = verification. Default 'act' when omitted. The architect MUST translate the strategy's Preconditions into explicit ordered 'arrange' steps (e.g. logIn, createBasicRopaEntry) — the writer will not invent them."
+        },
+        "args": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "AUTHORITATIVE ordered argument expressions the writer emits verbatim for this call — one per required parameter (plus any optional ones being set), in signature order. Each item is a code expression: a constant name the plan expects the writer to declare (e.g. 'USERNAME_ISP_OFFICE'), a quoted string literal (e.g. \"'Approved'\"), or a variable captured by an earlier step (e.g. 'entityName'). Populate this whenever the called method takes arguments — leaving it empty for a method that needs arguments is the defect that produces zero-arg stub calls. Use args_hint only for genuinely non-committal hints."
+        },
+        "args_hint": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Optional non-authoritative hints for the argument values (e.g. ['valid email', 'EXPECTED_URL']). Prefer the authoritative `args` field; the writer sources exact values from `args` first, then test-strategy.md."
+        },
+        "locator": {
+          "type": ["string", "null"],
+          "description": "Optional locator constant name this step interacts with — must reference a planned locators[].name in the same test case."
         }
       }
     },

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+
 import flet as ft
 
 from qtea.ui.state import STEP_DEFINITIONS, AppState
@@ -109,10 +111,8 @@ def build_progress_header(
         loop = state.pipeline_loop
         task = state.pipeline_task
         if loop is not None and task is not None:
-            try:
+            with contextlib.suppress(Exception):
                 loop.call_soon_threadsafe(task.cancel)
-            except Exception:
-                pass
 
         # Kill child processes (pytest workers, MCP/npx server, allure, etc.)
         # so blocking subprocess.run / Popen calls in the worker return.
@@ -121,10 +121,8 @@ def build_progress_header(
 
             me = psutil.Process()
             for child in me.children(recursive=True):
-                try:
+                with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
                     child.kill()
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
         except Exception:
             pass
 
@@ -132,22 +130,16 @@ def build_progress_header(
         # threading.Event, release it now so the worker thread can exit.
         pending = state.pending_hitl
         if pending is not None and pending.completion_event is not None:
-            try:
+            with contextlib.suppress(Exception):
                 pending.completion_event.set()
-            except Exception:
-                pass
         pending_rg = state.pending_review_gate
         if pending_rg is not None and pending_rg.completion_event is not None:
-            try:
+            with contextlib.suppress(Exception):
                 pending_rg.completion_event.set()
-            except Exception:
-                pass
 
         state.notify()
-        try:
+        with contextlib.suppress(Exception):
             page.update()
-        except Exception:
-            pass
 
     stop_button = ft.OutlinedButton(
         content="Stop",

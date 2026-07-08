@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -41,7 +41,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 
-class RewriteKind(str, Enum):
+class RewriteKind(StrEnum):
     TESTID = "testid"       # getByTestId('X')
     ROLE = "role"           # getByRole('button', { name: 'X' })
     TEXT_EXACT = "text_exact"   # getByText('X', { exact: true })
@@ -194,9 +194,9 @@ def _split_top_level_and(predicate: str) -> list[str]:
     i = 0
     while i < len(predicate):
         c = predicate[i]
-        if c == "[" or c == "(":
+        if c in {"[", "("}:
             depth += 1
-        elif c == "]" or c == ")":
+        elif c in {"]", ")"}:
             depth -= 1
         if depth == 0 and predicate[i:i + 5] == " and " and i + 5 <= len(predicate):
             parts.append("".join(buf).strip())
@@ -522,9 +522,9 @@ def _split_top_level_union(xpath: str) -> list[str] | None:
             in_quote = c
             buf.append(c)
             continue
-        if c == "[" or c == "(":
+        if c in {"[", "("}:
             depth += 1
-        elif c == "]" or c == ")":
+        elif c in {"]", ")"}:
             depth -= 1
         if depth == 0 and c == "|":
             branches.append("".join(buf))
@@ -630,9 +630,7 @@ def _looks_like_xpath(s: str) -> bool:
     if "text(" in s or "normalize-space" in s or "contains(" in s:
         return True
     # `//tag` where tag looks like an HTML tag name (not a domain)
-    if re.match(r"^//?[a-zA-Z][\w-]*(?:\[|/|$)", s):
-        return True
-    return False
+    return bool(re.match(r"^//?[a-zA-Z][\w-]*(?:\[|/|$)", s))
 
 
 # ---------------------------------------------------------------------------

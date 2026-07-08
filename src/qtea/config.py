@@ -54,6 +54,17 @@ AUTOFIX_MAX_TURNS: int = int(os.environ.get("QTEA_AUTOFIX_MAX_TURNS", "40"))
 # heal budget bump are independent knobs.
 HEAL_AGENT_TIMEOUT_S = 600
 
+# Inner heal-retry budget: how many times Step 9 will heal→re-run a single
+# failing test WITHIN one pipeline attempt before giving up on it. A human
+# SDET iterates on a locator/fixture until the test is green; a single heal
+# pass (the historical behaviour, =1) often lands a partial fix that a second
+# pass would complete. Each iteration re-invokes the polyglot-test-fixer with
+# the fresh traceback from the prior patch's re-run. Bounded to keep LLM+MCP
+# spend predictable (each iteration is one HEAL_AGENT_TIMEOUT_S budget).
+# Set to 1 to restore the old one-shot behaviour. Overridable via
+# QTEA_MAX_HEAL_ITERS.
+MAX_HEAL_ITERS: int = max(1, int(os.environ.get("QTEA_MAX_HEAL_ITERS", "3")))
+
 # Debug/fix chain budgets (used by qtea.steps.base._run_debug_rca and
 # _run_fix_proposal). The debug agent does fresh investigation of a failed
 # step (reads transcripts, source, POM, fixtures) before writing its RCA;

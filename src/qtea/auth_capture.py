@@ -388,7 +388,7 @@ def cmd_auth_capture(
         )
         env = safe_subprocess_env(isolate_venv=True)
         proc = subprocess.run(
-            cmd_prefix + [str(wrapper_path)],
+            [*cmd_prefix, str(wrapper_path)],
             cwd=str(sut_root),
             env=env,
             capture_output=True,

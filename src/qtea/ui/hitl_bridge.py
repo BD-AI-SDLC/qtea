@@ -10,6 +10,7 @@ fires the event.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 from dataclasses import dataclass, field
 from typing import Any
@@ -119,10 +120,8 @@ class HitlBridge:
         self.state.notify()
 
         try:
-            try:
+            with contextlib.suppress(Exception):
                 self.page.update()
-            except Exception:
-                pass
 
             # Wait for the user to submit / skip.
             await completion_event.wait()
@@ -146,9 +145,7 @@ class HitlBridge:
             self.state.pending_hitl = None
             self.state.resume_clock()
             self.state.notify()
-            try:
+            with contextlib.suppress(Exception):
                 self.page.update()
-            except Exception:
-                pass
             # Unblock the worker thread.
             pending.event.set()

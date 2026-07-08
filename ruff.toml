@@ -14,9 +14,20 @@ ignore = [
     "PLW0603",  # global statement — intentional in a few modules
     "S110",     # try/except/pass — intentional in best-effort cleanup paths
     "S310",     # urlopen audit — intentional URL opening
+    "PLW2901",  # loop variable overwritten — intentional (e.g. item = item.strip())
+    "SIM102",   # nested if — readability preference over single-line form
 ]
 
 [lint.per-file-ignores]
 "tests/**/*.py" = ["S", "PLR", "B", "E501", "E702", "SIM105", "PLW2901", "RUF005"]
 "src/qtea/report/html_renderer.py" = ["E501"]
 "src/qtea/cli.py" = ["B008", "E501"]
+"src/qtea/ado_client.py" = ["E501"]
+"src/qtea/jit_resolver.py" = ["E501"]
+"src/qtea/review_gate.py" = ["E501"]
+"src/qtea/steps/s09/failure_class.py" = ["E501"]
+"src/qtea/steps/s09/tbd_promotion.py" = ["E501"]
+"src/qtea/xpath_rewriter.py" = ["E501"]
+"src/qtea/ui/**/*.py" = ["E501", "E741", "S606", "SIM105", "S112"]
+"src/qtea/ui/views/results_view.py" = ["E501", "E741", "S606", "SIM105"]
+"src/qtea/sut_inventory.py" = ["S112"]

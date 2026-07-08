@@ -227,6 +227,12 @@ _ENV_REF_PATTERNS = [
     re.compile(r"ENV\.fetch\(\s*['\"]([A-Z][A-Z0-9_]{1,80})['\"]"),
 ]
 
+_ENV_CONTEXT_RE = re.compile(
+    r"process\.env|os\.environ|System\.getenv|ENV\[",
+)
+
+_QUOTED_ENVVAR_RE = re.compile(r"""['"]([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)['"]""")
+
 _SUT_SOURCE_GLOBS = ("**/*.ts", "**/*.js", "**/*.tsx", "**/*.jsx",
                      "**/*.py", "**/*.java", "**/*.rb", "**/*.cs")
 
@@ -505,6 +511,20 @@ def _discover_sut_env_keys(sut_path: Path) -> list[str]:
             for pat in _ENV_REF_PATTERNS:
                 for m in pat.finditer(text):
                     keys.add(m.group(m.lastindex))
+            # Second pass: in files that reference process.env / os.environ
+            # etc., look for quoted uppercase string literals that look like
+            # env var names. This catches env-var-guard arrays like
+            #   const REQUIRED = ['USERNAME_FOO', 'PASSWORD_FOO'];
+            # where the names are never accessed via process.env.X directly.
+            # Filtered to essential patterns (USERNAME, PASSWORD, URL, …)
+            # to avoid harvesting unrelated constants.
+            if _ENV_CONTEXT_RE.search(text):
+                from qtea.env_resolver import _is_essential_key
+
+                for m in _QUOTED_ENVVAR_RE.finditer(text):
+                    candidate = m.group(1)
+                    if _is_essential_key(candidate):
+                        keys.add(candidate)
 
     # Pydantic BaseSettings field declarations — implicit env-var bindings
     # that the regex source-scan above cannot detect.
@@ -540,6 +560,66 @@ def _persist_resolved_env(workspace_root: Path, resolved: Any) -> None:
         log.info("env_resolver.persisted", count=len(lines), path=str(dst))
     except OSError as exc:
         log.warning("env_resolver.persist_failed", error=str(exc))
+
+
+def _persist_env_to_sut(sut_path: Path, resolved: Any) -> None:
+    """Merge resolved env var values into ``<sut>/.env``.
+
+    After a qtea session, the user may want to re-run tests directly from
+    the SUT clone (``<workspace>/sut/``).  Without this, env vars supplied
+    via HITL or resolved from Azure DevOps variable groups are lost once
+    the ``os.environ`` injection from the current process goes away.
+
+    Merge semantics:
+      * Existing ``.env`` lines (comments, blank lines) are preserved.
+      * For keys already present: the resolved value replaces the old one.
+      * New keys are appended at the end.
+      * Internal keys (``QTEA_*``, ``ANTHROPIC_*``, etc.) and secrets
+        (``ANTHROPIC_API_KEY``, ``JIRA_API_TOKEN``, etc.) are filtered out.
+    """
+    if not resolved.values:
+        return
+    # Filter out internal / secret keys that have no business in the SUT.
+    filtered = {
+        k: v for k, v in resolved.values.items()
+        if k not in SECRET_ENV_KEYS
+        and k not in _INTERNAL_EXACT
+        and not any(k.startswith(p) for p in _INTERNAL_PREFIXES)
+    }
+    if not filtered:
+        return
+
+    dst = sut_path / ".env"
+    existing_lines: list[str] = []
+    existing_keys: dict[str, int] = {}  # key → line index
+    if dst.exists():
+        try:
+            existing_lines = dst.read_text(encoding="utf-8").splitlines(keepends=True)
+            for idx, line in enumerate(existing_lines):
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                eq = stripped.find("=")
+                if eq > 0:
+                    existing_keys[stripped[:eq].strip()] = idx
+        except OSError:
+            existing_lines = []
+
+    # Update in-place or append.
+    for key, value in sorted(filtered.items()):
+        entry = f"{key}={value}\n"
+        if key in existing_keys:
+            existing_lines[existing_keys[key]] = entry
+        else:
+            existing_lines.append(entry)
+
+    try:
+        dst.write_text("".join(existing_lines), encoding="utf-8")
+        if sys.platform != "win32":
+            dst.chmod(0o600)
+        log.info("env_resolver.persisted_to_sut", count=len(filtered), path=str(dst))
+    except OSError as exc:
+        log.warning("env_resolver.persist_to_sut_failed", error=str(exc))
 
 
 _FRAMEWORK_HINTS = (
@@ -773,6 +853,16 @@ class ResearchStep(Step):
             if sp.exists():
                 extras.append(sp)
 
+        _ckpt = (
+            skills_root
+            / "acquire-codebase-knowledge"
+            / "references"
+            / "inquiry-checkpoints.md"
+        )
+        inputs: dict[str, Path] = {}
+        if _ckpt.exists():
+            inputs["inquiry-checkpoints.md"] = _ckpt
+
         # Read-only access to the canonical SUT clone — no copy. Before this,
         # `extras.append(ctx.workspace.sut)` triggered a full `shutil.copytree`
         # inside `_stage_resources`, producing a redundant `<workspace>/step-06/sut/`
@@ -782,7 +872,7 @@ class ResearchStep(Step):
         result = await run_agent(
             agent,
             workdir=wd,
-            inputs={},
+            inputs=inputs,
             user_prompt=(
                 f"Follow the procedure in `./polyglot-test-researcher.prompt.md`. "
                 f"The repository under test is at the absolute path "
@@ -804,6 +894,13 @@ class ResearchStep(Step):
                 f"in `./polyglot-test-researcher.prompt.md`. Produce the "
                 f"Discovery Summary at `./research.md` with explicit Build, "
                 f"Test, and Lint commands and a clearly labelled detected stack."
+                + (
+                    " An investigation guide is staged at `./inquiry-checkpoints.md`"
+                    " — use it to know what aspects of the SUT to verify in each"
+                    " area of the scan output."
+                    if _ckpt.exists()
+                    else ""
+                )
             ),
             extra_paths=extras,
             add_dirs=[sut_abs],
@@ -927,6 +1024,7 @@ class ResearchStep(Step):
                 extra_required=pyd_required,
             )
             _persist_resolved_env(ctx.workspace.root, resolved)
+            _persist_env_to_sut(ctx.workspace.sut, resolved)
             env_resolution_audit = {
                 "resolved": list(resolved.values.keys()),
                 "sources": resolved.sources,

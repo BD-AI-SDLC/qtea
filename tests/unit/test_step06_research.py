@@ -483,7 +483,7 @@ async def test_research_step_rerun_loads_workspace_env_qtea_fallback(
     import qtea.env_resolver as env_resolver_mod
     from qtea.env_resolver import EnvResolverConfig as _RealConfig
 
-    seen: list[EnvResolverConfig] = []
+    seen: list[_RealConfig] = []
     orig_init = _RealConfig.__init__
 
     def spy_init(self, *args, **kwargs):

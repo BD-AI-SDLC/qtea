@@ -40,6 +40,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from qtea.logging_setup import get_logger
 
@@ -72,6 +73,14 @@ _PORT_RE = re.compile(r"(?:--port|--port[= ]|-p)\s*[= ]?\s*(\d{2,5})\b")
 _ENV_PORT_RE = re.compile(r"\bPORT\s*=\s*(\d{2,5})\b")
 _VITE_PORT_RE = re.compile(r"\bport\s*:\s*(\d{2,5})\b")
 _HARDCODED_LOCALHOST_RE = re.compile(r"https?://localhost:(\d{2,5})\b", re.I)
+# Any quoted/unquoted absolute http(s) URL literal in a JS/TS config expression.
+# Hostnames never contain whitespace, quotes, backticks, commas or closing parens,
+# so this cleanly captures each literal branch of a `baseURL:` ternary.
+_URL_LITERAL_RE = re.compile(r"https?://[^\s'\"`,)}\]]+")
+# `baseURL:` (Playwright) / `baseUrl:` (Cypress) property key. Case-insensitive
+# so both spellings (and `baseurl`) match; `\b` + trailing `:` avoid matching
+# substrings of unrelated identifiers.
+_BASEURL_KEY_RE = re.compile(r"\bbaseurl\s*:", re.IGNORECASE)
 
 
 @dataclass
@@ -414,6 +423,307 @@ def _probe_readme(sut: Path) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _url_role_rank(url: str) -> int:
+    """Rank a URL by its host's environment role. QA wins, prod/live lose.
+
+    Mirrors ``_role_for_key`` but classifies the hostname (config baseURLs
+    carry the role in the host, e.g. ``grchub-qa.example.com``), not a key.
+
+    Non-production roles require a WHOLE-TOKEN match (host split on ``. - _``)
+    so ``latest``/``product``/``backstage`` are not mis-read as test/prod/stage.
+    Production-family tokens use a substring match as a deliberate SAFETY net:
+    over-flagging a benign host as prod only lowers confidence and warns
+    (harmless under the QA-first invariant), whereas UNDER-flagging a real prod
+    host (e.g. ``latest-prod`` seen as ``test``) would silently point tests at
+    production.
+    """
+    host = (urlparse(url).hostname or url).lower()
+    tokens = set(re.split(r"[.\-_]", host))
+    # Check QA/test/staging/dev first, on token boundaries, so a host carrying
+    # both (e.g. 'preprod-qa') resolves to the safe QA role.
+    for token in ("qa", "test", "staging", "stage", "development", "dev"):
+        if token in tokens:
+            return _ROLE_RANK[token]
+    for token in ("production", "prod", "live"):
+        if token in host:
+            return _ROLE_RANK[token]
+    return _ROLE_RANK["base"]
+
+
+def _strip_js_comments(text: str) -> str:
+    """Remove JS/TS ``//`` line and ``/* */`` block comments, string-aware.
+
+    Preserves comment-like sequences INSIDE string literals (e.g. the ``//`` in
+    ``'https://qa.example.com'``) so a commented-out or example ``baseURL:``
+    can't be mistaken for the real declaration.
+    """
+    out: list[str] = []
+    i, n = 0, len(text)
+    quote: str | None = None
+    while i < n:
+        ch = text[i]
+        if quote is not None:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:  # keep escaped char verbatim
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in "'\"`":
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "/":
+            j = text.find("\n", i)
+            if j == -1:
+                break
+            i = j
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "*":
+            j = text.find("*/", i + 2)
+            if j == -1:
+                break
+            i = j + 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _capture_rhs(text: str, start: int) -> str:
+    """Capture a property's RHS expression from ``start`` (just after its `:`).
+
+    Scans tracking string state and bracket depth so a multi-line ternary is
+    captured whole, stopping at the first top-level comma (property separator)
+    or the enclosing object's closing brace.
+    """
+    i, n, depth = start, len(text), 0
+    quote: str | None = None
+    chars: list[str] = []
+    while i < n:
+        ch = text[i]
+        if quote is not None:
+            chars.append(ch)
+            if ch == quote and text[i - 1] != "\\":
+                quote = None
+        elif ch in "'\"`":
+            quote = ch
+            chars.append(ch)
+        elif ch in "([{":
+            depth += 1
+            chars.append(ch)
+        elif ch in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+            chars.append(ch)
+        elif ch == "," and depth == 0:
+            break
+        else:
+            chars.append(ch)
+        i += 1
+    return "".join(chars)
+
+
+def _select_base_url(text: str) -> str | None:
+    """Pick the QA-preferred absolute URL from a JS/TS config's ``baseURL`` RHS.
+
+    Config files hardcode the base URL as a plain literal or a
+    ``process.env.X ? 'urlA' : 'urlB'`` ternary. We strip comments, then across
+    EVERY ``baseURL:`` / ``baseUrl:`` declaration (a later ``projects[]``
+    override may hold the real value) capture each right-hand-side expression,
+    extract every absolute URL literal, drop empties (the ``PROD2 ? '' : ...``
+    branch) and interpolated literals (``…${PORT}…`` — not statically
+    resolvable), and choose by the QA-first role ranking — tie-breaking to the
+    LAST literal, which is the trailing ``else`` (default) branch of a ternary.
+
+    Returns ``None`` when no static absolute URL literal is present (e.g. a
+    computed or imported base URL), so the caller's cascade/HITL can resolve it.
+    """
+    text = _strip_js_comments(text)
+    urls: list[str] = []
+    for m in _BASEURL_KEY_RE.finditer(text):
+        rhs = _capture_rhs(text, m.end())
+        for u in _URL_LITERAL_RE.findall(rhs):
+            # Drop empties and template-literal-interpolated URLs (the `}` is
+            # already excluded by the regex, so an interpolated literal arrives
+            # here truncated and still carrying the `${` marker).
+            if u.strip() and "${" not in u:
+                urls.append(u)
+    if not urls:
+        return None
+    # min role rank wins; among equal ranks prefer the last (else/default) branch.
+    best_idx = 0
+    best_key = (_url_role_rank(urls[0]), 0)
+    for idx, u in enumerate(urls):
+        key = (_url_role_rank(u), -idx)
+        if key < best_key:
+            best_key = key
+            best_idx = idx
+    return urls[best_idx]
+
+
+def _probe_playwright_config(sut: Path) -> tuple[str | None, str | None]:
+    """Extract ``use.baseURL`` from a Playwright config. Returns (url, file)."""
+    for name in ("playwright.config.ts", "playwright.config.js",
+                 "playwright.config.mjs", "playwright.config.cjs",
+                 "playwright.config.mts", "playwright.config.cts"):
+        p = sut / name
+        if not p.exists():
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        url = _select_base_url(text)
+        if url:
+            return url, name
+    return None, None
+
+
+def _probe_cypress_config(sut: Path) -> tuple[str | None, str | None]:
+    """Extract ``baseUrl`` from a Cypress config (modern or legacy JSON)."""
+    for name in ("cypress.config.ts", "cypress.config.js",
+                 "cypress.config.mjs", "cypress.config.cjs"):
+        p = sut / name
+        if not p.exists():
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        url = _select_base_url(text)
+        if url:
+            return url, name
+    # Legacy cypress.json — baseUrl is a JSON string value.
+    legacy = sut / "cypress.json"
+    if legacy.exists():
+        try:
+            data = json.loads(legacy.read_text(encoding="utf-8"))
+            val = (data.get("baseUrl") or "").strip()
+            if val.startswith(("http://", "https://")):
+                return val, "cypress.json"
+        except (OSError, json.JSONDecodeError, AttributeError):
+            pass
+    return None, None
+
+
+# `base_url` / `baseUrl` / `SUT_BASE_URL` etc — a base-url-shaped identifier.
+# The `(?:^|_)` boundary excludes `database_url` (which ends in "base_url").
+_PY_BASEURL_NAME_RE = re.compile(r"(?:^|_)base_?url$", re.IGNORECASE)
+_PY_BASEURL_HINT_RE = re.compile(r"base_?url", re.IGNORECASE)
+
+
+def _is_http_url(s: str) -> bool:
+    return s.startswith(("http://", "https://"))
+
+
+def _is_base_url_name(name: str | None) -> bool:
+    return bool(name) and _PY_BASEURL_NAME_RE.search(name) is not None
+
+
+def _py_assign_target_name(target: ast.expr) -> str | None:
+    """The identifier of a simple assignment target (``x`` or ``self.x``)."""
+    if isinstance(target, ast.Name):
+        return target.id
+    if isinstance(target, ast.Attribute):
+        return target.attr
+    return None
+
+
+def _probe_python_base_url(sut: Path) -> tuple[str | None, str | None]:
+    """Scan Python source for a hardcoded base URL the BaseSettings scan misses.
+
+    Covers the common pytest-playwright / conftest patterns that live outside
+    a Pydantic settings class:
+      - assignment:  ``base_url = "https://qa…"`` / ``self.base_url = "…"``
+      - kwarg:       ``browser.new_context(base_url="https://qa…")``
+      - fixture:     ``def base_url(): return "https://qa…"``
+    Only http(s) string literals to a base-url-shaped name count. Among
+    candidates, QA-first ranking wins (tie-break: source path for determinism).
+    Returns ``(url, "<rel>:<where>")`` or ``(None, None)``.
+    """
+    candidates: list[tuple[str, str]] = []
+    for src in sut.glob("**/*.py"):
+        if not src.is_file() or src.stat().st_size > 512_000:
+            continue
+        if any(part in (".git", "node_modules", ".venv", "venv",
+                        "__pycache__")
+               for part in src.parts):
+            continue
+        try:
+            raw = src.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if not _PY_BASEURL_HINT_RE.search(raw):  # cheap prefilter
+            continue
+        import warnings
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", SyntaxWarning)
+                tree = ast.parse(raw, filename=str(src))
+        except SyntaxError:
+            continue
+        try:
+            rel = src.relative_to(sut).as_posix()
+        except ValueError:
+            rel = src.as_posix()
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                val = _literal_str(node.value)
+                if val and _is_http_url(val):
+                    for t in node.targets:
+                        nm = _py_assign_target_name(t)
+                        if _is_base_url_name(nm):
+                            candidates.append((val, f"{rel}:{nm}"))
+            elif isinstance(node, ast.AnnAssign):
+                val = _literal_str(node.value)
+                if val and _is_http_url(val):
+                    nm = _py_assign_target_name(node.target)
+                    if _is_base_url_name(nm):
+                        candidates.append((val, f"{rel}:{nm}"))
+            elif isinstance(node, ast.Call):
+                for kw in node.keywords:
+                    if _is_base_url_name(kw.arg):
+                        val = _literal_str(kw.value)
+                        if val and _is_http_url(val):
+                            candidates.append((val, f"{rel}:{kw.arg}="))
+            elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                if _is_base_url_name(node.name):
+                    for sub in ast.walk(node):
+                        if isinstance(sub, ast.Return):
+                            val = _literal_str(sub.value)
+                            if val and _is_http_url(val):
+                                candidates.append((val, f"{rel}:{node.name}()"))
+
+    if not candidates:
+        return None, None
+    candidates.sort(key=lambda c: (_url_role_rank(c[0]), c[1]))
+    return candidates[0]
+
+
+def _config_url_confidence(url: str) -> float:
+    """Confidence for a URL parsed from a Playwright/Cypress config.
+
+    A hardcoded remote QA URL is a strong, deliberate signal (stronger than a
+    synthesized ``http://localhost:<port>``). Production/live-only configs get
+    low confidence so the QA-first invariant surfaces them for confirmation.
+    """
+    rank = _url_role_rank(url)
+    if rank == _ROLE_RANK["qa"]:
+        return 0.85
+    if rank >= _ROLE_RANK["prod"]:
+        return 0.15
+    if rank in (_ROLE_RANK["test"], _ROLE_RANK["staging"]):
+        return 0.7
+    return 0.75  # base / dev — a real remote URL, still better than a port guess
+
+
 # ---------------------------------------------------------------------------
 # Main API
 # ---------------------------------------------------------------------------
@@ -493,6 +803,29 @@ def detect_qa_base_url(sut_path: Path) -> UrlResolution:
 
     # Step 3+: no BaseSettings URL fields. Fall back to manifest probes.
     res.trail.append("no_basesettings_url_fields; falling back to manifest probes")
+
+    # A hardcoded remote base URL in a Playwright/Cypress config is a stronger,
+    # more deliberate signal than a synthesized http://localhost:<port>, so
+    # probe these BEFORE the port probes. Common for browser-test SUTs that
+    # point at a shared QA environment (no local dev server).
+    for probe, source in (
+        (_probe_playwright_config, "playwright_config"),
+        (_probe_cypress_config, "cypress_config"),
+        (_probe_python_base_url, "python_source"),
+    ):
+        cfg_url, cfg_file = probe(sut_path)
+        if cfg_url:
+            res.key = "SUT_BASE_URL"
+            res.value = cfg_url
+            res.source = source
+            res.confidence = _config_url_confidence(cfg_url)
+            res.trail.append(f"base_url={cfg_url} from {cfg_file}")
+            if _url_role_rank(cfg_url) >= _ROLE_RANK["prod"]:
+                res.trail.append(
+                    f"WARN: {source} baseURL resolves to a production/live host "
+                    f"({cfg_url}); confirm before pointing tests at it"
+                )
+            return res
 
     port, src = _probe_package_json_port(sut_path)
     if port:

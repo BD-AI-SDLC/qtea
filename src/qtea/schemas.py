@@ -60,6 +60,42 @@ def is_valid(data: Any, schema_name: str) -> tuple[bool, str | None]:
     return True, None
 
 
+def normalize_arrays(data: Any, schema_name: str) -> Any:
+    """Coerce scalar values to single-element arrays where the schema expects arrays.
+
+    LLMs occasionally emit a bare string for a field that the schema defines as
+    ``"type": "array"`` (e.g. ``"args": "foo"`` instead of ``"args": ["foo"]``).
+    Walks the data + schema in parallel and wraps any such scalars.
+    """
+    schema = load_schema(schema_name)
+    return _coerce_arrays(data, schema, schema.get("$defs", {}))
+
+
+def _coerce_arrays(data: Any, schema: dict[str, Any], defs: dict[str, Any]) -> Any:
+    if "$ref" in schema:
+        ref_name = schema["$ref"].rsplit("/", 1)[-1]
+        schema = defs.get(ref_name, schema)
+
+    schema_type = schema.get("type")
+
+    if schema_type == "array":
+        if not isinstance(data, list):
+            if data is None:
+                return data
+            data = [data]
+        items_schema = schema.get("items", {})
+        return [_coerce_arrays(item, items_schema, defs) for item in data]
+
+    if isinstance(data, dict):
+        props = schema.get("properties", {})
+        for key in data:
+            if key in props:
+                data[key] = _coerce_arrays(data[key], props[key], defs)
+        return data
+
+    return data
+
+
 def write_validated(path: Path, data: Any, schema_name: str) -> None:
     """Validate then write JSON. Raises if invalid; never writes a bad file."""
     validate(data, schema_name)

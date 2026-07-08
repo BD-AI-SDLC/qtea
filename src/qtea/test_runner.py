@@ -277,10 +277,16 @@ def _inject_xdist_override(
     ``parallelism > 0`` pins to that many workers (``-n <value>``).
     ``parallelism == 0`` appends ``-n 0`` to run in-process (no worker
     subprocess).
+    ``parallelism == -1`` uses ``-n auto`` (one worker per logical CPU core).
     """
     if re.search(r"(?:^|\s)-n(?:\s|=)", command):
         return command
-    n_flag = f"-n {parallelism}" if parallelism > 0 else "-n 0"
+    if parallelism == -1:
+        n_flag = "-n auto"
+    elif parallelism > 0:
+        n_flag = f"-n {parallelism}"
+    else:
+        n_flag = "-n 0"
     return f"{command} {n_flag}"
 
 
@@ -298,8 +304,13 @@ def _inject_playwright_file_filter(command: str) -> str:
 
 def _inject_playwright_workers(command: str, parallelism: int) -> str:
     """Set Playwright Test ``--workers`` count."""
+    import os as _os
+
     if "--workers" in command:
         return command
+    if parallelism == -1:
+        workers = _os.cpu_count() or 4
+        return f"{command} --workers {workers}"
     if parallelism > 0:
         return f"{command} --workers {parallelism}"
     return command
@@ -985,6 +996,7 @@ def run_tests(
             runner_failure = classify_runner_failure(
                 stderr,
                 package_manager=profile.package_manager if profile else None,
+                stdout=stdout,
             ) or {
                 "kind": "internal_error",
                 "module": None,
@@ -1018,6 +1030,7 @@ def run_tests(
         runner_failure = classify_runner_failure(
             stderr,
             package_manager=profile.package_manager if profile else None,
+            stdout=stdout,
         )
         msg = f"command exited with code {exit_code}; no results parsed"
         if runner_failure:
@@ -1074,6 +1087,13 @@ _CONFTEST_IMPORT_ERROR_RE = re.compile(
 _PYTEST_COLLECTION_ERRORS_RE = re.compile(
     r"(?im)^\s*(?:errors during collection|=+\s*ERRORS\s*=+)"
 )
+
+_MISSING_ENV_RE = re.compile(
+    r"Missing required environment variables?\s*:?\s*"
+    r"(?P<body>(?:(?:\s|\\n)*-?\s*[A-Z][A-Z0-9_]+(?:\s|\\n)*)+)",
+    re.I,
+)
+_ENVVAR_NAME_RE = re.compile(r"[A-Z][A-Z0-9_]{2,80}")
 
 
 # Package-manager install hint by detected package_manager name. Best-effort
@@ -1175,17 +1195,21 @@ def install_command_for(
 
 
 def classify_runner_failure(
-    stderr: str, *, package_manager: str | None = None,
+    stderr: str,
+    *,
+    package_manager: str | None = None,
+    stdout: str = "",
 ) -> dict | None:
-    """Inspect stderr for collection-/import-time failures.
+    """Inspect stderr (and stdout) for collection-/import-time failures.
 
     Returns a dict describing the failure when one is detected, else None.
     Shape:
         {
-            "kind": "missing_module" | "collection_error",
+            "kind": "missing_module" | "missing_env" | "collection_error",
             "module": str | None,        # name of the missing module if known
             "hint":   str,               # human-readable one-line fix command
             "summary": str,              # short headline for the step error
+            "vars":   list[str] | None,  # missing env var names (missing_env only)
         }
 
     The kinds:
@@ -1193,15 +1217,18 @@ def classify_runner_failure(
         older `ImportError: No module named X`). `module` is filled in and
         `hint` is package-manager-aware. This is the common case (pytest
         plugin not installed, e.g. allure-pytest missing from pyproject).
+      - `missing_env` — the test runner (typically a globalSetup guard)
+        reported missing environment variables. `vars` lists the names.
       - `collection_error` — pytest blew up at collection time (broken
         conftest, syntax error in a test file, fixture-resolution failure)
         with no specific missing-module signal. `module` is None; `hint`
         points the user at the stderr tail.
     """
-    if not stderr:
+    combined = (stderr or "") + "\n" + (stdout or "")
+    if not combined.strip():
         return None
 
-    m = _MODULE_NOT_FOUND_RE.search(stderr)
+    m = _MODULE_NOT_FOUND_RE.search(combined)
     if m:
         module = m.group("module")
         return {
@@ -1211,7 +1238,24 @@ def classify_runner_failure(
             "summary": f"missing dependency: {module!r}",
         }
 
-    if _CONFTEST_IMPORT_ERROR_RE.search(stderr) or _PYTEST_COLLECTION_ERRORS_RE.search(stderr):
+    m = _MISSING_ENV_RE.search(combined)
+    if m:
+        body = m.group("body")
+        var_names = _ENVVAR_NAME_RE.findall(body)
+        return {
+            "kind": "missing_env",
+            "module": None,
+            "vars": var_names,
+            "hint": (
+                f"provide {', '.join(var_names)} via .env, host environment, "
+                f"or Azure DevOps Variable Groups"
+                if var_names
+                else "provide the missing environment variables"
+            ),
+            "summary": f"missing environment variables: {', '.join(var_names)}",
+        }
+
+    if _CONFTEST_IMPORT_ERROR_RE.search(combined) or _PYTEST_COLLECTION_ERRORS_RE.search(combined):
         return {
             "kind": "collection_error",
             "module": None,

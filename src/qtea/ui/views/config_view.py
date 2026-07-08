@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 
 import flet as ft
@@ -66,7 +67,7 @@ def build_config_view(
 
     # ── SUT path ─────────────────────────────────────────────────────────
     sut_field = ft.TextField(
-        label="System Under Test (SUT)",
+        label="System Under Test (SUT) / Automation Repository",
         hint_text="/path/to/project  |  https://github.com/org/repo",
         value=state.sut,
         border_color=DIVIDER,
@@ -177,29 +178,58 @@ def build_config_view(
     )
 
     # ── Parallel workers slider ──────────────────────────────────────────
+    _max_workers = min(os.cpu_count() or 4, 12)
+    _is_auto = state.parallel_run == -1
+    _manual_workers = state.parallel_run if state.parallel_run != -1 else 2
+
+    def _workers_label_text(auto: bool, count: int) -> str:
+        return "Parallel Workers: Auto" if auto else f"Parallel Workers: {count}"
+
     workers_label = ft.Text(
-        f"Parallel Workers: {state.parallel_run}",
+        _workers_label_text(_is_auto, _manual_workers),
         size=13,
         color=ON_SURFACE,
     )
 
-    def on_workers_change(e: ft.ControlEvent) -> None:
-        state.parallel_run = int(float(e.data))
-        workers_label.value = f"Parallel Workers: {state.parallel_run}"
-        page.update()
-
     workers_slider = ft.Slider(
         min=0,
-        max=16,
-        divisions=16,
-        value=state.parallel_run,
+        max=_max_workers,
+        divisions=_max_workers,
+        value=_manual_workers,
         active_color=SECONDARY,
-        on_change=on_workers_change,
+        disabled=_is_auto,
         expand=True,
     )
 
+    auto_checkbox = ft.Checkbox(
+        label="Auto",
+        value=_is_auto,
+        active_color=SECONDARY,
+    )
+
+    def on_workers_change(e: ft.ControlEvent) -> None:
+        val = int(float(e.data))
+        state.parallel_run = val
+        workers_label.value = _workers_label_text(False, val)
+        page.update()
+
+    def on_auto_change(e: ft.ControlEvent) -> None:
+        auto = bool(e.data)
+        if auto:
+            state.parallel_run = -1
+            workers_slider.disabled = True
+        else:
+            manual = int(workers_slider.value or 2)
+            state.parallel_run = manual
+            workers_slider.disabled = False
+        workers_label.value = _workers_label_text(auto, int(workers_slider.value or 2))
+        page.update()
+
+    workers_slider.on_change = on_workers_change
+    auto_checkbox.on_change = on_auto_change
+
     workers_row = ft.Row(
-        controls=[workers_label, workers_slider],
+        controls=[workers_label, workers_slider, auto_checkbox],
         spacing=12,
         vertical_alignment=ft.CrossAxisAlignment.CENTER,
     )
@@ -208,7 +238,7 @@ def build_config_view(
     from qtea.ui.state import STEP_DEFINITIONS
 
     skip_checks: list[ft.Control] = []
-    for num, name, _ in STEP_DEFINITIONS:
+    for num, _name, _ in STEP_DEFINITIONS:
 
         def make_handler(n: int) -> Callable:
             def handler(e: ft.ControlEvent) -> None:
@@ -225,7 +255,7 @@ def build_config_view(
 
         skip_checks.append(
             ft.Checkbox(
-                label=str(num),
+                label=f"{num}. {_name}",
                 value=num in state.skip_steps,
                 active_color=SECONDARY,
                 on_change=make_handler(num),
@@ -235,7 +265,7 @@ def build_config_view(
     skip_row = ft.Column(
         controls=[
             ft.Text("Skip Steps", size=13, color=ON_SURFACE_DIM),
-            ft.Row(controls=skip_checks, spacing=4, wrap=True),
+            ft.Column(controls=skip_checks, spacing=2, tight=True),
         ],
         spacing=4,
     )
@@ -383,6 +413,15 @@ def build_config_view(
         # Sync field values
         state.spec = spec_field.value or ""
         state.sut = sut_field.value or ""
+
+        # Authoritative sync of skip_steps: read checkbox .value directly
+        # rather than trusting on_change (which can miss events in some Flet
+        # builds). skip_checks[i] pairs 1-to-1 with STEP_DEFINITIONS[i].
+        state.skip_steps = {
+            num
+            for cb, (num, _, _) in zip(skip_checks, STEP_DEFINITIONS)
+            if cb.value
+        }
 
         if not state.spec.strip():
             error_text.value = "Spec source is required."

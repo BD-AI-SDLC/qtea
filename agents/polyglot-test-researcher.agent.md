@@ -97,6 +97,7 @@ Summary without doc = incomplete. Doc without summary = no machine hook.
 | Skill | When | Purpose |
 |---|---|---|
 | `skills/stack-catalog/SKILL.md` | When identifying or matching a framework | Per-framework indicators (deps + config + imports) and minimal pattern examples. |
+| `inquiry-checkpoints.md` | When investigating a specific area of the SUT (stack, structure, integrations, testing, concerns) | Per-area investigation questions that guide what to look for and verify in the scan output beyond raw file enumeration. |
 
 A deterministic codebase scan is pre-computed and staged as `./scan.txt`; read it first to seed discovery before exploring source files.
 

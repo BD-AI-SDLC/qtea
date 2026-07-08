@@ -1,10 +1,11 @@
 """Unit tests for self-heal scope guard, rollback on timeout, and quality gates.
 
-The heal agent may touch POM/locator source and codegen-generated test
-files (for interaction-pattern fixes). It must never touch fixtures,
-conftest, or pre-existing test files. Assertions in generated test
-files are immutable — the assertion-immutability gate reverts any patch
-that removes or alters a pre-existing assertion line.
+Scope model (see `agents/polyglot-test-fixer.agent.md`): the heal agent may
+edit any TEST-SIDE code — POMs, locators, helpers, fixtures, `conftest.py`,
+and codegen-generated test files. It must NOT edit application/production
+source (which would mask DEV bugs) nor pre-existing SUT-authored test files.
+Assertions may be corrected to match the Step-4 expected value but never
+weakened or removed.
 
 Tests exercise the pure-function helpers (no subprocess) and a tmp-dir
 git-based revert path.
@@ -17,13 +18,15 @@ from pathlib import Path
 
 import pytest
 
-from qtea.steps.s09_execute import (
-    _extract_assertion_lines,
+from qtea.steps.s09.heal_scope import (
     _heal_allowlist_dirs,
     _heal_path_in_scope,
     _heal_revert_all_uncommitted,
     _heal_scope_check_and_revert,
-    _patch_modifies_assertions,
+)
+from qtea.steps.s09.patch_gates import (
+    _extract_assertion_lines,
+    _patch_weakens_assertions,
 )
 
 # ---------------------------------------------------------------------------
@@ -59,18 +62,27 @@ def test_heal_allowlist_dirs_empty_when_no_active_module():
 
 
 @pytest.mark.parametrize("path", [
-    "tests/conftest.py",
-    "tests/fixtures/qtea_nav.py",
-    "tests/fixtures/anything.py",
     "tests/smoke/test_login.py",
     "tests/smoke/login_test.py",
     "tests/__tests__/foo.spec.js",
     "app/login.spec.ts",
     "src/main/java/LoginTest.java",
 ])
-def test_heal_path_in_scope_rejects_forbidden_paths(path: str):
-    # With an empty allowlist, only FORBIDDEN globs gate; these must all reject.
+def test_heal_path_in_scope_rejects_pre_existing_test_files(path: str):
+    # Pre-existing SUT-authored test files stay off-limits even with an empty
+    # allowlist (qtea's own tests are passed via generated_files instead).
     assert _heal_path_in_scope(path, set()) is False
+
+
+@pytest.mark.parametrize("path", [
+    "tests/conftest.py",
+    "tests/fixtures/qtea_nav.py",
+    "tests/fixtures/anything.py",
+])
+def test_heal_path_in_scope_allows_test_infra(path: str):
+    # Post-relaxation: conftest.py and fixture files are editable test
+    # infrastructure, allowed even with no allowlist information.
+    assert _heal_path_in_scope(path, set()) is True
 
 
 def test_heal_path_in_scope_allows_pom_inside_allowlist():
@@ -92,10 +104,20 @@ def test_heal_path_in_scope_rejects_pom_outside_allowlist():
 
 
 def test_heal_path_in_scope_permissive_when_allowlist_empty():
-    """Empty allowlist means 'no inventory info' — fall through to FORBIDDEN-only."""
+    """Empty allowlist means 'no inventory info' — permissive for non-test
+    paths; conftest is now editable test infrastructure."""
     assert _heal_path_in_scope("src/pkg/pages/object/login_page.py", set()) is True
-    # Still blocks the forbidden globs.
-    assert _heal_path_in_scope("tests/conftest.py", set()) is False
+    assert _heal_path_in_scope("tests/conftest.py", set()) is True
+    # Pre-existing SUT test files still blocked.
+    assert _heal_path_in_scope("tests/smoke/test_login.py", set()) is False
+
+
+def test_heal_path_in_scope_rejects_app_source_outside_allowlist():
+    """With a known allowlist, application/production source outside it is
+    out-of-scope so a heal cannot mask a DEV bug by editing the code under test."""
+    allowlist = {"src/pkg/pages/object", "src/pkg/pages/locators"}
+    assert _heal_path_in_scope("src/pkg/services/auth_service.py", allowlist) is False
+    assert _heal_path_in_scope("src/pkg/app/main.py", allowlist) is False
 
 
 # ---------------------------------------------------------------------------
@@ -137,24 +159,31 @@ def _init_git(sut: Path) -> str:
     return res.stdout.strip()
 
 
-def test_scope_check_reverts_out_of_scope_fixture_edit(tmp_path: Path):
-    """The exact run 20260611-184450 scenario: heal edits a fixtures file → revert."""
+def test_scope_check_reverts_app_source_edit_preserves_fixture_and_pom(tmp_path: Path):
+    """Post-relaxation: a fixture edit is IN scope (preserved); an
+    application/production-source edit outside the allowlist is reverted so a
+    heal cannot mask a DEV bug by editing the code under test."""
     sut = tmp_path / "sut"
     sut.mkdir()
     base_sha = _init_git(sut)
     allowlist = {"src/pkg/pages/object", "src/pkg/pages/locators"}
 
-    # Heal "edits" the fixtures file (out of scope) and the POM (in scope).
+    # Heal edits: the fixture (in scope), the POM (in scope), and a new
+    # application-source file (out of scope → must be reverted).
     fx = sut / "tests" / "fixtures" / "fx.py"
     pom = sut / "src" / "pkg" / "pages" / "object" / "login_page.py"
+    app = sut / "src" / "pkg" / "services" / "auth_service.py"
+    app.parent.mkdir(parents=True)
     fx.write_text("import pytest\n\n@pytest.fixture\ndef new_fix(): yield\n", encoding="utf-8")
     pom.write_text("class LoginPage:\n    def x(self): pass\n", encoding="utf-8")
+    app.write_text("def login(): return True  # masked DEV bug\n", encoding="utf-8")
 
     reverted = _heal_scope_check_and_revert(sut, base_sha, allowlist)
 
-    # The fixture edit must be reverted; the POM edit must be preserved.
-    assert reverted == ["tests/fixtures/fx.py"]
-    assert fx.read_text(encoding="utf-8") == "import pytest\n"
+    # Only the app-source edit is reverted; fixture + POM edits survive.
+    assert reverted == ["src/pkg/services/auth_service.py"]
+    assert not app.exists()
+    assert "new_fix" in fx.read_text(encoding="utf-8")
     assert "def x" in pom.read_text(encoding="utf-8")
 
 
@@ -225,15 +254,12 @@ def test_heal_path_in_scope_generated_overrides_allowlist():
     ) is True
 
 
-def test_heal_path_in_scope_conftest_not_overridden_by_generated():
-    """conftest.py remains FORBIDDEN even if (erroneously) listed in
-    generated_files — but generated_files overrides the forbidden check,
-    so this DOES pass. The intent is that conftest.py should never appear
-    in generated_files in practice."""
+def test_heal_path_in_scope_conftest_is_editable_test_infra():
+    """conftest.py is editable test infrastructure — in scope with or without
+    being listed in generated_files."""
     gen = {"tests/conftest.py"}
     assert _heal_path_in_scope("tests/conftest.py", set(), generated_files=gen) is True
-    # Without the override, conftest is forbidden.
-    assert _heal_path_in_scope("tests/conftest.py", set()) is False
+    assert _heal_path_in_scope("tests/conftest.py", set()) is True
 
 
 def test_scope_check_preserves_generated_test_file_edits(tmp_path: Path):
@@ -292,7 +318,7 @@ def test_scope_check_skips_pre_heal_dirty_files(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Assertion-immutability gate
+# Assertion-faithfulness gate (Gap F): corrections allowed, weakening rejected
 # ---------------------------------------------------------------------------
 
 
@@ -321,41 +347,51 @@ def test_extract_assertion_lines_finds_should():
     assert len(lines) == 1
 
 
-def test_patch_modifies_assertions_rejects_removal():
+def test_patch_weakens_assertions_rejects_removal():
     pre = b"x = 1\nassert x == 1\nprint('ok')\n"
     post = b"x = 1\nprint('ok')\n"
-    assert _patch_modifies_assertions(pre, post) is True
+    assert _patch_weakens_assertions(pre, post) is True
 
 
-def test_patch_modifies_assertions_rejects_mutation():
+def test_patch_weakens_assertions_allows_value_correction():
+    """Correcting an expected value (strong -> strong, same count) is a
+    legitimate codegen-transcription fix — NOT a weakening."""
     pre = b"assert x == 1\n"
     post = b"assert x == 2\n"
-    assert _patch_modifies_assertions(pre, post) is True
+    assert _patch_weakens_assertions(pre, post) is False
 
 
-def test_patch_modifies_assertions_allows_addition():
+def test_patch_weakens_assertions_rejects_downgrade_to_truthy():
+    """Downgrading a concrete comparison to a bare-truthy assert to force a
+    green is a weakening."""
+    pre = b"assert value == 'noopener noreferrer'\n"
+    post = b"assert value\n"
+    assert _patch_weakens_assertions(pre, post) is True
+
+
+def test_patch_weakens_assertions_allows_addition():
     pre = b"assert x == 1\n"
     post = b"assert x == 1\nexpect(locator).to_be_visible()\n"
-    assert _patch_modifies_assertions(pre, post) is False
+    assert _patch_weakens_assertions(pre, post) is False
 
 
-def test_patch_modifies_assertions_allows_no_change():
+def test_patch_weakens_assertions_allows_no_change():
     pre = b"assert x == 1\nassert y == 2\n"
     post = b"page.click('#z')\nassert x == 1\nassert y == 2\n"
-    assert _patch_modifies_assertions(pre, post) is False
+    assert _patch_weakens_assertions(pre, post) is False
 
 
-def test_patch_modifies_assertions_none_pre_is_safe():
+def test_patch_weakens_assertions_none_pre_is_safe():
     """When pre is None (new file), no prior assertions to protect."""
-    assert _patch_modifies_assertions(None, b"assert True\n") is False
+    assert _patch_weakens_assertions(None, b"assert True\n") is False
 
 
-def test_patch_modifies_assertions_none_post_is_safe():
-    assert _patch_modifies_assertions(b"assert True\n", None) is False
+def test_patch_weakens_assertions_none_post_is_safe():
+    assert _patch_weakens_assertions(b"assert True\n", None) is False
 
 
-def test_patch_modifies_assertions_no_assertions_in_pre():
+def test_patch_weakens_assertions_no_assertions_in_pre():
     """When pre has no assertions, any post content is safe."""
     pre = b"page.click('#x')\n"
     post = b"page.click('#y')\nassert True\n"
-    assert _patch_modifies_assertions(pre, post) is False
+    assert _patch_weakens_assertions(pre, post) is False

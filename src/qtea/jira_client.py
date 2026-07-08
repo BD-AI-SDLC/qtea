@@ -419,10 +419,134 @@ def _strip_html(html: str) -> str:
     return _HTML_TAG_RE.sub("", html).strip()
 
 
+# ---------------------------------------------------------------------------
+# Linked issues: fetch summary + description for related tickets
+# ---------------------------------------------------------------------------
+
+# Link type name fragments (lowercased) that disqualify a link from fetching.
+_JIRA_SKIP_LINK_FRAGMENTS = frozenset({"clone", "duplicat", "test"})
+
+
+def fetch_linked_issues(
+    base_url: str,
+    primary_payload: dict[str, Any],
+    *,
+    max_linked: int = 5,
+    client: httpx.Client | None = None,
+) -> list[dict[str, str]]:
+    """Fetch text content for linked issues referenced in *primary_payload*.
+
+    Only Jira text fields are fetched (summary, description, status,
+    acceptance criteria). External URLs embedded in those fields (Figma,
+    Confluence, etc.) are NOT followed.
+
+    Returns a list of dicts with keys:
+      ``key``, ``summary``, ``status``, ``relationship``, ``description``,
+      ``acceptance_criteria``.
+
+    Errors on individual linked-issue fetches are silently logged so a
+    broken or inaccessible link never aborts Step 1.
+
+    Priority order: parent/child links first, then blocks/depends, then
+    general relates-to.
+    """
+    links = (primary_payload.get("fields") or {}).get("issuelinks") or []
+    if not links:
+        return []
+
+    seen_keys: set[str] = set()
+    candidates: list[tuple[str, str, int]] = []  # (key, rel_text, priority)
+
+    for link in links:
+        link_type = link.get("type") or {}
+        type_name = (link_type.get("name") or "").lower()
+        if any(frag in type_name for frag in _JIRA_SKIP_LINK_FRAGMENTS):
+            continue
+
+        for direction, side_key in (
+            ("outward", "outwardIssue"),
+            ("inward", "inwardIssue"),
+        ):
+            linked_issue = link.get(side_key)
+            if not linked_issue:
+                continue
+            key = (linked_issue.get("key") or "").upper()
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            rel_text = link_type.get(direction) or direction
+            rel_lower = rel_text.lower()
+            if any(f in rel_lower for f in ("parent", "child")):
+                prio = 0
+            elif any(f in rel_lower for f in ("block", "depend")):
+                prio = 1
+            else:
+                prio = 2
+            candidates.append((key, rel_text, prio))
+
+    candidates.sort(key=lambda t: t[2])
+    candidates = candidates[:max_linked]
+    if not candidates:
+        return []
+
+    results: list[dict[str, str]] = []
+    owns_client = client is None
+    if owns_client:
+        client = _http_client(base_url)
+    try:
+        for key, relationship, _ in candidates:
+            try:
+                payload = fetch_issue(base_url, key, client=client)
+                fields = payload.get("fields") or {}
+
+                desc = adf_to_markdown(fields.get("description")).strip()
+                if not desc:
+                    rendered = (payload.get("renderedFields") or {}).get("description")
+                    if isinstance(rendered, str):
+                        desc = _strip_html(rendered).strip()
+
+                # AC lives in different custom fields across Jira instances.
+                ac = ""
+                for cf in (
+                    "customfield_10014",
+                    "customfield_10016",
+                    "customfield_10018",
+                    "customfield_10100",
+                ):
+                    raw = fields.get(cf)
+                    if raw:
+                        ac_text = (
+                            adf_to_markdown(raw).strip()
+                            if isinstance(raw, dict)
+                            else str(raw).strip()
+                        )
+                        if ac_text:
+                            ac = ac_text
+                            break
+
+                results.append({
+                    "key": key,
+                    "summary": fields.get("summary") or "",
+                    "status": (fields.get("status") or {}).get("name") or "",
+                    "relationship": relationship,
+                    "description": desc,
+                    "acceptance_criteria": ac,
+                })
+                log.info("jira.linked_fetch_ok", key=key, relationship=relationship)
+            except JiraFetchError as e:
+                log.warning("jira.linked_fetch_failed", key=key, error=str(e))
+    finally:
+        if owns_client:
+            client.close()
+
+    return results
+
+
 __all__ = [
     "JiraFetchError",
     "adf_to_markdown",
     "fetch_issue",
+    "fetch_linked_issues",
     "normalize_description",
     "parse_jira_spec_source",
 ]

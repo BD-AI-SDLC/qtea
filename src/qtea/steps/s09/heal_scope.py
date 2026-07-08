@@ -20,30 +20,41 @@ from qtea.logging_setup import get_logger
 log = get_logger(__name__)
 
 
-# File-shape predicates that heal is forbidden to touch. Mirrors the
-# FORBIDDEN block in `agents/polyglot-test-fixer.agent.md`. A heal that
-# modifies any file matching one of these (and not also matching the
-# POM allowlist) is reverted and reported as scope_violation. Catches
-# the run 20260611-184450 incident where the heal agent edited
-# `tests/fixtures/qtea_gemini_nav_*` instead of staying inside POM/
-# locator source. Implemented as predicates rather than glob patterns
-# because `fnmatch` does not handle `**`-recursive semantics portably.
+# Scope model (see `agents/polyglot-test-fixer.agent.md` "Strict Scope").
+#
+# The heal agent may edit any TEST-SIDE code needed to make a qtea test pass
+# correctly per the Step-4 cases: page objects, locators, helpers, fixtures,
+# `conftest.py`, test configuration, and qtea-GENERATED test files. Two
+# categories remain out of scope and are reverted:
+#
+#   1. Application / production source — editing the code under test would
+#      MASK genuine DEV bugs, which defeats the pipeline. Detected as any
+#      path that is neither a recognised test-infra shape nor under an
+#      inventory-derived allowlist directory (when an allowlist is known).
+#   2. Pre-existing, SUT-authored test files — those belong to the SUT team
+#      and are not qtea's deliverable (codegen never writes into them either).
+#      qtea's own generated tests are passed in via ``generated_files`` and
+#      ARE editable.
+#
+# Implemented as predicates rather than glob patterns because `fnmatch` does
+# not handle `**`-recursive semantics portably.
 
 
-def _heal_path_is_forbidden(rel_posix: str) -> bool:
-    """True iff the path matches a FORBIDDEN file shape (basename + segments)."""
+def _heal_path_is_pre_existing_test(rel_posix: str) -> bool:
+    """True iff the path is a SUT-authored test-file shape.
+
+    These stay off-limits to heal (qtea never edits the SUT team's own
+    tests). qtea-GENERATED test files match the same shapes but are allowed
+    because they are listed in ``generated_files`` and short-circuit the
+    scope check before this predicate runs. NOTE: ``conftest.py`` and
+    fixture files are deliberately NOT included here — under the current
+    scope model they are editable test infrastructure.
+    """
     p = rel_posix
     basename = p.rsplit("/", 1)[-1] if "/" in p else p
     segments = p.split("/")
-    if basename == "conftest.py":
-        return True
     if "__tests__" in segments:
         return True
-    if "tests" in segments and "fixtures" in segments:
-        # Forbidden when 'fixtures' sits directly under any 'tests/' segment.
-        for i, seg in enumerate(segments[:-1]):
-            if seg == "tests" and i + 1 < len(segments) and segments[i + 1] == "fixtures":
-                return True
     if "tests" in segments:
         if basename.startswith("test_") and basename.endswith(".py"):
             return True
@@ -54,18 +65,41 @@ def _heal_path_is_forbidden(rel_posix: str) -> bool:
     return bool(basename.endswith("Test.java"))
 
 
-def _heal_allowlist_dirs(active_module: dict | None) -> set[str]:
-    """POM/locator directories (SUT-relative, posix-style) heal may touch.
+def _heal_path_is_test_infra(rel_posix: str) -> bool:
+    """True iff the path is editable test infrastructure regardless of the
+    allowlist: ``conftest.py`` or any file under a ``fixtures`` directory.
 
-    Derived from `sut_inventory.json` → `modules[active].existing_page_objects`
-    + `existing_locators`. Empty set means "no allowlist information" — in
-    that case we fall back to permissive behaviour (only the FORBIDDEN globs
-    are enforced).
+    These are the categories the scope relaxation opened up — the heal agent
+    may create/repair fixtures and conftest entries so a qtea test's
+    preconditions are satisfied."""
+    p = rel_posix
+    basename = p.rsplit("/", 1)[-1] if "/" in p else p
+    segments = p.split("/")
+    if basename == "conftest.py":
+        return True
+    return "fixtures" in segments
+
+
+def _heal_allowlist_dirs(active_module: dict | None) -> set[str]:
+    """Test-side directories (SUT-relative, posix-style) heal may touch.
+
+    Derived from `sut_inventory.json` → the active module's existing POM /
+    locator / helper / fixture file locations, plus the test-directory and
+    src (pages/locators/helpers) layout roots. Empty set means "no
+    inventory information" — in that case we fall back to permissive
+    behaviour (only the pre-existing-test and test-infra predicates apply).
+
+    Application/production source lives OUTSIDE these dirs, so a non-empty
+    allowlist is what lets the scope check reject edits to the code under
+    test (which would mask DEV bugs).
     """
     if not isinstance(active_module, dict):
         return set()
     dirs: set[str] = set()
-    for key in ("existing_page_objects", "existing_locators"):
+    for key in (
+        "existing_page_objects", "existing_locators",
+        "existing_helpers", "existing_fixtures",
+    ):
         for entry in active_module.get(key) or []:
             file_rel = (entry.get("file") if isinstance(entry, dict) else "") or ""
             file_rel = file_rel.replace("\\", "/")
@@ -74,6 +108,21 @@ def _heal_allowlist_dirs(active_module: dict | None) -> set[str]:
             parent = file_rel.rsplit("/", 1)[0] if "/" in file_rel else ""
             if parent:
                 dirs.add(parent)
+    # Test-directory + src layout roots so newly-created files under them
+    # (e.g. a new fixture module, a new POM) are in-scope.
+    test_layout = active_module.get("test_directory_layout") or {}
+    for k in ("base_dir", "default_target"):
+        v = test_layout.get(k)
+        if isinstance(v, str) and v:
+            dirs.add(v.replace("\\", "/").rstrip("/"))
+    for sub in test_layout.get("subdirs") or []:
+        if isinstance(sub, dict) and sub.get("path"):
+            dirs.add(str(sub["path"]).replace("\\", "/").rstrip("/"))
+    src_layout = active_module.get("src_directory_layout") or {}
+    for k in ("pages_object_dir", "pages_locators_dir", "helpers_dir"):
+        v = src_layout.get(k)
+        if isinstance(v, str) and v:
+            dirs.add(v.replace("\\", "/").rstrip("/"))
     return dirs
 
 
@@ -84,18 +133,24 @@ def _heal_path_in_scope(
 ) -> bool:
     """True iff a heal-modified path is in-scope.
 
-    Logic:
-      0. If the path is a codegen-generated file → always in-scope
-         (the heal agent is fixing codegen's own mistakes).
-      1. If the path is FORBIDDEN (fixture / test / conftest shape) → out.
-      2. If ``allowlist_dirs`` is non-empty, the path's parent must START WITH
-         one of those dirs. Empty allowlist → only rule (1) applies.
+    Logic (in order):
+      0. qtea-generated file → always in-scope (heal fixes codegen's output).
+      1. Pre-existing SUT-authored test file → out-of-scope (never edit the
+         SUT team's tests; qtea's own tests are covered by rule 0).
+      2. Test infrastructure (conftest.py / fixtures/**) → in-scope.
+      3. Under an inventory allowlist dir → in-scope.
+      4. Empty allowlist (no inventory) → permissive in-scope.
+      5. Otherwise (application/production source when an allowlist IS known)
+         → out-of-scope, so a heal cannot mask a DEV bug by editing the code
+         under test.
     """
     p = rel_path.replace("\\", "/")
     if generated_files and p in generated_files:
         return True
-    if _heal_path_is_forbidden(p):
+    if _heal_path_is_pre_existing_test(p):
         return False
+    if _heal_path_is_test_infra(p):
+        return True
     if not allowlist_dirs:
         return True
     return any(p == d or p.startswith(d + "/") for d in allowlist_dirs)
@@ -215,7 +270,8 @@ __all__ = [
     "_git_status_porcelain",
     "_heal_allowlist_dirs",
     "_heal_path_in_scope",
-    "_heal_path_is_forbidden",
+    "_heal_path_is_pre_existing_test",
+    "_heal_path_is_test_infra",
     "_heal_revert_all_uncommitted",
     "_heal_scope_check_and_revert",
 ]

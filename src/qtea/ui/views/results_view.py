@@ -11,6 +11,7 @@ from pathlib import Path
 
 import flet as ft
 
+from qtea.ui.components.log_viewer import build_log_viewer
 from qtea.ui.state import STEP_DEFINITIONS, AppState
 from qtea.ui.theme import (
     BACKGROUND,
@@ -111,7 +112,7 @@ def build_results_view(
         if not s:
             continue
         status_color = STATUS_COLORS.get(s.status, ON_SURFACE_DIM)
-        phase_color = PHASE_COLORS.get(phase, ON_SURFACE_DIM)
+        PHASE_COLORS.get(phase, ON_SURFACE_DIM)
 
         table_rows.append(
             ft.DataRow(
@@ -314,8 +315,67 @@ def build_results_view(
                 except (json.JSONDecodeError, OSError):
                     pass
 
+    # ── Collapsible log viewer ──────────────────────────────────────────
+    _log_height: dict[str, float] = {"h": 400.0}
+
+    log_section = ft.Container(
+        content=build_log_viewer(page, state),
+        height=_log_height["h"],
+        visible=False,
+        border_radius=ft.BorderRadius(12, 12, 0, 0),
+    )
+
+    def _on_log_resize(e: ft.DragUpdateEvent) -> None:
+        delta = e.local_delta.y if e.local_delta else (e.primary_delta or 0.0)
+        new_h = max(150.0, min(900.0, _log_height["h"] + delta))
+        _log_height["h"] = new_h
+        log_section.height = new_h
+        import contextlib as _cl
+        with _cl.suppress(Exception):
+            page.update()
+
+    resize_handle = ft.GestureDetector(
+        content=ft.Container(
+            content=ft.Row(
+                controls=[
+                    ft.Container(
+                        width=48,
+                        height=4,
+                        bgcolor=DIVIDER,
+                        border_radius=2,
+                    )
+                ],
+                alignment=ft.MainAxisAlignment.CENTER,
+            ),
+            height=14,
+            bgcolor=CARD_BG,
+            border=ft.Border.all(1, DIVIDER),
+            border_radius=ft.BorderRadius(0, 0, 12, 12),
+            tooltip="Drag to resize log panel",
+        ),
+        mouse_cursor=ft.MouseCursor.RESIZE_ROW,
+        drag_interval=10,
+        on_vertical_drag_update=_on_log_resize,
+        visible=False,
+    )
+
     # ── Action buttons ───────────────────────────────────────────────────
     actions: list[ft.Control] = []
+
+    if state.log_lines:
+        log_btn = ft.OutlinedButton(
+            "View Logs",
+            icon=ft.Icons.TERMINAL,
+        )
+
+        def _toggle_logs(e: ft.ControlEvent) -> None:
+            log_section.visible = not log_section.visible
+            resize_handle.visible = log_section.visible
+            log_btn.text = "Hide Logs" if log_section.visible else "View Logs"
+            page.update()
+
+        log_btn.on_click = _toggle_logs
+        actions.append(log_btn)
 
     if state.workspace_path:
         def open_workspace(e: ft.ControlEvent) -> None:
@@ -380,6 +440,9 @@ def build_results_view(
                 summary_table,
                 ft.Container(height=12),
                 test_results_section,
+                ft.Container(height=12),
+                log_section,
+                resize_handle,
                 ft.Container(height=16),
                 actions_row,
                 ft.Container(height=24),

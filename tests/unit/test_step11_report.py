@@ -436,7 +436,13 @@ async def test_step11_report_auto_builtin_always(tmp_path: Path, monkeypatch):
 async def test_step11_open_report_flag(tmp_path: Path):
     ctx = _ctx(tmp_path, open_report=True)
     _seed(ctx, results=_sample_results())
-    with patch("qtea.steps.s11_report.webbrowser.open") as mock_open:
+    # Simulate allure being ABSENT so the built-in HTML path is used: when
+    # allure is installed the step auto-opens the Allure UI via `allure open`
+    # instead of webbrowser (and the test would otherwise be coupled to
+    # whether the runner has allure on PATH). With allure absent, --open-report
+    # falls back to webbrowser.open on the built-in index.html.
+    with patch("qtea.steps.s11_report.shutil.which", return_value=None), \
+            patch("qtea.steps.s11_report.webbrowser.open") as mock_open:
         result = await ReportStep().run(ctx)
         assert result.success
         assert mock_open.called

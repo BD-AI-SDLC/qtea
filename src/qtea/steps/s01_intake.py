@@ -38,6 +38,7 @@ import httpx
 
 from qtea.ado_client import (
     AdoFetchError,
+    fetch_linked_work_items,
     fetch_work_item,
     parse_ado_spec_source,
     slim_ado_payload,
@@ -49,6 +50,7 @@ from qtea.config import package_resource_root, step_timeout
 from qtea.jira_client import (
     JiraFetchError,
     fetch_issue,
+    fetch_linked_issues,
     normalize_description,
     parse_jira_spec_source,
 )
@@ -192,13 +194,24 @@ async def _jira_via_rest(
     if "fields" in payload:
         payload["fields"]["description"] = normalize_description(payload)
 
+    # Fetch linked issues BEFORE slimming — issuelinks lives in full fields.
+    linked_items = _fetch_linked_jira_safe(base_url, payload)
+
     slim = _slim_jira_payload(payload)
-    return await _enrich_jira_via_agent(
+    spec_path = await _enrich_jira_via_agent(
         workdir=workdir,
         out_dir=out_dir,
         source_label=f"{base_url}/browse/{ticket_id}",
         payload_json=json.dumps(slim, indent=2, ensure_ascii=False),
     )
+
+    if linked_items:
+        context_md = _format_linked_context_md(linked_items)
+        with spec_path.open("a", encoding="utf-8") as fh:
+            fh.write(context_md)
+        log.info("step01.linked_context_appended", count=len(linked_items))
+
+    return spec_path
 
 
 async def _enrich_ado_via_agent(
@@ -263,14 +276,25 @@ async def _ado_via_rest(
     if "fields" in payload:
         payload["fields"]["System.Description"] = ado_normalize_description(payload)
 
+    # Fetch linked work items BEFORE slimming — relations is in the full payload.
+    linked_items = _fetch_linked_ado_safe(org, project, payload)
+
     slim = slim_ado_payload(payload)
     source_label = f"https://dev.azure.com/{org}/{project}/_workitems/edit/{item_id}"
-    return await _enrich_ado_via_agent(
+    spec_path = await _enrich_ado_via_agent(
         workdir=workdir,
         out_dir=out_dir,
         source_label=source_label,
         payload_json=json.dumps(slim, indent=2, ensure_ascii=False),
     )
+
+    if linked_items:
+        context_md = _format_linked_context_md(linked_items)
+        with spec_path.open("a", encoding="utf-8") as fh:
+            fh.write(context_md)
+        log.info("step01.linked_context_appended", count=len(linked_items))
+
+    return spec_path
 
 
 def _url_passthrough(url: str, out_dir: Path) -> Path:
@@ -291,6 +315,68 @@ def _file_passthrough(src: str, out_dir: Path) -> Path:
     dst = out_dir / "spec.md"
     dst.write_text(raw_md, encoding="utf-8")
     return dst
+
+
+def _format_linked_context_md(linked_items: list[dict]) -> str:
+    """Render fetched linked-issue data as a markdown section for spec.md."""
+    if not linked_items:
+        return ""
+    lines = [
+        "",
+        "---",
+        "",
+        "## Linked Context (text only — external URLs not followed)",
+        "",
+        "> The following tickets are linked to this requirement and were fetched "
+        "automatically to provide broader context for refinement. "
+        "Only text fields from the issue tracker are included; Figma designs, "
+        "Confluence pages, and other external URLs are not accessible and have "
+        "not been fetched.",
+        "",
+    ]
+    for item in linked_items:
+        key = item.get("key") or item.get("id") or "?"
+        title = item.get("summary") or item.get("title") or ""
+        status = item.get("status") or ""
+        rel = item.get("relationship") or "linked"
+        desc = (item.get("description") or "").strip()
+        ac = (item.get("acceptance_criteria") or "").strip()
+
+        lines.append(f"### {key} · {rel} — {title}")
+        lines.append("")
+        meta: list[str] = []
+        if status:
+            meta.append(f"**Status:** {status}")
+        meta.append(f"**Relationship to primary:** {rel}")
+        lines.extend(meta)
+        lines.append("")
+        if desc:
+            lines.append(desc)
+            lines.append("")
+        if ac:
+            lines.append("**Acceptance Criteria:**")
+            lines.append("")
+            lines.append(ac)
+            lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _fetch_linked_jira_safe(base_url: str, payload: dict) -> list[dict]:
+    """Fetch linked Jira issues; returns [] on any error (never aborts Step 1)."""
+    try:
+        return fetch_linked_issues(base_url, payload, max_linked=5)
+    except Exception as e:
+        log.warning("step01.linked_jira_error", error=str(e))
+        return []
+
+
+def _fetch_linked_ado_safe(org: str, project: str, payload: dict) -> list[dict]:
+    """Fetch linked ADO work items; returns [] on any error (never aborts Step 1)."""
+    try:
+        return fetch_linked_work_items(org, project, payload, max_linked=5)
+    except Exception as e:
+        log.warning("step01.linked_ado_error", error=str(e))
+        return []
 
 
 class IntakeStep(Step):
@@ -413,7 +499,10 @@ __all__ = [
     "_download_text",
     "_enrich_ado_via_agent",
     "_enrich_jira_via_agent",
+    "_fetch_linked_ado_safe",
+    "_fetch_linked_jira_safe",
     "_file_passthrough",
+    "_format_linked_context_md",
     "_is_ado",
     "_is_jira",
     "_is_url",

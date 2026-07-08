@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+
 import flet as ft
 
 from qtea.ui.components.log_viewer import build_log_viewer
@@ -123,10 +125,8 @@ def build_pipeline_view(page: ft.Page, state: AppState) -> ft.Container:
                 new_w = max(MIN, min(MAX, widths["metrics"] - delta))
                 widths["metrics"] = new_w
                 metrics_panel.width = new_w
-            try:
+            with contextlib.suppress(Exception):
                 page.update()
-            except Exception:
-                pass
 
         handle = ft.Container(
             width=6,
@@ -216,6 +216,8 @@ def build_pipeline_view(page: ft.Page, state: AppState) -> ft.Container:
 
                     recent = state.log_lines[-MAX_DISPLAY_LINES:]
                     log_list.controls = [_build_log_line(l) for l in recent]
+                    with contextlib.suppress(Exception):
+                        log_list.scroll_to(offset=-1, duration=0)
                     header_row = cols[0]
                     if hasattr(header_row, "controls") and len(header_row.controls) >= 5:
                         header_row.controls[-1].value = f"{len(state.log_lines)} lines"
