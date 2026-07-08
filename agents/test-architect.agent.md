@@ -21,6 +21,7 @@ These arrive **inlined** in the user prompt as fenced markdown sections (no work
   - `existing_locators[]` — class_name, file, constants[] with selectors. Reuse target for locators.
   - `auth_flow` — type, entry_method, credentials_env_vars, fixture_entry. Most tests need this.
 - **`research.md`** (Step 6 narrative, optional) — for human-readable context only. The structured JSON is authoritative.
+- **`live-map.json`** (Step 7 live-exploration output, optional) — a snapshot of the RUNNING SUT captured just before you plan: per strategy-referenced route, whether it `exists`, any `redirected_to`, and `notable_roles` observed on the page. When present it reflects reality; **prefer it over inventory guesses when the two disagree.** For any route marked `"exists": false`, do NOT plan locators/POM methods against it — instead add a `[CLARIFICATION NEEDED]` string to the top-level `notes` array naming the missing route, and skip or minimise that test case. Use observed `notable_roles` to ground your `create_tbd` intents in real element names.
 - **`reuse-source/<sut-relative-path>`** (zero or more) — the FULL source text of every existing POM, fixture, and helper file the inventory lists for the active module. These are the materials you use to verify reuse FIT (not just existence). The inventory tells you a symbol exists; only the source tells you whether that symbol's actual behaviour matches what your test case needs. The orchestrator caps the total inlined bytes; any files skipped due to budget are listed at the end of the user prompt — treat skipped files as "presumed unfit" and prefer `create` over `reuse` for symbols defined in them.
 
 ## Output
@@ -48,7 +49,7 @@ For each AUTOMATABLE test case in `test-strategy.md`:
 
 1. **Determine `test_file_target`.** Use `test_directory_layout.default_target` + convention (`by_type` → e.g. `tests/e2e/qtea_<slug>_test.py`; `by_page` → `tests/<page>/qtea_<slug>_test.py`; `flat` → `tests/qtea_<slug>_test.py`). File name pattern is strict: `qtea_<feature>_test.py` for Python (starts with the `qtea_` collision-avoidance prefix and ends with `_test.py` so it matches pytest's default `*_test.py` discovery — note `qteaest_<feature>.py` matches NEITHER `test_*.py` nor `*_test.py` and would be silently uncollected), `qtea_<feature>.spec.ts` for TS/JS, `Qtea<Feature>Test.java` for Java.
 
-2. **Map preconditions to fixtures.** For each precondition (e.g. "user is authenticated"), look in `existing_fixtures` for a fixture that covers it. If found → emit `{"source": "reuse", "from": "<file>:<fixture_name>"}`. If not → apply the **compose-over-create check** below before emitting `source: create`. Default new fixtures to `tests/conftest.py` unless the inventory shows a different fixture file convention.
+2. **Map preconditions to fixtures OR Arrange steps.** For each precondition (e.g. "user is authenticated", "a completed entry exists"), first look in `existing_fixtures` for a fixture that covers it. If found → emit `{"source": "reuse", "from": "<file>:<fixture_name>"}`. If not → apply the **compose-over-create check** below before emitting `source: create`. Default new fixtures to `tests/conftest.py` unless the inventory shows a different fixture file convention. **Crucially: a precondition that is not met by a fixture is not "done" — it becomes an explicit Arrange step in `steps[]` (see step 6a).** A `loginPage`/page-object fixture that only constructs the page object does NOT authenticate; the login must be an Arrange step. Never assume the SUT arrives at the first Act step already logged-in and pre-populated unless a reused fixture actually guarantees it.
 
    **Compose-over-create check** (mandatory before emitting `source: create`):
    - **Can the precondition be met by calling an existing POM method in the test body?** Check `existing_page_objects[].methods` and `existing_locators[].constants` for a method or locator that already handles this concern (e.g. `LANGUAGE_DROP_DOWN` + `SELECT_EN` locator constants mean the test can switch language via an existing POM method — no fixture needed). If yes, omit the fixture; the precondition is met inline in the test function body.
@@ -69,6 +70,26 @@ For each AUTOMATABLE test case in `test-strategy.md`:
 
 5. **Emit test function signatures.** Per test case, list one or more test_functions with name, markers (one of `qtea_smoke|qtea_regression|qtea_e2e|qtea_exploratory` derived from test-strategy `tags` or priority — default `qtea_smoke`), and the fixtures each function consumes.
 
+6. **Emit the ordered choreography (`steps[]`) — Arrange first, then Act.** This is the behavioral half of the plan — without it, the codegen writer re-derives the call sequence from prose and frequently picks the wrong method or wrong order (e.g. selecting a dropdown option before opening the dropdown). The writer transpiles `steps[]` **verbatim and will NOT invent setup** — so if a login or entity-creation action is not a step here, the generated test will have no login and no entity, and will fail at runtime (this is the single most common defect). Build `steps[]` in two phases:
+
+   **6a. Arrange steps (`phase: "arrange"`) — translate the `Preconditions:` block.** Walk the strategy test case's `Preconditions:` and emit an ordered step for every precondition that must be *established by the test* and is NOT already guaranteed by a reused auto-authenticating fixture (check `auth_flow.fixture_entry` and the fixture source — a fixture that merely constructs a page object does NOT authenticate). Typical Arrange steps:
+   - **Authentication:** the initial login as the role named in the precondition / step 1 ("As the <role>, …"). Emit `{"phase":"arrange","pom":"LoginPage","method":"<logIn>","args":["<USERNAME_CONST>","<PASSWORD_CONST>"]}`, choosing the credential constants from `auth_flow.credentials_env_vars` that match the named user. A mid-flow `switchUser(...)` changes identity later — it is NOT the initial login and does not replace it.
+   - **State setup:** creation/opening of the entity the test acts on (e.g. `createBasicRopaEntry` capturing an entity name), and navigation to it.
+
+   **6b. Act steps (`phase: "act"`).** Walk the manual test case's `Steps:` in order and emit one entry per interaction step.
+
+   Each `steps[]` entry carries:
+   - `order` — 1-based position across BOTH phases (Arrange steps come first).
+   - `phase` — `"arrange"` | `"act"` (default `"act"` if omitted).
+   - `manual_step_ref` — a short pointer to the originating manual step or precondition (e.g. `"precondition: logged in as editor"`, `"step 2: approve as Testuser92"`).
+   - `pom` — the owning POM class name (must match a `page_objects[].name` you emit in this test case).
+   - `method` — the method to call: either an existing reused method on that POM, or one of its `missing_methods[].name`. Never name a method you did not either reuse or list as missing.
+   - `locator` (optional) — the locator constant the step interacts with (must match a `locators[].name` in this test case).
+   - **`args` (REQUIRED whenever the method takes arguments)** — the authoritative, ordered argument expressions, one per required parameter, sourced from the strategy. This is where "which user", "which comment", "which expected value" live. Examples: a `switchUser` to the ISP Office approver → `args: ["USERNAME_ISP_OFFICE","PASSWORD_ISP_OFFICE"]`; an `approveReview` → `args: ["entityName","'ISP Office approval'","'…dialog text…'"]`; an `assertRopaStatus` → `args: ["'Approved'"]`. If a step's method needs arguments and you leave `args` empty, the writer emits a zero-arg stub that fails compilation — do not do this. Declare the credential/expected constants once (the writer emits them from the strategy) and reference them by name in `args`.
+   - `args_hint` (optional) — only for genuinely non-committal hints; prefer `args`.
+
+   Pure-assertion steps (verifying an expected result) do NOT need a `steps[]` entry — the writer lifts assertions from `test-strategy.md`. `steps[]` describes the ARRANGE + ACT actions that drive the test to the assertion point. Emit `steps[]` whenever the flow has more than one action; a single-action test may omit it.
+
 ## Non-negotiable rules
 
 1. **Never propose duplicates.** Every `create` decision must be justified by absence in the inventory. If a fixture / POM / helper / locator already exists with the right shape, you MUST emit `reuse` referencing it. The codegen agent enforces byte-match deduplication as a backstop, but planning duplicates wastes its turns.
@@ -79,6 +100,8 @@ For each AUTOMATABLE test case in `test-strategy.md`:
 6. **Plan version is `"1.0"`.** Set `plan_version: "1.0"` exactly. The codegen step rejects other values.
 7. **Schema-first.** Your output is validated against `schemas/code-modification-plan.schema.json` before handoff. Any schema violation is a hard rejection.
 8. **Generated names are always `create`.** Names starting with `qtea_` (Python/TS) or `Qtea` (Java) are reserved for pipeline-generated artifacts — they do NOT exist in the SUT. Never set `source: "reuse"` on an entry whose `name` contains this prefix; always use `source: "create"` (or `create_tbd` for locators). This includes `from` paths containing `qtea_` — a file like `src/pages/qtea_custom_page.py` is generated, not pre-existing.
+10. **Every test must arrange its own preconditions and bind its arguments.** If a test performs authenticated actions and no reused fixture authenticates, `steps[]` MUST begin with an Arrange login step (`phase: "arrange"`). If a test acts on an entity, `steps[]` MUST create/open it. Every step whose method takes parameters MUST carry an authoritative `args` array sourced from the strategy — never leave `args` empty for a parameterized method (that produces zero-arg stub calls that fail codegen). The phase gate rejects a plan that references a login page object/fixture but never invokes a login method.
+
 9. **Justify every reuse against the source you read.** Every `source: "reuse"` entry MUST include a `reuse_justification` field — one sentence (≤200 chars) that names the concrete matching dimension you observed when reading the inlined `reuse-source/*` file. Reference the matching dimension explicitly: yielded type and pre-state for fixtures (e.g. `"yields Page already authenticated as admin and dismisses welcome modal"`), owning-page coherence for POMs (e.g. `"ChatPage already models the /chat route and its side-nav region this TC exercises"`), selector-intent overlap for locators (e.g. `"existing SIGN_IN_BUTTON constant targets the same primary CTA on the login form"`). Empty / generic / shape-less justifications ("matches", "fits", "reuse from inventory") are rejected by the phase gate. If after reading the source you cannot name a concrete matching dimension, emit `source: "create"` (or `create_tbd` for locators) instead.
 
 ## Workflow
@@ -103,6 +126,7 @@ Every entry below MUST have its required fields present, with the right discrimi
 | top-level plan | `plan_version`, `active_module`, `test_cases` | — | — |
 | `test_case` | `id` (TC-…), `test_file_target`, `test_functions` | — | — |
 | `test_function` | `name` | — | — |
+| `choreography_step` (in `test_functions[].steps[]`) | `order`, `pom`, `method` (+ `args` whenever the method takes parameters; + `phase: "arrange"` on login/setup steps) | — | — |
 | `fixture_entry` | `name`, `source` | `from`, **`reuse_justification`** | `at` |
 | `page_object_entry` | `name`, `source` | `from`, **`reuse_justification`** | `at`; each `missing_methods[]` needs `name` + `signature` |
 | `helper_entry` | `name`, `source` | `from`, **`reuse_justification`** | `at` |
@@ -126,7 +150,11 @@ Every entry below MUST have its required fields present, with the right discrimi
         {
           "name": "test_login_with_valid_credentials",
           "markers": ["qtea_smoke"],
-          "uses_fixtures": ["authenticated_session"]
+          "uses_fixtures": ["authenticated_session"],
+          "steps": [
+            {"order": 1, "phase": "arrange", "manual_step_ref": "precondition: on the login page", "pom": "LoginPage", "method": "fill_email", "locator": "EMAIL_INPUT", "args": ["VALID_EMAIL"]},
+            {"order": 2, "phase": "act", "manual_step_ref": "step 2: submit", "pom": "LoginPage", "method": "submit", "locator": "SIGN_IN_BUTTON"}
+          ]
         }
       ],
       "fixtures": [
@@ -158,6 +186,7 @@ The step's phase gate validates:
 - Every `missing_methods` entry has a signature (no shape-less stubs).
 - Every `create_tbd` locator has an `intent` string of ≤120 chars.
 - Marker names match `qtea_<phase>` convention exactly.
+- **Arrange/login coverage:** if a test case plans a login/auth page object or fixture (name matching `login`/`signin`/`auth`) but no `steps[]` entry invokes a login method, the plan is rejected — a planned-but-never-invoked login page is the "missing login" defect. Either add the Arrange login step or drop the unused login page object.
 - The plan validates against `schemas/code-modification-plan.schema.json`.
 
 Failures abort the pipeline. No retry beyond the standard MAX_ATTEMPTS=2.

@@ -11,7 +11,7 @@ test-manager: claude-sonnet-4-6
 polyglot-test-researcher: claude-opus-4-6
 test-architect: claude-opus-4-6
 codegen-violation-fixer: claude-sonnet-4-6
-codegen-pom-extender: claude-sonnet-4-6
+codegen-pom-extender: claude-opus-4-6
 codegen-test-writer: claude-opus-4-6
 
 # -- Phase C: Execution & Reporting --

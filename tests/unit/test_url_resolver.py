@@ -22,6 +22,45 @@ def _touch(p: Path, content: str = "") -> None:
 
 
 # ---------------------------------------------------------------------------
+# Python base-URL source probe (pytest-playwright / conftest fixtures)
+# ---------------------------------------------------------------------------
+
+
+def test_python_base_url_fixture_return(tmp_path: Path):
+    """A `base_url()` fixture returning a literal URL is picked up when no
+    BaseSettings URL field exists (the pytest-playwright convention)."""
+    _touch(tmp_path / "conftest.py", (
+        "import pytest\n"
+        "@pytest.fixture(scope='session')\n"
+        "def base_url():\n"
+        "    return 'https://app-qa.example.com'\n"
+    ))
+    res = detect_qa_base_url(tmp_path)
+    assert res.value == "https://app-qa.example.com"
+    assert res.source == "python_source"
+    assert res.key == "SUT_BASE_URL"
+
+
+def test_python_base_url_qa_first_across_sources(tmp_path: Path):
+    """When several base-url assignments exist, QA-first ranking wins over
+    prod/staging, honouring the module's non-negotiable invariant."""
+    _touch(tmp_path / "prod.py", "BASE_URL = 'https://app-prod.example.com'\n")
+    _touch(tmp_path / "ctx.py",
+           "def mk(b):\n    b.new_context(base_url='https://staging.example.com')\n")
+    _touch(tmp_path / "conf.py", "qa_base_url = 'https://app-qa.example.com'\n")
+    res = detect_qa_base_url(tmp_path)
+    assert res.value == "https://app-qa.example.com"
+
+
+def test_python_base_url_ignores_database_url(tmp_path: Path):
+    """`database_url` ends in 'base_url' but must NOT be treated as a base URL
+    (and a non-http value never qualifies anyway)."""
+    _touch(tmp_path / "db.py", "database_url = 'https://db.example.com'\n")
+    res = detect_qa_base_url(tmp_path)
+    assert res.value is None
+
+
+# ---------------------------------------------------------------------------
 # _role_for_key — env-key → role rank
 # ---------------------------------------------------------------------------
 

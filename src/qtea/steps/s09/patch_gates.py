@@ -12,7 +12,6 @@ unit-test and safe to import from anywhere in the pipeline.
 from __future__ import annotations
 
 import re
-from collections import Counter
 
 # Literal XPath markers checked by ``_count_xpath_markers``.
 _XPATH_PATTERNS: tuple[str, ...] = (
@@ -63,7 +62,16 @@ def _patch_introduces_xpath(pre: bytes | None, post: bytes | None) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Assertion-immutability gate (mirrors XPath gate above)
+# Assertion-faithfulness gate (Gap F)
+#
+# The heal agent MAY correct a mis-transcribed assertion so it matches the
+# Step-4 expected result, but MUST NOT *weaken* one: no removal, and no
+# downgrade of a "strong" assertion (a concrete comparison / matcher) into a
+# "weak" one (a bare-truthy `assert <expr>`) to force a green over a real
+# value mismatch. This preserves the DEV-bug signal while letting the fixer
+# repair genuine codegen transcription errors — the exact intent of the
+# scope relaxation. (Replaces the former blanket assertion-immutability gate,
+# which rejected ALL assertion edits including legitimate corrections.)
 # ---------------------------------------------------------------------------
 
 _ASSERTION_LINE_PATTERNS: tuple[re.Pattern, ...] = (
@@ -78,6 +86,12 @@ _ASSERTION_LINE_PATTERNS: tuple[re.Pattern, ...] = (
     re.compile(r"^\s*Should\s+(?:Be|Contain|Match|Not)", re.IGNORECASE),
 )
 
+# Operators / call-forms that make a Python `assert` a CONCRETE (strong)
+# check rather than a bare-truthy one.
+_STRONG_ASSERT_SIGNAL_RE = re.compile(
+    r"==|!=|>=|<=|<|>|\bis\b|\bin\b|\bnot\b"
+)
+
 
 def _extract_assertion_lines(source: str) -> list[str]:
     """Extract normalised assertion lines from source (stripped + lowered)."""
@@ -89,12 +103,49 @@ def _extract_assertion_lines(source: str) -> list[str]:
     return out
 
 
-def _patch_modifies_assertions(pre: bytes | None, post: bytes | None) -> bool:
-    """True iff the post-heal source REMOVED or ALTERED any assertion line
-    that existed in the pre-heal source.
+def _is_strong_assertion(line: str) -> bool:
+    """True iff a (normalised, lower-cased) assertion line makes a CONCRETE
+    check rather than a bare-truthy one.
 
-    Adding new assertions is allowed. When *pre* is ``None`` the file was
-    created by the heal, so there were no prior assertions to protect."""
+    Strong: Playwright `expect(...).to_*`, `.should(...)`, JUnit-style
+    `assertequals/asserttrue/...(...)`, Robot `should be/contain/...`, and any
+    Python `assert` carrying a comparison/membership/identity operator.
+    Weak (bare-truthy): `assert loc.is_visible()`, `assert value` — the classic
+    softening target when downgrading a real comparison to force a pass."""
+    stripped = line.strip()
+    if (
+        stripped.startswith("expect(")
+        or ".should(" in stripped
+        or stripped.startswith("with pytest.raises")
+        or stripped.startswith("should ")
+        or re.match(
+            r"assert(?:equals|true|false|null|notnull|that|same|throws)\s*\(",
+            stripped,
+        )
+    ):
+        return True
+    if stripped.startswith("assert"):
+        # Python bare `assert`: strong only when it carries a real operator.
+        body = stripped[len("assert"):]
+        return bool(_STRONG_ASSERT_SIGNAL_RE.search(body))
+    # Unknown assertion-ish line — treat as strong (conservative: don't let an
+    # unrecognised form be silently dropped/weakened).
+    return True
+
+
+def _count_strong_assertions(assertion_lines: list[str]) -> int:
+    return sum(1 for ln in assertion_lines if _is_strong_assertion(ln))
+
+
+def _patch_weakens_assertions(pre: bytes | None, post: bytes | None) -> bool:
+    """True iff the post-heal source WEAKENS the test's assertions relative to
+    pre-heal — i.e. it removed an assertion, or downgraded a strong assertion
+    into a weak (bare-truthy) one.
+
+    Correcting an assertion's expected value (strong → strong, same count) is
+    ALLOWED — that's a legitimate fix for a codegen transcription error.
+    Adding assertions is allowed. When *pre* is ``None`` the file was created
+    by the heal, so there were no prior assertions to protect."""
     if pre is None or post is None:
         return False
     try:
@@ -106,11 +157,13 @@ def _patch_modifies_assertions(pre: bytes | None, post: bytes | None) -> bool:
     if not pre_assertions:
         return False
     post_assertions = _extract_assertion_lines(post_src)
-    pre_counts = Counter(pre_assertions)
-    post_counts = Counter(post_assertions)
-    return any(
-        post_counts.get(assertion, 0) < count
-        for assertion, count in pre_counts.items()
+    # Removal: fewer assertion lines after the heal.
+    if len(post_assertions) < len(pre_assertions):
+        return True
+    # Downgrade: fewer CONCRETE assertions after the heal (a strong check was
+    # turned into a bare-truthy one to force a pass).
+    return _count_strong_assertions(post_assertions) < _count_strong_assertions(
+        pre_assertions
     )
 
 
@@ -175,9 +228,11 @@ __all__ = [
     "_EMPTY_HANDLER_PATTERNS",
     "_XPATH_PATTERNS",
     "_count_empty_handlers",
+    "_count_strong_assertions",
     "_count_xpath_markers",
     "_extract_assertion_lines",
+    "_is_strong_assertion",
     "_patch_has_anti_patterns",
     "_patch_introduces_xpath",
-    "_patch_modifies_assertions",
+    "_patch_weakens_assertions",
 ]

@@ -119,18 +119,32 @@ def write_allure_results(report: RunReport, out_dir: Path) -> list[Path]:
     return written
 
 
-def generate_allure_html(results_dir: Path, html_dir: Path) -> bool:
-    # On Windows `allure` is installed as `allure.bat` / `allure.cmd`. Without
-    # shell=True, subprocess.run(["allure", ...]) fails with [WinError 2] —
-    # CreateProcess doesn't auto-append extensions. shutil.which() resolves
-    # the full path including extension on every platform.
+def resolve_allure_cmd() -> list[str] | None:
+    """Return the allure invocation to use.
+
+    Prefers a system-installed binary; falls back to npx (already a hard
+    prerequisite of qtea) so Allure works out of the box without a separate
+    global install. Returns None only if neither is available.
+    """
+    # On Windows allure ships as allure.bat / allure.cmd — shutil.which
+    # resolves the full path including extension on every platform.
     allure_bin = shutil.which("allure")
-    if not allure_bin:
+    if allure_bin:
+        return [allure_bin]
+    npx_bin = shutil.which("npx")
+    if npx_bin:
+        return [npx_bin, "--yes", "allure-commandline"]
+    return None
+
+
+def generate_allure_html(results_dir: Path, html_dir: Path) -> bool:
+    cmd = resolve_allure_cmd()
+    if not cmd:
         log.info("report.allure_not_found")
         return False
     try:
         proc = subprocess.run(
-            [allure_bin, "generate", str(results_dir), "-o", str(html_dir), "--clean"],
+            cmd + ["generate", str(results_dir), "-o", str(html_dir), "--clean"],
             capture_output=True,
             text=True,
             timeout=120,

@@ -198,7 +198,7 @@ async def call_reasoning_llm(
     output_schema: dict | None = None,
     inputs: dict[str, str] | None = None,
     model: str | None = None,
-    max_tokens: int = 16000,
+    max_tokens: int = 32000,
     timeout_s: int | None = None,
     step: int | None = None,
     hitl_history: list[dict] | None = None,

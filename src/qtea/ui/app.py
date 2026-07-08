@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 
 import flet as ft
@@ -63,18 +64,14 @@ def main(page: ft.Page):
                 try:
                     widget.update()
                 except Exception:
-                    try:
+                    with contextlib.suppress(Exception):
                         page.update()
-                    except Exception:
-                        pass
             if step_widget is not None and _state.current_step:
                 s = _state.steps.get(_state.current_step)
                 if s:
                     step_widget.value = fmt_elapsed(s.elapsed_s)
-                    try:
+                    with contextlib.suppress(Exception):
                         step_widget.update()
-                    except Exception:
-                        pass
             await asyncio.sleep(1)
 
     # ── Pipeline runner ──────────────────────────────────────────────────
@@ -155,10 +152,8 @@ def main(page: ft.Page):
             except asyncio.CancelledError:
                 return 130
             finally:
-                try:
+                with contextlib.suppress(Exception):
                     loop.close()
-                except Exception:
-                    pass
                 _state.pipeline_loop = None
                 _state.pipeline_task = None
 
@@ -261,6 +256,32 @@ def main(page: ft.Page):
 
     page.on_route_change = route_change
     page.on_view_pop = view_pop
+
+    # ── Ctrl+/Ctrl- zoom (resize window ±10%; Ctrl+0 resets) ────────────
+    _DEFAULT_W = int(page.window.width or 1480)
+    _DEFAULT_H = int(page.window.height or 920)
+    _STEP = 0.10  # 10% per keypress
+
+    def _on_keyboard(e: ft.KeyboardEvent) -> None:
+        if not e.ctrl:
+            return
+        w = int(page.window.width or _DEFAULT_W)
+        h = int(page.window.height or _DEFAULT_H)
+        if e.key in ("=", "+", "Numpad Add"):
+            page.window.width = max(800, round(w * (1 + _STEP)))
+            page.window.height = max(600, round(h * (1 + _STEP)))
+        elif e.key in ("-", "Numpad Subtract"):
+            page.window.width = max(800, round(w * (1 - _STEP)))
+            page.window.height = max(600, round(h * (1 - _STEP)))
+        elif e.key == "0":
+            page.window.width = _DEFAULT_W
+            page.window.height = _DEFAULT_H
+        else:
+            return
+        page.update()
+
+    page.on_keyboard_event = _on_keyboard
+
     # Populate initial view directly — page.go(page.route) is a no-op when
     # route hasn't changed, so route_change wouldn't fire.
     _build_views_for_route("/")

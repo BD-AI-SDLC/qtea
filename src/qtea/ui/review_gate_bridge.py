@@ -14,6 +14,7 @@ returns the user's Approve/Reject decision once the UI dialog completes.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 from typing import Any
 
@@ -103,10 +104,8 @@ class ReviewGateBridge:
         self.state.notify()
 
         try:
-            try:
+            with contextlib.suppress(Exception):
                 self.page.update()
-            except Exception:
-                pass
 
             await completion_event.wait()
 
@@ -130,8 +129,6 @@ class ReviewGateBridge:
             self.state.pending_review_gate = None
             self.state.resume_clock()
             self.state.notify()
-            try:
+            with contextlib.suppress(Exception):
                 self.page.update()
-            except Exception:
-                pass
             done.set()

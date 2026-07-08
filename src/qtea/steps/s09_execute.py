@@ -38,6 +38,7 @@ from qtea.claude_runner import run_agent
 from qtea.config import (
     HEAL_AGENT_MAX_TURNS,
     HEAL_AGENT_TIMEOUT_S,
+    MAX_HEAL_ITERS,
     package_resource_root,
     step_timeout,
 )
@@ -86,7 +87,7 @@ _QTEA_PYTEST_MARKER_FILTER = os.environ.get(
     "qtea_smoke or qtea_regression or qtea_e2e or qtea_exploratory",
 )
 
-# Patch-content quality gates (XPath / assertion-immutability / anti-patterns)
+# Patch-content quality gates (XPath / assertion-faithfulness / anti-patterns)
 # live in a dedicated submodule. Re-exported here so external callers and the
 # test suite keep resolving `qtea.steps.s09_execute._foo` at the historical
 # dotted path (test files pin these names via `from qtea.steps.s09_execute
@@ -94,6 +95,7 @@ _QTEA_PYTEST_MARKER_FILTER = os.environ.get(
 # Attempt-N state persistence + install-signature fingerprinting live in a
 # dedicated submodule. Re-exported here to preserve the historical dotted path.
 from qtea.steps.s09.attempt_state import (
+    _attempt_state_path,
     _compute_install_sig,
     _load_attempt_state,
     _save_attempt_state,
@@ -137,8 +139,10 @@ from qtea.steps.s09.dep_install import (
 from qtea.steps.s09.failure_class import (
     _build_bug_candidates,
     _classify_failure,
+    _extract_locator_search_term,  # noqa: F401 — re-exported for tests
     _failing_tests,
     _partition_failures,
+    _refine_element_not_in_dom,  # noqa: F401 — re-exported for tests
 )
 
 # Fixer-agent prompt builder, patch application, and runner-narrowing helpers
@@ -189,9 +193,10 @@ from qtea.steps.s09.overlay_sweep import (
     _interceptors_path,
 )
 from qtea.steps.s09.patch_gates import (
+    _count_xpath_markers,
     _patch_has_anti_patterns,
     _patch_introduces_xpath,
-    _patch_modifies_assertions,
+    _patch_weakens_assertions,
 )
 
 # TBD-sentinel promotion (rewrites tbd("intent") calls end-of-attempt) lives
@@ -199,8 +204,69 @@ from qtea.steps.s09.patch_gates import (
 # dotted path used by tests (test_promote_tbd_gating imports these via
 # `from qtea.steps.s09_execute import _promote_resolved_tbds`).
 from qtea.steps.s09.tbd_promotion import (
+    _ensure_runtime_imports,
+    _format_promoted_substitution,
     _promote_resolved_tbds,
 )
+
+
+def _hitl_request_env_vars(var_names: list[str]) -> dict[str, str]:
+    """Prompt the user for missing env var values via the shared HITL channel."""
+    from qtea.hitl import RESOLUTION_ANSWERED, Question, prompt_user
+
+    questions = [
+        Question(
+            id=k,
+            kind="env",
+            prompt_text=k,
+            context="missing — required by the test runner's globalSetup",
+        )
+        for k in var_names
+    ]
+    try:
+        answers = prompt_user(questions, agent_label="env-recovery")
+    except Exception as e:
+        log.warning("step09.env_recover_hitl_failed", error=str(e))
+        return {}
+
+    out: dict[str, str] = {}
+    for k in var_names:
+        ans = answers.get(k)
+        if ans is None:
+            continue
+        resolution, val = ans
+        if resolution != RESOLUTION_ANSWERED:
+            continue
+        val = (val or "").strip()
+        if val:
+            out[k] = val
+    return out
+
+
+def _persist_env_vars(workspace: Any, env_vars: dict[str, str]) -> None:
+    """Append newly supplied env vars to .env.qtea and sut/.env."""
+    for target in (workspace.root / ".env.qtea", workspace.sut / ".env"):
+        if not target.exists():
+            continue
+        try:
+            lines = target.read_text(encoding="utf-8")
+            existing_keys = {
+                line.split("=", 1)[0]
+                for line in lines.splitlines()
+                if "=" in line
+            }
+            additions = [
+                f"{k}={v}"
+                for k, v in sorted(env_vars.items())
+                if k not in existing_keys
+            ]
+            if additions:
+                if not lines.endswith("\n"):
+                    lines += "\n"
+                lines += "\n".join(additions) + "\n"
+                target.write_text(lines, encoding="utf-8")
+        except OSError:
+            pass
 
 
 def _compose_runner_stream_diagnostics(
@@ -1135,7 +1201,6 @@ class ExecuteStep(Step):
         heal_log_path = boot.heal_log_path
         _current_attempt = boot.current_attempt
         _prior_state = boot.prior_state
-        research = boot.research
         framework = boot.framework
         detected_cmd = boot.detected_cmd
         sut_tests = boot.sut_tests
@@ -1234,20 +1299,32 @@ class ExecuteStep(Step):
                 )
             )
             if _is_empty_collection and _applied_marker_filter:
+                _empty_err = (
+                    f"{framework} collected 0 tests matching the qtea "
+                    f"test filter. This is a codegen defect: Step 8 must "
+                    f"generate test files with the 'qtea_' prefix "
+                    f"(Playwright Test) or add @pytest.mark.qtea_<phase> "
+                    f"to every test function (pytest). Check the test files "
+                    f"in the SUT and ensure they follow the naming convention. "
+                    f"Override with QTEA_PYTEST_MARKER='' to run without "
+                    f"scoping (runs the full SUT suite, not recommended)."
+                )
+                # Step 9->8 back-edge (Gap C): zero-collection is a structural
+                # codegen defect no heal can fix — ask the pipeline to
+                # regenerate Step 8 once with this reason, then replay Step 9.
+                # The pipeline guards against cycles (single replay per run).
+                ctx.extras["rerun_step"] = 8
+                ctx.extras["rerun_reason"] = (
+                    "Step 9 collected 0 tests matching the qtea marker filter "
+                    f"({_applied_marker_filter}). Generated tests are missing "
+                    "the required @pytest.mark.qtea_<phase> marker (pytest) or "
+                    "the qtea_ filename prefix (Playwright Test)."
+                )
                 return StepResult(
                     success=False,
                     status="failed",
                     outputs=[],
-                    error=(
-                        f"{framework} collected 0 tests matching the qtea "
-                        f"test filter. This is a codegen defect: Step 8 must "
-                        f"generate test files with the 'qtea_' prefix "
-                        f"(Playwright Test) or add @pytest.mark.qtea_<phase> "
-                        f"to every test function (pytest). Check the test files "
-                        f"in the SUT and ensure they follow the naming convention. "
-                        f"Override with QTEA_PYTEST_MARKER='' to run without "
-                        f"scoping (runs the full SUT suite, not recommended)."
-                    ),
+                    error=_empty_err,
                 )
 
             log.info(
@@ -1463,6 +1540,64 @@ class ExecuteStep(Step):
                                 failing_after=len(failing),
                             )
 
+            # Missing env-var recovery: when the runner blew up because
+            # required env vars are absent (e.g. a globalSetup guard),
+            # prompt the user via HITL, inject the values, and retry.
+            if runner_only:
+                rf = (failing[0].runner_failure or {})
+                missing_vars = rf.get("vars") if rf.get("kind") == "missing_env" else None
+                if missing_vars and not getattr(ctx, "_env_recovery_done", False):
+                    ctx._env_recovery_done = True  # type: ignore[attr-defined]
+                    hitl_available = (
+                        (sys.stdin.isatty() or getattr(ctx.options, "ui_mode", False))
+                        and not getattr(ctx.options, "no_hitl", False)
+                        and not getattr(ctx.options, "yes", False)
+                    )
+                    if hitl_available:
+                        supplied = _hitl_request_env_vars(missing_vars)
+                        if supplied:
+                            for k, v in supplied.items():
+                                os.environ[k] = v
+                            _persist_env_vars(ctx.workspace, supplied)
+                            log.info(
+                                "step09.env_recovery_applied",
+                                keys=list(supplied.keys()),
+                            )
+                            first = run_tests(
+                                framework,
+                                cwd=ctx.workspace.sut,
+                                detected_command=_orig_cmd,
+                                timeout_s=min(self.timeout_s or 1800, 1800),
+                                env_extra=runtime_env,
+                                profile=stack_profile,
+                                headless=getattr(ctx.options, "headless", True),
+                                marker_filter=_QTEA_PYTEST_MARKER_FILTER,
+                                parallelism=getattr(ctx.options, "parallelism", 0),
+                            )
+                            test_runner_invocations = 2
+                            failing = _failing_tests(first)
+                            runner_only = (
+                                len(failing) > 0
+                                and all(r.id == "T-runner-failure" for r in failing)
+                            )
+                            if (
+                                not runner_only
+                                and first.exit_code == 3
+                                and all(r.runner_failure is not None for r in failing)
+                            ):
+                                runner_only = True
+                            log.info(
+                                "step09.env_recover_retry",
+                                runner_only_after=runner_only,
+                                failing_after=len(failing),
+                            )
+                    else:
+                        log.warning(
+                            "step09.env_recover_skipped",
+                            reason="non-interactive — cannot prompt for env vars",
+                            vars=missing_vars,
+                        )
+
             if runner_only:
                 rf = (failing[0].runner_failure or {})
                 log.warning(
@@ -1549,7 +1684,10 @@ class ExecuteStep(Step):
             # cap blocked the entire heal flow → no recovery → user saw
             # 11 mixed failures with the cache holding wrong selectors.
             if failing:
-                healable, real_bugs = _partition_failures(failing)
+                healable, real_bugs = _partition_failures(
+                    failing,
+                    aom_dir=ctx.workspace.root / "aom-at-failure",
+                )
                 if real_bugs:
                     _ts = datetime.now(UTC).isoformat()
                     for entry, cls in real_bugs:
@@ -1619,7 +1757,29 @@ class ExecuteStep(Step):
                         server=self._LAZY_MCP_SERVER,
                         warmup_s=mcp_warmup_s,
                     )
-            if failing and len(failing) <= _MAX_HEAL_TESTS:
+            if failing and len(failing) > _MAX_HEAL_TESTS:
+                log.warning(
+                    "step09.heal_skip",
+                    reason="too many failing tests",
+                    count=len(failing),
+                    cap=_MAX_HEAL_TESTS,
+                )
+
+            # Inner heal-retry loop (Gap D): heal → batch-rerun → recompute,
+            # up to MAX_HEAL_ITERS rounds, so a single test can be healed more
+            # than once within one pipeline attempt (a human SDET iterates on a
+            # locator/fixture until green). Each round re-invokes the fixer with
+            # the FRESH traceback from the prior round's re-run. The batch
+            # re-run stays a single post-gather run per round, preserving the
+            # shared-artifact safety of the parallel-heal design.
+            _heal_round = 0
+            while (
+                failing
+                and len(failing) <= _MAX_HEAL_TESTS
+                and _heal_round < MAX_HEAL_ITERS
+            ):
+                _heal_round += 1
+                _patches_before = patches_applied
                 fixer_agent = package_resource_root() / "agents" / "polyglot-test-fixer.agent.md"
                 sut_base_url = os.environ.get("SUT_BASE_URL")
                 heal_relevant_sut_files = _auth_relevant_sut_files(active_module)
@@ -1656,10 +1816,22 @@ class ExecuteStep(Step):
                     "step09.heal_parallel_start",
                     failing_count=len(failing),
                     concurrency=_heal_concurrency,
-                    tests=[e.name for e in failing],
+                    tests=[_fe.name for _fe in failing],
                 )
 
-                async def _do_one_heal(entry):
+                async def _do_one_heal(
+                    entry,
+                    *,
+                    # Bind the round-invariant setup values as default args so
+                    # the closure doesn't capture names assigned in the
+                    # enclosing heal-round loop (ruff B023 / late-binding).
+                    _heal_sem=_heal_sem,
+                    fixer_agent=fixer_agent,
+                    sut_base_url=sut_base_url,
+                    heal_relevant_sut_files=heal_relevant_sut_files,
+                    heal_allowlist=heal_allowlist,
+                    generated_files=generated_files,
+                ):
                     nonlocal patches_applied, patches_rejected
                     heal_wd = ctx.workspace.step_workdir(9) / f"heal-{entry.id}"
                     heal_wd.mkdir(parents=True, exist_ok=True)
@@ -1855,12 +2027,12 @@ class ExecuteStep(Step):
                                     target_in_sut.write_bytes(pre_bytes)
                                 elif target_in_sut.exists():
                                     target_in_sut.unlink()
-                            except OSError as e:
+                            except OSError as exc:
                                 log.warning(
                                     "step09.xpath_revert_failed",
                                     test_id=entry.id,
                                     file=entry.file,
-                                    error=str(e),
+                                    error=str(exc),
                                 )
                             log.warning(
                                 "step09.heal_rejected_xpath",
@@ -1874,19 +2046,19 @@ class ExecuteStep(Step):
                         post_bytes_assert = (
                             target_in_sut.read_bytes() if target_in_sut.exists() else None
                         )
-                        if _patch_modifies_assertions(pre_bytes, post_bytes_assert):
+                        if _patch_weakens_assertions(pre_bytes, post_bytes_assert):
                             assertion_rejected = True
                             try:
                                 if pre_bytes is not None:
                                     target_in_sut.write_bytes(pre_bytes)
                                 elif target_in_sut.exists():
                                     target_in_sut.unlink()
-                            except OSError as e:
+                            except OSError as exc:
                                 log.warning(
                                     "step09.assertion_revert_failed",
                                     test_id=entry.id,
                                     file=entry.file,
-                                    error=str(e),
+                                    error=str(exc),
                                 )
                             log.warning(
                                 "step09.heal_rejected_assertion_modified",
@@ -1911,12 +2083,12 @@ class ExecuteStep(Step):
                                     target_in_sut.write_bytes(pre_bytes)
                                 elif target_in_sut.exists():
                                     target_in_sut.unlink()
-                            except OSError as e:
+                            except OSError as exc:
                                 log.warning(
                                     "step09.anti_pattern_revert_failed",
                                     test_id=entry.id,
                                     file=entry.file,
-                                    error=str(e),
+                                    error=str(exc),
                                 )
                             log.warning(
                                 "step09.heal_rejected_anti_pattern",
@@ -1959,8 +2131,10 @@ class ExecuteStep(Step):
                         )
                     elif assertion_rejected:
                         summary_text = (
-                            "rejected: heal modified assertions in generated "
-                            "test (Step 9 assertion-immutability gate)"
+                            "rejected: heal WEAKENED an assertion (removed it or "
+                            "downgraded a concrete check to bare-truthy) — Step 9 "
+                            "assertion-faithfulness gate. Corrections that keep "
+                            "the check concrete are allowed; softening is not."
                         )
                     elif anti_pattern_rejected:
                         summary_text = (
@@ -1988,7 +2162,7 @@ class ExecuteStep(Step):
                     if xpath_rejected:
                         heal_entry["rejected"] = "xpath"
                     if assertion_rejected:
-                        heal_entry["rejected"] = "assertion_modified"
+                        heal_entry["rejected"] = "assertion_weakened"
                     if anti_pattern_rejected:
                         heal_entry["rejected"] = "anti_pattern"
                     if scope_violation:
@@ -2004,7 +2178,7 @@ class ExecuteStep(Step):
                 # do not raise; anything that DOES raise here is a true
                 # orchestrator bug worth surfacing.
                 _heal_t0 = time.monotonic()
-                await asyncio.gather(*[_do_one_heal(e) for e in failing])
+                await asyncio.gather(*[_do_one_heal(_fe) for _fe in failing])
                 log.info(
                     "step09.heal_parallel_done",
                     failing_count=len(failing),
@@ -2051,13 +2225,30 @@ class ExecuteStep(Step):
                             by_id.get(r.id, r) for r in first.results
                         ]
                         first.exit_code = second.exit_code
-            elif failing:
-                log.warning(
-                    "step09.heal_skip",
-                    reason="too many failing tests",
-                    count=len(failing),
-                    cap=_MAX_HEAL_TESTS,
+
+                # --- Inner heal-retry control (Gap D) ---
+                # Decide whether another round is worthwhile. Stop when no new
+                # patch landed this round (no progress to build on) or every
+                # previously-failing test now passes. Recompute `failing` from
+                # the merged results so the next round re-invokes the fixer with
+                # the fresh traceback from this round's patch. The while
+                # condition caps total rounds at MAX_HEAL_ITERS.
+                _iter_patches = patches_applied - _patches_before
+                if _iter_patches == 0:
+                    break
+                _prev_ids = {e.id for e in failing}
+                _still_healable, _ = _partition_failures(
+                    _failing_tests(first),
+                    aom_dir=ctx.workspace.root / "aom-at-failure",
                 )
+                failing = [e for e in _still_healable if e.id in _prev_ids]
+                if failing and _heal_round < MAX_HEAL_ITERS:
+                    log.info(
+                        "step09.heal_round_done",
+                        round=_heal_round,
+                        still_failing=len(failing),
+                        max_rounds=MAX_HEAL_ITERS,
+                    )
 
             # Post-run pipeline (payload assembly + artifacts + TBD promotion
             # + HITL sweeps + bug candidates + status determination) lives in
@@ -2089,7 +2280,14 @@ class ExecuteStep(Step):
 __all__ = [
     "ExecuteStep",
     "_apply_fixer_outputs",
+    # Re-exported from s09 submodules to preserve historical dotted paths used
+    # by tests (monkeypatch / direct import). Listed here so they count as
+    # intentional public re-exports rather than unused imports.
+    "_attempt_state_path",
     "_build_bug_candidates",
     "_build_fixer_prompt",
+    "_count_xpath_markers",
+    "_ensure_runtime_imports",
     "_filter_command_for_tests",
+    "_format_promoted_substitution",
 ]

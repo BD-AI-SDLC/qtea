@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+
 import flet as ft
 
 from qtea.ui.state import AppState, LogLine
@@ -148,17 +150,21 @@ def build_log_viewer(page: ft.Page, state: AppState) -> ft.Container:
             ]
         return lines
 
-    # Log list
-    log_list = ft.ListView(
-        auto_scroll=True,
+    # Log list — ft.Column with scroll=ALWAYS gives a permanently visible
+    # scrollbar. ft.ListView suppresses the bar when content fits or when
+    # the widget is inside a scrollable ancestor, which is the case in the
+    # results view. scroll_to(offset=-1) replaces ListView's auto_scroll.
+    log_list = ft.Column(
+        scroll=ft.ScrollMode.ALWAYS,
         spacing=0,
-        padding=ft.Padding.symmetric(vertical=4),
         expand=True,
     )
 
     def refresh_log_list() -> None:
         filtered = _get_filtered_lines()
         log_list.controls = [_build_log_line(l) for l in filtered]
+        with contextlib.suppress(Exception):
+            log_list.scroll_to(offset=-1, duration=0)
 
     refresh_log_list()
 

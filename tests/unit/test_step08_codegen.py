@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from qtea.checkpoints import RunState
 from qtea.pipeline import PipelineOptions
 from qtea.runtime.dev_locators import DevLocator
@@ -588,7 +590,7 @@ def test_phase_b55_collects_stragglers_for_llm(tmp_path: Path):
         "}\n",
         encoding="utf-8",
     )
-    reports, stragglers = _run_phase_b55_xpath_normalisation(
+    _reports, stragglers = _run_phase_b55_xpath_normalisation(
         sut_root=sut,
         candidates={pom.resolve()},
     )
@@ -1115,7 +1117,7 @@ def test_detect_init_placement_with_self_attrs():
 
 
 def test_detect_init_placement_class_level():
-    use_self, indent, idx = _detect_init_placement(_LOCATORS_CLASS_LEVEL)
+    use_self, _indent, _idx = _detect_init_placement(_LOCATORS_CLASS_LEVEL)
     assert use_self is False
 
 

@@ -2,7 +2,6 @@
 
 > **Documentation only.** This file describes what `src/qtea/pipeline.py` does — no Python code loads it at runtime. It is the canonical human/AI-facing specification of the orchestration contract; keep it in sync when the contract changes.
 
-> HOW to execute what `docs/qa-orchestrator.agent.md` defines.
 > Read `CLAUDE.md` first -- it is the source of truth for pipeline structure,
 > agent-model map, MCP servers, and non-negotiable rules.
 >
@@ -80,7 +79,7 @@ For each step in `_select_steps()` (respecting `--from-step`, `--only-step`, `--
    - The curated input bundle (files listed in section 3 below).
    - MCP servers as configured in [`.mcp.json`](../.mcp.json).
    - A per-step timeout cap from [`config.py`](../src/qtea/config.py)
-     (`step_timeout(N)`; the global cap is `MAX_STEP_TIMEOUT`).
+     (`step_timeout(N)`; the global cap is `MAX_STEP_TIMEOUT_S`, overridable via `QTEA_MAX_STEP_TIMEOUT_S`).
 4. Stream agent progress. Write each event to `run.log.jsonl` with fields:
    `run_id`, `step`, `agent`, `attempt`, `correlation_id`, `timestamp`.
 5. Mask secrets in all log output: `ANTHROPIC_API_KEY`, `JIRA_API_TOKEN`,
@@ -525,3 +524,150 @@ After step 11 completes (or after abort):
 2. Log a summary line: total steps completed, total duration, pass rate.
 3. Success = all 11 steps `completed` (or `skipped` for step 5 / step 9).
    Any `failed` step → run is partial.
+
+---
+
+## 9. Environment Variables Reference
+
+All variables are optional unless marked **required**. Defaults are applied in `src/qtea/config.py` unless noted.
+
+### Authentication
+
+| Variable | Default | Description |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | — | **Required** (unless `ANTHROPIC_AUTH_TOKEN` or Vertex is used). Masked in all logs. |
+| `ANTHROPIC_AUTH_TOKEN` | — | Bearer-token alternative; takes priority over `ANTHROPIC_API_KEY` when set. |
+| `ANTHROPIC_BASE_URL` | Anthropic default | Override the Anthropic API base URL (e.g. BMF/proxy relay endpoint). |
+| `ANTHROPIC_CUSTOM_HEADERS` | — | Semicolon-separated `Key: Value` headers injected into every API call. Prompt caching is auto-enabled when this contains the BMF sticky-session header (`x-bmf-sticky-session-instance`). |
+| `ANTHROPIC_VERTEX_BASE_URL` | — | Vertex AI proxy endpoint. Set alongside `CLAUDE_CODE_USE_VERTEX=1`. |
+| `ANTHROPIC_VERTEX_PROJECT_ID` | — | GCP project for Vertex AI routing. |
+| `CLOUD_ML_REGION` | `us-east5` | GCP region for Vertex AI. |
+| `CLAUDE_CODE_USE_VERTEX` | `0` | Set `1` to route `claude` CLI calls through Vertex AI. |
+| `DISABLE_PROMPT_CACHING` | — | Set `1` to globally disable prompt caching; forwarded to every `claude` subprocess. |
+
+### Jira / Xray (Steps 1, 5)
+
+| Variable | Default | Description |
+|---|---|---|
+| `JIRA_BASE_URL` | — | Jira instance URL (e.g. `https://company.atlassian.net`). Required for `jira:` specs. |
+| `JIRA_EMAIL` | — | Jira Cloud user email for Basic auth. |
+| `JIRA_API_TOKEN` | — | Jira Cloud API token. Masked in logs. |
+| `JIRA_PAT` | — | Personal Access Token for Jira Server / Data Center (Bearer auth). Masked in logs. |
+| `JIRA_AUTH_TYPE` | auto-detect | Override auth scheme: `basic` or `bearer`. Auto-detected from which credential vars are present. |
+| `JIRA_PROJECT_KEY` | — | Jira project key used as Xray upload fallback when the test-strategy omits one. |
+| `JIRA_XRAY_CLIENT_ID` | — | Xray Cloud OAuth2 client ID. Masked in logs. |
+| `JIRA_XRAY_CLIENT_SECRET` | — | Xray Cloud OAuth2 client secret. Masked in logs. |
+| `JIRA_XRAY_API_KEY` | — | Xray DC/Server API key (alternative to client ID/secret). Masked in logs. |
+
+### Azure DevOps (Step 1)
+
+| Variable | Default | Description |
+|---|---|---|
+| `AZDO_ORG` | — | Azure DevOps organisation slug. Required for `ado:` specs. |
+| `AZDO_PROJECT` | — | Azure DevOps project name. |
+| `AZDO_PAT` | — | Personal Access Token for ADO REST. Masked in logs. |
+| `AZDO_VARIABLE_GROUP` | — | Variable group name to pull SUT env vars from during Step 6 research. |
+
+### Proxy
+
+| Variable | Default | Description |
+|---|---|---|
+| `HTTPS_PROXY` / `https_proxy` | — | Standard HTTPS proxy. Picked up by HTTP clients and by the runtime's Playwright proxy-injection patch. |
+| `HTTP_PROXY` / `http_proxy` | — | HTTP proxy for non-TLS traffic. |
+| `NO_PROXY` / `no_proxy` | — | Comma-separated hosts to bypass the proxy. |
+| `QTEA_PROXY` | — | QTEA-specific proxy override; wins over `HTTPS_PROXY` in the runtime subprocess. |
+| `QTEA_DISABLE_PROXY_INJECT` | `0` | Set `1` to disable the runtime's automatic `proxy=` injection into `BrowserType.launch`. |
+
+### Pipeline Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `QTEA_DEFAULT_WORKSPACE` | `~/.qtea` | Root directory for all run workspaces. |
+| `QTEA_MAX_STEP_TIMEOUT_S` | `1800` | Per-step hard timeout (seconds). Overrides the `MAX_STEP_TIMEOUT_S` constant. |
+| `QTEA_CLAUDE_BIN` | `claude` | Name or path of the `claude` CLI binary to invoke. |
+| `QTEA_RESOURCE_ROOT` | (wheel snapshot) | Point at the live repository root so edited Markdown/YAML agent files take effect without reinstalling. Python edits still require reinstall. |
+| `SUT_BASE_URL` | — | Web root of the SUT. Used by Steps 6 and 7 live-explore when not inferrable from research. |
+
+### Debug / Fix-Chain Tuning
+
+| Variable | Default | Description |
+|---|---|---|
+| `QTEA_DEBUG_AGENT_MAX_TURNS` | `40` | Turn budget for the debug RCA agent. |
+| `QTEA_DEBUG_AGENT_TIMEOUT_S` | `900` | Wall-clock timeout for the debug agent (seconds). |
+| `QTEA_FIX_AGENT_MAX_TURNS` | `25` | Turn budget for the `critical-thinking` fix-strategy agent. |
+| `QTEA_FIX_AGENT_TIMEOUT_S` | `600` | Wall-clock timeout for the fix-strategy agent (seconds). |
+| `QTEA_AUTOFIX_MAX_TURNS` | `40` | Turn budget for the `principal-software-engineer` fix-proposal agent. |
+
+### Step 7 — Live Explore
+
+| Variable | Default | Description |
+|---|---|---|
+| `QTEA_LIVE_EXPLORE` | `1` | Set `0` to skip the live browser exploration pass in Step 7. |
+| `QTEA_LIVE_EXPLORE_MAX_ROUTES` | unlimited | Cap the number of routes explored per live-explore pass. |
+| `QTEA_LIVE_EXPLORE_MAX_TURNS` | `40` | Turn budget for the live-explore agent. |
+| `QTEA_LIVE_EXPLORE_TIMEOUT_S` | (step timeout) | Wall-clock timeout for the live-explore pass (seconds). |
+| `QTEA_REUSE_SOURCE_BUDGET` | unlimited | Max source files scanned when classifying locators as `reuse` vs `create_tbd`. |
+
+### Step 8 — Codegen Quality Gates
+
+| Variable | Default | Description |
+|---|---|---|
+| `QTEA_CODEGEN_CONCURRENCY` | `3` | Number of parallel `call_reasoning_llm` calls during Step 8 Phase A/B. |
+| `QTEA_SKIP_PARSE_CHECK` / `QTEA_NO_PARSE_CHECK` | — | Set `1` to skip Python `ast.parse` validation of generated test files. Emergency bypass only. |
+| `QTEA_SKIP_STATIC_CHECK` / `QTEA_NO_STATIC_CHECK` | — | Set `1` to skip the Ruff/mypy static-check gate. Emergency bypass only. |
+| `QTEA_STATIC_CHECK_TIMEOUT_S` | `120` | Timeout for static-check invocations (seconds). |
+| `QTEA_SKIP_INTENT_SCORE` | — | Set `1` to skip the intent-matching quality score gate. |
+| `QTEA_INTENT_FAIL_AS_WARN` | — | Set `1` to demote intent-score failures to warnings (non-blocking). |
+
+### Step 9 — Execution & Self-Heal
+
+| Variable | Default | Description |
+|---|---|---|
+| `QTEA_MAX_HEAL_ITERS` | `3` | Maximum heal→re-run rounds per attempt before reporting a test as `failed`. |
+| `QTEA_MAX_HEAL` | `15` | Maximum failing tests submitted to the heal agent per round. |
+| `QTEA_HEAL_CONCURRENCY` | `3` | Parallel heal worker slots. |
+| `QTEA_HEAL_MAX_TURNS` | `40` | Turn budget per `polyglot-test-fixer` invocation. |
+| `QTEA_HEAL_ALL` | — | Set `1` to attempt healing on failures the classifier would normally skip. |
+| `QTEA_DEFAULT_TIMEOUT_MS` | `60000` | Default Playwright action timeout injected into the SUT subprocess (milliseconds). |
+| `QTEA_INFLATE_TIMEOUTS` | `1` | Set `0` to disable the runtime's automatic timeout inflation on first-run TBD sentinels. |
+| `QTEA_STORAGE_STATE` | — | Path to a Playwright `storageState.json` to inject into the MCP browser. Overrides `<sut>/.qtea/storage-state.json`. |
+| `QTEA_PYTEST_MARKER` | — | Extra pytest marker expression appended to the test command. |
+| `QTEA_NO_LLM_RESOLVE` | — | Set `1` to disable LLM resolver tiers (4–5) and the heal agent symmetrically. Standard CI default for zero-LLM-spend runs. |
+
+### JIT Locator Resolution (Playwright stacks only)
+
+| Variable | Default | Description |
+|---|---|---|
+| `QTEA_DEV_LOCATORS` | `<workspace>/locator-cache/dev-locators.json` | Path to the operator-curated dev-locator file. |
+| `QTEA_DEV_POOL_THRESHOLD` | `0.65` | Minimum token-set-ratio score for a tier-1b intent-pool match. |
+| `QTEA_DEV_POOL_MARGIN` | `0.10` | Minimum margin between top and second-best pool match (prevents near-tie false positives). |
+| `QTEA_DEV_POOL_PAGE_PENALTY` | `0.15` | Score penalty when a pool entry's page differs from the current page context. |
+| `QTEA_AOM_DEPTH` | unlimited | Maximum depth for `aria_snapshot` traversal. Cap to control snapshot size on deep DOMs. |
+| `QTEA_AOM_BOXES` | `auto` | Bounding-box mode: `auto` (use when Playwright ≥1.60 detected), `off`, or `force`. |
+| `QTEA_AOM_LEGACY_OK` | `1` | Set `0` to hard-fail when Playwright is too old to support `aria_snapshot`. |
+| `QTEA_DISABLE_JIT` | — | Set `1` to disable the JIT monkey-patch entirely (sentinels pass through as literal strings). |
+| `QTEA_VERIFY_UNIQUE` | `1` | Set `0` to skip the uniqueness check on promotable selectors. |
+
+### Overlay Handling
+
+| Variable | Default | Description |
+|---|---|---|
+| `QTEA_OVERLAY_HANDLING` | `1` | Set `0` to disable overlay auto-dismissal and the `page.add_locator_handler` registration path. |
+
+### Set by Pipeline (read-only for operators)
+
+These are injected into the SUT subprocess by `s09_execute.py`. Do not set manually — listed here for observability and troubleshooting.
+
+| Variable | Description |
+|---|---|
+| `QTEA_RUN_ID` | Unique run identifier (ISO-8601 timestamp or UUID). |
+| `QTEA_CACHE_DIR` | Directory where the JIT runtime reads/writes `locator-cache.json`. |
+| `QTEA_TESTS_DIR` | Absolute path to the SUT's test root (from `research.json`). |
+| `QTEA_WORKSPACE_DIR` | Absolute path to `.qtea/<run-id>/`. |
+| `QTEA_RESOLVER_PORT` | Port of the parent-side `ResolverServer` for tier-4 LLM resolution over loopback. |
+| `QTEA_RESOLVER_TOKEN` | Per-run HMAC secret authenticating resolver requests. `ANTHROPIC_API_KEY` is stripped from the subprocess env — the key stays in the trusted resolver process. |
+| `QTEA_RESOLVER_MODEL` | Model identifier used by `ResolverServer` for tier-4 LLM calls (from `agent_models.yaml`). |
+| `QTEA_RESOLVER_CMD` | Legacy subprocess fallback resolver command (used when `QTEA_RESOLVER_PORT` is unset). |
+| `QTEA_STORAGE_STATE_ARG` | `--storage-state=<path>` fragment injected into the Playwright MCP server command. |
+| `QTEA_MCP_USER_DATA_DIR_ARG` | `--user-data-dir=<path>` fragment for the MCP browser user-data directory. |
+| `QTEA_INTERCEPTORS` | Path to the persisted overlay interceptors file (`<sut>/.qtea/interceptors.json`). |

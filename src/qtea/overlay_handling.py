@@ -538,9 +538,7 @@ def _event_matches_bug_candidate(ev: OverlayEvent, bc: dict[str, Any]) -> bool:
     reclassified, even if the overlay could theoretically have caused it.
     """
     bc_test = str(bc.get("test_id") or bc.get("test") or "")
-    if not bc_test or bc_test != ev.test_id:
-        return False
-    return True
+    return not (not bc_test or bc_test != ev.test_id)
 
 
 def reclassify_bug_candidates(

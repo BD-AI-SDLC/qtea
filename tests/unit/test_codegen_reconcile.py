@@ -17,9 +17,72 @@ from qtea.codegen_reconcile import (
     Mismatch,
     fixture_mismatches_to_fixture_tasks,
     mismatches_to_pom_tasks,
+    pom_method_signatures,
     reconcile_codegen,
     reconcile_fixtures,
 )
+
+_TS_POM_ARROW_PROPERTIES = """\
+import { Page } from '@playwright/test';
+
+export class LoginPage {
+  readonly page: Page;
+  constructor(page: Page) { this.page = page; }
+
+  // classic method
+  goTo(): Promise<void> { return this.page.goto('/'); }
+
+  // arrow-function class properties (modern TS POM style)
+  logIn = async (username: string, password: string): Promise<void> => {
+    await this.page.fill('#u', username);
+  };
+  clickSubmit = () => this.page.click('#s');
+
+  // non-method properties must NOT be extracted as methods
+  count = 0;
+  items = [1, 2, 3];
+}
+"""
+
+
+def test_pom_method_signatures_extracts_arrow_properties():
+    """Arrow-function class-property methods (`logIn = async (u,p) => {}`) must
+    be extracted with correct params/arity, same as classic methods — and plain
+    data properties must be ignored."""
+    sigs = pom_method_signatures(_TS_POM_ARROW_PROPERTIES, "LoginPage", "typescript")
+    assert sigs["goTo"] == "()"
+    assert sigs["logIn"] == "(username: string, password: string)"
+    assert sigs["clickSubmit"] == "()"
+    # data properties are not methods
+    assert "count" not in sigs
+    assert "items" not in sigs
+
+
+def test_reconcile_arrow_property_arity(tmp_path: Path):
+    """A zero-arg call to an arrow-property method with required params is a
+    genuine arity mismatch (previously the method was invisible → the call
+    would have mis-reported as method_not_found)."""
+    pom_rel = "src/pages/LoginPage.ts"
+    test_rel = "tests/login.spec.ts"
+    _touch(tmp_path / pom_rel, _TS_POM_ARROW_PROPERTIES)
+    _touch(tmp_path / test_rel, """\
+import { LoginPage } from '../src/pages/LoginPage';
+import { test } from '@playwright/test';
+
+test('t', async ({ page }) => {
+  const loginPage = new LoginPage(page);
+  await loginPage.logIn();          // arity 0, needs 2 -> mismatch
+  await loginPage.clickSubmit();    // arity 0, needs 0 -> OK
+});
+""")
+    pom_files = [{"file": pom_rel, "class_name": "LoginPage"}]
+    result = reconcile_codegen(
+        [tmp_path / test_rel], pom_files, tmp_path, "typescript",
+    )
+    kinds = {(m.call_site.method_name, m.kind) for m in result.mismatches}
+    assert ("logIn", "arity_mismatch") in kinds
+    # clickSubmit takes no args → a 0-arg call is fine, no mismatch.
+    assert not any(m.call_site.method_name == "clickSubmit" for m in result.mismatches)
 
 
 def _touch(p: Path, content: str = "") -> None:

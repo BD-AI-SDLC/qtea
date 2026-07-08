@@ -179,7 +179,7 @@ def _check_fixture_graph(
                     continue
                 if dep in path:
                     # Found a cycle.
-                    cycle_path = path[path.index(dep):] + [dep]
+                    cycle_path = [*path[path.index(dep):], dep]
                     edges = frozenset(
                         (cycle_path[i], cycle_path[i + 1])
                         for i in range(len(cycle_path) - 1)
@@ -200,7 +200,7 @@ def _check_fixture_graph(
                         )
                     )
                     continue
-                stack.append((dep, path + [dep]))
+                stack.append((dep, [*path, dep]))
     return out
 
 
@@ -534,7 +534,7 @@ def _check_auth_fixture_missing(
         # Build the set of POM class names imported in this file.
         imported_names: set[str] = set()
         for node in _ast.walk(tree):
-            if isinstance(node, _ast.ImportFrom) or isinstance(node, _ast.Import):
+            if isinstance(node, (_ast.ImportFrom, _ast.Import)):
                 for alias in node.names:
                     imported_names.add(alias.asname or alias.name)
         relevant_poms = imported_names & auth_scoped_poms

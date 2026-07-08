@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import re
 from datetime import UTC, datetime
+from pathlib import Path
 
 from qtea.test_runner import RunResult, TestRunEntry
 
@@ -63,9 +64,30 @@ def _failing_tests(run: RunResult) -> list[TestRunEntry]:
 # Operator escape: set `QTEA_HEAL_ALL=1` to bypass the classifier and
 # heal every failure (useful for debugging the classifier itself).
 
+# ``fixture_missing`` is healable since the heal scope was relaxed to permit
+# editing fixtures / conftest / test infrastructure: a `fixture 'X' not
+# found` error is a codegen/setup defect the fixer can repair in-loop
+# (create the fixture, fix its name, wire the dependency) rather than a
+# real product bug. ``import_error`` stays OUT of the healable set — a
+# missing generated module is a structural codegen gap best handled by the
+# Step 9->8 back-edge, not a per-test heal.
 _FAILURE_CLASS_HEALABLE = frozenset({
-    "locator_timeout", "tbd_unresolvable", "assertion_value", "unknown",
+    "locator_timeout", "tbd_unresolvable", "assertion_value",
+    "fixture_missing", "unknown",
 })
+
+# Positive signal: Playwright confirmed the locator resolved to a DOM node
+# before timing out (element found but not yet visible/enabled/stable).
+# Absence of this line in a Playwright Locator.* timeout means the element
+# was never found — classified as element_not_in_dom, not locator_timeout.
+_ELEMENT_IN_DOM_RE = re.compile(r"locator resolved to\s*<", re.I)
+
+# Guard: only apply the element_not_in_dom refinement when the timeout was
+# raised by a Locator method call, not a page-level event / navigation wait
+# (e.g. "Timeout Xms exceeded while waiting for event 'load'").
+# Case-insensitive so it matches both Playwright Python ("Locator.click:")
+# and Playwright TypeScript/JS ("locator.click:").
+_LOCATOR_METHOD_RE = re.compile(r"\bLocator\.", re.I)
 
 _CLASSIFY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     # JIT runtime fail-fast — the bundle was exhausted, LLM re-resolve gave
@@ -74,13 +96,29 @@ _CLASSIFY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("tbd_unresolvable", re.compile(
         r"qtea JIT runtime: could not resolve locator", re.I,
     )),
+    # Element genuinely absent from the DOM — frameworks that raise a
+    # dedicated "not found" exception rather than timing out. Covers
+    # Selenium/WebDriver/Appium (all languages), Cypress, and WebdriverIO.
+    # Playwright TimeoutError cases are refined separately in
+    # _classify_failure using the call-log "locator resolved to" signal.
+    ("element_not_in_dom", re.compile(
+        r"NoSuchElementException"                                # Selenium/Appium — Java, Python, Ruby, C#
+        r"|no\s+such\s+element"                                  # WebDriver wire-protocol prose
+        r"|Unable\s+to\s+locate\s+element"                       # Selenium error text
+        r"|element\s+not\s+found"                                # WebdriverIO / generic stacks
+        r"|Expected\s+to\s+find\s+element.*but\s+never\s+found"  # Cypress
+        r"|querying\s+.+yielded\s+0\s+elements",                 # Cypress alternate form
+        re.I,
+    )),
     # Playwright TimeoutError on any Locator action (get_attribute, click,
     # select_option, etc.). The runtime template's bundle-fallback already
     # tried alternatives + re-resolved; reaching this stage means we need
-    # MCP-driven live inspection.
+    # MCP-driven live inspection. _classify_failure refines this class to
+    # element_not_in_dom when the call log lacks "locator resolved to".
     ("locator_timeout", re.compile(
-        r"playwright[\._]+_impl[\._]+_errors\.TimeoutError"
-        r"|TimeoutError:\s*Locator\.",
+        r"playwright[\._]+_impl[\._]+_errors\.TimeoutError"  # Python module path
+        r"|TimeoutError:\s*Locator\."                        # Python: "TimeoutError: Locator.click:"
+        r"|locator\.\w+:\s*Timeout\s+\d+ms\s+exceeded",     # TypeScript/JS: "locator.click: Timeout Xms"
         re.I,
     )),
     ("locator_timeout", re.compile(
@@ -136,18 +174,149 @@ def _classify_failure(entry: TestRunEntry) -> str:
     AssertionError). Returns ``"unknown"`` when nothing matches; the heal
     gate treats unknown as healable so a classifier gap never blocks a
     fix opportunity.
+
+    Playwright locator_timeout refinement (Layer 1):
+    When a Playwright Locator.* timeout matches, the call log is inspected
+    for "locator resolved to <" — Playwright's signal that the element WAS
+    found in the DOM (it just wasn't in the required state yet). If that
+    signal is absent, the element was never found and the failure is
+    reclassified as element_not_in_dom so the heal agent is not invoked.
+    The refinement only fires for Locator-method timeouts (_LOCATOR_METHOD_RE),
+    not page-level event / navigation waits which lack a locator resolution
+    step entirely.
     """
     haystack = "\n".join(filter(None, (entry.message, entry.traceback)))
     if not haystack:
         return "unknown"
     for label, pat in _CLASSIFY_PATTERNS:
         if pat.search(haystack):
+            if (
+                label == "locator_timeout"
+                and _LOCATOR_METHOD_RE.search(haystack)
+                and not _ELEMENT_IN_DOM_RE.search(haystack)
+            ):
+                return "element_not_in_dom"
             return label
     return "unknown"
 
 
+# ---------------------------------------------------------------------------
+# Layer 2: AOM-at-failure cross-check
+#
+# When Layer 1 classifies a failure as element_not_in_dom, that could be:
+#   (a) element genuinely absent from the DOM  →  real DEV bug, no heal
+#   (b) locator is wrong / stale but element exists  →  heal can fix
+#
+# Layer 2 resolves the ambiguity by reading the AOM snapshot captured by
+# the runtime plugin at the moment of failure
+# (<workspace>/aom-at-failure/<entry_id>.txt) and searching for a
+# distinctive token extracted from the Playwright call-log locator
+# expression. If the token appears in the AOM, the element is present on
+# the page and the failure is reclassified as locator_timeout (healable).
+# If absent, element_not_in_dom is confirmed.
+# ---------------------------------------------------------------------------
+
+# Regex to pull the locator expression out of a Playwright call log.
+_WAITING_FOR_LOCATOR_RE = re.compile(
+    r"waiting\s+for\s+locator\(\s*['\"](.+?)['\"]\s*\)",
+    re.I,
+)
+# Extract the value of a data-testid attribute from a CSS selector.
+_TESTID_RE = re.compile(r'data-testid\s*=\s*["\']([^"\']+)["\']', re.I)
+# Extract a role= value (Playwright engine or ARIA).
+_ROLE_RE = re.compile(r'\brole\s*=\s*["\']([^"\']+)["\']', re.I)
+
+# Generic UI vocabulary that appears in almost every AOM and provides no
+# discriminating signal when searching for a specific element.
+_GENERIC_UI_TOKENS = frozenset({
+    "btn", "button", "link", "input", "text", "form", "icon",
+    "img", "image", "div", "span", "label", "item", "list",
+    "nav", "header", "footer", "main", "section", "container",
+    "wrapper", "inner", "outer",
+})
+
+
+def _extract_locator_search_term(haystack: str) -> str | None:
+    """Return a distinctive search token from a Playwright call-log entry.
+
+    Priority:
+      1. ``data-testid`` value — split by ``-/_``, return first token >3
+         chars that is not in the generic UI vocabulary.
+      2. ``role=`` value — the ARIA role name.
+      3. Any quoted string ≥4 chars in the locator expression.
+    Returns ``None`` when no useful token can be extracted.
+    """
+    m = _WAITING_FOR_LOCATOR_RE.search(haystack)
+    if not m:
+        return None
+    expr = m.group(1)
+
+    # data-testid → most reliable; pick the first non-generic token
+    m2 = _TESTID_RE.search(expr)
+    if m2:
+        val = m2.group(1)
+        for tok in re.split(r"[-_\s]+", val):
+            if len(tok) > 3 and tok.lower() not in _GENERIC_UI_TOKENS:
+                return tok
+        return val  # full value as fallback
+
+    # role= → ARIA role name
+    m2 = _ROLE_RE.search(expr)
+    if m2:
+        return m2.group(1)
+
+    # Any quoted string fragment ≥4 chars (covers text= / name= locators)
+    m2 = re.search(r'["\']([^"\']{4,})["\']', expr)
+    if m2:
+        return m2.group(1)
+
+    return None
+
+
+def _refine_element_not_in_dom(
+    entry: TestRunEntry,
+    aom_dir: Path | None,
+) -> str:
+    """Validate an element_not_in_dom classification against the AOM snapshot
+    captured at failure time (Layer 2).
+
+    If a distinctive token from the locator expression is found in the AOM,
+    the element exists on the page under a different selector
+    (wrong/stale locator) → reclassify as ``locator_timeout`` so the heal
+    agent gets the chance to find the correct selector.
+
+    If the token is absent (or no AOM is available), the element is
+    confirmed absent → keep ``element_not_in_dom``.
+    """
+    if aom_dir is None:
+        return "element_not_in_dom"
+    # Import here to avoid a hard dependency on pathlib at module import time
+    # in contexts where only the regex helpers are needed.
+    from pathlib import Path as _Path
+    aom_path = _Path(aom_dir) / f"{entry.id}.txt"
+    if not aom_path.exists():
+        return "element_not_in_dom"
+    try:
+        aom_text = aom_path.read_text(encoding="utf-8")
+    except OSError:
+        return "element_not_in_dom"
+    if not aom_text.strip():
+        return "element_not_in_dom"
+
+    haystack = "\n".join(filter(None, (entry.message, entry.traceback)))
+    term = _extract_locator_search_term(haystack)
+    if not term:
+        return "element_not_in_dom"
+
+    if term.lower() in aom_text.lower():
+        return "locator_timeout"
+
+    return "element_not_in_dom"
+
+
 def _partition_failures(
     failing: list[TestRunEntry],
+    aom_dir: Path | None = None,
 ) -> tuple[list[TestRunEntry], list[tuple[TestRunEntry, str]]]:
     """Split ``failing`` into (healable, real_bugs).
 
@@ -157,6 +326,12 @@ def _partition_failures(
     Operator escape: ``QTEA_HEAL_ALL=1`` returns ``(failing, [])`` —
     skips classification and heals everything. Use when the classifier
     itself is suspected of false-positively excluding a real heal target.
+
+    ``aom_dir`` — when provided (``<workspace>/aom-at-failure``), any
+    tentative ``element_not_in_dom`` result is refined via Layer 2:
+    if the locator's distinctive token appears in the AOM snapshot
+    captured at failure time, the element exists under a wrong selector
+    and the class is upgraded to ``locator_timeout`` (healable).
     """
     if os.environ.get("QTEA_HEAL_ALL") == "1":
         return list(failing), []
@@ -164,6 +339,8 @@ def _partition_failures(
     real_bugs: list[tuple[TestRunEntry, str]] = []
     for entry in failing:
         cls = _classify_failure(entry)
+        if cls == "element_not_in_dom" and aom_dir is not None:
+            cls = _refine_element_not_in_dom(entry, aom_dir)
         if cls in _FAILURE_CLASS_HEALABLE:
             healable.append(entry)
         else:
@@ -192,9 +369,17 @@ def _build_bug_candidates(failing: list[TestRunEntry]) -> dict:
 
 __all__ = [
     "_CLASSIFY_PATTERNS",
+    "_ELEMENT_IN_DOM_RE",
     "_FAILURE_CLASS_HEALABLE",
+    "_GENERIC_UI_TOKENS",
+    "_LOCATOR_METHOD_RE",
+    "_ROLE_RE",
+    "_TESTID_RE",
+    "_WAITING_FOR_LOCATOR_RE",
     "_build_bug_candidates",
     "_classify_failure",
+    "_extract_locator_search_term",
     "_failing_tests",
     "_partition_failures",
+    "_refine_element_not_in_dom",
 ]

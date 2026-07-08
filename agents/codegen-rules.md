@@ -183,7 +183,25 @@ When the active module's POM already wraps a common Playwright/Selenium/framewor
 - The action is POM-internal (inside a new POM method you're writing) and you're implementing the primitive that the test will call — raw framework API is correct here.
 - The test is exercising framework edge-case behavior (e.g. testing that a `page.goto` with `wait_until="commit"` differs from `"networkidle"`) where the POM abstraction would hide what's under test.
 
-## 8. DOM Attribute Diagnostics for POM Methods (Python + pytest + Playwright)
+## 8. Pre-existing Locator Preservation
+
+When reusing a locator constant from the SUT inventory, preserve its selector value **exactly as-is** — even if it uses XPath, bare CSS, or any strategy below the priority ladder (§1). Rewriting a pre-existing locator risks breaking the SUT team's own tests and invalidates their established selectors.
+
+**Allowed:** Adding a comment next to the constant definition recommending migration:
+```typescript
+// RECOMMENDATION: consider migrating to getByRole('button', {name: 'Actions'}) for resilience
+readonly btnAction = '[data-testid="action-menu-button"]//button[contains(@class,"primary")]';
+```
+
+**Forbidden:**
+- Changing the value of the locator constant
+- Replacing the selector strategy (e.g. XPath → CSS, CSS → role)
+- Wrapping the value in a different Playwright/Selenium API call
+- Removing the locator and replacing it with a new one
+
+The §1 locator priority (`id > data-testid > role > … > scoped CSS; Never XPath`) applies only to **new locators created by qtea** (emitted as `tbd("intent")` sentinels). Pre-existing SUT locators are pass-through.
+
+## 9. DOM Attribute Diagnostics for POM Methods (Python + pytest + Playwright)
 
 Any POM method whose sole purpose is to **read a DOM attribute** (i.e. it calls `.get_attribute("attr_name")` and returns the result) MUST capture the element's opening HTML tag as an Allure attachment immediately before the `return`. This makes the raw attribute value visible in the Allure report without the noise of the full page source.
 

@@ -9,6 +9,7 @@ Two channels:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from typing import TYPE_CHECKING, Any
@@ -142,10 +143,8 @@ class _UILogHandler(logging.Handler):
     def _notify(self) -> None:
         """Push state change + page update."""
         self.state.notify()
-        try:
+        with contextlib.suppress(Exception):
             self.page.update()
-        except Exception:
-            pass
 
     def _throttled_update(self) -> None:
         """Rate-limited page update for high-frequency log lines."""
@@ -153,10 +152,8 @@ class _UILogHandler(logging.Handler):
         if now - self._last_update > self._throttle_ms:
             self._last_update = now
             self.state.notify()
-            try:
+            with contextlib.suppress(Exception):
                 self.page.update()
-            except Exception:
-                pass
 
     def _extract_event_dict(self, record: logging.LogRecord) -> dict[str, Any]:
         """Extract the structured event dict from a structlog LogRecord.

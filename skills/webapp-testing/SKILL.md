@@ -1,36 +1,22 @@
 ---
 name: webapp-testing
-description: Toolkit for interacting with and testing local web applications using Playwright. Supports verifying frontend functionality, debugging UI behavior, capturing browser screenshots, and viewing browser logs.
+description: Polyglot toolkit for interacting with and testing web applications using Playwright. Covers TypeScript, Python (pytest-playwright), and Java. Supports verifying frontend functionality, debugging UI behavior, capturing screenshots, and fixing hard-wait and XPath violations.
 ---
 
 # Web Application Testing
 
-This skill enables comprehensive testing and debugging of local web applications using Playwright automation.
-
-You should use the Playwright MCP Server to undertake the work if possible. If the MCP Server is unavailable, you can run the code in a local Node.js environment with Playwright installed.
+This skill provides Playwright patterns for all three supported test languages: **TypeScript**, **Python (pytest-playwright)**, and **Java**. Use the section matching your target language.
 
 ## When to Use This Skill
 
-Use this skill when you need to:
-
-- Test frontend functionality in a real browser
-- Verify UI behavior and interactions
-- Debug web application issues
-- Capture screenshots for documentation or debugging
-- Inspect browser console logs
-- Validate form submissions and user flows
-- Check responsive design across viewports
-
-## Prerequisites
-
-- Node.js installed on the system
-- A locally running web application (or accessible URL)
-- Playwright will be installed automatically if not present
+- Replacing `time.sleep()` / `Thread.sleep()` / `cy.wait(n)` with proper wait strategies
+- Replacing XPath locators with preferred Playwright locator APIs
+- Generating or fixing test interactions (navigation, form fill, click, assertion)
+- Debugging UI behavior with screenshots or console inspection
 
 ## Core Capabilities
 
 ### 1. Browser Automation
-
 - Navigate to URLs
 - Click buttons and links
 - Fill form fields
@@ -38,96 +24,179 @@ Use this skill when you need to:
 - Handle dialogs and alerts
 
 ### 2. Verification
-
-- Assert element presence
+- Assert element presence and visibility (web-first assertions — preferred)
 - Verify text content
-- Check element visibility
-- Validate URLs
-- Test responsive behavior
+- Validate URLs and page titles
+- Check element counts
 
 ### 3. Debugging
+- Capture screenshots (full-page or element-scoped)
+- Inspect browser console logs
+- Debug failed locator interactions
 
-- Capture screenshots
-- View console logs
-- Inspect network requests
-- Debug failed tests
+---
 
 ## Usage Examples
 
-### Example 1: Basic Navigation Test
+### Example 1: Navigation + Title Assertion
 
-```javascript
-// Navigate to a page and verify title
+**TypeScript**
+```typescript
 await page.goto("http://localhost:3000");
-const title = await page.title();
-console.log("Page title:", title);
+await expect(page).toHaveTitle("My App");
 ```
 
-### Example 2: Form Interaction
-
-```javascript
-// Fill out and submit a form
-await page.fill("#username", "testuser");
-await page.fill("#password", "password123");
-await page.click('button[type="submit"]');
-await page.waitForURL("**/dashboard");
+**Python**
+```python
+page.goto("http://localhost:3000")
+expect(page).to_have_title("My App")
 ```
+
+**Java**
+```java
+page.navigate("http://localhost:3000");
+assertThat(page).hasTitle("My App");
+```
+
+---
+
+### Example 2: Form Interaction + URL Assertion
+
+**TypeScript**
+```typescript
+await page.getByLabel("Username").fill("testuser");
+await page.getByLabel("Password").fill("password123");
+await page.getByRole("button", { name: "Sign in" }).click();
+await expect(page).toHaveURL("**/dashboard");
+```
+
+**Python**
+```python
+page.get_by_label("Username").fill("testuser")
+page.get_by_label("Password").fill("password123")
+page.get_by_role("button", name="Sign in").click()
+expect(page).to_have_url("**/dashboard")
+```
+
+**Java**
+```java
+page.getByLabel("Username").fill("testuser");
+page.getByLabel("Password").fill("password123");
+page.getByRole(AriaRole.BUTTON, new Page.GetByRoleOptions().setName("Sign in")).click();
+assertThat(page).hasURL(Pattern.compile(".*/dashboard"));
+```
+
+---
 
 ### Example 3: Screenshot Capture
 
-```javascript
-// Capture a screenshot for debugging
+**TypeScript**
+```typescript
 await page.screenshot({ path: "debug.png", fullPage: true });
 ```
 
-## Guidelines
+**Python**
+```python
+page.screenshot(path="debug.png", full_page=True)
+```
 
-1. **Always verify the app is running** - Check that the local server is accessible before running tests
-2. **Use explicit waits** - Wait for elements or navigation to complete before interacting
-3. **Capture screenshots on failure** - Take screenshots to help debug issues
-4. **Clean up resources** - Always close the browser when done
-5. **Handle timeouts gracefully** - Set reasonable timeouts for slow operations
-6. **Test incrementally** - Start with simple interactions before complex flows
-7. **Use selectors wisely** - Prefer data-testid or role-based selectors over CSS classes
+**Java**
+```java
+page.screenshot(new Page.ScreenshotOptions()
+    .setPath(Paths.get("debug.png"))
+    .setFullPage(true));
+```
+
+---
 
 ## Common Patterns
 
-### Pattern: Wait for Element
+### Pattern: Web-First Assertion (preferred over explicit waits)
 
-```javascript
-await page.waitForSelector("#element-id", { state: "visible" });
+Use web-first assertions — they auto-wait for the element to satisfy the condition. **Never use `time.sleep()`, `Thread.sleep()`, or `cy.wait(n)`.**
+
+**TypeScript**
+```typescript
+await expect(page.getByText("Welcome")).toBeVisible();
+await expect(page.getByRole("button", { name: "Submit" })).toBeEnabled();
+await expect(page.getByTestId("error-banner")).toBeHidden();
 ```
+
+**Python**
+```python
+expect(page.get_by_text("Welcome")).to_be_visible()
+expect(page.get_by_role("button", name="Submit")).to_be_enabled()
+expect(page.get_by_test_id("error-banner")).to_be_hidden()
+```
+
+**Java**
+```java
+assertThat(page.getByText("Welcome")).isVisible();
+assertThat(page.getByRole(AriaRole.BUTTON, new Page.GetByRoleOptions().setName("Submit"))).isEnabled();
+assertThat(page.getByTestId("error-banner")).isHidden();
+```
+
+---
+
+### Pattern: Wait for Element State (when web-first assertion is not available)
+
+**TypeScript**
+```typescript
+await page.getByRole("heading", { name: "Results" }).waitFor({ state: "visible" });
+```
+
+**Python**
+```python
+page.get_by_role("heading", name="Results").wait_for(state="visible")
+```
+
+**Java**
+```java
+page.getByRole(AriaRole.HEADING, new Page.GetByRoleOptions().setName("Results"))
+    .waitFor(new Locator.WaitForOptions().setState(WaitForSelectorState.VISIBLE));
+```
+
+---
 
 ### Pattern: Check if Element Exists
 
-```javascript
-const exists = (await page.locator("#element-id").count()) > 0;
+**TypeScript**
+```typescript
+const exists = await page.getByTestId("error-banner").count() > 0;
 ```
 
-### Pattern: Get Console Logs
-
-```javascript
-page.on("console", (msg) => console.log("Browser log:", msg.text()));
+**Python**
+```python
+exists = page.get_by_test_id("error-banner").count() > 0
 ```
 
-### Pattern: Handle Errors
-
-```javascript
-try {
-  await page.click("#button");
-} catch (error) {
-  await page.screenshot({ path: "error.png" });
-  throw error;
-}
+**Java**
+```java
+boolean exists = page.getByTestId("error-banner").count() > 0;
 ```
 
-## Limitations
+---
 
-- Requires Node.js environment
-- Cannot test native mobile apps (use React Native Testing Library instead)
-- May have issues with complex authentication flows
-- Some modern frameworks may require specific configuration
+### Pattern: Locator Priority (generated code — in order of preference)
 
-## Helper Functions
+| Priority | Strategy | TypeScript | Python | Java |
+|---|---|---|---|---|
+| 1 | id | `page.locator("#submit")` | `page.locator("#submit")` | `page.locator("#submit")` |
+| 2 | data-testid | `page.getByTestId("submit-btn")` | `page.get_by_test_id("submit-btn")` | `page.getByTestId("submit-btn")` |
+| 3 | role | `page.getByRole("button", { name: "Submit" })` | `page.get_by_role("button", name="Submit")` | `page.getByRole(AriaRole.BUTTON, ...)` |
+| 4 | text | `page.getByText("Submit")` | `page.get_by_text("Submit")` | `page.getByText("Submit")` |
+| 5 | label | `page.getByLabel("Email")` | `page.get_by_label("Email")` | `page.getByLabel("Email")` |
+| 6 | placeholder | `page.getByPlaceholder("Enter email")` | `page.get_by_placeholder("Enter email")` | `page.getByPlaceholder("Enter email")` |
 
-Some helper functions are available in [`test-helper.js`](./assets/test-helper.js) to simplify common tasks like waiting for elements, capturing screenshots, and handling errors. You can import and use these functions in your tests to improve readability and maintainability.
+**Never use XPath in new or generated locators.**
+
+---
+
+## Guidelines
+
+1. **Verify the app is running** before navigating — check the server is accessible.
+2. **Use web-first assertions** (`toBeVisible`, `to_be_visible`, `isVisible`) instead of explicit waits. Never use `time.sleep()`, `Thread.sleep()`, or `cy.wait(n)`.
+3. **Prefer semantic locators** (`getByRole`, `getByLabel`, `getByTestId`) over CSS selectors. Never use XPath in new locators.
+4. **Capture screenshots on failure** for debugging — use `page.screenshot()` in error handlers.
+5. **Test incrementally** — start with simple navigation before complex flows.
+6. **No hard waits** — use `locator.waitFor(state="visible")` when you must wait, or restructure to use a web-first assertion.

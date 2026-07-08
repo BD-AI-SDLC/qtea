@@ -1192,20 +1192,35 @@ def test_parse_aria_snapshot_strips_box_and_ref_together(runtime):
 
 
 def test_heuristic_resolve_box_tiebreaker_picks_topmost(runtime):
-    """When two same-role+name candidates tie within
-    ``_HEURISTIC_TIE_GAP`` AND both have box coords, the tie-break
-    prefers the smaller-y (visually-higher) candidate."""
+    """Box tie-break picks the visually-higher (smaller-y) candidate among a
+    score near-tie. The winner's name must be UNIQUE for the emitted
+    role=name selector to survive the strict-mode uniqueness gate, so the
+    case the tie-break actually resolves is two DISTINCT names that tie on
+    score — position then decides which one wins."""
     yaml = (
-        '- button "Sign in" [box=10,500,80,30]\n'  # bottom
-        '- button "Sign in" [box=10,50,80,30]'    # top — should win
+        '- button "Sign in top" [box=10,50,80,30]\n'      # top — should win
+        '- button "Sign in bottom" [box=10,500,80,30]'    # bottom
     )
     tree = runtime._parse_aria_snapshot_yaml(yaml)
     selector = runtime._heuristic_resolve("sign in button", tree)
-    # Without the tie-break, the duplicate match would return None; the
-    # box-based tie-break promotes the visually-higher candidate.
-    assert selector == 'role=button[name="Sign in"]'
+    # Both match the intent equally; the box tie-break promotes the
+    # visually-higher ("top") candidate, whose name is unique.
+    assert selector == 'role=button[name="Sign in top"]'
     nodes = [n for n in runtime._aom_walk(tree) if n.get("role") == "button"]
     assert len(nodes) == 2
+
+
+def test_heuristic_resolve_rejects_identical_name_duplicates(runtime):
+    """Two IDENTICAL role+name candidates cannot be uniquely targeted by a
+    bare ``role=<role>[name="..."]`` selector (it would trip Playwright
+    strict mode), so the heuristic returns None regardless of box coords and
+    defers to the LLM tier's spatial-hint disambiguation."""
+    yaml = (
+        '- button "Sign in" [box=10,500,80,30]\n'  # bottom
+        '- button "Sign in" [box=10,50,80,30]'    # top
+    )
+    tree = runtime._parse_aria_snapshot_yaml(yaml)
+    assert runtime._heuristic_resolve("sign in button", tree) is None
 
 
 def test_heuristic_resolve_no_box_tiebreak_when_only_one_has_box(runtime):

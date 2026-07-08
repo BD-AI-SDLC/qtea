@@ -165,7 +165,7 @@ def _az_cli_token() -> str | None:
         result = subprocess.run(
             [az, "account", "get-access-token",
              "--resource", "499b84ac-1321-427f-aa17-267ca6975798"],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=15, check=False,
         )
         if result.returncode != 0:
             log.debug("ado.az_cli_failed", stderr=result.stderr[:200])
@@ -456,8 +456,128 @@ def slim_ado_payload(payload: dict) -> dict:
     return slim
 
 
+# ---------------------------------------------------------------------------
+# Linked work items: fetch title + description for related items
+# ---------------------------------------------------------------------------
+
+_ADO_WI_ID_FROM_URL_RE = re.compile(r"/workitems/(\d+)(?:[?#]|$)")
+
+# Relation types to skip entirely (children, test links, attachments, duplicates).
+_ADO_SKIP_REL_TYPES = frozenset({
+    "System.LinkTypes.Hierarchy-Forward",          # children — usually many, no context
+    "Microsoft.VSTS.Common.TestedBy-Forward",
+    "Microsoft.VSTS.Common.TestedBy-Reverse",
+    "Microsoft.VSTS.TestCase.SharedParameterReferences",
+    "System.LinkTypes.Duplicate-Forward",
+    "System.LinkTypes.Duplicate-Reverse",
+    "System.LinkTypes.Hyperlink",
+    "AttachedFile",
+    "ArtifactLink",
+})
+
+_ADO_REL_LABELS: dict[str, str] = {
+    "System.LinkTypes.Hierarchy-Reverse": "Parent",
+    "System.LinkTypes.Dependency-Reverse": "Predecessor",
+    "System.LinkTypes.Dependency-Forward": "Successor",
+    "System.LinkTypes.Related": "Related",
+}
+
+_ADO_REL_PRIORITY: dict[str, int] = {
+    "System.LinkTypes.Hierarchy-Reverse": 0,
+    "System.LinkTypes.Dependency-Reverse": 1,
+    "System.LinkTypes.Dependency-Forward": 1,
+    "System.LinkTypes.Related": 2,
+}
+
+
+def fetch_linked_work_items(
+    org: str,
+    project: str,
+    primary_payload: dict[str, Any],
+    *,
+    max_linked: int = 5,
+    client: httpx.Client | None = None,
+) -> list[dict[str, str]]:
+    """Fetch text content for work items linked to *primary_payload*.
+
+    Only text fields (title, description, acceptance criteria, status) are
+    fetched. External URLs embedded in ADO fields are not followed.
+
+    Returns a list of dicts with keys:
+      ``id``, ``title``, ``status``, ``relationship``, ``description``,
+      ``acceptance_criteria``.
+
+    Errors on individual fetches are silently logged — Step 1 must not fail
+    because a linked item is inaccessible.
+
+    Priority order: parent first, then predecessor/successor, then related.
+    """
+    relations = primary_payload.get("relations") or []
+    if not relations:
+        return []
+
+    seen_ids: set[int] = set()
+    candidates: list[tuple[int, str, int]] = []  # (item_id, label, priority)
+
+    for rel in relations:
+        rel_type = rel.get("rel") or ""
+        if rel_type in _ADO_SKIP_REL_TYPES:
+            continue
+        url = rel.get("url") or ""
+        m = _ADO_WI_ID_FROM_URL_RE.search(url)
+        if not m:
+            continue
+        wi_id = int(m.group(1))
+        if wi_id in seen_ids:
+            continue
+        seen_ids.add(wi_id)
+        label = (
+            _ADO_REL_LABELS.get(rel_type)
+            or (rel.get("attributes") or {}).get("name")
+            or rel_type
+        )
+        prio = _ADO_REL_PRIORITY.get(rel_type, 3)
+        candidates.append((wi_id, label, prio))
+
+    candidates.sort(key=lambda t: t[2])
+    candidates = candidates[:max_linked]
+    if not candidates:
+        return []
+
+    results: list[dict[str, str]] = []
+    owns_client = client is None
+    if owns_client:
+        client = _http_client()
+    try:
+        for wi_id, relationship, _ in candidates:
+            try:
+                payload = fetch_work_item(org, project, wi_id, client=client)
+                fields = payload.get("fields") or {}
+                desc = normalize_description(payload)
+                ac = html_to_markdown(
+                    fields.get("Microsoft.VSTS.Common.AcceptanceCriteria") or ""
+                ).strip()
+                results.append({
+                    "id": str(wi_id),
+                    "title": fields.get("System.Title") or "",
+                    "status": fields.get("System.State") or "",
+                    "relationship": relationship,
+                    "description": desc,
+                    "acceptance_criteria": ac,
+                })
+                log.info("ado.linked_fetch_ok", item_id=wi_id, relationship=relationship)
+            except AdoFetchError as e:
+                log.warning("ado.linked_fetch_failed", item_id=wi_id, error=str(e))
+    finally:
+        if owns_client:
+            client.close()
+
+    return results
+
+
 __all__ = [
     "AdoFetchError",
+    "fetch_linked_work_items",
     "fetch_work_item",
     "html_to_markdown",
     "normalize_description",

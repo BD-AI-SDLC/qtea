@@ -108,7 +108,7 @@ def test_run_dep_install_poetry_noop_treated_as_failure(tmp_path, monkeypatch):
     def fake_run(argv, **kwargs):
         return sp.CompletedProcess(argv, returncode=0, stdout=poetry_noop_stdout, stderr="")
 
-    monkeypatch.setattr("qtea.steps.s09_execute.subprocess.run", fake_run)
+    monkeypatch.setattr("qtea.steps.s09.dep_install.subprocess.run", fake_run)
     install_log = tmp_path / "install.log"
     ok, summary = _run_dep_install("poetry", "pydantic_settings", tmp_path, install_log)
     assert ok is False
@@ -134,7 +134,7 @@ def test_run_dep_install_poetry_real_install_succeeds(tmp_path, monkeypatch):
             stderr="",
         )
 
-    monkeypatch.setattr("qtea.steps.s09_execute.subprocess.run", fake_run)
+    monkeypatch.setattr("qtea.steps.s09.dep_install.subprocess.run", fake_run)
     ok, summary = _run_dep_install(
         "poetry", "pytest-asyncio", tmp_path, tmp_path / "install.log"
     )
@@ -155,7 +155,7 @@ def test_run_dep_install_passes_isolate_venv_for_poetry(tmp_path, monkeypatch):
         return sp.CompletedProcess(argv, returncode=0, stdout="installed", stderr="")
 
     monkeypatch.setenv("VIRTUAL_ENV", "/qtea/.venv")
-    monkeypatch.setattr("qtea.steps.s09_execute.subprocess.run", fake_run)
+    monkeypatch.setattr("qtea.steps.s09.dep_install.subprocess.run", fake_run)
     _run_dep_install("poetry", "pkg", tmp_path, tmp_path / "log")
     assert "VIRTUAL_ENV" not in captured_env
 
@@ -176,7 +176,7 @@ def test_run_dep_install_pip_uses_venv_pip_from_profile(tmp_path, monkeypatch):
         captured_argv.extend(argv)
         return sp.CompletedProcess(argv, returncode=0, stdout="installed", stderr="")
 
-    monkeypatch.setattr("qtea.steps.s09_execute.subprocess.run", fake_run)
+    monkeypatch.setattr("qtea.steps.s09.dep_install.subprocess.run", fake_run)
     profile = StackProfile(
         language="python", package_manager="pip", wrapper_prefix=".venv/bin",
     )
@@ -196,7 +196,7 @@ def test_run_dep_install_pip_without_profile_refuses(tmp_path, monkeypatch):
     def fake_run(argv, **kwargs):
         return sp.CompletedProcess(argv, returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr("qtea.steps.s09_execute.subprocess.run", fake_run)
+    monkeypatch.setattr("qtea.steps.s09.dep_install.subprocess.run", fake_run)
     ok, summary = _run_dep_install("pip", "requests", tmp_path, tmp_path / "log")
     assert ok is False
     assert "pip auto-install requires" in summary
@@ -208,7 +208,7 @@ def test_run_dep_install_isolates_for_all_python_venv_managers(tmp_path, monkeyp
     import subprocess as sp
 
     monkeypatch.setenv("VIRTUAL_ENV", "/qtea/.venv")
-    monkeypatch.setattr("qtea.steps.s09_execute.subprocess.run", lambda argv, **kw:
+    monkeypatch.setattr("qtea.steps.s09.dep_install.subprocess.run", lambda argv, **kw:
         (kw.setdefault("_seen", kw.get("env", {})),
          sp.CompletedProcess(argv, 0, "installed", ""))[1])
 
@@ -219,7 +219,7 @@ def test_run_dep_install_isolates_for_all_python_venv_managers(tmp_path, monkeyp
             captured.update(kwargs.get("env") or {})
             return sp.CompletedProcess(argv, returncode=0, stdout="installed", stderr="")
 
-        monkeypatch.setattr("qtea.steps.s09_execute.subprocess.run", fake_run)
+        monkeypatch.setattr("qtea.steps.s09.dep_install.subprocess.run", fake_run)
         _run_dep_install(pm, "x", tmp_path, tmp_path / f"log-{pm}")
         assert "VIRTUAL_ENV" not in captured, f"{pm} did not strip VIRTUAL_ENV"
 
@@ -239,7 +239,7 @@ def test_run_dep_install_keeps_virtualenv_for_node_managers(tmp_path, monkeypatc
             captured.update(kwargs.get("env") or {})
             return sp.CompletedProcess(argv, returncode=0, stdout="added 1 package", stderr="")
 
-        monkeypatch.setattr("qtea.steps.s09_execute.subprocess.run", fake_run)
+        monkeypatch.setattr("qtea.steps.s09.dep_install.subprocess.run", fake_run)
         ok, _ = _run_dep_install(pm, "lodash", tmp_path, tmp_path / f"log-{pm}")
         assert ok is True
         assert captured.get("VIRTUAL_ENV") == "/some/venv", (
@@ -1842,9 +1842,11 @@ def _mk_entry(*, id_: str = "T-x", message: str = "", traceback: str = ""):
     )
 
 
-def test_classify_locator_timeout_playwright_module_path():
-    """The canonical Playwright TimeoutError on Locator.get_attribute —
-    the exact shape that caused 4+ failures in run 20260621-213751-ee0fef."""
+def test_classify_element_not_in_dom_playwright_no_resolve():
+    """Playwright Locator.* timeout where the call log has NO 'locator resolved to'
+    line — the element was never found in the DOM. Classified as element_not_in_dom
+    (not healable) rather than locator_timeout. Exact shape from run
+    20260621-213751-ee0fef (Locator.get_attribute on a missing img)."""
     entry = _mk_entry(
         message=(
             "playwright._impl._errors.TimeoutError: Locator.get_attribute: "
@@ -1852,14 +1854,33 @@ def test_classify_locator_timeout_playwright_module_path():
             "locator(\"a[href*='vertexaisearch'] img\")"
         ),
     )
+    assert _classify_failure(entry) == "element_not_in_dom"
+
+
+def test_classify_locator_timeout_playwright_element_in_dom_not_visible():
+    """Playwright Locator.* timeout WITH 'locator resolved to' — element IS in
+    the DOM but not yet visible/enabled. This is a state/interaction issue the
+    heal agent can fix, so it stays locator_timeout (healable)."""
+    entry = _mk_entry(
+        message=(
+            "playwright._impl._errors.TimeoutError: Locator.click: "
+            "Timeout 30000ms exceeded.\nCall log:\n"
+            "  - waiting for locator('[data-testid=\"submit\"]') to be visible\n"
+            "  - locator resolved to <button class=\"btn\">Submit</button>\n"
+            "  waiting for element to be visible, enabled and stable\n"
+            "  element is not visible"
+        ),
+    )
     assert _classify_failure(entry) == "locator_timeout"
 
 
-def test_classify_locator_timeout_click():
+def test_classify_element_not_in_dom_playwright_click_no_resolve():
+    """Playwright Locator.click timeout with no 'locator resolved to' —
+    the button was never found in the DOM."""
     entry = _mk_entry(
         message="playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceeded.",
     )
-    assert _classify_failure(entry) == "locator_timeout"
+    assert _classify_failure(entry) == "element_not_in_dom"
 
 
 def test_classify_locator_timeout_waiting_for_event():
@@ -1942,6 +1963,189 @@ def test_classify_unknown_when_no_pattern_matches():
     assert _classify_failure(entry) == "unknown"
 
 
+# ---------------------------------------------------------------------------
+# element_not_in_dom — cross-framework coverage
+# ---------------------------------------------------------------------------
+
+def test_classify_element_not_in_dom_selenium_java():
+    entry = _mk_entry(
+        message=(
+            "org.openqa.selenium.NoSuchElementException: no such element: "
+            "Unable to locate element: {\"method\":\"css selector\","
+            "\"selector\":\"[data-testid='submit-btn']\"}"
+        ),
+    )
+    assert _classify_failure(entry) == "element_not_in_dom"
+
+
+def test_classify_element_not_in_dom_selenium_python():
+    entry = _mk_entry(
+        message="selenium.common.exceptions.NoSuchElementException: Message: no such element",
+    )
+    assert _classify_failure(entry) == "element_not_in_dom"
+
+
+def test_classify_element_not_in_dom_webdriverio():
+    entry = _mk_entry(message="element not found: $('[data-testid=\"btn\"]')")
+    assert _classify_failure(entry) == "element_not_in_dom"
+
+
+def test_classify_element_not_in_dom_cypress():
+    entry = _mk_entry(
+        message=(
+            "AssertionError: Timed out retrying after 4000ms: "
+            "Expected to find element: '[data-testid=\"action-btn\"]', "
+            "but never found it."
+        ),
+    )
+    assert _classify_failure(entry) == "element_not_in_dom"
+
+
+def test_classify_element_not_in_dom_playwright_typescript():
+    """Playwright TypeScript uses lowercase 'locator.' in the error prefix;
+    _LOCATOR_METHOD_RE is case-insensitive so the refinement still fires."""
+    entry = _mk_entry(
+        message=(
+            "Error: locator.click: Timeout 30000ms exceeded.\n"
+            "Call log:\n  - waiting for locator('[data-testid=\"missing-btn\"]')"
+        ),
+    )
+    assert _classify_failure(entry) == "element_not_in_dom"
+
+
+def test_classify_locator_timeout_page_event_unaffected():
+    """Page-level event wait has no Locator method reference — the
+    element_not_in_dom refinement must NOT fire for it."""
+    entry = _mk_entry(
+        message='Timeout 30000ms exceeded while waiting for event "page"',
+    )
+    assert _classify_failure(entry) == "locator_timeout"
+
+
+def test_element_not_in_dom_is_not_healable():
+    """element_not_in_dom must route to real_bugs, never to the heal queue."""
+    failing = [
+        _mk_entry(
+            id_="T-absent",
+            message=(
+                "playwright._impl._errors.TimeoutError: Locator.click: "
+                "Timeout 30000ms exceeded.\nCall log:\n"
+                "  - waiting for locator('[data-testid=\"action-menu-button\"]')"
+            ),
+        ),
+    ]
+    healable, real_bugs = _partition_failures(failing)
+    assert healable == []
+    assert len(real_bugs) == 1
+    assert real_bugs[0][1] == "element_not_in_dom"
+
+
+# ---------------------------------------------------------------------------
+# Layer 2: AOM-at-failure cross-check (_refine_element_not_in_dom)
+# ---------------------------------------------------------------------------
+
+from qtea.steps.s09_execute import (
+    _extract_locator_search_term,
+    _refine_element_not_in_dom,
+)
+
+
+def test_extract_locator_search_term_data_testid():
+    """data-testid value → first non-generic token > 3 chars."""
+    haystack = (
+        "playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceeded.\n"
+        "Call log:\n  - waiting for locator('[data-testid=\"action-menu-button\"]')"
+    )
+    assert _extract_locator_search_term(haystack) == "action"
+
+
+def test_extract_locator_search_term_role():
+    haystack = "Call log:\n  - waiting for locator('role=\"button\"')"
+    assert _extract_locator_search_term(haystack) == "button"
+
+
+def test_extract_locator_search_term_none_when_no_call_log():
+    assert _extract_locator_search_term("AssertionError: assert None == 'x'") is None
+
+
+def test_refine_element_not_in_dom_no_aom_dir_stays_not_in_dom():
+    entry = _mk_entry(
+        id_="T-foo",
+        message="playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceeded.\nCall log:\n  - waiting for locator('[data-testid=\"action-menu-button\"]')",
+    )
+    assert _refine_element_not_in_dom(entry, aom_dir=None) == "element_not_in_dom"
+
+
+def test_refine_element_not_in_dom_no_file_stays_not_in_dom(tmp_path):
+    entry = _mk_entry(
+        id_="T-foo",
+        message="playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceeded.\nCall log:\n  - waiting for locator('[data-testid=\"action-menu-button\"]')",
+    )
+    assert _refine_element_not_in_dom(entry, aom_dir=tmp_path) == "element_not_in_dom"
+
+
+def test_refine_element_not_in_dom_token_found_reclassifies(tmp_path):
+    """AOM contains the distinctive token → element exists under wrong locator
+    → reclassify as locator_timeout so the heal agent gets a chance."""
+    aom_text = (
+        "- navigation\n"
+        "  - link \"Home\"\n"
+        "- main\n"
+        "  - button \"Actions\"\n"   # "action" token matches "action-menu-button"
+        "  - heading \"ROPA Entry\"\n"
+    )
+    (tmp_path / "T-foo.txt").write_text(aom_text, encoding="utf-8")
+    entry = _mk_entry(
+        id_="T-foo",
+        message=(
+            "playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceeded.\n"
+            "Call log:\n  - waiting for locator('[data-testid=\"action-menu-button\"]')"
+        ),
+    )
+    assert _refine_element_not_in_dom(entry, aom_dir=tmp_path) == "locator_timeout"
+
+
+def test_refine_element_not_in_dom_token_absent_stays_not_in_dom(tmp_path):
+    """AOM has content but the distinctive token is nowhere in it → element
+    is truly absent → keep element_not_in_dom."""
+    aom_text = (
+        "- navigation\n"
+        "  - link \"Home\"\n"
+        "- main\n"
+        "  - heading \"ROPA Entry\"\n"
+        "  - textbox \"Search\"\n"
+    )
+    (tmp_path / "T-foo.txt").write_text(aom_text, encoding="utf-8")
+    entry = _mk_entry(
+        id_="T-foo",
+        message=(
+            "playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceeded.\n"
+            "Call log:\n  - waiting for locator('[data-testid=\"release-gate-button\"]')"
+        ),
+    )
+    assert _refine_element_not_in_dom(entry, aom_dir=tmp_path) == "element_not_in_dom"
+
+
+def test_partition_layer2_upgrades_wrong_locator_to_healable(tmp_path):
+    """End-to-end: partition with aom_dir reclassifies a wrong-locator failure
+    from element_not_in_dom → locator_timeout → enters heal queue."""
+    aom_text = "- main\n  - button \"Actions\"\n"
+    (tmp_path / "T-absent.txt").write_text(aom_text, encoding="utf-8")
+    failing = [
+        _mk_entry(
+            id_="T-absent",
+            message=(
+                "playwright._impl._errors.TimeoutError: Locator.click: "
+                "Timeout 30000ms exceeded.\nCall log:\n"
+                "  - waiting for locator('[data-testid=\"action-menu-button\"]')"
+            ),
+        ),
+    ]
+    healable, real_bugs = _partition_failures(failing, aom_dir=tmp_path)
+    assert len(healable) == 1
+    assert real_bugs == []
+
+
 def test_classify_tti_pattern_does_not_match_settings_word():
     """Regression: an earlier classifier matched `TTI` inside `seTTIngs`
     in AOM dumps, falsely categorizing locator-timeout failures as
@@ -1957,8 +2161,15 @@ def test_classify_tti_pattern_does_not_match_settings_word():
 
 
 def test_partition_splits_healable_from_real_bugs():
-    """The full 11-failure decomposition from run 20260621-213751-ee0fef
-    — 7 healable + 3 real bugs + 1 codegen bug (fixture_missing → real)."""
+    """The full 12-failure decomposition from run 20260621-213751-ee0fef.
+    Post heal-scope relaxation, ``fixture_missing`` (T-3) is HEALABLE — the
+    fixer may now create/repair fixtures and conftest.
+
+    Layer-1 trade-off: T-1, T-4, T-7, T-8 are Playwright Locator.* timeouts
+    whose call logs lack "locator resolved to", so they are classified as
+    element_not_in_dom (not healable). In some of those original failures the
+    element existed under a different selector; QTEA_HEAL_ALL=1 covers that
+    edge case while Layer 2 (AOM-at-failure capture) is pending."""
     failing = [
         _mk_entry(id_="T-1", message="playwright._impl._errors.TimeoutError: Locator.get_attribute: Timeout 60000ms exceeded."),
         _mk_entry(id_="T-2", message="AssertionError: assert None == 'noopener noreferrer'"),
@@ -1974,18 +2185,17 @@ def test_partition_splits_healable_from_real_bugs():
         _mk_entry(id_="T-12", message="AssertionError: Gemini button should appear before New Chat in DOM order"),
     ]
     healable, real_bugs = _partition_failures(failing)
-    # Use sets so the assertion isn't sensitive to lexicographic ordering
-    # (e.g. "T-10" < "T-2" by string compare). The classifier itself
-    # doesn't promise order; the partition just preserves input order.
     healable_ids = {e.id for e in healable}
     real_bug_ids = {e.id for e, _ in real_bugs}
-    # 7 locator/timeout + assertion-value + tbd_unresolvable → healable
-    assert healable_ids == {"T-1", "T-2", "T-4", "T-5", "T-6", "T-7", "T-8", "T-10"}
-    # fixture-missing + WCAG + TTI + dom-order → real bugs
-    assert real_bug_ids == {"T-3", "T-9", "T-11", "T-12"}
-    # Each real-bug row carries its classifier label for the heal-log audit.
-    by_id = dict((e.id, cls) for e, cls in real_bugs)
-    assert by_id["T-3"] == "fixture_missing"
+    # assertion-value + tbd_unresolvable + fixture_missing + page-event timeout → healable
+    assert healable_ids == {"T-2", "T-3", "T-5", "T-6", "T-10"}
+    # element_not_in_dom (T-1,4,7,8) + WCAG + TTI + dom-order → real bugs
+    assert real_bug_ids == {"T-1", "T-4", "T-7", "T-8", "T-9", "T-11", "T-12"}
+    by_id = {e.id: cls for e, cls in real_bugs}
+    assert by_id["T-1"] == "element_not_in_dom"
+    assert by_id["T-4"] == "element_not_in_dom"
+    assert by_id["T-7"] == "element_not_in_dom"
+    assert by_id["T-8"] == "element_not_in_dom"
     assert by_id["T-9"] == "wcag_violation"
     assert by_id["T-11"] == "tti_budget"
     assert by_id["T-12"] == "dom_order"

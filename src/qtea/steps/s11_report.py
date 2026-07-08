@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import shutil
+import contextlib
 import subprocess
 import sys
 import time
@@ -10,7 +10,7 @@ import webbrowser
 
 from qtea.config import step_timeout
 from qtea.logging_setup import get_logger
-from qtea.report.allure_writer import generate_allure_html, write_allure_results
+from qtea.report.allure_writer import generate_allure_html, resolve_allure_cmd, write_allure_results
 from qtea.report.data_builder import build_report, to_dict
 from qtea.report.html_renderer import render_html
 from qtea.schemas import write_validated
@@ -60,21 +60,14 @@ class ReportStep(Step):
 
         allure_ok = False
         if want_allure:
-            allure_present = shutil.which("allure") is not None
-            if mode == "auto" and not allure_present:
-                notes_parts.append("allure=skipped")
-            elif not allure_present:
-                notes_parts.append("allure=not-found")
-                log.warning("report.allure_requested_but_absent")
-            else:
-                allure_results_dir = out_dir / "allure-results"
-                write_allure_results(report, allure_results_dir)
-                allure_html_dir = out_dir / "allure-html"
-                allure_ok = generate_allure_html(allure_results_dir, allure_html_dir)
-                outputs.append(allure_results_dir)
-                if allure_ok:
-                    outputs.append(allure_html_dir)
-                notes_parts.append(f"allure={'yes' if allure_ok else 'results-only'}")
+            allure_results_dir = out_dir / "allure-results"
+            write_allure_results(report, allure_results_dir)
+            allure_html_dir = out_dir / "allure-html"
+            allure_ok = generate_allure_html(allure_results_dir, allure_html_dir)
+            outputs.append(allure_results_dir)
+            if allure_ok:
+                outputs.append(allure_html_dir)
+            notes_parts.append(f"allure={'yes' if allure_ok else 'results-only'}")
 
         status = "completed"
         if mode == "allure" and not allure_ok:
@@ -93,8 +86,8 @@ class ReportStep(Step):
         # We additionally sleep ~2 s so Jetty has time to bind the port
         # before our process exits (cold-start ~1.5–3 s).
         if allure_ok and mode in ("auto", "allure", "both"):
-            allure_bin = shutil.which("allure")
-            if allure_bin:
+            allure_cmd = resolve_allure_cmd()
+            if allure_cmd:
                 stderr_log = out_dir / "allure-open.log"
                 # Pipe stderr to a file so users have a diagnostic when the
                 # Java side fails (missing JAVA_HOME, port collision, etc.).
@@ -122,7 +115,7 @@ class ReportStep(Step):
                     popen_kwargs["start_new_session"] = True
                 try:
                     subprocess.Popen(
-                        [allure_bin, "open", "--host", "127.0.0.1",
+                        allure_cmd + ["open", "--host", "127.0.0.1",
                          str(allure_html_dir)],
                         **popen_kwargs,
                     )
@@ -142,10 +135,8 @@ class ReportStep(Step):
                     # Close our handle to the stderr log; the child has its
                     # own duplicated fd (Popen dup'd before close_fds=True
                     # took effect on our side).
-                    try:
+                    with contextlib.suppress(OSError):
                         stderr_fp.close()
-                    except OSError:
-                        pass
         elif ctx.options.open_report:
             html_path = out_dir / "index.html"
             if html_path.exists():

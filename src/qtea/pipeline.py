@@ -835,7 +835,15 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
 
     exit_code = 0
     _after_step_status = False  # True right after printing a step ok/warned/FAILED line
-    for step_num in selected_steps:
+    # Index-based iteration so the Step 9->8 back-edge (Gap C) can rewind to
+    # Step 8 and replay 8->9 once. ``_i`` advances at the top of each turn, so
+    # every existing bare ``continue`` moves to the next step unchanged; the
+    # back-edge overrides ``_i`` explicitly before its own ``continue``.
+    _step_list = list(selected_steps)
+    _i = 0
+    while _i < len(_step_list):
+        step_num = _step_list[_i]
+        _i += 1
         if not opts.force and is_step_complete(state, step_num):
             if not outputs_match(state, step_num, ws.step_dir(step_num)):
                 log.info("step.invalidated", step=step_num)
@@ -877,6 +885,34 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
             # Let steps 10 (bug classification) and 11 (allure report)
             # run so the operator gets a full report with findings.
             if step_num == 9:
+                # Step 9->8 back-edge (Gap C): a structural codegen defect
+                # (zero tests collected, missing generated import) is not a
+                # heal target — Step 9 asks to regenerate. Replay 8->9 exactly
+                # once per run (guard prevents cycles), passing the reason to
+                # Step 8 so it fixes the specific gap.
+                if (
+                    ctx.extras.pop("rerun_step", None) == 8
+                    and not ctx.extras.get("_rerun8_used")
+                ):
+                    ctx.extras["_rerun8_used"] = True
+                    _reason = ctx.extras.get("rerun_reason", "codegen defect")
+                    ctx.extras["step8_defect_feedback"] = _reason
+                    log.info(
+                        "pipeline.step_rerun_requested",
+                        from_step=9, target_step=8, reason=_reason,
+                    )
+                    console.print(
+                        f"[yellow]step 09 requested Step 8 regeneration "
+                        f"({_reason}) — replaying steps 8->9[/]"
+                    )
+                    # Reset checkpoints so 8 and 9 re-run, and rewind the
+                    # step cursor to Step 8 (when present in this run's plan).
+                    for _s in (8, 9):
+                        state.steps.pop(_s, None)
+                    if 8 in _step_list:
+                        _i = _step_list.index(8)
+                        exit_code = 0
+                        continue
                 _after_step_status = True
                 continue
             break

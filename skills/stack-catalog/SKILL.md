@@ -197,9 +197,47 @@ class LoginMobileTest {
 
 When detected language has no dedicated catalog entry, **do not fail**. Apply this minimal recipe so downstream pipeline keeps a viable signal:
 
-1. **Manifest match** — use `skills/acquire-codebase-knowledge/references/stack-detection.md` to identify ecosystem from manifest file. Record `language`, `package_manager`, `runtime_version`.
+1. **Manifest match** — see the **Manifest → Ecosystem Lookup** appendix at the end of this file to identify ecosystem from manifest file. Record `language`, `package_manager`, `runtime_version`.
 2. **Test directory heuristics** — look for any of: `test/`, `tests/`, `spec/`, `specs/`, `__tests__/`, `t/` (Perl-style), `features/`. Treat as test root.
 3. **Filename heuristics** — flag files matching: `test_*`, `*_test.*`, `*Test.*`, `*Tests.*`, `*Spec.*`, `*Specs.*`, `*.test.*`, `*.spec.*`, `*-test.*`, `*-spec.*`, `*.feature`, `*.robot`.
 4. **Build/test command discovery** — read `Makefile`, `justfile`, `Taskfile.yml`, README "Testing" / "How to run tests" section, CI pipeline files (`.github/workflows/*.yml`, `Jenkinsfile`, `.gitlab-ci.yml`).
 5. **Record handoff** — emit `framework: null`, `confidence: low`, `language: <detected>`, `discoveryMethod: universal-fallback` plus any test files / commands found. Downstream agents (planner, implementer, fixer) treat this as "polyglot best-effort" mode and rely on file-pattern recognition rather than framework idioms.
 6. **Do not invent patterns** — if no test files match heuristics, emit empty inventory + warning `"No tests detected; framework unknown — manual scaffolding required."` Do **not** synthesize fake examples.
+
+---
+
+## Appendix: Manifest → Ecosystem Lookup
+
+### Manifest File → Ecosystem
+
+| File | Ecosystem | Key fields to read |
+|------|-----------|--------------------|
+| `package.json` | Node.js / JavaScript / TypeScript | `dependencies`, `devDependencies`, `scripts`, `main`, `type`, `engines` |
+| `go.mod` | Go | Module path, Go version, `require` block |
+| `requirements.txt` | Python (pip) | Package list with pinned versions |
+| `Pipfile` | Python (pipenv) | `[packages]`, `[dev-packages]`, `[requires]` python version |
+| `pyproject.toml` | Python (poetry / uv / hatch) | `[tool.poetry.dependencies]`, `[project]`, `[build-system]` |
+| `setup.py` / `setup.cfg` | Python (setuptools, legacy) | `install_requires`, `python_requires` |
+| `Cargo.toml` | Rust | `[dependencies]`, `[[bin]]`, `[lib]` |
+| `pom.xml` | Java / Kotlin (Maven) | `<dependencies>`, `<artifactId>`, `<groupId>`, `<java.version>` |
+| `build.gradle` / `build.gradle.kts` | Java / Kotlin (Gradle) | `dependencies {}`, `sourceCompatibility` |
+| `composer.json` | PHP | `require`, `require-dev` |
+| `Gemfile` | Ruby | `gem` declarations, `ruby` version constraint |
+| `mix.exs` | Elixir | `deps/0`, `elixir: "~> X.Y"` |
+| `pubspec.yaml` | Dart / Flutter | `dependencies`, `dev_dependencies`, `environment.sdk` |
+| `*.csproj` | .NET / C# | `<PackageReference>`, `<TargetFramework>` |
+| `*.sln` | .NET solution | References multiple `.csproj` projects |
+| `deno.json` / `deno.jsonc` | Deno (TypeScript runtime) | `imports`, `tasks` |
+| `bun.lockb` | Bun (JavaScript runtime) | Binary lockfile — check `package.json` for deps |
+
+### Language Runtime Version Detection
+
+| Language | Where to find the version |
+|----------|--------------------------|
+| Node.js | `.nvmrc`, `.node-version`, `engines.node` in `package.json`, Docker `FROM node:X` |
+| Python | `.python-version`, `pyproject.toml [requires-python]`, Docker `FROM python:X` |
+| Go | First line of `go.mod` (`go 1.21`) |
+| Java | `<java.version>` in `pom.xml`, `sourceCompatibility` in `build.gradle`, Docker `FROM eclipse-temurin:X` |
+| Ruby | `.ruby-version`, `Gemfile` `ruby 'X.Y.Z'` |
+| Rust | `rust-toolchain.toml`, `rust-toolchain` file |
+| .NET | `<TargetFramework>` in `.csproj` (e.g., `net8.0`) |

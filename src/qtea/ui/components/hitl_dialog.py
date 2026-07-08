@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import re
 from collections.abc import Callable
 from pathlib import Path
 
@@ -293,11 +295,7 @@ def show_hitl_dialog(page: ft.Page, state: AppState) -> None:
     for q in req.questions:
         q_id = q.get("id", "")
         q_text = q.get("text", q.get("question", ""))
-        # Rationale / severity / AC references are intentionally NOT shown
-        # under the question — the block id is already in the red chip and
-        # that's enough to correlate. The full row stays in the
-        # ``user-answers.md`` ledger if anyone needs to trace it later.
-        q_context = ""
+        q_context = q.get("context", "")
         q_type = q.get("type", "blocker")
         q_metadata = q.get("metadata") or {}
 
@@ -358,14 +356,25 @@ def show_hitl_dialog(page: ft.Page, state: AppState) -> None:
                         ),
                         *(
                             [
-                                ft.Text(
-                                    q_context,
-                                    size=11,
-                                    color=ON_SURFACE_DIM,
-                                    italic=True,
+                                ft.Container(
+                                    content=ft.Text(
+                                        q_context,
+                                        size=11,
+                                        color=ON_SURFACE_DIM,
+                                        italic=True,
+                                        selectable=True,
+                                    ),
+                                    bgcolor=BACKGROUND,
+                                    border_radius=4,
+                                    border=ft.Border(
+                                        left=ft.BorderSide(2, DIVIDER),
+                                    ),
+                                    padding=ft.Padding.only(
+                                        left=8, top=4, bottom=4, right=4,
+                                    ),
                                 )
                             ]
-                            if q_context
+                            if q_context and q_context != q_text
                             else []
                         ),
                         field,
@@ -509,22 +518,32 @@ def _parse_raw_tc_markdown(raw: str) -> dict[str, list[str] | str]:
     if not raw:
         return out
 
+    # Patterns match both `**Steps:**` (colon inside) and `**Steps**:` (colon
+    # outside) — agents emit either form depending on model/prompt variation.
+    _SEC_PRE = re.compile(r"\*\*preconditions?\*\*:?|preconditions?:", re.I)
+    _SEC_STE = re.compile(r"\*\*steps?\*\*:?|steps?:", re.I)
+    _SEC_EXP = re.compile(r"\*\*expected\s+results?\*\*:?|\*\*expected\*\*:?", re.I)
+    # Generic `- **Foo:**` / `- **Foo**:` header that is NOT one of the known
+    # sections above — resets the current section so its content is skipped.
+    _SEC_OTHER = re.compile(r"^-?\s*\*\*[^*]+\*\*:?$")
+
     section: str | None = None
     for line in raw.splitlines():
         stripped = line.strip()
         low = stripped.lower()
-        # Section headers
-        if "**preconditions:**" in low:
+        # Known section headers — checked before the generic "other header"
+        # pattern so `**Steps**:` is recognised before being swallowed.
+        if _SEC_PRE.search(low):
             section = "preconditions"
             continue
-        if "**steps:**" in low:
+        if _SEC_STE.search(low):
             section = "steps"
             continue
-        if "**expected result:**" in low or "**expected:**" in low:
+        if _SEC_EXP.search(low):
             section = "expected"
             continue
-        if stripped.startswith("- **") and stripped.endswith(":**"):
-            # Some other header (Type, Priority, etc.) — leave the section
+        if _SEC_OTHER.match(stripped):
+            # Some other header (Type, Priority, etc.) — leave the section.
             section = None
             continue
         if stripped.startswith("---"):
@@ -703,10 +722,8 @@ def _make_per_row_edit_panel(
         edit_field.border_color = DIVIDER
         edit_caption.value = caption_default
         edit_caption.color = ON_SURFACE_DIM
-        try:
+        with contextlib.suppress(Exception):
             panel.update()
-        except Exception:
-            pass
 
     panel = ft.Container(
         content=ft.Column(
@@ -739,10 +756,8 @@ def _make_per_row_edit_panel(
     def toggle() -> None:
         open_state["v"] = not open_state["v"]
         panel.visible = open_state["v"]
-        try:
+        with contextlib.suppress(Exception):
             panel.update()
-        except Exception:
-            pass
 
     return panel, toggle
 

@@ -331,7 +331,7 @@ def _smoke_check_non_python(path: Path, rel: str, language: str,
     """Best-effort regex smoke check when no native backend is available."""
     try:
         with path.open("r", encoding="utf-8", errors="replace") as f:
-            lines = [ln.rstrip("\n") for _, ln in zip(range(20), f)]
+            lines = [ln.rstrip("\n") for _, ln in zip(range(20), f, strict=False)]
     except OSError as e:
         return ParseFileResult(
             file=rel, language=language, backend_used="regex-smoke",

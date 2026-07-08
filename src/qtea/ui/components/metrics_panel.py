@@ -54,7 +54,7 @@ def _build_cost_bars(state: AppState) -> ft.Column:
     max_cost = max(max_cost, 0.01)
 
     bars: list[ft.Control] = []
-    for num, name, phase in STEP_DEFINITIONS:
+    for num, _name, phase in STEP_DEFINITIONS:
         s = state.steps.get(num)
         if not s or s.cost_usd < 0.001:
             continue

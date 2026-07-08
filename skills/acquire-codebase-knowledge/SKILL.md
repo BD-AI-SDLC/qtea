@@ -2,6 +2,15 @@
 
 Produces seven populated documents in `docs/codebase/` covering everything needed to work effectively on the project. Only document what is verifiable from files or terminal output — never infer or assume.
 
+## qtea Pipeline Usage
+
+In the qtea QA pipeline, this skill is used in two specific ways — **the 4-phase doc-generation workflow below does not run**:
+
+1. **`scripts/scan.py`** — invoked directly by the pipeline as a subprocess at the start of Step 6 (repo discovery), before the researcher agent runs. It produces `scan.txt` which seeds the researcher agent's discovery.
+2. **`references/inquiry-checkpoints.md`** — staged to the researcher agent's working directory as `./inquiry-checkpoints.md`. The researcher uses it to know what aspects of the SUT to verify in each area (stack, structure, integrations, testing, concerns) beyond the raw scan output.
+
+The 4-phase workflow (Phases 2–4) and its 7-document output contract (`STACK.md`, `STRUCTURE.md`, etc.) are not part of qtea's pipeline — qtea's researcher agent produces `research.json`, not docs.
+
 ## Output Contract (Required)
 
 Before finishing, all of the following must be true:

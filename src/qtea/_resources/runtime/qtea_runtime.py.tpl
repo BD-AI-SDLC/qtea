@@ -1112,6 +1112,33 @@ _NAME_FILLERS: frozenset[str] = frozenset({
 _HEURISTIC_MIN_SCORE: float = 0.9
 _HEURISTIC_TIE_GAP: float = 0.1
 
+# Uniqueness verification: when on (default), a heuristic winner is only
+# returned if its role+name selector maps to EXACTLY ONE node in the AOM
+# snapshot. A non-unique selector (e.g. two "OK" buttons) would pass the
+# immediate box tie-break but then trip Playwright strict-mode at action
+# time — better to fall through to the LLM tier, which can emit a more
+# specific selector (testid, scoped css). Disable with QTEA_VERIFY_UNIQUE=0.
+_VERIFY_UNIQUE: bool = os.environ.get("QTEA_VERIFY_UNIQUE", "1") != "0"
+
+
+def _count_role_name_matches(
+    snapshot: dict[str, Any], role: str, name: str,
+) -> int:
+    """Count AOM nodes whose role matches and whose accessible name equals
+    ``name`` (case-insensitive exact). Mirrors what a Playwright
+    ``role=<role>[name="<name>"]`` selector resolves to, so a return value
+    of 1 means the heuristic selector is unique on the captured snapshot."""
+    target = (name or "").strip().lower()
+    if not target:
+        return 0
+    count = 0
+    for node in _aom_walk(snapshot):
+        if node.get("role") != role:
+            continue
+        if (node.get("name") or "").strip().lower() == target:
+            count += 1
+    return count
+
 
 def _parse_intent(intent: str) -> tuple[str | None, list[str], str]:
     """Split an intent string into ``(role, name_tokens, name_hint)``.
@@ -1210,6 +1237,19 @@ def _heuristic_resolve(intent: str, snapshot: dict[str, Any]) -> str | None:
             tied.sort(key=lambda c: c[2][1])  # smaller y first
             top_name = tied[0][1]
         else:
+            return None
+    # Uniqueness gate: the role+name selector we're about to emit must map
+    # to exactly one node in the snapshot, else it would fail Playwright
+    # strict-mode at action time. Fall through to the LLM tier on a non-
+    # unique (or vanished) match so a more specific selector can be found.
+    if _VERIFY_UNIQUE:
+        n_matches = _count_role_name_matches(snapshot, role, top_name)
+        if n_matches != 1:
+            log.info(
+                "qtea.heuristic_rejected_non_unique intent=%s role=%s "
+                "name=%s matches=%d",
+                intent, role, _sanitize_for_log(top_name), n_matches,
+            )
             return None
     return _format_role_selector(role, top_name)
 
@@ -1995,7 +2035,10 @@ class _RetryingLocator(_SyncLocatorBase):
                                     ov_exc,
                                 )
                             raise
-                        if not _is_playwright_timeout(exc):
+                        if not (
+                            _is_playwright_timeout(exc)
+                            or (_VERIFY_UNIQUE and _is_strict_mode_violation(exc))
+                        ):
                             raise
                         stale = self._resolution
                         log.info(
@@ -2080,7 +2123,10 @@ class _RetryingLocator(_SyncLocatorBase):
                         # error. Event is recorded by _try_overlay_dismiss_sync
                         # so the parent-side sweep can HITL-prompt.
                         raise
-                    if not _is_playwright_timeout(exc):
+                    if not (
+                        _is_playwright_timeout(exc)
+                        or (_VERIFY_UNIQUE and _is_strict_mode_violation(exc))
+                    ):
                         raise
                     stale = self._resolution
                     log.info(
@@ -2136,6 +2182,18 @@ class _RetryingLocator(_SyncLocatorBase):
                 return result
 
         return _retry_wrapper
+
+
+def _is_strict_mode_violation(exc: BaseException) -> bool:
+    """Detect a Playwright strict-mode violation — the error raised when a
+    locator resolves to MORE THAN ONE element (e.g. a cached/LLM selector
+    that matched two same-role+name nodes). Message shape:
+    ``strict mode violation: locator ... resolved to 2 elements``. Treated
+    like a timeout by the retry wrappers so the ambiguous selector is
+    invalidated and re-resolved (the resolver LLM is prompted to return a
+    UNIQUE selector). Gated by :data:`_VERIFY_UNIQUE`."""
+    msg = str(exc).lower()
+    return "strict mode violation" in msg and "resolved to" in msg
 
 
 def _is_playwright_timeout(exc: BaseException) -> bool:
@@ -3738,6 +3796,47 @@ def _record_passing_witnesses(nodeid: str) -> None:
             log.warning("qtea.passing_witness_write_failed %s", e)
 
 
+def _capture_aom_on_failure(item: Any) -> None:
+    """Snapshot the current page AOM immediately after a test failure.
+
+    Written to ``<QTEA_WORKSPACE_DIR>/aom-at-failure/<entry_id>.txt``.
+    The filename key mirrors ``test_runner._normalize_id`` so the Step 9
+    failure classifier can correlate by ``TestRunEntry.id`` (Layer 2).
+
+    Silently skipped when: no workspace is configured, no ``page`` fixture
+    is present, the page object is not a real Playwright Page (e.g. async
+    fixture placeholder), or any capture error occurs — failures here must
+    never surface to the test output.
+    """
+    workspace = os.environ.get("QTEA_WORKSPACE_DIR")
+    if not workspace:
+        return
+    page = getattr(item, "funcargs", {}).get("page")
+    # Guard against async fixtures and non-Page objects: a real Playwright
+    # sync Page always exposes `.locator`; anything else is silently skipped.
+    if page is None or not hasattr(page, "locator"):
+        return
+    try:
+        snap, _ = _snapshot_page(page)
+        if not snap:
+            return
+        # Reconstruct TestRunEntry.id — mirrors test_runner._normalize_id:
+        #   T-{slugify(stem + "-" + name)}
+        # where slugify = re.sub(r"[^A-Za-z0-9]+", "-", s).strip("-").lower()
+        parts = item.nodeid.split("::")
+        file_part = parts[0] if parts else ""
+        name_part = parts[-1] if parts else item.nodeid
+        stem = Path(file_part).stem if file_part else ""
+        combined = f"{stem}-{name_part}" if stem else name_part
+        slug = re.sub(r"[^A-Za-z0-9]+", "-", combined).strip("-").lower() or "untitled"
+        entry_id = f"T-{slug}"
+        out_dir = Path(workspace) / "aom-at-failure"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / f"{entry_id}.txt").write_text(snap, encoding="utf-8")
+    except Exception as exc:
+        log.debug("qtea.aom_capture_on_failure_failed %s", exc)
+
+
 def pytest_runtest_makereport(item, call):  # noqa: D401, ARG001 - pytest hook signature
     """Stash per-phase reports on the item so :func:`pytest_runtest_teardown`
     can tell whether the test passed.
@@ -3757,6 +3856,8 @@ def pytest_runtest_makereport(item, call):  # noqa: D401, ARG001 - pytest hook s
     if call.when == "call":
         passed = call.excinfo is None
         item.rep_call = type("_RepStub", (), {"passed": passed})()
+        if not passed:
+            _capture_aom_on_failure(item)
 
 
 def pytest_runtest_teardown(item, nextitem):  # noqa: D401, ARG001 - pytest hook signature

@@ -59,7 +59,7 @@ def ui() -> None:
             "[red]Flet is not installed.[/red] "
             "Install the UI extra: [bold]uv pip install -e '.\\[ui]'[/bold]"
         )
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
     launch()
 
 
@@ -236,7 +236,7 @@ def run(
     force: bool = typer.Option(
         False, "--force", help="Ignore checkpoints; re-run everything."
     ),
-    parallelism: int = typer.Option(2, "--parallel-run", min=0, max=16, help="Number of parallel test workers (0 = in-process)."),
+    parallelism: int = typer.Option(2, "--parallel-run", min=0, help="Number of parallel test workers (0 = in-process)."),
     headless: bool = typer.Option(True, "--headless/--headed"),
     debug: bool = typer.Option(
         False,

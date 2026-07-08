@@ -668,6 +668,21 @@ def _extract_blockers(md_text: str) -> list[Question]:
                 ),
             ),
         )
+        # Find supplementary columns to build a human-readable context string.
+        desc_idx = next(
+            (i for i, h in enumerate(header) if "description" in h and i != prompt_idx),
+            None,
+        )
+        sev_idx = next(
+            (i for i, h in enumerate(header) if "severity" in h),
+            None,
+        )
+        ac_idx = next(
+            (i for i, h in enumerate(header)
+             if ("ac" in h or "affected" in h) and i != prompt_idx),
+            None,
+        )
+
         for row_idx, row in enumerate(table[1:], start=1):
             if row_idx > len(table) - 1:
                 break
@@ -677,12 +692,29 @@ def _extract_blockers(md_text: str) -> list[Question]:
             text = text.strip()
             if not text or text.lower().startswith("no blockers") or text == "—":
                 continue
+
+            # Build a concise context from Description + Severity + Affected ACs.
+            ctx_parts: list[str] = []
+            if desc_idx is not None and desc_idx < len(row):
+                d = row[desc_idx].strip()
+                if d and d not in ("—", text):
+                    ctx_parts.append(d)
+            if sev_idx is not None and sev_idx < len(row):
+                sev = row[sev_idx].strip()
+                if sev and sev != "—":
+                    ctx_parts.append(f"Severity: {sev}")
+            if ac_idx is not None and ac_idx < len(row):
+                acs = row[ac_idx].strip()
+                if acs and acs != "—":
+                    ctx_parts.append(f"Affects: {acs}")
+            context = " · ".join(ctx_parts) if ctx_parts else ""
+
             out.append(
                 Question(
                     id=f"BLOCK-{row_idx:02d}",
                     kind="blocker",
                     prompt_text=_blocker_prompt(text),
-                    context=" | ".join(row),
+                    context=context,
                 )
             )
     if not out:

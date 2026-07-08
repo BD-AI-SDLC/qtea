@@ -136,12 +136,27 @@ class ReconciliationResult:
 @dataclass
 class _Sig:
     name: str
-    arity: int
+    arity: int  # total declared parameter count (informational)
     arg_names: list[str]
-    # True when the POM method has *args / **kwargs / kwonly args / defaults
-    # (Python) or rest params / default values (JS). Arity check is skipped
-    # for flexible sigs — they accept variable call shapes.
+    # True when the POM method has *args / **kwargs (Python) or rest params
+    # (JS/Java varargs) — i.e. an UNBOUNDED max arity. Retained for callers
+    # that predate the min/max range fields below.
     flexible: bool = False
+    # Accepted positional-arity RANGE. ``min_arity`` counts required params
+    # (excludes those with a default value or a TS ``?`` optional marker);
+    # ``max_arity`` is the largest accepted count, or ``None`` when unbounded
+    # (rest/varargs). When populated, the reconciler range-checks a call site
+    # against [min_arity, max_arity] instead of exact-matching ``arity`` — this
+    # both stops false positives on all-optional signatures (e.g.
+    # ``sendForReview(reviewer?, dueDate?)`` called with 0 args) and stops
+    # genuine zero-arg calls to required-param methods from slipping through
+    # the old coarse "has a default → skip the check entirely" behaviour.
+    min_arity: int | None = None
+    max_arity: int | None = None
+    # Raw parameter list source (e.g. ``"(username: string, password: string)"``)
+    # so Step 8 can hand the test writer real signatures for PRE-EXISTING POM
+    # methods, not just the ones being newly created. Empty when unknown.
+    params: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -228,16 +243,38 @@ def _py_pom_methods(tree: ast.AST, class_name: str) -> list[_Sig]:
             if stmt.name.startswith("_"):
                 continue
             args = [a.arg for a in stmt.args.args]
-            if args and args[0] in ("self", "cls"):
+            had_receiver = bool(args and args[0] in ("self", "cls"))
+            if had_receiver:
                 args = args[1:]
+            has_vararg = stmt.args.vararg is not None
             flexible = bool(
-                stmt.args.vararg is not None
+                has_vararg
                 or stmt.args.kwarg is not None
                 or stmt.args.kwonlyargs
                 or stmt.args.defaults
                 or stmt.args.kw_defaults
             )
-            out.append(_Sig(stmt.name, len(args), args, flexible=flexible))
+            # Positional-arity range: trailing params with defaults are optional.
+            # `*args` makes the max unbounded. `**kwargs`/kwonly only affect
+            # keyword args (the reconciler already skips calls that use them),
+            # so they don't change the positional range.
+            n_pos = len(args)
+            min_arity = max(0, n_pos - len(stmt.args.defaults))
+            max_arity = None if has_vararg else n_pos
+            try:
+                raw = ast.unparse(stmt.args)
+                # Strip the leading self/cls receiver so the params string
+                # matches the JS/Java (receiver-free) convention and the
+                # self-stripped arity range.
+                if had_receiver:
+                    raw = re.sub(r"^(self|cls)\b\s*,?\s*", "", raw)
+                params = "(" + raw + ")"
+            except Exception:  # pragma: no cover - ast.unparse edge cases
+                params = ""
+            out.append(_Sig(
+                stmt.name, n_pos, args, flexible=flexible,
+                min_arity=min_arity, max_arity=max_arity, params=params,
+            ))
     return out
 
 
@@ -316,12 +353,22 @@ _JS_NEW_RE = re.compile(
 _JS_CALL_HEAD_RE = re.compile(
     r"(?:await\s+)?([A-Za-z_$][\w$]*)\s*\??\.\s*([A-Za-z_$][\w$]*)\s*\(",
 )
-# Method definition HEAD inside a class body: optional modifiers, name,
-# optional `<...>` generics, then `(`. The closing paren / generic close are
-# located by depth-aware walks rather than by regex.
+# Method definition HEAD inside a class body. Two forms:
+#   1. Classic method:        `[modifiers] name<T>(...)` — name immediately
+#      followed by (optional generics and) the params `(`.
+#   2. Arrow-fn class property: `[modifiers] name = (async )?(...) => ...` —
+#      common in modern TS POMs (`logIn = async (u, p) => {...}`). The `(`
+#      matched is the PARAMS paren in both cases; the closing paren / generic
+#      close are located by depth-aware walks rather than by regex, and the
+#      def-vs-call disambiguation in `_js_pom_methods` accepts a `=>` tail.
 _JS_METHOD_HEAD_RE = re.compile(
     r"^[ \t]*(?:(?:public|private|protected|static|async|readonly|override|get|set)\s+)*"
-    r"([A-Za-z_$][\w$]*)\s*(?:<[^<>]*>)?\s*\(",
+    r"([A-Za-z_$][\w$]*)\s*"
+    r"(?:"
+    r"(?:<[^<>]*>)?\s*\("        # classic:  name(  /  name<T>(
+    r"|"
+    r"=\s*(?:async\s+)?\("       # arrow property:  name = (  /  name = async (
+    r")",
     re.MULTILINE,
 )
 _JS_KW_RE = re.compile(r"([A-Za-z_$][\w$]*)\s*:")
@@ -411,23 +458,23 @@ def _js_class_body(src: str, class_name: str) -> str | None:
     return None
 
 
-def _split_js_args(blob: str) -> tuple[int, list[str], bool]:
-    """Split a JS arg blob into (count, keyword_names, flexible).
+def _split_arg_parts(blob: str, open_chars: str, close_chars: str) -> list[str]:
+    """Comma-split a param/arg blob at top level, respecting bracket nesting.
 
-    `flexible=True` when any arg is a rest param (`...args`) or carries a
-    default (`a = 1`) — those signal a JS signature whose runtime arity is
-    flexible. Caller's arity check is skipped in that case.
+    Shared by the JS and Java splitters. ``open_chars`` / ``close_chars`` let
+    Java include ``<>`` for generics (``List<Map<K,V>>``) while JS does not
+    (``=>`` arrows and comparisons would confuse depth tracking).
     """
     blob = blob.strip()
     if not blob:
-        return 0, [], False
+        return []
     depth = 0
     parts: list[str] = []
     cur = ""
     for ch in blob:
-        if ch in "([{":
+        if ch in open_chars:
             depth += 1
-        elif ch in ")]}":
+        elif ch in close_chars:
             depth -= 1
         if ch == "," and depth == 0:
             parts.append(cur.strip())
@@ -436,9 +483,51 @@ def _split_js_args(blob: str) -> tuple[int, list[str], bool]:
             cur += ch
     if cur.strip():
         parts.append(cur.strip())
+    return parts
+
+
+def _split_js_args(blob: str) -> tuple[int, list[str], bool]:
+    """Split a JS CALL-SITE arg blob into (count, keyword_names, flexible).
+
+    `flexible=True` when any arg is a rest/spread (`...args`) or carries a
+    default (`a = 1`). Used for call sites (argument count) and — via the
+    legacy path — nothing else now that POM signatures go through
+    ``_js_param_range``.
+    """
+    parts = _split_arg_parts(blob, "([{", ")]}")
     flexible = any(p.startswith("...") or "=" in p for p in parts)
     kw_names = [m.group(1) for p in parts if (m := _JS_KW_RE.match(p))]
     return len(parts), kw_names, flexible
+
+
+def _param_range(parts: list[str], *, ts_optional: bool) -> tuple[int, int | None, int]:
+    """Compute (min_required, max_allowed|None, total) for a param declaration.
+
+    A param is OPTIONAL (excluded from ``min_required``) when it has a default
+    (`a = 1` / `a: T = 1`) or — when ``ts_optional`` — a TS optional marker
+    (`name?: T`). A rest/varargs param (`...args` / `String... xs`) makes
+    ``max_allowed`` unbounded (``None``) and does not itself count toward min.
+    """
+    min_req = 0
+    max_allowed = 0
+    unbounded = False
+    for p in parts:
+        if not p:
+            continue
+        # Rest/varargs detection on the param HEAD only (before any default),
+        # so a spread inside a default value (`arr = [...DEFAULTS]`) is not
+        # mistaken for a rest param. `...args` (JS) → head startswith; Java
+        # `String... xs` → `...` in the type-before-name region.
+        head = p.split("=", 1)[0]
+        if head.strip().startswith("...") or "..." in head.split(":", 1)[0]:
+            unbounded = True
+            continue
+        max_allowed += 1
+        name_part = p.split(":", 1)[0].strip() if ":" in p else p
+        optional = ("=" in p) or (ts_optional and name_part.endswith("?"))
+        if not optional:
+            min_req += 1
+    return min_req, (None if unbounded else max_allowed), len(parts)
 
 
 def _js_pom_methods(src: str, class_name: str) -> list[_Sig]:
@@ -462,40 +551,18 @@ def _js_pom_methods(src: str, class_name: str) -> list[_Sig]:
         if not tail or (tail[0] not in "{:" and not tail.startswith("=>")):
             continue
         blob = body[m.end(): close]
-        arity, _kw, flexible = _split_js_args(blob)
-        # Param names omitted on the JS side — they aren't used downstream.
+        min_req, max_allowed, total = _param_range(
+            _split_arg_parts(blob, "([{", ")]}"), ts_optional=True,
+        )
+        # Param names omitted on the JS side — they aren't used downstream,
+        # but the raw param blob feeds Step 8's writer manifest.
         seen.add(name)
-        out.append(_Sig(name, arity, [], flexible=flexible))
+        out.append(_Sig(
+            name, total, [], flexible=(max_allowed is None),
+            min_arity=min_req, max_arity=max_allowed,
+            params=f"({blob.strip()})",
+        ))
     return out
-
-
-def _split_java_args(blob: str) -> tuple[int, list[str], bool]:
-    """Split a Java parameter blob into (arity, [], flexible).
-
-    Params like ``int x, String y``, ``List<Map<K,V>> m``, ``String... args``.
-    ``flexible=True`` when any param uses varargs (``...``) — arity check is
-    then skipped since callers can pass 0..N values.
-    """
-    blob = blob.strip()
-    if not blob:
-        return 0, [], False
-    depth = 0
-    parts: list[str] = []
-    cur = ""
-    for ch in blob:
-        if ch in "([{<":
-            depth += 1
-        elif ch in ")]}>":
-            depth -= 1
-        if ch == "," and depth == 0:
-            parts.append(cur.strip())
-            cur = ""
-        else:
-            cur += ch
-    if cur.strip():
-        parts.append(cur.strip())
-    flexible = any("..." in p for p in parts)
-    return len(parts), [], flexible
 
 
 def _java_pom_methods(src: str, class_name: str) -> list[_Sig]:
@@ -526,10 +593,45 @@ def _java_pom_methods(src: str, class_name: str) -> list[_Sig]:
         if not tail or (tail[0] not in "{;" and not tail.startswith("throws")):
             continue
         blob = body[m.end(): close]
-        arity, _kw, flexible = _split_java_args(blob)
+        # Java: no optional/default params; `String... xs` is varargs.
+        min_req, max_allowed, total = _param_range(
+            _split_arg_parts(blob, "([{<", ")]}>"), ts_optional=False,
+        )
         seen.add(name)
-        out.append(_Sig(name, arity, [], flexible=flexible))
+        out.append(_Sig(
+            name, total, [], flexible=(max_allowed is None),
+            min_arity=min_req, max_arity=max_allowed,
+            params=f"({blob.strip()})",
+        ))
     return out
+
+
+def pom_method_signatures(
+    pom_text: str, class_name: str, language: str,
+) -> dict[str, str]:
+    """Return ``{method_name: "(param, param, ...)"}`` for ``class_name``.
+
+    Step 8 uses this to give the test writer real signatures for POM methods
+    that ALREADY EXIST in the SUT (the codegen plan only carries signatures for
+    methods being newly created, so pre-existing methods referenced by the
+    choreography would otherwise reach the writer as bare names — which is how
+    the writer ended up emitting zero-arg stub calls). Reuses the same parsers
+    the reconciler uses, so what the writer sees matches what the arity gate
+    later checks. Best-effort: returns ``{}`` on parse failure.
+    """
+    lang = (language or "").lower()
+    sigs: list[_Sig]
+    if lang in ("python", "py"):
+        try:
+            tree = ast.parse(pom_text)
+        except SyntaxError:
+            return {}
+        sigs = _py_pom_methods(tree, class_name)
+    elif lang == "java":
+        sigs = _java_pom_methods(pom_text, class_name)
+    else:  # typescript / javascript / tsx / jsx / ...
+        sigs = _js_pom_methods(pom_text, class_name)
+    return {s.name: s.params for s in sigs if s.params}
 
 
 def _js_imports(src: str, known: set[str]) -> dict[str, str]:
@@ -729,18 +831,37 @@ def reconcile_codegen(
                     existing_methods=existing,
                 ))
                 continue
-            # Skip arity check when EITHER side is flexible:
-            #   - caller uses kwargs / spread → can't pin runtime arity
-            #   - POM def has *args / **kwargs / defaults / kwonly → accepts
-            #     variable call shapes
-            if site.kw_names or site.has_spread or match.flexible:
+            # Skip the arity check when the CALLER's shape is dynamic — kwargs
+            # or spread/`...` args mean the runtime positional count is unknown.
+            if site.kw_names or site.has_spread:
                 continue
-            if site.arity != match.arity:
-                mismatches.append(Mismatch(
-                    kind="arity_mismatch", call_site=site,
-                    resolved_pom=resolved, pom_file=pom_file_rel,
-                    existing_methods=existing,
-                ))
+            # Range check against the POM signature's [min_arity, max_arity].
+            # This is precise about optional/default params and rest/varargs:
+            #   - all-optional method called with 0 args → OK (no false positive)
+            #   - required-param method called with too few → flagged (the
+            #     zero-arg-stub bug the old "defaults → skip" logic masked)
+            if match.min_arity is not None:
+                too_few = site.arity < match.min_arity
+                too_many = (
+                    match.max_arity is not None and site.arity > match.max_arity
+                )
+                if too_few or too_many:
+                    mismatches.append(Mismatch(
+                        kind="arity_mismatch", call_site=site,
+                        resolved_pom=resolved, pom_file=pom_file_rel,
+                        existing_methods=existing,
+                    ))
+            else:
+                # Legacy fallback (extractor didn't compute a range): keep the
+                # old flexible-skip + exact-match behaviour.
+                if match.flexible:
+                    continue
+                if site.arity != match.arity:
+                    mismatches.append(Mismatch(
+                        kind="arity_mismatch", call_site=site,
+                        resolved_pom=resolved, pom_file=pom_file_rel,
+                        existing_methods=existing,
+                    ))
 
     return ReconciliationResult(
         test_files_scanned=files_scanned,
@@ -1176,5 +1297,6 @@ def fixture_mismatches_to_fixture_tasks(
 __all__ = [
     "CallSite", "FixtureMismatch", "Mismatch", "ReconciliationResult",
     "fixture_mismatches_to_fixture_tasks",
-    "mismatches_to_pom_tasks", "reconcile_codegen", "reconcile_fixtures",
+    "mismatches_to_pom_tasks", "pom_method_signatures",
+    "reconcile_codegen", "reconcile_fixtures",
 ]

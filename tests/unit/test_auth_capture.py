@@ -247,9 +247,12 @@ def test_cmd_auth_capture_raises_when_no_inventory(tmp_path):
         cmd_auth_capture(sut=sut)
 
 
-def test_cmd_auth_capture_raises_when_non_python_sut(tmp_path):
-    sut = _seed_sut_for_capture(tmp_path, language="typescript")
-    with pytest.raises(NotImplementedError, match=r"Python\+Playwright SUTs only"):
+def test_cmd_auth_capture_raises_when_unsupported_language(tmp_path):
+    # Python and Node.js (JS/TS) Playwright SUTs are supported; other stacks
+    # (e.g. Java/C#) raise NotImplementedError since storageState is
+    # Playwright-specific.
+    sut = _seed_sut_for_capture(tmp_path, language="java")
+    with pytest.raises(NotImplementedError, match=r"Python and Node\.js"):
         cmd_auth_capture(sut=sut)
 
 

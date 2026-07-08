@@ -6,121 +6,110 @@
 
 | Tool | Required? | Check | Install |
 | --- | --- | --- | --- |
-| Python 3.11+ | Yes | `python --version` | python.org or `uv python install 3.12` |
 | uv | Yes | `uv --version` | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
+| Python 3.11+ | Yes | `python --version` | python.org or `uv python install` (latest) |
 | Claude Code CLI | Yes | `claude --version` | `npm install -g @anthropic-ai/claude-code` |
 | npx | Yes | `npx --version` | Bundled with Node.js (install nodejs.org) |
-| Allure CLI | Optional | `allure --version` | `npm install -g allure-commandline` |
+| Allure CLI | Auto (via npx) | `allure --version` | Bundled automatically via npx — no manual install needed |
 
 ## 1. Install qtea
 
 ```bash
-uv tool install /path/to/qtea
+git clone https://github.com/BD-AI-SDLC/qtea.git
+cd qtea
+uv tool install '.[ui]'
 qtea --help
+qtea ui          # opens the desktop configuration window
 ```
 
-To also install the desktop UI (Flet-based):
+This installs both the CLI (`qtea run`, `qtea doctor`, …) and the Flet-based desktop UI (`qtea ui`).
+
+**CLI only** (headless / CI environments):
 
 ```bash
-uv tool install '/path/to/qtea[ui]'
-qtea ui          # opens the configuration window
+uv tool install .
 ```
 
-Or for development:
+### Quick example of using QTea CLI
 
 ```bash
-cd /path/to/qtea
-uv sync --extra ui    # omit --extra ui if you don't need the desktop UI
-uv run qtea --help
+qtea run --spec ./feature-spec.md --sut ./my-app
 ```
 
 ## 2. Configure environment
 
-Create a `.env` file in your working directory with your values:
+### User / system environment variables
 
-```bash
-# Required — Anthropic API key for Claude agents
-ANTHROPIC_API_KEY=sk-ant-api03-...
+Set these as persistent **user** variables, not in a `.env` file.
 
-# Jira (needed when --spec is jira:KEY or a Jira URL)
-JIRA_BASE_URL=https://yourcompany.atlassian.net
-JIRA_EMAIL=you@company.com
-JIRA_API_TOKEN=your-jira-api-token
+**Windows:** System → Advanced system settings → Environment Variables → **User variables** → New. Open a fresh terminal afterwards.
+**macOS / Linux:** add `export VAR=value` to `~/.bashrc` or `~/.zshrc`.
 
-# Azure DevOps (needed when --spec is ado:ID shorthand; not needed for
-# full URLs or ado:ORG/PROJECT/ID form).  Auth: AZDO_PAT or `az login`.
-AZDO_ORG=MyOrg
-AZDO_PROJECT=MyProject
-AZDO_PAT=your-personal-access-token    # optional if logged in via `az login`
+**LLM backend (BMF / Vertex proxy):**
 
-# Optional — Xray Cloud (step 5 auto-skips if unset)
-JIRA_XRAY_CLIENT_ID=
-JIRA_XRAY_CLIENT_SECRET=
-
-# Optional — corporate proxy (also forwarded to MCP servers)
-HTTP_PROXY=http://proxy:3128
-HTTPS_PROXY=http://proxy:3128
-
-# Required — URL where your app runs (for browser-based testing)
-SUT_BASE_URL=http://localhost:3000
+```env
+ANTHROPIC_API_KEY=sk-ant-api03-... 
+ANTHROPIC_VERTEX_BASE_URL=https://aoai-farm.bosch-temp.com/api/google/v1
+ANTHROPIC_VERTEX_PROJECT_ID=_
+CLOUD_ML_REGION=_
+CLAUDE_CODE_USE_VERTEX=1
+CLAUDE_CODE_SKIP_VERTEX_AUTH=1
 ```
 
-**Minimum for a local run:** only `ANTHROPIC_API_KEY` is required. Jira,
-Azure DevOps, and Xray credentials are optional — steps 1 and 5 auto-adapt.
+**Prompt caching — IMPORTANT (BMF only), set this first:**
 
-### Prompt caching (BMF sticky sessions) — IMPORTANT, set this first
+> Without the BMF sticky-session header the relay does not honour `cache_control` — caching becomes a net **cost loss** (25% creation surcharge, zero read-side payback). With it, qtea auto-enables caching on every step; no `--cache` flag needed.
 
-> **Set `ANTHROPIC_CUSTOM_HEADERS` as a USER environment variable before running qtea.** Single most impactful one-time setup. Without the BMF sticky-session header the relay does not honour `cache_control` — caching becomes a net **cost loss** (25% creation surcharge, zero read-side payback). With it, qtea auto-enables caching on every step; no `--cache` flag needed.
+Pick **one** replica (`01` or `02`) and stick with it across runs for cache locality. Set the below environment variables:
 
-Pick **one** BMF replica (`01` or `02`) and stick with the same value across runs for cache locality:
-
-```bash
-ANTHROPIC_CUSTOM_HEADERS="x-bmf-sticky-session-instance: 01"   # or 02
+```env
+ANTHROPIC_CUSTOM_HEADERS=x-bmf-sticky-session-instance: 01
 ```
-
-**How to set:**
-- **Windows (recommended):** System → Advanced system settings → Environment Variables → **User variables** → New → Name `ANTHROPIC_CUSTOM_HEADERS`, Value `x-bmf-sticky-session-instance: 01`. Open a fresh terminal afterwards.
-- **macOS / Linux:** add `export ANTHROPIC_CUSTOM_HEADERS="x-bmf-sticky-session-instance: 01"` to `~/.bashrc` / `~/.zshrc`.
-- **Claude Code config (alternative):** add to `~/.claude/settings.json`:
-  ```json
-  { "env": { "ANTHROPIC_CUSTOM_HEADERS": "x-bmf-sticky-session-instance: 01" } }
-  ```
 
 Forwarded to both Claude Code CLI subprocesses and direct Anthropic SDK calls (reasoning, JIT resolver) — every layer benefits automatically.
 
-**MCP servers:** `.mcp.json` references `JIRA_BASE_URL`, `JIRA_EMAIL`,
-`JIRA_API_TOKEN`, `HTTP_PROXY`, and `HTTPS_PROXY` via `${VAR}` syntax.
-The Claude CLI resolves these from your environment at launch time, so
-make sure they are set in your `.env` file or exported in your shell.
+**Corporate proxy (if applicable):**
 
-Alternatively, pass a custom env file at runtime (the file can live
-anywhere on disk — it does not need to be inside the SUT):
+```env
+HTTP_PROXY=http://localhost:3128
+HTTPS_PROXY=http://localhost:3128
+```
+
+**Jira** (needed when `--spec` is `jira:KEY` or a Jira URL):
+
+```env
+JIRA_BASE_URL=https://yourcompany.atlassian.net
+JIRA_EMAIL=you@company.com           # Cloud only
+JIRA_API_TOKEN=your-jira-api-token   # Cloud only
+JIRA_PAT=your-personal-access-token  # Server / Data Center only
+```
+
+**Azure DevOps** (needed when `--spec` is `ado:ID` shorthand; not needed for full URLs or `ado:ORG/PROJECT/ID`):
+
+```env
+AZDO_ORG=MyOrg
+AZDO_PROJECT=MyProject
+AZDO_PAT=your-personal-access-token    # optional if logged in via `az login`
+```
+
+**Xray Cloud** (optional — step 5 auto-skips if unset):
+
+```env
+JIRA_XRAY_CLIENT_ID=
+JIRA_XRAY_CLIENT_SECRET=
+```
+
+**Minimum for a local run:** only the LLM backend vars are required. Jira, Azure DevOps, and Xray are optional — steps 1 and 5 auto-adapt.
+
+> **Multiple projects / different credentials per run:** use `--env-file /path/to/.env` instead of user variables.
 
 ```bash
 qtea run --spec ./spec.md --sut ./app --env-file /path/to/.env.prod
 ```
 
-### SUT environment variables (interactive resolution)
-
-Step 6 scans the SUT for env-var keys (`.env.example`, `process.env.VAR`, `os.environ.get("VAR")`). **Required** keys that aren't already set are prompted interactively; sensitive ones (containing `PASSWORD`, `SECRET`, `TOKEN`, etc.) are masked. Entered values are injected into the process environment for the rest of the run but **never logged or persisted to disk**.
-
-```text
-  SUT_BASE_URL: https://qa.askbosch.com
-  USERNAME: test_user
-  PASSWORD: ********
-```
-
-A key is **required** when it appears in `.env.example` or matches `*BASE_URL*`, `SUT_*`, `*DATABASE_URL*`. All other discovered keys are optional — logged, not prompted.
-
-CI / non-interactive: pass `--no-hitl` to skip prompts entirely (assumes vars are pre-set by the pipeline):
-
-```bash
-qtea run --spec ./spec.md --sut ./app --no-hitl
-```
-
 ### Remote SUT (git URL)
 
-`--sut` accepts git URLs from any major hosting provider (shallow-cloned `--depth=1` into the workspace):
+`--sut` accepts git URLs from any major hosting provider (shallow-cloned `--depth=1` into the workspace). Example when using CLI version:
 
 ```bash
 qtea run --spec ./spec.md --sut https://github.com/org/app.git                     # GitHub / GitLab / Bitbucket
@@ -134,10 +123,25 @@ qtea run --spec ./spec.md --sut git@ssh.dev.azure.com:v3/org/project/repo       
 
 `AZDO_PAT` is shared across two features: **work item intake** (Step 1) and **Variable Group env resolution** (Step 6). If you're logged in via `az login`, the PAT is optional — qtea falls back to Azure CLI OAuth tokens automatically.
 
+> **`az login` covers authentication only** — it provides the access token but not the org/project name. `AZDO_ORG` and `AZDO_PROJECT` are needed only for the bare `ado:ID` shorthand. The self-contained forms (`ado:Org/Project/ID` or a full URL) work without any env vars beyond auth.
+
+**Finding your org and project names:** look at any work item URL — the two path segments after `dev.azure.com` are your values:
+
+```
+https://dev.azure.com/BoschGPT/MyProject/_workitems/edit/9370
+                       ^^^^^^^^ ^^^^^^^^^
+                       AZDO_ORG AZDO_PROJECT
+```
+
+```bash
+AZDO_ORG=BoschGPT
+AZDO_PROJECT=MyProject
+```
+
 | Env Var | Used by | Purpose |
 | --- | --- | --- |
-| `AZDO_ORG` | Step 1 (`ado:ID` shorthand), Step 6 | Azure DevOps organization name |
-| `AZDO_PROJECT` | Step 1 (`ado:ID` shorthand), Step 6 | Azure DevOps project name |
+| `AZDO_ORG` | Step 1 (`ado:ID` shorthand only), Step 6 | Default organization — only needed when using `ado:9370` bare shorthand or Variable Groups |
+| `AZDO_PROJECT` | Step 1 (`ado:ID` shorthand only), Step 6 | Default project — same conditions as `AZDO_ORG` |
 | `AZDO_PAT` | Step 1 (work item fetch), Step 6 | PAT with **Work Items (Read)** + **Variable Groups (Read)** scopes. Optional if `az login` is active. |
 | `AZDO_VARIABLE_GROUP` | Step 6 only | Variable Group name to read from |
 
@@ -156,6 +160,19 @@ steps:
 
 **Note:** Variables marked **secret** in Azure DevOps cannot be retrieved via REST (API returns `null`) — set them in the pipeline definition or use `--env-file`.
 
+> **`--no-hitl` skips the review gates at steps 4, 7, and 8** (test strategy, code-modification plan, TBD intents). qtea is designed for interactive, operator-driven use — those gates are where you catch AI mistakes before they generate or run code. Only use `--no-hitl` for the SUT env-var prompt suppression use case (pre-set all vars via `--env-file`) or in unattended scenarios where you accept the output without review.
+
+### Jira integration
+
+| Env Var | Required when | Auth scheme | Purpose |
+| --- | --- | --- | --- |
+| `JIRA_BASE_URL` | `jira:KEY` shorthand only | — | Base URL of your Jira instance. Not needed when passing a full Jira URL. |
+| `JIRA_EMAIL` | Atlassian Cloud (`*.atlassian.net`) | Basic | Your Atlassian account email. Used together with `JIRA_API_TOKEN`. |
+| `JIRA_API_TOKEN` | Atlassian Cloud (`*.atlassian.net`) | Basic | API token from `id.atlassian.com/manage-profile/security/api-tokens`. |
+| `JIRA_PAT` | Jira Server / Data Center (on-prem) | Bearer | Personal Access Token from Jira → Profile → Personal Access Tokens. Not used on Cloud. |
+
+qtea auto-detects the scheme from the hostname: `*.atlassian.net` → Cloud (Basic); any other host → Server/DC (Bearer). Override with `JIRA_AUTH_TYPE=cloud` or `JIRA_AUTH_TYPE=datacenter` if auto-detection is wrong.
+
 ## 3. Validate your setup
 
 ```bash
@@ -171,35 +188,9 @@ proceeding. Common issues:
 | npx: FAIL | Install Node.js (includes npx) |
 | ANTHROPIC_API_KEY: WARN | Add it to your `.env` file |
 | proxy: INFO | Safe to ignore if you're not behind a corporate proxy |
-| allure CLI: INFO | Optional — built-in HTML report is always generated |
+| allure CLI: INFO | Resolved automatically via npx — no manual install needed |
 
-Doctor flags:
-
-| Flag | Purpose |
-| --- | --- |
-| `--probe-mcp` | Smoke-spawn each MCP server to verify they start |
-| `--json` | Emit results as JSON (useful for CI integration) |
-
-## 4. Write your spec (or use Jira / Azure DevOps)
-
-Create a markdown file describing the feature to test:
-
-```markdown
-# Login Feature Spec
-
-## Overview
-Users should be able to log in with email and password.
-
-## Requirements
-- REQ-01: Login form has email and password fields
-- REQ-02: Valid credentials redirect to the dashboard
-- REQ-03: Invalid credentials show an error message
-- REQ-04: Empty fields show validation errors
-```
-
-Save as `feature-spec.md`.
-
-## 5. Run the full pipeline
+## 4. Run the full pipeline via CLI
 
 **With a local spec and local SUT:**
 
@@ -229,55 +220,22 @@ qtea run --spec jira:PROJ-123 \
   --env-file ./qa.env
 ```
 
-**With the report opening automatically:**
+Common flags:
 
-```bash
-qtea run --spec ./feature-spec.md --sut ./app --open-report
-```
+| Flag | Purpose |
+| --- | --- |
+| `--spec` | required — `jira:KEY`, `ado:ID`, `ado:ORG/PROJECT/ID`, Azure DevOps URL, or path to spec file |
+| `--sut` | required — local path or git URL of the app under test |
+| `--run-id` | resume an existing run |
+| `--from-step N` | re-run from a specific step |
+| `--force` | ignore checkpoints, re-run everything |
+| `--headed` | show the browser window (useful for debugging) |
+| `--open-report` | open the report automatically when the run finishes |
+| `--env-file PATH` | load credentials from a file instead of user env vars |
 
-The pipeline runs all 11 steps. You'll see console output like:
+For the full flag reference: `qtea run --help`
 
-```text
-workspace .qtea/20260523-143012-a1b2c3
-run_id    20260523-143012-a1b2c3
->>> step 1 intake
-step 1 ok  -> 2 outputs
->>> step 2 refine
-step 2 ok  -> 2 outputs
-...
->>> step 11 report
-step 11 ok  -> 2 outputs
-```
-
-All `run` flags:
-
-| Flag | Default | Purpose |
-| --- | --- | --- |
-| `--spec` | required | `jira:KEY-123`, `ado:ID`, `ado:ORG/PROJECT/ID`, Azure DevOps URL, path to spec file, or URL |
-| `--sut` | required | Local path or git URL of the System Under Test |
-| `--run-id` | auto | Resume an existing workspace by its run-id |
-| `--from-step N` | — | Start from step N (skips already-completed steps) |
-| `--only-step N` | — | Run exactly one step |
-| `--skip-step N` | — | Skip step N (repeatable) |
-| `--force` | false | Ignore checkpoints and re-run everything |
-| `--parallel-run N` | 2 | Number of parallel test workers (0 = in-process, 1–16) |
-| `--headless / --headed` | headless | Run browser tests headless or with a visible window |
-| `--debug` | false | Run the debug agent on attempt-1 failures too (attempt-2 failure always gets RCA) |
-| `--no-fix` | false | Suppress the auto fix-proposal chain that fires after retry exhaustion (debug RCA still writes) |
-| `--strict-xray` | false | Fail the pipeline if Xray upload doesn't succeed |
-| `--report MODE` | auto | `auto \| builtin \| allure \| both` |
-| `--report-inline-images` | false | Embed screenshots as base64 in the HTML report |
-| `--open-report` | false | Open the built-in report in your browser when the run finishes (not needed with `--report allure` / `both` — those auto-open the Allure UI) |
-| `--log-level LEVEL` | info | `info \| debug \| trace` |
-| `--env-file PATH` | — | Path to a `.env` file to load (values never appear in logs) |
-| `--no-hitl` | false | Disable interactive prompts (CI mode) |
-| `--cache / --no-cache` | auto | Prompt caching: auto-enabled when BMF sticky-session header is detected, disabled otherwise. `--cache` forces on, `--no-cache` forces off |
-| `--dev-locators PATH` | — | Dev-supplied locator file for JIT resolution (highest-priority Tier 1) |
-| `--storage-state PATH` | — | Playwright `storageState.json` injected into the Step 9 heal-agent's Playwright MCP browser so it skips the 10-30 s auth-replay per heal call. Resolution priority: this flag > `QTEA_STORAGE_STATE` > `<sut>/.qtea/storage-state.json` (from `qtea auth-capture`) > `<workspace>/storage-state.json` (auto-captured by the runtime on first passing test of the current run). |
-| `--no-cleanup` | false | Keep step artifacts when using `--from-step` (default cleans target step onward) |
-| `-w / --workspace PATH` | `~/.qtea` | Override the workspace base directory |
-
-## 6. List and inspect workspaces
+## 5. List and inspect workspaces
 
 ```bash
 qtea list
@@ -292,22 +250,13 @@ Shows all workspaces under `~/.qtea`, newest first:
  20260522-091500-b3c4d5   failed    7     7      2026-05-22 09:15:00  jira-PROJ-123
 ```
 
-List flags:
-
-| Flag | Purpose |
-| --- | --- |
-| `--all / -a` | Include stale/empty workspaces (zero steps done) |
-| `--limit N` | Max workspaces to display (default 20, max 500) |
-| `--json` | Emit JSON instead of a table |
-| `-w / --workspace PATH` | Override workspace base directory |
-
 Use the `run-id` column with `--run-id` to resume a specific run:
 
 ```bash
 qtea run --spec ./spec.md --sut ./app --run-id 20260522-091500-b3c4d5
 ```
 
-## 7. Find your results
+## 6. Find your results
 
 All artifacts are under `.qtea/<run-id>/artifacts/`:
 
@@ -331,14 +280,13 @@ All artifacts are under `.qtea/<run-id>/artifacts/`:
 
 **Open the report:**
 
-```bash
-# Built-in HTML (always generated)
-open .qtea/<run-id>/artifacts/step11/index.html
+An Allure report is generated and opened automatically at the end. You can also open manually the Built-in HTML:
 
-# Or use the --open-report flag to auto-open at end of run
+```bash
+open .qtea/<run-id>/artifacts/step11/index.html
 ```
 
-## 8. Common workflows
+## 7. Common workflows
 
 ```bash
 # Re-run only the report (after editing bug classifications)
@@ -362,9 +310,18 @@ qtea run --spec ./spec.md --sut ./app --no-fix
 
 Debug artifacts land in `.qtea/<run-id>/debug/`. When a step fails twice, the fix-proposal chain (`debug` → `critical-thinking` → `principal-software-engineer`) auto-fires and writes `step-NN-fix-proposal.md` alongside the aggregated `step-NN-rca.md` — suggestions only, never auto-edits.
 
-### Review gates (interactive)
+### Human-in-the-loop (HITL)
 
-On TTY runs (not `--no-hitl`), the pipeline pauses after steps 4, 7, and 8 for human review:
+On TTY runs (not `--no-hitl`), the pipeline pauses at several points to ask for your input. There are four kinds:
+
+**Clarification questions — Steps 2 & 3**
+The agent may surface a `[CLARIFICATION NEEDED]` question mid-generation when it encounters a missing required fact. You answer inline; the answer is recorded in `user-answers.md` and propagated to all later steps so the same question is never asked twice.
+
+**Missing SUT env vars — Step 6**
+If the SUT requires environment variables that are not set (credentials, base URLs, feature flags), the pipeline prompts for them one by one. Answers are stored and re-used on resume. Pre-set them via `--env-file` to skip this entirely.
+
+**Review gates — Steps 4, 7 & 8**
+The pipeline pauses after generating a key artifact and asks you to approve before proceeding:
 
 | Gate | Artifact reviewed | Options |
 | --- | --- | --- |
@@ -372,7 +329,16 @@ On TTY runs (not `--no-hitl`), the pipeline pauses after steps 4, 7, and 8 for h
 | Step 7 — Code-modification plan | `code-modification-plan.md` | `[y]` approve, `[n]` reject (abort), `[f]` open in `$EDITOR` to revise |
 | Step 8 — TBD intents | `tbd-index.json` intent quality | `[y]` approve, `[n]` reject (abort) |
 
-Edits made via the `[f]` option are fed back to the agent for a revision pass before continuing. Pass `--no-hitl` to skip all gates (CI mode).
+Edits made via `[f]` are fed back to the agent for a revision pass before continuing.
+
+**Runtime prompts — Step 9**
+During test execution the pipeline may pause for:
+
+- **Unresolvable locators** — a `tbd("intent")` sentinel could not be resolved automatically; you supply the selector once and it is cached for all future runs.
+- **Overlay / popup handling** — an unexpected overlay blocked an action; you choose whether to persist the dismiss handler for future runs.
+- **Dependency install** — a missing test dependency is detected; you confirm before the package manager runs.
+
+`--no-hitl` bypasses all four kinds. Only use it when you deliberately accept unreviewed output — e.g. a repeat run of a previously approved spec against a known-stable SUT, or a fully pre-configured CI pipeline.
 
 ### Skip Xray upload (or enforce it)
 
@@ -406,62 +372,7 @@ qtea run --spec ./feature-spec.md --sut ./path-to-your-app   # subsequent runs r
 
 **Explicit override:** pass `--storage-state PATH` to `qtea run` to force a specific file. **`auth-capture` supports Python and Node.js (JS/TS) Playwright SUTs.** Java / .NET / Selenium / Cypress / Robot SUTs raise `NotImplementedError` — produce a Playwright-format `storageState.json` manually and pass it via `--storage-state`.
 
-## 9. The 11 steps explained
-
-| # | Step | What it does |
-| --- | --- | --- |
-| 1 | **Intake** | Fetches the spec from Jira, Azure DevOps, URL, or local file |
-| 2 | **Refine** | AI refines the spec into structured requirements |
-| 3 | **Plan** | AI creates a test plan with phases and success criteria |
-| 4 | **Strategy** | AI generates test cases (TC-IDs) with steps and priorities |
-| 5 | **Xray** | Uploads test cases to Xray Cloud (auto-skips if no creds) |
-| 6 | **Research** | AI analyzes the SUT codebase, detects stack and patterns |
-| 7 | **Test Architect** | AI emits `code-modification-plan.json` — per-test-case placement decisions (fixtures/POM methods/locators to reuse vs create) |
-| 8 | **Codegen** | AI transpiles the plan into executable test code; emits `tbd(...)` sentinels for unresolved locators |
-| 9 | **Execute** | Runs tests; JIT resolves `tbd(...)` at runtime (Playwright stacks) or self-heals via agent on failure (non-Playwright) |
-| 10 | **Classify** | AI classifies failures into structured bug reports |
-| 11 | **Report** | Generates HTML report + optional Allure report |
-
-## 10. Reporting options
-
-```bash
---report auto       # (default) built-in HTML + Allure when CLI present
---report builtin    # built-in HTML only (zero dependencies)
---report allure     # Allure only (requires allure CLI; auto-opens Allure UI)
---report both       # always generate both (auto-opens Allure UI)
-
---report-inline-images  # embed screenshots as base64 in HTML
---open-report           # open the built-in report in your browser when done
-                        # (not needed with --report allure / both — those auto-open)
-```
-
-## Developing qtea locally
-
-The installed wheel holds **two kinds of frozen content** that don't auto-update on source edits:
-
-| Edited content | How to pick it up |
-| --- | --- |
-| Markdown resources: `agents/`, `templates/`, `schemas/`, `skills/`, `examples/`, `CLAUDE.md`, `.mcp.json` | Set `QTEA_RESOURCE_ROOT=<repo-root>` — runner reads from there instead of the frozen `_resources/` snapshot. **No reinstall needed.** |
-| Python code: `src/qtea/**.py` | Reinstall the tool **or** run the dev venv binary (editable install). The env var does **not** help — Python imports come from site-packages. |
-
-```bash
-# A) Resource-root env var (markdown only):
-export QTEA_RESOURCE_ROOT=/path/to/qtea       # bash / zsh
-$Env:QTEA_RESOURCE_ROOT = "C:\path\to\qtea"   # PowerShell
-set QTEA_RESOURCE_ROOT=C:\path\to\qtea        # cmd
-
-# B) Reinstall the tool (covers both markdown + Python):
-uv tool install --reinstall --force /path/to/qtea
-
-# C) Dev venv binary (editable; pair with QTEA_RESOURCE_ROOT for markdown):
-/path/to/qtea/.venv/bin/qtea run ...                       # Unix
-C:\path\to\qtea\.venv\Scripts\qtea.exe run ...             # Windows
-```
-
-CI / non-interactive: pass `--no-hitl` to `qtea run`.
-
 ## Next steps
 
 - See `docs/qa-orchestrator.instructions.md` for the full operator reference
-- See `CHANGELOG.md` for version history
 - Run `qtea doctor` any time to diagnose environment issues

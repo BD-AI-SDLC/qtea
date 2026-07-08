@@ -1,6 +1,6 @@
 [project]
 name = "qtea"
-version = "0.1.2"
+version = "1.0.0-rc.1"
 description = "QTea - Fully autonomous QA SDLC orchestrator (Python + LLM hybrid)."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -8,7 +8,7 @@ license = { text = "MIT" }
 authors = [{ name = "Sagui Ettinger" }]
 keywords = ["qa", "sdlc", "automation", "testing", "playwright", "allure", "llm", "claude"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
@@ -32,10 +32,10 @@ dependencies = [
     "PyYAML>=6",
     "nodeenv>=1.8",
     "psutil>=5.9",
+    "allure-pytest>=2.13",
 ]
 
 [project.optional-dependencies]
-allure = ["allure-pytest>=2.13"]
 ui = ["flet>=0.28", "flet-desktop>=0.28"]
 
 [project.scripts]
