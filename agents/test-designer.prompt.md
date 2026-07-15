@@ -1,8 +1,8 @@
-# Test Manager — Reference Data
+# Test Design — Reference Data (Senior SDET persona)
 
-On-demand lookup tables, templates, decision trees, and design principles for the `test-manager.agent.md`. The agent reads specific sections of this file via the Read tool when it needs a template or decision framework — it is NOT loaded into the system prompt.
+On-demand lookup tables, templates, decision trees, and design principles for the `test-designer.agent.md`. The agent reads specific sections of this file via the Read tool when it needs a template or decision framework — it is NOT loaded into the system prompt.
 
-Persona, mission, workflow steps, decision-making guidance, error handling, and quality gates live in `test-manager.agent.md`.
+Persona, mission, workflow steps, decision-making guidance, error handling, and quality gates live in `test-designer.agent.md`.
 
 ---
 
@@ -25,8 +25,12 @@ TC-XXX: [Title]
 - Type: [UI/API/Integration/Performance/Security]
 - Priority: [P0/P1/P2/P3]
 - Preconditions: [Required state — describe WHAT, not HOW]
-- Steps: [Numbered list]
-- Expected Result: [Outcome]
+- Steps: [Numbered list — state-changing actions only: open/click/fill/select/submit.
+  Never "Verify/Confirm/Observe/Inspect/Monitor/Ensure/Assert/Validate ..." — that's an
+  assertion, not a step.]
+- Expected Result: [Every checkable fact the steps must produce, one bullet each — the
+  "mini verifications" along the way plus the terminal "main verification" last. Never
+  repeat a fact that's already worded as a step.]
 ```
 
 ---

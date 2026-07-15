@@ -8,7 +8,7 @@ page/route which doesn't exist is only discovered at Step 9 runtime — as a
 hard-to-classify failure.
 
 This module adds that missing step: before the architect reasons, it navigates
-each distinct route referenced in ``test-strategy.md`` via the Playwright MCP
+each distinct route referenced in ``test-design.md`` via the Playwright MCP
 browser (authenticated with the resolved storage-state), captures a light AOM
 digest per route, and writes ``artifacts/step07/live-map.json``. A route that
 404s or unexpectedly redirects to login is flagged so the architect can raise a
@@ -117,7 +117,7 @@ def _build_explore_prompt(base_url: str, routes: list[str]) -> str:
     route_lines = "\n".join(f"  - {r}" for r in routes)
     return (
         f"Confirm which of the following routes exist on the SUT and capture a "
-        f"light structural digest of each, so the test architect can plan "
+        f"light structural digest of each, so the test automation architect can plan "
         f"against reality instead of assumptions.\n\n"
         f"SUT base URL: `{base_url}`\n"
         f"Routes to probe (paths are relative to the base URL):\n{route_lines}\n\n"

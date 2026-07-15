@@ -23,7 +23,7 @@ from ._fake_claude import install_fake_query
 
 def test_agent_key_strips_suffixes():
     assert _agent_key(Path("refine-spec.agent.md")) == "refine-spec"
-    assert _agent_key(Path("test-manager.prompt.md")) == "test-manager"
+    assert _agent_key(Path("test-designer.prompt.md")) == "test-designer"
     assert _agent_key(Path("plain.md")) == "plain"
 
 

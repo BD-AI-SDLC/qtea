@@ -399,23 +399,67 @@ _JAVA_LIFECYCLE_NAMES: frozenset[str] = frozenset({
 
 
 def _js_strip(src: str) -> str:
-    """Blank out string literals + comments while preserving length.
+    """Blank out string literals + comments while preserving length AND newlines.
 
-    Strings first: a `//` inside a URL like `"http://x"` would otherwise be
-    eaten as a line comment by a comments-first pass, taking the closing
-    quote (and the rest of the file) with it.
+    Historical bug (fixed): the original implementation processed strings
+    FIRST with ``re.DOTALL`` on a single alternation regex covering ``'``,
+    ``"``, and `` ` ``. A ``//`` line comment containing an apostrophe
+    (e.g. ``// verify it's about missing checkbox``) would trap the string
+    regex — the apostrophe was treated as an opening quote and the regex
+    consumed non-greedily until finding the next apostrophe elsewhere in
+    the file, blanking hundreds of intermediate newlines. The stripped
+    output collapsed enough lines that ``re.MULTILINE`` line-anchor
+    regexes downstream (like ``_JS_METHOD_HEAD_RE``) stopped matching
+    methods that had lost their leading ``\\n``.
+
+    Fix: comments FIRST (line + block), and every blanking substitution
+    preserves newlines. Non-template strings run with ``re.DOTALL=off``
+    because valid TS/JS ``'...'`` / ``"..."`` cannot span a raw newline;
+    template literals (backticks) can, so their blanking preserves ``\\n``.
+
+    A ``//`` inside a URL like ``"http://x"`` is safe because the double
+    quote pass has already blanked the string content by that point? No —
+    order is comments-first now. Instead, safety comes from the string
+    regex being greedy enough: ``"http://x"`` is matched as a single
+    string BEFORE the line-comment pass, but under the new order the
+    line-comment pass runs first. The line comment regex ``//[^\\n]*``
+    would match ``//x"`` inside the string if we ran it against the raw
+    source. Preventing that: we skip line-comment substitution inside
+    strings by running the string blanker FIRST for double-quoted /
+    single-quoted (non-DOTALL, so it can't overrun a line), THEN the
+    comment blanker, THEN the template-literal blanker. Order:
+
+      1. Non-template strings (no DOTALL) — neutralises ``"http://x"``.
+      2. Line comments — safe now, ``//x"`` inside the ex-string is spaces.
+      3. Block comments (DOTALL, preserve ``\\n``).
+      4. Template literals (DOTALL, preserve ``\\n``).
     """
+    # 1. Single-line strings (single- or double-quoted). NOT template literals.
+    #    NO re.DOTALL — valid TS/JS strings cannot span raw newlines, and
+    #    keeping DOTALL off means an unterminated string (source-code bug)
+    #    fails to match and doesn't consume the rest of the file.
     src = re.sub(
-        r"(['\"`])(?:\\.|(?!\1).)*?\1",
+        r"(['\"])(?:\\.|(?!\1).)*?\1",
         lambda m: m.group(1) + " " * (len(m.group(0)) - 2) + m.group(1),
-        src, flags=re.DOTALL,
+        src,
     )
+    # 2. Line comments — apostrophes inside them are now safe because any
+    #    real string containing an apostrophe has already been blanked.
+    src = re.sub(r"//[^\n]*", lambda m: " " * len(m.group(0)), src)
+    # 3. Block comments — preserve newlines so downstream re.MULTILINE
+    #    anchors and line-number calculations stay honest.
     src = re.sub(
         r"/\*.*?\*/",
-        lambda m: " " * len(m.group(0)),
+        lambda m: re.sub(r"[^\n]", " ", m.group(0)),
         src, flags=re.DOTALL,
     )
-    return re.sub(r"//[^\n]*", lambda m: " " * len(m.group(0)), src)
+    # 4. Template literals (backticks). Can span newlines — preserve them.
+    src = re.sub(
+        r"`(?:\\.|[^`])*?`",
+        lambda m: re.sub(r"[^\n]", " ", m.group(0)),
+        src, flags=re.DOTALL,
+    )
+    return src
 
 
 def _find_balanced(src: str, open_idx: int) -> int:

@@ -57,7 +57,7 @@ def test_legacy_strategy_without_new_fields_still_validates() -> None:
             }
         ],
     }
-    ok, err = is_valid(legacy, "test-strategy")
+    ok, err = is_valid(legacy, "test-design")
     assert ok, err
 
 
@@ -122,5 +122,5 @@ def test_legacy_strategy_md_parses_with_default_derived_from() -> None:
     assert tc["ac_ids"] == []
     assert tc["req_id"] == ""
     assert tc["automation_type"] == "UNKNOWN"
-    ok, err = is_valid(proj, "test-strategy")
+    ok, err = is_valid(proj, "test-design")
     assert ok, err

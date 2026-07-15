@@ -68,7 +68,7 @@ from pathlib import Path
 from typing import Any
 
 from qtea.config import package_resource_root
-from qtea.proxy import safe_subprocess_env
+from qtea.proxy import safe_subprocess_env, with_proxy_env
 
 _ENV_VAR_PATTERN = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
 
@@ -79,6 +79,8 @@ class McpServer:
     command: str
     args: list[str]
     env: dict[str, str]
+    type: str = "stdio"
+    url: str = ""
 
 
 def find_mcp_config(start: Path | None = None) -> Path:
@@ -158,6 +160,8 @@ def load_mcp_config(
             command=resolved.get("command", ""),
             args=_filter_empty_args(list(resolved.get("args") or [])),
             env={k: str(v) for k, v in (resolved.get("env") or {}).items()},
+            type=resolved.get("type", "stdio"),
+            url=resolved.get("url", ""),
         )
     return out
 
@@ -220,6 +224,38 @@ def stage_empty_mcp_config(target_dir: Path) -> Path:
     return dst
 
 
+def _probe_http(url: str, timeout_s: float = 5.0) -> tuple[bool, str]:
+    """Probe an HTTP/SSE MCP endpoint. Any HTTP response means the server is up.
+
+    Uses the same proxy env as subprocess callers (``with_proxy_env``) so
+    that Windows-registry proxy settings — which may not be in ``os.environ``
+    in all shell contexts — are honoured.
+    """
+    if not url:
+        return False, "no url configured"
+    import urllib.error
+    import urllib.request
+
+    env = with_proxy_env()
+    proxies: dict[str, str] = {}
+    for key, val in env.items():
+        if key.lower() == "http_proxy" and "http" not in proxies:
+            proxies["http"] = val
+        elif key.lower() == "https_proxy" and "https" not in proxies:
+            proxies["https"] = val
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+    try:
+        with opener.open(url, timeout=timeout_s) as resp:
+            return True, f"http endpoint reachable (HTTP {resp.status})"
+    except urllib.error.HTTPError as e:
+        # 4xx/5xx still means the endpoint answered — it's reachable.
+        return True, f"http endpoint reachable (HTTP {e.code})"
+    except OSError as e:
+        return False, f"http endpoint unreachable: {e}"
+    except Exception as e:
+        return False, f"http endpoint unreachable: {e}"
+
+
 def probe_server(server: McpServer, timeout_s: float = 30.0) -> tuple[bool, str]:
     """Best-effort: try to start the server briefly to verify it spawns.
 
@@ -242,7 +278,12 @@ def probe_server(server: McpServer, timeout_s: float = 30.0) -> tuple[bool, str]
     preflight (see `pipeline._mcp_preflight_for_step`), the 30 s window
     now runs contiguously with the SDK spawn instead of 18 minutes
     before it, so the warmup actually sticks.
+
+    HTTP-type servers (``"type": "http"`` in ``.mcp.json``) are probed
+    via a lightweight HTTP GET rather than a subprocess spawn.
     """
+    if server.type == "http":
+        return _probe_http(server.url, timeout_s=min(timeout_s, 10.0))
     if not server.command:
         return False, "no command"
     resolved = shutil.which(server.command)

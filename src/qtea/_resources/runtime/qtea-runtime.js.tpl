@@ -458,18 +458,313 @@ function callResolverSocket(req) {
  * }} Resolution
  */
 
-/** Capture AOM via Playwright's accessibility API.
+// ---------------------------------------------------------------------------
+// AOM snapshot — Locator.ariaSnapshot capability ladder + iframe enumeration.
+// Mirrors the Python runtime. Rungs: A (mode+boxes, 1.60+) → B (mode, 1.59)
+// → C (no-opts, 1.49-1.58; iframes enumerated manually) → D (legacy <1.49).
+// Return split: `text` has iframes (for LLM); `dict` is main-frame-only
+// (for tier-3 heuristic — avoids wrong-scope selectors).
+// ---------------------------------------------------------------------------
+
+/** @type {{modeAi: boolean | null, boxes: boolean | null}} */
+const AOM_CAPS = { modeAi: null, boxes: null };
+
+function readAomEnv() {
+  let depth = null;
+  const rawDepth = process.env.QTEA_AOM_DEPTH;
+  if (rawDepth) {
+    const parsed = parseInt(rawDepth, 10);
+    if (Number.isInteger(parsed) && parsed > 0) depth = parsed;
+  }
+  const mode = String(process.env.QTEA_AOM_BOXES || "auto").trim().toLowerCase();
+  const wantBoxes = mode !== "off";
+  const forceBoxes = mode === "force";
+  const legacyOk = process.env.QTEA_AOM_LEGACY_OK !== "0";
+  return { depth, wantBoxes, forceBoxes, legacyOk };
+}
+
+/**
+ * Build the kwarg ladder honouring the capability cache. Rungs proven
+ * unsupported are skipped.
+ * @param {{depth: number | null, wantBoxes: boolean, forceBoxes: boolean}} env
+ * @returns {Array<Record<string, any>>}
+ */
+function aomKwargLadder(env) {
+  /** @type {Array<Record<string, any>>} */
+  const rungs = [];
+  // Rung A: mode='ai' + boxes=true (+depth) — Playwright 1.60+
+  if (
+    env.wantBoxes
+    && AOM_CAPS.modeAi !== false
+    && (env.forceBoxes || AOM_CAPS.boxes !== false)
+  ) {
+    /** @type {Record<string, any>} */
+    const kw = { mode: "ai", boxes: true };
+    if (env.depth !== null) kw.depth = env.depth;
+    rungs.push(kw);
+  }
+  // Rung B: mode='ai' (+depth) — Playwright 1.59
+  if (AOM_CAPS.modeAi !== false) {
+    /** @type {Record<string, any>} */
+    const kw = { mode: "ai" };
+    if (env.depth !== null) kw.depth = env.depth;
+    rungs.push(kw);
+  }
+  // Rung C: no opts — Playwright 1.49-1.58 (iframes must be enumerated)
+  rungs.push({});
+  return rungs;
+}
+
+/** Cache an option-shape rejection. Attribute to most-recently-added opt.
+ * @param {Record<string, any>} opts */
+function updateAomCapsFromFailure(opts) {
+  if (opts.boxes === true) { AOM_CAPS.boxes = false; return; }
+  if (opts.mode === "ai") { AOM_CAPS.modeAi = false; }
+}
+/** @param {Record<string, any>} opts */
+function updateAomCapsFromSuccess(opts) {
+  if (opts.mode === "ai") AOM_CAPS.modeAi = true;
+  if (opts.boxes === true) AOM_CAPS.boxes = true;
+}
+
+/**
+ * Detect a Playwright JS "unknown option" error. Node throws different
+ * error shapes across Playwright versions; catch anything that looks like
+ * a signature mismatch and let the caller move down the ladder.
+ * @param {any} err
+ */
+function isSignatureError(err) {
+  if (!err) return false;
+  if (err.name === "TypeError") return true;
+  const msg = String(err.message || err);
+  return /unknown|unexpected|invalid/i.test(msg);
+}
+
+/**
+ * Call Locator.ariaSnapshot with the richest supported opts. Descends the
+ * kwarg ladder on signature failures; propagates non-signature errors so
+ * the caller can decide whether to fall through to legacy.
+ * @param {any} bodyLocator
+ * @param {{depth: number | null, wantBoxes: boolean, forceBoxes: boolean}} env
+ * @returns {Promise<string>}
+ */
+async function callAriaSnapshot(bodyLocator, env) {
+  let lastErr = null;
+  for (const opts of aomKwargLadder(env)) {
+    try {
+      const keys = Object.keys(opts);
+      // Playwright JS ariaSnapshot takes a single options object (or no arg).
+      const result = keys.length === 0
+        ? await bodyLocator.ariaSnapshot()
+        : await bodyLocator.ariaSnapshot(opts);
+      updateAomCapsFromSuccess(opts);
+      return result || "";
+    } catch (e) {
+      if (isSignatureError(e)) {
+        updateAomCapsFromFailure(opts);
+        lastErr = e;
+        continue;
+      }
+      throw e;
+    }
+  }
+  if (lastErr) throw lastErr;
+  return "";
+}
+
+/**
+ * Best-effort iframe label: url() → name() → "unknown". Frame.url and
+ * Frame.name are methods on Playwright JS Frame.
+ * @param {any} frame
+ * @returns {string}
+ */
+function iframeLabel(frame) {
+  try {
+    if (typeof frame.url === "function") {
+      const u = frame.url();
+      if (u) return String(u);
+    }
+  } catch (_) {}
+  try {
+    if (typeof frame.name === "function") {
+      const n = frame.name();
+      if (n) return String(n);
+    }
+  } catch (_) {}
+  return "unknown";
+}
+
+/**
+ * Enumerate iframes and append each non-main frame's snapshot to `mainText`.
+ * Called on Rung C where Playwright does NOT include iframe subtrees.
+ * Marker: `# iframe: <label>` — `#` prefix is ignored by parseAriaSnapshotYaml.
+ * @param {any} page
+ * @param {string} mainText
+ * @param {{depth: number | null, wantBoxes: boolean, forceBoxes: boolean}} env
+ * @returns {Promise<string>}
+ */
+async function appendIframeSnapshots(page, mainText, env) {
+  let frames;
+  try {
+    frames = typeof page.frames === "function" ? page.frames() : page.frames;
+  } catch (_) {
+    return mainText;
+  }
+  if (!Array.isArray(frames)) return mainText;
+  let mainFrame = null;
+  try {
+    mainFrame = typeof page.mainFrame === "function" ? page.mainFrame() : page.mainFrame;
+  } catch (_) {}
+  const parts = [mainText];
+  for (const frame of frames.filter((f) => f !== mainFrame)) {
+    let sub = "";
+    try {
+      const body = frame.locator("body");
+      if (!body || typeof body.ariaSnapshot !== "function") continue;
+      sub = await callAriaSnapshot(body, env);
+    } catch (e) {
+      log("iframe_snapshot_skip", { error: String(e) });
+      continue;
+    }
+    if (!sub) continue;
+    parts.push(`# iframe: ${iframeLabel(frame)}`);
+    parts.push(sub);
+  }
+  return parts.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// YAML parser for Locator.ariaSnapshot() output — port of the Python
+// `_parse_aria_snapshot_yaml`. Produces the same {role, name, children}
+// shape the heuristicResolve expects. Skips lines that don't start with
+// `- ` (comment/marker lines, blank lines, attribute metadata under `/`).
+// ---------------------------------------------------------------------------
+
+const AOM_RE_BOX = /\s*\[box=([\d.,\-]+)\]/;
+const AOM_RE_REF = /\s*\[ref=e?\d+\]/;
+const AOM_RE_ATTR = /\s*\[[A-Za-z_][A-Za-z0-9_-]*=[^\]]*\]/;
+const AOM_RE_QUOTED = /^([A-Za-z][A-Za-z0-9_-]*)\s+"((?:[^"\\]|\\.)*)"(.*)$/;
+const AOM_RE_INLINE = /^([A-Za-z][A-Za-z0-9_-]*)\s*:\s*(.*)$/;
+const AOM_RE_ROLE_ONLY = /^([A-Za-z][A-Za-z0-9_-]*).*$/;
+
+/**
+ * Parse Locator.ariaSnapshot() YAML into a dict tree compatible with
+ * aomWalk / heuristicResolve. Returns `{}` for empty input.
+ * @param {string} yamlText
+ * @returns {any}
+ */
+function parseAriaSnapshotYaml(yamlText) {
+  if (!yamlText || !yamlText.trim()) return {};
+
+  /** @type {Array<any>} */
+  const rootChildren = [];
+  // Stack: [indent, childListToAppendInto]
+  /** @type {Array<[number, Array<any>]>} */
+  const stack = [[-1, rootChildren]];
+
+  for (const rawLine of yamlText.split("\n")) {
+    if (!rawLine.trim()) continue;
+    const indent = rawLine.length - rawLine.trimStart().length;
+    const line = rawLine.trim();
+    if (!line.startsWith("- ")) continue;  // skips `# iframe:` markers etc.
+    let body = line.slice(2).trim();
+    if (body.startsWith("/")) continue;  // attribute metadata, not a node
+
+    // Extract + strip annotations before role/name parsing.
+    /** @type {[number, number, number, number] | null} */
+    let box = null;
+    const mBox = AOM_RE_BOX.exec(body);
+    if (mBox) {
+      const parts = mBox[1].split(",");
+      if (parts.length === 4) {
+        const nums = parts.map((p) => parseFloat(p));
+        if (nums.every((n) => Number.isFinite(n))) {
+          box = [nums[0], nums[1], nums[2], nums[3]];
+        }
+      }
+      body = body.replace(AOM_RE_BOX, "");
+    }
+    body = body.replace(AOM_RE_REF, "");
+    body = body.replace(AOM_RE_ATTR, "").trim();
+
+    if (body.endsWith(":")) body = body.slice(0, -1).trimEnd();
+
+    let role = "";
+    let name = "";
+    const mQ = AOM_RE_QUOTED.exec(body);
+    if (mQ) {
+      role = mQ[1];
+      name = mQ[2];
+    } else {
+      const mI = AOM_RE_INLINE.exec(body);
+      if (mI) {
+        role = mI[1];
+        const inlineText = mI[2].trim();
+        if (inlineText) name = inlineText;
+      } else {
+        const mR = AOM_RE_ROLE_ONLY.exec(body);
+        if (!mR) continue;
+        role = mR[1];
+      }
+    }
+
+    /** @type {any} */
+    const node = { role, name, children: [] };
+    if (box !== null) node.box = box;
+
+    // Pop stack until parent indent is strictly less than current.
+    while (stack.length > 1 && stack[stack.length - 1][0] >= indent) {
+      stack.pop();
+    }
+    stack[stack.length - 1][1].push(node);
+    stack.push([indent, node.children]);
+  }
+
+  return { role: "document", name: "", children: rootChildren };
+}
+
+/** Capture AOM via the modern Locator.ariaSnapshot API with capability
+ * ladder + iframe enumeration + legacy accessibility fallback.
  * @param {any} page
  * @returns {Promise<{text: string, dict: any}>}
  */
 async function snapshotPage(page) {
+  const env = readAomEnv();
+  // ---- Primary: Locator.ariaSnapshot (Playwright JS 1.49+) ----
   try {
-    const ax = (await page.accessibility.snapshot()) || {};
-    return { text: JSON.stringify(ax), dict: ax };
+    if (page && typeof page.locator === "function") {
+      const body = page.locator("body");
+      if (body && typeof body.ariaSnapshot === "function") {
+        const mainText = await callAriaSnapshot(body, env);
+        // Parse the MAIN-FRAME dict BEFORE appending iframe text so the
+        // tier-3 heuristic never sees iframe-scoped elements.
+        const dict = parseAriaSnapshotYaml(mainText);
+        let fullText;
+        if (AOM_CAPS.modeAi !== true) {
+          fullText = await appendIframeSnapshots(page, mainText, env);
+        } else {
+          fullText = mainText;
+        }
+        return { text: fullText, dict };
+      }
+    }
   } catch (e) {
-    log("snapshot_failed", { error: String(e) });
-    return { text: "{}", dict: {} };
+    log("snapshot_failed_aria", { error: String(e) });
+    // Fall through — older Playwright JS might still expose the legacy API.
   }
+
+  // ---- Legacy: page.accessibility.snapshot() (Playwright JS <1.49; also
+  // works on 1.49-1.56 where it was deprecated but not yet removed) ----
+  if (!env.legacyOk) return { text: "", dict: {} };
+  try {
+    if (page && page.accessibility && typeof page.accessibility.snapshot === "function") {
+      const ax = (await page.accessibility.snapshot()) || {};
+      return { text: JSON.stringify(ax), dict: ax };
+    }
+  } catch (e) {
+    log("snapshot_failed_legacy", { error: String(e) });
+  }
+  return { text: "", dict: {} };
 }
 
 /** Best-effort: read the current test's filename from env (set by PW Test / Jest / Vitest). */
@@ -785,6 +1080,105 @@ function installMonkeyPatch() {
 }
 
 // ---------------------------------------------------------------------------
+// On-failure AOM capture — mirrors the Python `_capture_aom_on_failure`.
+// Writes <QTEA_WORKSPACE_DIR>/aom-at-failure/<entry_id>.txt so the Step 9
+// Layer 2 refinement can cross-check the failure against the live page
+// AOM state.
+//
+// Registration: exported as `test` (an extension of @playwright/test's
+// `test` with an auto-use fixture). Operators opt in with a one-line
+// import change in their fixture module:
+//
+//     const { test, expect } = require("./tests/qtea-runtime");
+//
+// Without that change, the on-failure capture does NOT fire and Layer 2
+// remains dead code for the JS SUT — no other behaviour is affected.
+// ---------------------------------------------------------------------------
+
+/** Match Python `md_parser.slugify`. */
+function slugify(s) {
+  const base = String(s || "").replace(/[^A-Za-z0-9]+/g, "-").replace(/^-+|-+$/g, "").toLowerCase();
+  return base || "untitled";
+}
+
+/** Match Python `test_runner._normalize_id(file_rel, name)`. */
+function normalizeTestId(fileRel, name) {
+  const stem = fileRel ? path.parse(fileRel).name : "";
+  const combined = fileRel ? `${stem}-${name}` : name;
+  return "T-" + slugify(combined);
+}
+
+/**
+ * Snapshot the page AOM and write it to
+ * `<QTEA_WORKSPACE_DIR>/aom-at-failure/<entry_id>.txt`. Silently no-ops
+ * when the workspace env-var is unset or the page is unusable — capture
+ * failures must never affect the test outcome.
+ * @param {any} page
+ * @param {any} testInfo  Playwright Test's TestInfo (or a compatible shape)
+ */
+async function captureAomOnFailure(page, testInfo) {
+  try {
+    const workspace = process.env.QTEA_WORKSPACE_DIR;
+    if (!workspace) return;
+    if (!page || typeof page.locator !== "function") return;
+    const snap = await snapshotPage(page);
+    if (!snap || !snap.text) return;
+    let fileRel = (testInfo && testInfo.file) ? String(testInfo.file) : "";
+    if (fileRel) {
+      try { fileRel = path.relative(process.cwd(), fileRel); } catch (_) {}
+    }
+    const title = (testInfo && testInfo.title) ? String(testInfo.title) : "test";
+    const entryId = normalizeTestId(fileRel, title);
+    const outDir = path.join(workspace, "aom-at-failure");
+    fs.mkdirSync(outDir, { recursive: true });
+    fs.writeFileSync(path.join(outDir, entryId + ".txt"), snap.text, "utf8");
+    log("aom_capture_on_failure_ok", { entryId });
+  } catch (e) {
+    log("aom_capture_on_failure_failed", { error: String(e) });
+  }
+}
+
+/**
+ * Extend @playwright/test's `test` object with an auto-use fixture that
+ * captures AOM on failed test teardown. Returns `null` when
+ * `@playwright/test` is not installed (Jest/Mocha/Vitest SUTs) — the
+ * caller should degrade gracefully.
+ * @returns {any}
+ */
+function buildQteaTest() {
+  let pwTest;
+  try {
+    pwTest = require("@playwright/test");
+  } catch (_) {
+    return null;
+  }
+  if (!pwTest || !pwTest.test || typeof pwTest.test.extend !== "function") {
+    return null;
+  }
+  try {
+    return pwTest.test.extend({
+      // Auto-use fixture: no visible test API, no arg pollution. The
+      // fixture body awaits `use()` (the test runs), then inspects
+      // `testInfo.status` and captures AOM only on failure/timeout.
+      _qteaFailureCapture: [
+        async ({ page }, use, testInfo) => {
+          await use(undefined);
+          const status = testInfo && testInfo.status;
+          if (status !== "failed" && status !== "timedOut") return;
+          await captureAomOnFailure(page, testInfo);
+        },
+        { auto: true },
+      ],
+    });
+  } catch (e) {
+    log("qtea_test_extend_failed", { error: String(e) });
+    return null;
+  }
+}
+
+const _qteaTest = buildQteaTest();
+
+// ---------------------------------------------------------------------------
 // Entry points
 // ---------------------------------------------------------------------------
 
@@ -801,6 +1195,12 @@ module.exports.tbd = tbd;
 module.exports.isSentinel = isSentinel;
 module.exports.parseSentinel = parseSentinel;
 module.exports.installMonkeyPatch = installMonkeyPatch;
+// On-failure capture — operators opt in by importing `test`/`expect` from
+// this module instead of `@playwright/test`.
+module.exports.test = _qteaTest;
+module.exports.expect = (() => {
+  try { return require("@playwright/test").expect; } catch (_) { return null; }
+})();
 // Test-time exports (unit-tested in qtea's own suite).
 module.exports.__internal = {
   heuristicResolve,
@@ -809,4 +1209,17 @@ module.exports.__internal = {
   ROLE_KEYWORDS,
   NAME_FILLERS,
   SENTINEL_PREFIX,
+  // AOM helpers (Thread 2: modern API + iframe support).
+  AOM_CAPS,
+  readAomEnv,
+  aomKwargLadder,
+  callAriaSnapshot,
+  iframeLabel,
+  appendIframeSnapshots,
+  parseAriaSnapshotYaml,
+  snapshotPage,
+  // On-failure capture (Thread 2 sub-task).
+  slugify,
+  normalizeTestId,
+  captureAomOnFailure,
 };

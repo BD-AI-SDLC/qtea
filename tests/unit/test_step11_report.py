@@ -106,7 +106,7 @@ def _seed(ctx: StepContext, *, results=None, totals=None, bugs=None, plan=None, 
     if strategy is not None:
         s4 = ctx.workspace.step_dir(4)
         s4.mkdir(parents=True, exist_ok=True)
-        (s4 / "test-strategy.json").write_text(json.dumps(strategy), encoding="utf-8")
+        (s4 / "test-design.json").write_text(json.dumps(strategy), encoding="utf-8")
 
 
 def _sample_results():
@@ -148,7 +148,9 @@ def test_build_report_zero_results(tmp_path: Path):
     _seed(ctx, results=[])
     report = build_report(ctx.workspace)
     assert report.summary.total_tests == 0
-    assert report.summary.pass_rate == 1.0
+    # Finding 20: a run that executed ZERO real tests must NOT read as a 100%
+    # pass (the report-layer false-green). Zero tests => 0% pass rate.
+    assert report.summary.pass_rate == 0.0
 
 
 def test_to_dict_validates_against_schema(tmp_path: Path):
@@ -434,15 +436,35 @@ async def test_step11_report_auto_builtin_always(tmp_path: Path, monkeypatch):
 
 
 async def test_step11_open_report_flag(tmp_path: Path):
+    """When ``--open-report`` is set AND allure HTML generation didn't
+    succeed, the step must fall back to opening the built-in HTML report
+    via ``webbrowser.open``.
+
+    The step's decision tree (see ``s11_report.py:88-146``):
+      - allure_ok=True + mode in (auto|allure|both) → spawn ``allure open``
+        (background Java server), never touches ``webbrowser``.
+      - Otherwise + open_report=True → ``webbrowser.open(html_uri)``.
+
+    This test locks in the fallback path. We simulate "allure did not
+    succeed" by patching ``generate_allure_html`` to return False — the
+    exact return value the step checks — so the test doesn't depend on
+    whether the runner has an ``allure`` binary on PATH.
+    """
     ctx = _ctx(tmp_path, open_report=True)
     _seed(ctx, results=_sample_results())
-    # Simulate allure being ABSENT so the built-in HTML path is used: when
-    # allure is installed the step auto-opens the Allure UI via `allure open`
-    # instead of webbrowser (and the test would otherwise be coupled to
-    # whether the runner has allure on PATH). With allure absent, --open-report
-    # falls back to webbrowser.open on the built-in index.html.
-    with patch("qtea.steps.s11_report.shutil.which", return_value=None), \
+    with patch("qtea.steps.s11_report.generate_allure_html", return_value=False), \
             patch("qtea.steps.s11_report.webbrowser.open") as mock_open:
         result = await ReportStep().run(ctx)
-        assert result.success
-        assert mock_open.called
+
+    assert result.success
+    # Fallback was invoked exactly once — not repeated, not skipped.
+    assert mock_open.call_count == 1
+    # And it opened the specific artifact the step produced: a `file://`
+    # URI pointing to the built-in HTML report on disk. A test that
+    # merely asserts ``mock_open.called`` would pass even if the step
+    # opened the wrong thing (a stale path, an allure-html URL, etc.);
+    # verifying the URI proves the step routed to the built-in report.
+    opened_uri = mock_open.call_args.args[0]
+    expected_html = ctx.workspace.step_dir(11) / "index.html"
+    assert expected_html.exists(), "step should have written the built-in HTML"
+    assert opened_uri == expected_html.as_uri()

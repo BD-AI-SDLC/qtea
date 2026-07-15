@@ -95,7 +95,7 @@ def _ctx(
 ) -> StepContext:
     ws = create_workspace(tmp_path / ".ws")
     if with_strategy:
-        (ws.step_dir(4) / "test-strategy.md").write_text(
+        (ws.step_dir(4) / "test-design.md").write_text(
             "# Strategy\n#### TC-STUB:\nSteps: go to /\nExpected: page loads\n",
             encoding="utf-8",
         )
@@ -124,7 +124,7 @@ async def test_step08_requires_strategy(tmp_path: Path):
     ctx = _ctx(tmp_path, with_strategy=False)
     result = await CodegenStep().run(ctx)
     assert not result.success
-    assert "test-strategy.md" in (result.error or "")
+    assert "test-design.md" in (result.error or "")
 
 
 async def test_step08_happy_path_indexes_and_validates(tmp_path: Path, monkeypatch):
@@ -240,7 +240,7 @@ async def test_step08_fails_fast_when_sut_inventory_missing(tmp_path: Path):
 async def test_step08_fails_fast_when_inventory_files_unreachable(tmp_path: Path):
     ws_path = tmp_path / ".ws"
     ws = create_workspace(ws_path)
-    (ws.step_dir(4) / "test-strategy.md").write_text("# s\n", encoding="utf-8")
+    (ws.step_dir(4) / "test-design.md").write_text("# s\n", encoding="utf-8")
     inventory = {
         "modules": [
             {
@@ -1194,15 +1194,17 @@ def test_write_tbd_locators_instance_placement(tmp_path: Path):
             break
 
 
-def test_write_tbd_locators_defers_inline_object_property(
+def test_write_tbd_locators_writes_inline_object_property(
     tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """When the SUT uses `inline_object_property` convention (elements
-    dict on POM class), Step 8 should DEFER the task to the POM extender
-    agent rather than mechanically writing.
+    """When the SUT uses ``inline_object_property`` convention
+    (``elements`` dict on POM class), Step 8 MUST now mechanically
+    insert the new constant as ``KEY: tbd("intent")`` before the
+    object's closing ``}`` — closing the coherence trap that let the
+    pom-extender invent selectors when the sentinel wasn't pre-written.
 
-    Regression: the previous behaviour warned `tbd_locator_no_file` even
-    though the file exists and the convention is fully recognised.
+    Prior behaviour DEFERRED to the extender; that path led to
+    fabricated XPath strings (see fix-batch RCA-B).
     """
     import logging
 
@@ -1221,20 +1223,191 @@ def test_write_tbd_locators_defers_inline_object_property(
         locator_file="src/pages/RopaEntryPage.ts",
         location_pattern="inline_object_property",
         container_name="elements",
+        container_class_name="RopaEntryPage",
     )]
     caplog.set_level(logging.INFO)
     count = _write_tbd_locators(tasks, tmp_path, "typescript")
-    # Nothing mechanically written; POM extender handles it downstream.
+    assert count == 1
+    content = pom_file.read_text(encoding="utf-8")
+    assert 'btnSendForApproval: tbd("send for approval button")' in content
+    # Original entry preserved:
+    assert 'btnCreate' in content
+    # Written INFO log fires (not the legacy defer log):
+    messages = [rec.message for rec in caplog.records]
+    assert any(
+        "tbd_locators_written_object_literal" in m for m in messages
+    ), f"expected object-literal-written INFO log; got {messages!r}"
+
+
+def test_write_tbd_locators_export_const_object_appends(tmp_path: Path):
+    """``export const FooSelectors = { ... }`` — new entries inserted
+    before the object's closing ``}``, preserving existing keys AND
+    importing ``tbd`` with a specifier relative to the file (the runtime is
+    vendored at ``<sut>/tests/qtea-runtime.js``, so from ``src/pages/`` that
+    is ``../../tests/qtea-runtime``)."""
+    pom_file = tmp_path / "src" / "pages" / "TrialPage.ts"
+    pom_file.parent.mkdir(parents=True, exist_ok=True)
+    pom_file.write_text(
+        'import { Page } from "@playwright/test";\n'
+        "\n"
+        "export const TrialPageSelectors = {\n"
+        '  ExistingBtn: "//button[@id=\'go\']",\n'
+        '  ExistingInp: "#name",\n'
+        "};\n"
+        "\n"
+        "export class TrialPage {\n"
+        "  constructor(page: Page) {}\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    tasks = [
+        _LocatorTask(
+            constant_name="CHECKBOX_MARKETING_CONSENT",
+            intent="marketing consent checkbox on trial form",
+            owning_page="TrialPage",
+            locator_file="src/pages/TrialPage.ts",
+            location_pattern="export_const_object",
+            container_class_name="TrialPageSelectors",
+        ),
+    ]
+    count = _write_tbd_locators(tasks, tmp_path, "typescript")
+    assert count == 1
+    content = pom_file.read_text(encoding="utf-8")
+    assert (
+        'CHECKBOX_MARKETING_CONSENT: tbd("marketing consent checkbox on trial form")'
+        in content
+    )
+    # Existing entries preserved:
+    assert 'ExistingBtn' in content
+    assert 'ExistingInp' in content
+    # New entry lands inside the object, before the closing brace of the
+    # TrialPageSelectors const — not somewhere else in the file.
+    obj_open = content.find("TrialPageSelectors = {")
+    obj_close = content.find("};", obj_open)
+    new_entry_pos = content.find("CHECKBOX_MARKETING_CONSENT")
+    assert obj_open < new_entry_pos < obj_close, (
+        "new entry must be inside the TrialPageSelectors object body"
+    )
+    # tbd import injected once, with a file-relative specifier:
+    assert content.count("qtea-runtime") == 1
+    assert 'import { tbd } from "../../tests/qtea-runtime";' in content
+
+
+def test_write_tbd_locators_export_const_object_dev_match(tmp_path: Path):
+    """When a dev-locator matches, its raw selector is written into the
+    object literal INSTEAD of a ``tbd()`` sentinel — and the tbd import
+    is NOT injected because no sentinel was emitted."""
+    pom_file = tmp_path / "src" / "pages" / "TrialPage.ts"
+    pom_file.parent.mkdir(parents=True, exist_ok=True)
+    pom_file.write_text(
+        "export const TrialPageSelectors = {\n"
+        '  Existing: "#x",\n'
+        "};\n",
+        encoding="utf-8",
+    )
+    dev = {"CHECKBOX_MARKETING_CONSENT": DevLocator(
+        constant_name="CHECKBOX_MARKETING_CONSENT",
+        selector="[data-testid='marketing-consent']",
+    )}
+    tasks = [_LocatorTask(
+        constant_name="CHECKBOX_MARKETING_CONSENT",
+        intent="marketing consent checkbox",
+        owning_page="TrialPage",
+        locator_file="src/pages/TrialPage.ts",
+        location_pattern="export_const_object",
+        container_class_name="TrialPageSelectors",
+    )]
+    count = _write_tbd_locators(tasks, tmp_path, "typescript", dev_locators=dev)
+    assert count == 1
+    content = pom_file.read_text(encoding="utf-8")
+    assert (
+        "CHECKBOX_MARKETING_CONSENT: \"[data-testid='marketing-consent']\""
+        in content
+    )
+    assert "tbd(" not in content
+    assert "qtea-runtime" not in content
+
+
+def test_write_tbd_locators_promotes_mislabeled_separate_class_ts(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Durable TD-1 fix (run 20260708-121117-99f5ed): a TS file whose
+    ``export const XSelectors = {…}`` object was mislabeled ``separate_class``
+    by Step-6 must NOT be deferred to the LLM extender. Step 8 detects the
+    real object-literal shape from the file content (via container_class_name)
+    and writes the sentinel + a file-relative import deterministically."""
+    import logging
+
+    pom_file = tmp_path / "src" / "pages" / "TrialPage.ts"
+    pom_file.parent.mkdir(parents=True, exist_ok=True)
+    pom_file.write_text(
+        'import { Page } from "@playwright/test";\n'
+        "\n"
+        "export const TrialPageSelectors = {\n"
+        '  Existing: "#x",\n'
+        "};\n",
+        encoding="utf-8",
+    )
+    tasks = [_LocatorTask(
+        constant_name="CHECKBOX_MARKETING_CONSENT",
+        intent="marketing consent checkbox on the trial form",
+        owning_page="TrialPage",
+        locator_file="src/pages/TrialPage.ts",
+        location_pattern="separate_class",  # the Step-6 mislabel
+        container_class_name="TrialPageSelectors",
+    )]
+    caplog.set_level(logging.INFO)
+    count = _write_tbd_locators(tasks, tmp_path, "typescript")
+    assert count == 1
+    content = pom_file.read_text(encoding="utf-8")
+    # Sentinel written INTO the object literal, before its closing brace:
+    assert (
+        'CHECKBOX_MARKETING_CONSENT: tbd("marketing consent checkbox on the '
+        'trial form")' in content
+    )
+    obj_open = content.find("TrialPageSelectors = {")
+    obj_close = content.find("};", obj_open)
+    assert obj_open < content.find("CHECKBOX_MARKETING_CONSENT") < obj_close
+    # File-relative import, not the hardcoded ./qtea-runtime:
+    assert 'import { tbd } from "../../tests/qtea-runtime";' in content
+    # And it was NOT deferred to the extender:
+    messages = [rec.message for rec in caplog.records]
+    assert not any(
+        "tbd_locator_deferred_to_extender" in m for m in messages
+    ), f"mislabeled object literal must be written, not deferred; got {messages!r}"
+
+
+def test_write_tbd_locators_still_defers_ts_when_no_container(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Regression guard: a non-object-literal TS task whose container is
+    genuinely absent from the file still defers to the extender and writes
+    nothing (the promotion path must not swallow truly-unknown shapes)."""
+    import logging
+
+    pom_file = tmp_path / "src" / "pages" / "TrialPage.ts"
+    pom_file.parent.mkdir(parents=True, exist_ok=True)
+    pom_file.write_text(
+        'import { Page } from "@playwright/test";\n'
+        "export class TrialPage {}\n",
+        encoding="utf-8",
+    )
+    tasks = [_LocatorTask(
+        constant_name="CHECKBOX_MARKETING_CONSENT",
+        intent="marketing consent checkbox",
+        owning_page="TrialPage",
+        locator_file="src/pages/TrialPage.ts",
+        location_pattern="separate_class",
+        container_class_name="TrialPageSelectors",  # not present in the file
+    )]
+    caplog.set_level(logging.INFO)
+    count = _write_tbd_locators(tasks, tmp_path, "typescript")
     assert count == 0
-    # Verify a DEFER log fired at INFO — NOT a warning about missing file.
+    assert "tbd(" not in pom_file.read_text(encoding="utf-8")
     messages = [rec.message for rec in caplog.records]
     assert any(
         "tbd_locator_deferred_to_extender" in m for m in messages
-    ), f"expected deferred INFO log; got {messages!r}"
-    # Old warning event MUST NOT fire when the convention is recognised.
-    assert not any(
-        "tbd_locator_no_file" in m for m in messages
-    ), "old 'no_file' warning must not fire for recognised patterns"
+    ), f"expected defer log for unresolvable container; got {messages!r}"
 
 
 def test_write_tbd_locators_defers_when_no_locator_source(
@@ -1259,6 +1432,54 @@ def test_write_tbd_locators_defers_when_no_locator_source(
     assert any(
         "tbd_locator_no_source_defer" in m for m in messages
     ), f"expected no-source-defer INFO log; got {messages!r}"
+
+
+def test_write_tbd_locators_dedupes_deferral_across_invocations(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A shared ``deferral_seen`` set suppresses the
+    ``tbd_locator_deferred_to_extender`` log for a repeated (constant, file)
+    across the multiple times ``_write_tbd_locators`` runs per run (Phase A2
+    + Phase A3.25 re-assert × MAX_ATTEMPTS). Without the set, every call
+    re-logs — preserving legacy behaviour for callers that don't pass one."""
+    import logging
+
+    pom_file = tmp_path / "src" / "pages" / "TrialPage.ts"
+    pom_file.parent.mkdir(parents=True, exist_ok=True)
+    pom_file.write_text("export class TrialPage {}\n", encoding="utf-8")
+    tasks = [_LocatorTask(
+        constant_name="CHECKBOX_MARKETING_CONSENT",
+        intent="marketing consent checkbox",
+        owning_page="TrialPage",
+        locator_file="src/pages/TrialPage.ts",
+        location_pattern="separate_class",
+    )]
+
+    caplog.set_level(logging.INFO)
+    seen: set[tuple[str, str]] = set()
+    # Simulate the 4 per-run invocations (2 phases × 2 attempts).
+    for _ in range(4):
+        _write_tbd_locators(
+            tasks, tmp_path, "typescript", deferral_seen=seen,
+        )
+    deferrals = [
+        r for r in caplog.records
+        if "tbd_locator_deferred_to_extender" in r.message
+    ]
+    assert len(deferrals) == 1, (
+        f"expected the deferral logged once with a shared set; "
+        f"got {len(deferrals)}"
+    )
+
+    # No set → legacy behaviour: every invocation re-logs.
+    caplog.clear()
+    for _ in range(4):
+        _write_tbd_locators(tasks, tmp_path, "typescript")
+    deferrals = [
+        r for r in caplog.records
+        if "tbd_locator_deferred_to_extender" in r.message
+    ]
+    assert len(deferrals) == 4
 
 
 def test_build_locator_tasks_matches_inline_by_owning_pom(tmp_path: Path):
@@ -1327,6 +1548,174 @@ def test_build_locator_tasks_backwards_compat_separate_class(tmp_path: Path):
     tasks = _build_locator_tasks(plan, inventory)
     assert len(tasks) == 1
     assert tasks[0].locator_file == "src/locators/login.py"
+
+
+def test_verify_tbd_compliance_passes_on_tbd_sentinel(tmp_path: Path):
+    """The happy path: extender wrote ``KEY: tbd("intent")`` — no violations."""
+    from qtea.steps.s08_codegen import _verify_tbd_compliance
+
+    pom = tmp_path / "src" / "pages" / "TrialPage.ts"
+    pom.parent.mkdir(parents=True, exist_ok=True)
+    pom.write_text(
+        'import { tbd } from "./qtea-runtime";\n'
+        "export const TrialPageSelectors = {\n"
+        '  Existing: "//x",\n'
+        '  CHECKBOX_MARKETING_CONSENT: tbd("marketing consent"),\n'
+        "};\n",
+        encoding="utf-8",
+    )
+    tasks = [_LocatorTask(
+        constant_name="CHECKBOX_MARKETING_CONSENT",
+        intent="marketing consent",
+        owning_page="TrialPage",
+        locator_file="src/pages/TrialPage.ts",
+        location_pattern="export_const_object",
+        container_class_name="TrialPageSelectors",
+    )]
+    violations = _verify_tbd_compliance(tasks, tmp_path)
+    assert violations == []
+
+
+def test_verify_tbd_compliance_passes_on_dev_locator_match(tmp_path: Path):
+    """A raw string matching a dev-locator selector is compliant."""
+    from qtea.steps.s08_codegen import _verify_tbd_compliance
+
+    pom = tmp_path / "src" / "pages" / "TrialPage.ts"
+    pom.parent.mkdir(parents=True, exist_ok=True)
+    pom.write_text(
+        "export const TrialPageSelectors = {\n"
+        '  Existing: "//x",\n'
+        "  CHECKBOX_MARKETING_CONSENT: \"[data-testid='marketing-consent']\",\n"
+        "};\n",
+        encoding="utf-8",
+    )
+    tasks = [_LocatorTask(
+        constant_name="CHECKBOX_MARKETING_CONSENT",
+        intent="marketing consent",
+        owning_page="TrialPage",
+        locator_file="src/pages/TrialPage.ts",
+        location_pattern="export_const_object",
+        container_class_name="TrialPageSelectors",
+    )]
+    dev = {"CHECKBOX_MARKETING_CONSENT": DevLocator(
+        constant_name="CHECKBOX_MARKETING_CONSENT",
+        selector="[data-testid='marketing-consent']",
+    )}
+    violations = _verify_tbd_compliance(tasks, tmp_path, dev_locators=dev)
+    assert violations == []
+
+
+def test_verify_tbd_compliance_fails_on_invented_xpath(tmp_path: Path):
+    """Regression for the exact 20260708-121117-99f5ed failure — the
+    pom-extender wrote a raw XPath under the constant name instead of
+    a tbd() sentinel. Gate MUST flag it with both the constant name
+    and (truncated) selector value in the message."""
+    from qtea.steps.s08_codegen import _verify_tbd_compliance
+
+    pom = tmp_path / "src" / "pages" / "TrialPage.ts"
+    pom.parent.mkdir(parents=True, exist_ok=True)
+    pom.write_text(
+        "export const TrialPageSelectors = {\n"
+        '  Existing: "//x",\n'
+        "  MarketingConsentCheckbox: \"//div[contains(@class,'m-form-field "
+        "m-form-field--checkbox')]//input[@type='checkbox'][last()]\",\n"
+        "};\n",
+        encoding="utf-8",
+    )
+    tasks = [_LocatorTask(
+        constant_name="MarketingConsentCheckbox",
+        intent="marketing consent checkbox on trial form",
+        owning_page="TrialPage",
+        locator_file="src/pages/TrialPage.ts",
+        location_pattern="export_const_object",
+        container_class_name="TrialPageSelectors",
+    )]
+    violations = _verify_tbd_compliance(tasks, tmp_path)
+    assert len(violations) == 1
+    msg = violations[0]
+    assert "MarketingConsentCheckbox" in msg
+    assert "//div" in msg  # raw selector value visible in the message
+    assert "RCA-B" in msg  # points reader at the fix batch context
+
+
+def test_verify_tbd_compliance_flags_missing_constant(tmp_path: Path):
+    """When the pom-extender simply omitted the constant, still fail loud."""
+    from qtea.steps.s08_codegen import _verify_tbd_compliance
+
+    pom = tmp_path / "src" / "pages" / "TrialPage.ts"
+    pom.parent.mkdir(parents=True, exist_ok=True)
+    pom.write_text(
+        "export const TrialPageSelectors = { Existing: \"//x\" };\n",
+        encoding="utf-8",
+    )
+    tasks = [_LocatorTask(
+        constant_name="MISSING_KEY",
+        intent="something",
+        owning_page="TrialPage",
+        locator_file="src/pages/TrialPage.ts",
+        location_pattern="export_const_object",
+        container_class_name="TrialPageSelectors",
+    )]
+    violations = _verify_tbd_compliance(tasks, tmp_path)
+    assert len(violations) == 1
+    assert "not found" in violations[0]
+
+
+def test_verify_tbd_compliance_skips_tasks_without_locator_file(tmp_path: Path):
+    """Tasks with no inventory-resolved file are handled by the extender's
+    inline-in-method-body path — the compliance gate skips them here."""
+    from qtea.steps.s08_codegen import _verify_tbd_compliance
+
+    tasks = [_LocatorTask(
+        constant_name="INLINE_ONLY",
+        intent="inline",
+        owning_page="UnknownPage",
+        locator_file=None,
+    )]
+    assert _verify_tbd_compliance(tasks, tmp_path) == []
+
+
+def test_build_locator_tasks_resolves_page_to_selectors_const_by_name(
+    tmp_path: Path,
+):
+    """Fix batch 2026-07: ``_resolve()`` must match ``{OwningPage}Selectors``
+    (and ``…Elements``) in addition to the historical ``…Locators``. The
+    failing run 20260708-121117-99f5ed had ``TrialPage`` in the plan and
+    ``TrialPageSelectors`` in the inventory but no ``owning_pom`` field on
+    the entry — the old resolver returned None and every marketing-consent
+    task got deferred to the LLM, which invented raw XPath.
+    """
+    from qtea.steps.s08_codegen import _build_locator_tasks
+
+    plan = {
+        "test_cases": [{
+            "id": "TC-1",
+            "locators": [{
+                "source": "create_tbd",
+                "name": "CHECKBOX_MARKETING_CONSENT",
+                "intent": "marketing consent checkbox",
+                "owning_page": "TrialPage",
+            }],
+        }],
+    }
+    inventory = {
+        "modules": [{
+            "name": "sut", "path": ".", "language": "typescript",
+            "existing_locators": [{
+                "class_name": "TrialPageSelectors",
+                "file": "src/pages/TrialPage.ts",
+                "location_pattern": "export_const_object",
+                # NOTE: no owning_pom — this is the failing-run shape
+            }],
+        }],
+        "active_module": "sut",
+    }
+    tasks = _build_locator_tasks(plan, inventory)
+    assert len(tasks) == 1
+    t = tasks[0]
+    assert t.locator_file == "src/pages/TrialPage.ts"
+    assert t.location_pattern == "export_const_object"
+    assert t.container_class_name == "TrialPageSelectors"
 
 
 # ---------------------------------------------------------------------------

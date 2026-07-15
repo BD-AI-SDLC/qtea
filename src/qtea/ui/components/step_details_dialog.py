@@ -19,6 +19,7 @@ from qtea.ui.theme import (
     SECONDARY,
     STATUS_COLORS,
     STATUS_ICONS,
+    sz,
 )
 
 
@@ -57,8 +58,8 @@ def _open_in_explorer(path: Path) -> None:
 def _metric_row(label: str, value: str, value_color: str = ON_SURFACE) -> ft.Row:
     return ft.Row(
         controls=[
-            ft.Text(label, size=12, color=ON_SURFACE_DIM, width=120),
-            ft.Text(value, size=13, weight=ft.FontWeight.W_500, color=value_color),
+            ft.Text(label, size=sz(12), color=ON_SURFACE_DIM, width=120),
+            ft.Text(value, size=sz(13), weight=ft.FontWeight.W_500, color=value_color),
         ],
         spacing=8,
     )
@@ -77,12 +78,12 @@ def show_step_details_dialog(
     # ── Header ──────────────────────────────────────────────────────────
     header = ft.Row(
         controls=[
-            ft.Icon(icon_name, color=status_color, size=28),
+            ft.Icon(icon_name, color=status_color, size=sz(28)),
             ft.Column(
                 controls=[
                     ft.Text(
                         f"Step {step.number}: {step.name}",
-                        size=18,
+                        size=sz(18),
                         weight=ft.FontWeight.BOLD,
                         color=ON_SURFACE,
                     ),
@@ -91,7 +92,7 @@ def show_step_details_dialog(
                             ft.Container(
                                 content=ft.Text(
                                     step.phase,
-                                    size=10,
+                                    size=sz(10),
                                     weight=ft.FontWeight.BOLD,
                                     color="#FFFFFF",
                                 ),
@@ -104,7 +105,7 @@ def show_step_details_dialog(
                             ft.Container(
                                 content=ft.Text(
                                     step.status.upper(),
-                                    size=10,
+                                    size=sz(10),
                                     weight=ft.FontWeight.BOLD,
                                     color="#FFFFFF",
                                 ),
@@ -178,13 +179,13 @@ def show_step_details_dialog(
                     controls=[
                         ft.Text(
                             "NOTES",
-                            size=10,
+                            size=sz(10),
                             weight=ft.FontWeight.BOLD,
                             color=ON_SURFACE_DIM,
                         ),
                         ft.Text(
                             step.notes,
-                            size=12,
+                            size=sz(12),
                             color=ON_SURFACE,
                             selectable=True,
                         ),
@@ -205,13 +206,13 @@ def show_step_details_dialog(
                     controls=[
                         ft.Text(
                             "ERROR",
-                            size=10,
+                            size=sz(10),
                             weight=ft.FontWeight.BOLD,
                             color="#FF5252",
                         ),
                         ft.Text(
                             step.error,
-                            size=12,
+                            size=sz(12),
                             color="#FF5252",
                             selectable=True,
                         ),
@@ -292,19 +293,19 @@ def show_step_details_dialog(
                             controls=[
                                 ft.Icon(
                                     ft.Icons.INSERT_DRIVE_FILE,
-                                    size=14,
+                                    size=sz(14),
                                     color=ON_SURFACE_DIM,
                                 ),
                                 ft.Text(
                                     f.name,
-                                    size=12,
+                                    size=sz(12),
                                     color=ON_SURFACE,
                                     expand=True,
                                     selectable=True,
                                 ),
                                 ft.IconButton(
                                     icon=ft.Icons.OPEN_IN_NEW,
-                                    icon_size=14,
+                                    icon_size=sz(14),
                                     tooltip="Open",
                                     on_click=lambda e, p=f: _open_in_explorer(p),
                                 ),
@@ -317,7 +318,7 @@ def show_step_details_dialog(
                     file_rows.append(
                         ft.Text(
                             f"... +{len(files) - 20} more",
-                            size=11,
+                            size=sz(11),
                             color=ON_SURFACE_DIM,
                             italic=True,
                         )
@@ -328,7 +329,7 @@ def show_step_details_dialog(
                             controls=[
                                 ft.Text(
                                     "ARTIFACTS",
-                                    size=10,
+                                    size=sz(10),
                                     weight=ft.FontWeight.BOLD,
                                     color=ON_SURFACE_DIM,
                                 ),
@@ -345,6 +346,7 @@ def show_step_details_dialog(
 
     # ── Dialog ──────────────────────────────────────────────────────────
     def on_close(e):
+        state.active_step_dialog_num = None
         page.pop_dialog()
 
     dlg_content = ft.Column(
@@ -374,4 +376,5 @@ def show_step_details_dialog(
         actions_alignment=ft.MainAxisAlignment.END,
     )
 
+    state.active_step_dialog_num = step.number
     page.show_dialog(dlg)

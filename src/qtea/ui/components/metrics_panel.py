@@ -12,6 +12,7 @@ from qtea.ui.theme import (
     ON_SURFACE_DIM,
     PHASE_COLORS,
     SECONDARY,
+    sz,
 )
 
 
@@ -40,9 +41,9 @@ def _fmt_elapsed(seconds: float) -> str:
 def _metric_row(label: str, value: str, color: str = ON_SURFACE) -> ft.Row:
     return ft.Row(
         controls=[
-            ft.Text(label, size=12, color=ON_SURFACE_DIM),
+            ft.Text(label, size=sz(12), color=ON_SURFACE_DIM),
             ft.Container(expand=True),
-            ft.Text(value, size=13, weight=ft.FontWeight.W_600, color=color),
+            ft.Text(value, size=sz(13), weight=ft.FontWeight.W_600, color=color),
         ],
         spacing=4,
     )
@@ -63,7 +64,7 @@ def _build_cost_bars(state: AppState) -> ft.Column:
         bars.append(
             ft.Row(
                 controls=[
-                    ft.Text(f"{num:02d}", size=10, color=ON_SURFACE_DIM, width=20),
+                    ft.Text(f"{num:02d}", size=sz(10), color=ON_SURFACE_DIM, width=20),
                     ft.Container(
                         content=ft.Container(
                             bgcolor=phase_color,
@@ -76,7 +77,7 @@ def _build_cost_bars(state: AppState) -> ft.Column:
                     ),
                     ft.Text(
                         f"${s.cost_usd:.2f}",
-                        size=10,
+                        size=sz(10),
                         color=ON_SURFACE_DIM,
                         width=50,
                         text_align=ft.TextAlign.RIGHT,
@@ -94,7 +95,7 @@ def _build_cost_bars(state: AppState) -> ft.Column:
             ft.Container(height=6),
             ft.Text(
                 "COST PER STEP",
-                size=10,
+                size=sz(10),
                 weight=ft.FontWeight.BOLD,
                 color=ON_SURFACE_DIM,
             ),
@@ -115,13 +116,13 @@ def build_metrics_panel(state: AppState) -> ft.Container:
         current_info = [
             ft.Text(
                 f"Step {s.number}: {s.name}",
-                size=14,
+                size=sz(14),
                 weight=ft.FontWeight.W_600,
                 color=SECONDARY,
             ),
             ft.Text(
                 f"Phase {s.phase}",
-                size=12,
+                size=sz(12),
                 color=PHASE_COLORS.get(s.phase, ON_SURFACE_DIM),
             ),
             ft.Container(height=4),
@@ -130,7 +131,7 @@ def build_metrics_panel(state: AppState) -> ft.Container:
         ]
     elif state.run_status == "running":
         current_info = [
-            ft.Text("Initializing...", size=14, color=ON_SURFACE_DIM, italic=True),
+            ft.Text("Initializing...", size=sz(14), color=ON_SURFACE_DIM, italic=True),
             ft.Container(height=8),
         ]
 
@@ -139,7 +140,7 @@ def build_metrics_panel(state: AppState) -> ft.Container:
         controls=[
             ft.Text(
                 "METRICS",
-                size=10,
+                size=sz(10),
                 weight=ft.FontWeight.BOLD,
                 color=ON_SURFACE_DIM,
             ),

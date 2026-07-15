@@ -199,6 +199,7 @@ def test_is_recoverable_category_lists():
         FailureCategory.SCHEMA_TYPE_MISMATCH,
         FailureCategory.SCHEMA_MISSING_REQUIRED_FIELD,
         FailureCategory.JSON_UNPARSEABLE,
+        FailureCategory.PLAN_GATE_VIOLATION,
     }
     for cat in FailureCategory:
         assert is_recoverable_category(cat) == (cat in recoverable)

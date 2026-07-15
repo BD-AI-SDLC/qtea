@@ -31,6 +31,21 @@ from typing import Any
 # order. Keep in sync with CLAUDE.md § Locator priority.
 _PRIORITY = ("id", "data-testid", "role", "label", "text", "placeholder", "css")
 
+_SNAPSHOT_REDACT_PATTERNS = re.compile(
+    r"(?:"
+    r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"  # email
+    r"|sk-[A-Za-z0-9]{20,}"                               # API key
+    r"|ghp_[A-Za-z0-9]{36}"                                # GitHub PAT
+    r"|eyJ[A-Za-z0-9_-]{20,}\.eyJ[A-Za-z0-9_-]+"          # JWT
+    r"|https?://[^\s\"']+:[^\s\"']+@[^\s\"']+"             # URL with credentials
+    r"|AKIA[A-Z0-9]{16}"                                   # AWS key
+    r")"
+)
+
+
+def _redact_snapshot(text: str) -> str:
+    return _SNAPSHOT_REDACT_PATTERNS.sub("<redacted>", text)
+
 # Default model. `claude-sonnet-4-6` balances quality and speed for selector
 # inference; users who want to trade quality for speed can override via env.
 _DEFAULT_MODEL = "claude-sonnet-4-6"
@@ -696,8 +711,9 @@ def _build_prompt(
     # The modern ladder (Playwright 1.40+) emits YAML; the legacy
     # ``page.accessibility.snapshot()`` fallback emits a JSON dict. Label
     # the fence truthfully so the model parses correctly.
-    fence_lang = "json" if snapshot_text.lstrip().startswith("{") else "yaml"
-    user_parts.append(f"AOM snapshot:\n```{fence_lang}\n{snapshot_text}\n```")
+    redacted = _redact_snapshot(snapshot_text)
+    fence_lang = "json" if redacted.lstrip().startswith("{") else "yaml"
+    user_parts.append(f"AOM snapshot:\n```{fence_lang}\n{redacted}\n```")
     user = "\n\n".join(user_parts)
     return system, user
 
@@ -738,7 +754,7 @@ def _call_anthropic(system: str, user: str, *, model: str) -> tuple[str, dict[st
     # whitespace or stray prose by scanning to the first balanced object.
     response = client.messages.create(
         model=send_model,
-        max_tokens=512,
+        max_tokens=1024,
         temperature=0.0,
         system=system,
         messages=[

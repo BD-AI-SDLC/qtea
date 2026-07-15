@@ -208,14 +208,14 @@ traceability backbone -- they propagate through every downstream artifact.
 
 ---
 
-#### Step 4 -- Test strategy
+#### Step 4 -- Test design
 
 | Field | Value |
 |---|---|
-| Agent | `test-manager` |
+| Agent | `test-designer` |
 | Input | `artifacts/step03/plan.json` |
-| Output | `artifacts/step04/test-strategy.md`, `test-strategy.json` |
-| Schema | `schemas/test-strategy.schema.json` |
+| Output | `artifacts/step04/test-design.md`, `test-design.json` |
+| Schema | `schemas/test-design.schema.json` |
 
 **Phase gate:** `test_cases` array is non-empty. Each `id` matches
 `^TC-[A-Za-z0-9\-_]+$`. Every `priority` is one of P0-P3 or UNKNOWN.
@@ -229,7 +229,7 @@ traceability backbone -- they propagate through every downstream artifact.
 | Field | Value |
 |---|---|
 | Agent | None (pure code) |
-| Input | `artifacts/step04/test-strategy.json`, Xray env vars |
+| Input | `artifacts/step04/test-design.json`, Xray env vars |
 | Output | `artifacts/step05/xray-mapping.json` |
 | Schema | `schemas/xray-mapping.schema.json` |
 
@@ -266,16 +266,16 @@ null, involve HITL.
 
 ---
 
-#### Step 7 -- Test Architect
+#### Step 7 -- Test Automation Architect
 
 | Field | Value |
 |---|---|
-| Agent | `test-architect` |
-| Input | `artifacts/step04/test-strategy.md`, `artifacts/step06/sut_inventory.json`, `artifacts/step06/research.md` |
+| Agent | `test-automation-architect` |
+| Input | `artifacts/step04/test-design.md`, `artifacts/step06/sut_inventory.json`, `artifacts/step06/research.md` |
 | Output | `artifacts/step07/code-modification-plan.json`, `code-modification-plan.md` |
 | Schema | `schemas/code-modification-plan.schema.json` |
 
-**Procedure.** Read `test-strategy.md` + `sut_inventory.json`. For each test
+**Procedure.** Read `test-design.md` + `sut_inventory.json`. For each test
 case, emit explicit structural decisions: `test_file_target`, per-test
 `test_functions[]` (with markers + uses_fixtures), fixtures classified as
 `reuse` (with `from: "<file>:<symbol>"`) or `create` (with `at:`, `yields`,
@@ -321,7 +321,7 @@ JIT resolver respectively).
 | Sub-agents | `codegen-pom-extender` (Phase A), `codegen-test-writer` (Phase B), `codegen-violation-fixer` (Phase C violation fix only) |
 | Shared rules | `agents/codegen-rules.md` — canonical quality rules (locator priority, no hard waits, TBD conventions, assertion fidelity, naming). Injected as `inputs["codegen-rules.md"]` into Phase A/B reasoning calls; Phase C agent reads it via tools. |
 | Transport | `call_reasoning_llm` (Phases A/B — single API call per invocation, no multi-turn), `run_agent` (Phase C only) |
-| Input | `artifacts/step07/code-modification-plan.json` (authoritative), `artifacts/step04/test-strategy.md` (assertion values), `artifacts/step06/sut_inventory.json` (style mimicry + dedup), `--sut` path |
+| Input | `artifacts/step07/code-modification-plan.json` (authoritative), `artifacts/step04/test-design.md` (assertion values), `artifacts/step06/sut_inventory.json` (style mimicry + dedup), `--sut` path |
 | Output | Test source files in `sut/`, `artifacts/step08/tbd-index.json`, `generated-files.json` |
 | Schema | `schemas/tbd-index.schema.json` |
 
@@ -406,7 +406,7 @@ failed test.
 | Field | Value |
 |---|---|
 | Agent | `bug-report-classifier` |
-| Input | `artifacts/step09/run-results.json`, `artifacts/step04/test-strategy.json`, `bugs/*.md` candidates |
+| Input | `artifacts/step09/run-results.json`, `artifacts/step04/test-design.json`, `bugs/*.md` candidates |
 | Output | `artifacts/step10/bug-reports.md`, `bug-reports.json` |
 | Schema | `schemas/bug-reports.schema.json` |
 
@@ -423,7 +423,7 @@ failed test.
 | Field | Value |
 |---|---|
 | Agent | None (pure code via `report/`) |
-| Input | `artifacts/step09/run-results.json`, `artifacts/step10/bug-reports.json`, `artifacts/step04/test-strategy.json` |
+| Input | `artifacts/step09/run-results.json`, `artifacts/step10/bug-reports.json`, `artifacts/step04/test-design.json` |
 | Output | `artifacts/step11/report/index.html`, optionally `allure-report/`, `allure-summary.json` |
 | Schema | `schemas/report-data.schema.json` |
 
@@ -447,7 +447,7 @@ failed test.
 Step 1  --> spec.md -----------------------> Step 2
 Step 2  --> refined-spec.md/json ----------> Step 3
 Step 3  --> plan.md/json ------------------> Step 4
-Step 4  --> test-strategy.md/json ---------> Steps 7, 8, 9, 10, 11
+Step 4  --> test-design.md/json ---------> Steps 7, 8, 9, 10, 11
 Step 5  --> xray-mapping.json            (stand-alone; no downstream dependency)
 Step 6  --> research.md/json --------------> Steps 7, 8, 9
          -> sut_inventory.json ------------> Steps 7, 8
@@ -471,8 +471,8 @@ Every artifact links back to the requirement that spawned it:
 
 ```
 REQ-<slug>  (step 2: refine-spec assigns)
-  --> TC-<slug>  (step 4: test-manager creates test cases)
-      --> code-modification-plan entry (step 7: test-architect maps TC → code)
+  --> TC-<slug>  (step 4: test-designer creates test cases)
+      --> code-modification-plan entry (step 7: test-automation-architect maps TC → code)
           --> test files with tc_refs  (step 8: codegen-violation-fixer transpiles)
               --> run-results per test  (step 9: execute + self-heal)
                   --> BUG-<run-id>-<seq> with requirement_id  (step 10)
@@ -507,7 +507,7 @@ These are non-negotiable. Violations trigger step rejection and the retry/fix cy
 | Plan reuse-vs-create | Step 7 | Every `reuse` reference points to an inventory entry; every `create`/`create_tbd` target is in an inventory-approved directory |
 | Auth-chaining | Step 7 | `source=create` fixtures yielding non-primitive types must declare `depends_on` with the auth fixture from `auth_flow.fixture_entry` |
 | Schema-first | Every step | Every JSON artifact validated via `schemas.py` before hand-off |
-| AOM snapshot only | Steps 9, 10 | Generated test code: AOM only — `page.content()` / raw page-source dumps are forbidden. Step 9 runtime: AOM via `browser_snapshot` is the default; raw-DOM via `browser_evaluate(... outerHTML)` is permitted ONLY when the target element is missing from the AOM, non-semantic, or screen-reader-hidden, AND the fallback is annotated per-item with `snapshot_source="raw_dom_fallback"` + a `fallback_reason`. Unjustified raw captures are logged as advisory violations. |
+| AOM snapshot only (with iframe exception) | Steps 9, 10 | Generated test code: AOM for regular DOM and shadow-root elements; full DOM (`page.content()` / `frame.content()`) permitted when the target is inside an `<iframe>`. Step 9 runtime: AOM via `browser_snapshot` is the default; raw-DOM via `browser_evaluate(... outerHTML)` is permitted ONLY when the target element is missing from the AOM, non-semantic, screen-reader-hidden, or inside an iframe, AND the fallback is annotated per-item with `snapshot_source="raw_dom_fallback"` + a `fallback_reason`. Unjustified raw captures are logged as advisory violations. |
 
 ---
 
@@ -554,7 +554,7 @@ All variables are optional unless marked **required**. Defaults are applied in `
 | `JIRA_API_TOKEN` | — | Jira Cloud API token. Masked in logs. |
 | `JIRA_PAT` | — | Personal Access Token for Jira Server / Data Center (Bearer auth). Masked in logs. |
 | `JIRA_AUTH_TYPE` | auto-detect | Override auth scheme: `basic` or `bearer`. Auto-detected from which credential vars are present. |
-| `JIRA_PROJECT_KEY` | — | Jira project key used as Xray upload fallback when the test-strategy omits one. |
+| `JIRA_PROJECT_KEY` | — | Jira project key used as Xray upload fallback when the test-design omits one. |
 | `JIRA_XRAY_CLIENT_ID` | — | Xray Cloud OAuth2 client ID. Masked in logs. |
 | `JIRA_XRAY_CLIENT_SECRET` | — | Xray Cloud OAuth2 client secret. Masked in logs. |
 | `JIRA_XRAY_API_KEY` | — | Xray DC/Server API key (alternative to client ID/secret). Masked in logs. |

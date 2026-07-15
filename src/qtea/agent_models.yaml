@@ -1,32 +1,102 @@
-# QTea defaults; agent.md overrides via frontmatter when present.
-# Sourced by src/qtea/config.py (single source of truth).
-
 # -- Phase A: Requirements & Planning --
-ticket-to-ai-spec: claude-haiku-4-5@20251001
-refine-spec: claude-sonnet-4-6
-polyglot-test-planner: claude-sonnet-4-6
-test-manager: claude-sonnet-4-6
+ticket-to-ai-spec:          # direct-SDK (call_reasoning_llm)
+  model: claude-sonnet-5
+  thinking: adaptive
+
+refine-spec:                # direct-SDK (call_reasoning_llm_with_hitl)
+  model: claude-sonnet-5
+  thinking: adaptive
+
+refine-format-fixer:        # direct-SDK (call_reasoning_llm) — rescue path on Step 2 audit failure
+  model: claude-haiku-4-5@20251001
+  thinking: disabled
+
+polyglot-test-planner:      # direct-SDK (call_reasoning_llm_with_hitl)
+  model: claude-sonnet-5
+  thinking: adaptive
+
+test-designer:               # direct-SDK (call_reasoning_llm)
+  model: claude-opus-4-8
+  thinking: adaptive
 
 # -- Phase B: Research & Implementation --
-polyglot-test-researcher: claude-opus-4-6
-test-architect: claude-opus-4-6
-codegen-violation-fixer: claude-sonnet-4-6
-codegen-pom-extender: claude-opus-4-6
-codegen-test-writer: claude-opus-4-6
+polyglot-test-researcher:
+  model: claude-sonnet-5
+  effort: high
+  thinking: adaptive
+
+test-automation-architect:  # direct-SDK (call_reasoning_llm)
+  model: claude-opus-4-8
+  thinking: adaptive
+
+codegen-violation-fixer:
+  model: claude-sonnet-5
+  effort: high
+  thinking: adaptive
+
+codegen-pom-extender:       # direct-SDK (call_reasoning_llm)
+  model: claude-sonnet-5
+  thinking: adaptive
+
+codegen-test-writer:        # direct-SDK (call_reasoning_llm)
+  model: claude-opus-4-8
+  thinking: adaptive
 
 # -- Phase C: Execution & Reporting --
-polyglot-test-fixer: claude-opus-4-6
-bug-report-classifier: claude-sonnet-4-6
+polyglot-test-fixer:
+  model: claude-opus-4-8
+  effort: high
+  thinking: adaptive
 
-# -- HITL --
-plan-editor: claude-haiku-4-5@20251001
-strategy-editor: claude-haiku-4-5@20251001
-tbd-intent-editor: claude-haiku-4-5@20251001
+bug-report-classifier:      # direct-SDK (call_reasoning_llm)
+  model: claude-sonnet-5
+  thinking: adaptive
 
-# -- Step 8 Phase D (TBD intent quality gate) --
-tbd-intent-scorer: claude-haiku-4-5@20251001
+# -- Step 7 live exploration (browser, run_agent) --
+site-explorer:
+  model: claude-sonnet-5
+  effort: medium
+  thinking: adaptive
 
-# -- Infrastructure / Support --
-debug: claude-opus-4-6
-critical-thinking: claude-opus-4-6
-principal-software-engineer: claude-opus-4-6
+# -- Review-gate editors (Steps 3/4/8; direct-SDK call_reasoning_llm) --
+plan-editor:
+  model: claude-haiku-4-5@20251001
+  thinking: disabled
+
+design-editor:
+  model: claude-haiku-4-5@20251001
+  thinking: disabled
+
+tbd-intent-editor:
+  model: claude-haiku-4-5@20251001
+  thinking: disabled
+
+# -- Step 8 Phase D (TBD intent quality gate; direct-SDK) --
+tbd-intent-scorer:
+  model: claude-haiku-4-5@20251001
+  thinking: adaptive
+
+# -- Step 8 Stage-3 assertion-intent judge (shadow; direct-SDK) --
+assertion-intent-judge:
+  model: claude-sonnet-5
+  thinking: adaptive
+
+# -- Step 8 Phase A3.6 purpose-fidelity judge (shadow by default; direct-SDK) --
+purpose-fidelity-judge:
+  model: claude-sonnet-5
+  thinking: adaptive
+
+debug:
+  model: claude-opus-4-8
+  effort: xhigh
+  thinking: adaptive
+
+critical-thinking:
+  model: claude-opus-4-8
+  effort: high
+  thinking: adaptive
+
+principal-software-engineer:
+  model: claude-opus-4-8
+  effort: high
+  thinking: adaptive

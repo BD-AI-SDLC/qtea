@@ -37,9 +37,18 @@ export class LoginPage {
 
 Consumers call the factory directly: `await this.inpUsername().fill(user)` (never `this.page.locator(...)` on a locator string). Phase B.5.5 rewrites legacy `elements: Record<string, string>` containers into this shape and updates matching call sites automatically.
 
-## 2. AOM Snapshot Only in Generated Test Code
+## 2. Snapshot Strategy in Generated Test Code
 
-When generated test code inspects page state, it MUST use the accessibility tree (e.g. Playwright `Locator.aria_snapshot()` in Python, the equivalent in your target framework). **Never** raw-DOM dumps (`page.content()`, `driver.page_source`) inside tests — they waste tokens and ignore semantic structure.
+When generated test code inspects page state, choose the snapshot method based on DOM structure:
+
+| DOM structure | Snapshot method | Rationale |
+|---|---|---|
+| Regular DOM / Shadow DOM | AOM — `aria_snapshot()` | AOM naturally pierces shadow roots and captures semantic structure without token waste. |
+| Iframes | Full DOM — `page.content()` / `frame.content()` | Iframe content lives in a separate document; AOM snapshots may miss elements or fail to traverse cross-origin frames reliably. |
+
+**Default (no iframes):** use the accessibility tree (e.g. Playwright `Locator.aria_snapshot()` in Python, the equivalent in your target framework). Shadow-root elements are fully visible to AOM — no special handling needed.
+
+**Iframe exception:** when the test interacts with elements inside an `<iframe>`, use full DOM snapshots (`page.content()`, `frame.content()`, `driver.page_source`) scoped to the target frame. This is the ONE case where raw-DOM inspection is permitted in generated tests.
 
 **Do not emit `boxes=True` or `mode="ai"` literals in generated test code.** Those kwargs (Playwright 1.60+ and 1.59+ respectively) are runtime-only affordances used by the JIT resolver. Generated tests target the 1.40+ floor and must call `aria_snapshot()` plain so they work on any supported Playwright version. The runtime's capability ladder handles richer kwargs internally and gracefully degrades.
 
@@ -253,7 +262,7 @@ TS/JS rules:
 
 ## 9. Qtea-t Attribution Markers (pytest stacks only)
 
-Every test function in a qtea-generated test file MUST carry a `@pytest.mark.qtea_<phase>` decorator. The phase comes from the test strategy entry for that TC (`smoke`, `regression`, `e2e`, or `exploratory`); default to `smoke` when absent. The markers are auto-registered by the vendored `tests/qtea_runtime.py` plugin — without them the qtea runner's marker filter will collect zero tests. Skip this rule on non-pytest stacks.
+Every test function in a qtea-generated test file MUST carry a `@pytest.mark.qtea_<phase>` decorator. The phase comes from the test design entry for that TC (`smoke`, `regression`, `e2e`, or `exploratory`); default to `smoke` when absent. The markers are auto-registered by the vendored `tests/qtea_runtime.py` plugin — without them the qtea runner's marker filter will collect zero tests. Skip this rule on non-pytest stacks.
 
 ```python
 import pytest
@@ -283,6 +292,98 @@ Generated tests, fixtures, and POMs may read files only from inside `<sut>/` and
 
 ---
 
+## Assertions Belong in Test Methods, Not POMs (NON-NEGOTIABLE)
+
+Assertions (`expect(...)`, bare `assert`, `assertThat(...)`, `Assertions.assert*(...)`, Cypress `.should(...)`) may live ONLY in test methods, never in page-object support files (`**/pages/**`, `**/pageobjects/**`, `**/page_objects/**`, `**/pom/**`). Page objects encapsulate ACTIONS and PROBES — they return raw values that tests then assert against. **This applies to `kind: "assertion"` POM methods too:** a `kind: "assertion"` method is a *probe*, not a self-grading verdict. It NEVER calls `expect()`/`assert`, NEVER computes a `true`/`false` "did it pass" and `return`s it, and NEVER ends in `return true`. It returns the RAW thing the test's matcher operates on; the test holds the `expect(...)`. This is enforced by the `pom-assertion` rule in `test_indexer.py` (and its Phase A3.5 sibling `codegen_pom_hygiene.find_pom_assertion_violations`):
+
+- **error** severity when the enclosing method is one that qtea codegen added this run (present in the plan's `missing_methods`). Hard-fails Step 8.
+- **warning** severity when the enclosing method is pre-existing SUT code — logged for migration triage but does not block the build.
+
+**What the probe returns (pick by the criterion's `check`):**
+
+| Criterion `check` | POM probe returns | Test asserts with (auto-retry) |
+|---|---|---|
+| `exact_text` | the **`Locator`** | `expect(loc).toHaveText(EXPECTED)` |
+| `exact_count` | the **`Locator`** | `expect(loc).toHaveCount(n)` |
+| `exact_attribute` | the **`Locator`** | `expect(loc).toHaveAttribute(k, v)` |
+| `value_equals` | the **`Locator`** | `expect(loc).toHaveValue(v)` |
+| `visible` / `focusable` | the **`Locator`** | `expect(loc).toBeVisible()` / `.toBeFocused()` |
+| `url_matches` | — (assert on `page`) | `expect(page).toHaveURL(u)` |
+| `boundingbox_below` / `_above` | the **`Locator`** — **one probe per element**; the test extracts `.boundingBox()` and compares | `expect(aBox.y).toBeGreaterThan(bBox.y)` |
+
+**Always return a `Locator`; never a resolved string/count/geometry.** This is the single most important codegen rule for POM methods and it is **language- and execution-model-agnostic** — it holds identically for TypeScript, Python (sync AND async), and Java. `getMarketingConsentLabel(): Locator { return this.page.locator(SEL.MARKETING_CONSENT_LABEL); }` beats `getMarketingConsentLabelText(): Promise<string|null>`. Returning the Locator and passing it straight into `expect(...)` keeps Playwright's auto-retry (the matcher polls the DOM), works uniformly across all stacks, keeps the probe reusable for any matcher, and is what the Step-8 body-verifier's oracle patterns look for. Even a positional check returns Locators — the *test* calls `.boundingBox()` on them and compares the geometry. Reserve a resolved-value return (a plain `number`/`string`) only for values that can never be a Playwright object — a parsed JSON field, a computed length over a collected list — where a bare `assert`/`expect(value)` in the test is correct (see §"Assertion Fidelity").
+
+**Correct shape (Locator probe + test-side matcher):**
+
+```typescript
+// POM — pure getter, no expect(), no boolean verdict:
+getMarketingConsentLabel(): Locator {
+  return this.page.locator(TrialPageSelectors.CHECKBOX_MARKETING_CONSENT_LABEL);
+}
+getMandatoryCheckboxErrors(): Locator {
+  return this.page.locator(TrialPageSelectors.TrialPageWarnings);
+}
+
+// TEST — every assertion lives here, referencing the strategy's expected constant:
+test("marketing consent label matches strategy copy", async ({ page }) => {
+  const trialPage = new TrialPage(page);
+  await expect(trialPage.getMarketingConsentLabel()).toHaveText(EXPECTED_MARKETING_CONSENT_LABEL);
+  await expect(trialPage.getMandatoryCheckboxErrors()).toHaveCount(3);
+});
+```
+
+**Correct shape (positional check — one Locator probe per element, geometry + comparison in the test):**
+
+```typescript
+// POM — two Locator getters, no expect(), no geometry math:
+getMarketingConsentCheckbox(): Locator {
+  return this.page.locator(TrialPageSelectors.CHECKBOX_MARKETING_CONSENT);
+}
+getLegalProtectionCheckbox(): Locator {
+  return this.page.locator(TrialPageSelectors.CHECKBOX_LEGAL_PROTECTION);
+}
+
+// TEST — extract geometry and make the one final assertion.
+// A missing element yields null at boundingBox(); the `!`/comparison surfaces it — no mini-guard needed.
+const marketingBox = await trialPage.getMarketingConsentCheckbox().boundingBox();
+const legalBox = await trialPage.getLegalProtectionCheckbox().boundingBox();
+expect(marketingBox!.y).toBeGreaterThan(legalBox!.y); // "below" ⇒ larger y
+```
+
+**Separate concerns.** Several small single-purpose probes that a test composes are better than one `verify*` method that reads several elements, compares them, and self-grades. Each probe does ONE DOM read and returns ONE value; the test orchestrates the reads and makes the assertions. This is more readable, gives real failure diagnostics (a failed `toHaveCount(3)` says "got 2", a failed `.toBe(true)` says nothing), and keeps the POM reusable.
+
+**Why this is enforced:** when a SUT POM already contains `expect()` calls (pre-existing drift), or when a plan names a method `verify*`, the pom-extender is tempted to write the assertion *inside* the POM (or compute a boolean verdict and `return true`) — propagating the anti-pattern into qtea-authored code and producing dead `expect(await pom.verify()).toBe(true)` checks in the test. The agent's instructions (this file and its persona) are the authority for new methods, not the existing code in the file being extended, and not the `verify` in a method name. The `pom-assertion` rule enforces this mechanically: Phase A3.5 scans every agent-authored method body immediately after the extender writes it and hard-fails Step 8 on any assertion-shaped call. The later `index_tests` pass (Phase C) flags pre-existing calls as warnings for migration triage without blocking the build.
+
+## One Coherent Final Assertion, Not One Per Mini-Verification (NON-NEGOTIABLE)
+
+A strategy's `Expected Result:` block enumerates verification facts in a fixed order: mini verifications (checkable facts along the way) first, ending with the terminal/main verification last (test-designer.agent.md's convention). **Do not translate every bullet into its own `expect()`/`assert`.** The plan (`code-modification-plan.json`) already decided which bullets are assertable — only the terminal/main verification's `kind: "assertion"` missing_method(s) become real assertions (test-automation-architect.agent.md steps 3/3a/3b). This file's job is to transpile that decision faithfully, not re-derive it from prose.
+
+- **Terminal verification → the assertion(s).** For each `kind: "assertion"` probe the plan lists, emit its `expect(<probe>).<matcher>(EXPECTED)` in the test, appended after the choreographed actions, using the probe's `acceptance_criteria` as the oracle for the matcher + expected value. The `expect()` lives in the test, never in the probe (see §"Assertions Belong in Test Methods, Not POMs"). A positional check's two single-value probes are called, the numbers compared, and ONE final `expect(...)` made — all in the test.
+- **Mid-flow mini verifications → nothing, or a wait, never an assertion.** If the plan has no method for a mini-verification bullet, Step 7 judged it implied by the next action's own auto-wait — emit nothing. If the plan lists a `kind: "action"` sync method (name pattern `waitFor<Condition>`), call it in choreography order, and its body must use a polling wait primitive — `locator.wait_for(state="visible"|"attached"|"hidden")` (Python) / `.waitFor({state: ...})` (TS) — never `expect()`/`assert`. This is the same poll-don't-sleep discipline as §4 "No Hard Waits", applied to POM-body synchronization instead of test-body timeouts.
+
+**Bad** (one assertion per Expected-Result bullet — the anti-pattern this rule forbids):
+
+```python
+def test_should_save_entry_when_form_is_valid(page, entry_page, entry_list_page):
+    ...
+    expect(entry_page.locators.SUCCESS_TOAST).to_be_visible()               # mini verification
+    expect(entry_page.locators.SAVE_BUTTON).to_be_disabled()                # mini verification
+    expect(entry_list_page.locators.NEW_ENTRY_STATUS).to_have_text("Draft") # terminal verification
+```
+
+**Good** (the mid-flow fact that actually gates the next step becomes a wait, not a check; the fact that gates nothing is dropped; one coherent final assertion against a probe's return remains):
+
+```python
+def test_should_save_entry_when_form_is_valid(page, entry_page, entry_list_page):
+    ...
+    entry_page.wait_for_success_toast_visible()   # kind: action — polling wait, not an assertion
+    entry_list_page.click_view_entries()
+    # kind: assertion probe returns the Locator; the one terminal check lives here:
+    expect(entry_list_page.new_entry_status_row("My Entry")).to_have_text("Draft")
+```
+
+This caps HOW MANY / WHICH bullets become assertions — it does not lower the floor. §9's zero-assertions gate (every test needs ≥1 assertion unless `qtea_setup`) still applies.
+
 ## Assertion Fidelity (NON-NEGOTIABLE)
 
 The single most common defect in machine-generated tests is **weak assertions**: tests that pass against any non-broken SUT instead of verifying a specific expected behavior. Eliminate them at write time.
@@ -296,7 +397,9 @@ Playwright's `expect()` API provides **auto-retry with configurable timeout** �
 | Locator text content | `expect(loc).to_have_text("Expected")` | `assert loc.text_content() == "Expected"` |
 | Locator attribute | `expect(loc).to_have_attribute("href", expected)` | `assert loc.get_attribute("href") == expected` |
 | Locator visibility | `expect(loc).to_be_visible()` | `assert loc.is_visible()` |
-| Locator count | `expect(loc).to_have_count(3)` | `assert loc.count() == 3` |
+| Locator focus state | `expect(loc).to_be_focused()` (Python) / `await expect(loc).toBeFocused()` (TS) | `assert loc.evaluate("el => el === document.activeElement")` |
+| Locator count (present) | `expect(loc).to_have_count(3)` | `assert loc.count() == 3` |
+| Locator count (absent) | `expect(loc).to_have_count(0)` — e.g. "no validation errors shown" | `assert loc.count() == 0` |
 | Locator CSS class | `expect(loc).to_have_class(re.compile(r"active"))` | `assert "active" in loc.get_attribute("class")` |
 | Locator value (input) | `expect(loc).to_have_value("hello")` | `assert loc.input_value() == "hello"` |
 | Page URL | `expect(page).to_have_url("https://example.com")` | `assert page.url == "https://example.com"` |

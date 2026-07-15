@@ -54,7 +54,12 @@ def _is_git_url(s: str) -> bool:
         return False
     if s.endswith(".git"):
         return True
-    return any(host in s for host in _GIT_HOSTS)
+    from urllib.parse import urlparse
+    try:
+        netloc = urlparse(s).netloc.lower()
+    except Exception:
+        return False
+    return any(netloc == host or netloc.endswith("." + host) for host in _GIT_HOSTS)
 
 
 def _rmtree_safe(path: Path) -> None:
@@ -102,6 +107,18 @@ def _materialize_sut(src: str, dst: Path, *, run_id: str) -> None:
             env=with_proxy_env(),
             timeout=300,
         )
+        # Drop the live `origin` remote (finding 35). qtea's whole model is an
+        # isolated local branch reviewed via `git diff` / a manually-opened PR;
+        # a retained origin is a push target that a compromised/prompt-injected
+        # heal or codegen agent could clobber (`git push --force origin main`).
+        # Removing it makes upstream-clobbering structurally impossible.
+        try:
+            subprocess.run(
+                ["git", "remote", "remove", "origin"],
+                cwd=str(dst), check=False, capture_output=True, timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log.warning("sut.remote_remove_failed", error=str(e))
     else:
         p = Path(src).expanduser().resolve()
         if not p.exists():
@@ -123,6 +140,15 @@ def _materialize_sut(src: str, dst: Path, *, run_id: str) -> None:
     # surfaces the message clearly.
     if dst.is_file():
         return
+    # Gitignore the qtea artifact dir + storage-state credential in the SUT
+    # BEFORE the baseline commit (finding 2). `.qtea/storage-state.json` holds
+    # live session cookies (auth-capture writes it there at mode 600); nothing
+    # else gitignored it, so `commit_step`'s `git add -A` would stage the
+    # credential into the qtea/run-* branch — the branch a human reviews / opens
+    # a PR from. Ignoring it keeps it on disk (Step 9 reads it by path) but out
+    # of every commit. Belt-and-suspenders on cloned repos (no .qtea there yet).
+    _ensure_gitignore_entry(dst, ".qtea/")
+    _ensure_gitignore_entry(dst, "storage-state.json")
     ensure_git_repo_and_branch(dst, run_id)
 
 
@@ -555,11 +581,28 @@ def _persist_resolved_env(workspace_root: Path, resolved: Any) -> None:
     try:
         lines = [f"{k}={v}\n" for k, v in sorted(resolved.values.items())]
         dst.write_text("".join(lines), encoding="utf-8")
-        if sys.platform != "win32":
-            dst.chmod(0o600)
+        from qtea.proxy import set_owner_only_perms
+        set_owner_only_perms(dst)
         log.info("env_resolver.persisted", count=len(lines), path=str(dst))
     except OSError as exc:
         log.warning("env_resolver.persist_failed", error=str(exc))
+
+
+def _ensure_gitignore_entry(directory: Path, entry: str) -> None:
+    """Append *entry* to ``<directory>/.gitignore`` if it is not already listed."""
+    gitignore = directory / ".gitignore"
+    try:
+        if gitignore.exists():
+            text = gitignore.read_text(encoding="utf-8", errors="replace")
+            if any(line.strip() == entry for line in text.splitlines()):
+                return
+            if text and not text.endswith("\n"):
+                text += "\n"
+        else:
+            text = ""
+        gitignore.write_text(text + entry + "\n", encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _persist_env_to_sut(sut_path: Path, resolved: Any) -> None:
@@ -589,6 +632,8 @@ def _persist_env_to_sut(sut_path: Path, resolved: Any) -> None:
     if not filtered:
         return
 
+    _ensure_gitignore_entry(sut_path, ".env")
+
     dst = sut_path / ".env"
     existing_lines: list[str] = []
     existing_keys: dict[str, int] = {}  # key → line index
@@ -615,8 +660,8 @@ def _persist_env_to_sut(sut_path: Path, resolved: Any) -> None:
 
     try:
         dst.write_text("".join(existing_lines), encoding="utf-8")
-        if sys.platform != "win32":
-            dst.chmod(0o600)
+        from qtea.proxy import set_owner_only_perms
+        set_owner_only_perms(dst)
         log.info("env_resolver.persisted_to_sut", count=len(filtered), path=str(dst))
     except OSError as exc:
         log.warning("env_resolver.persist_to_sut_failed", error=str(exc))

@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qtea/schemas/purpose-fidelity-verdict.schema.json",
+  "title": "PurposeFidelityVerdicts",
+  "description": "Output of the Step 8 purpose-fidelity judge. One verdict per judged POM method: does the generated method BODY actually implement what its own `purpose` string declares? Scoped to the blind spot deterministic checks (codegen_body_verify.py) cannot cover: kind=action/query methods (no acceptance_criteria) and kind=assertion methods whose criteria include a check=\"custom\" entry.",
+  "type": "object",
+  "required": ["verdicts"],
+  "additionalProperties": false,
+  "properties": {
+    "verdicts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["method", "pom", "fulfills_purpose", "weakness"],
+        "additionalProperties": false,
+        "properties": {
+          "method": {
+            "type": "string",
+            "description": "POM method name this verdict is about."
+          },
+          "pom": {
+            "type": "string",
+            "description": "Owning Page Object class/file name."
+          },
+          "fulfills_purpose": {
+            "type": "boolean",
+            "description": "True iff the method body's logic would actually detect a regression of the behaviour its `purpose` describes."
+          },
+          "weakness": {
+            "type": "string",
+            "enum": [
+              "none",
+              "wrong_locator",
+              "wrong_comparison",
+              "stub_or_noop",
+              "unrelated_logic",
+              "incomplete"
+            ],
+            "description": "Primary failure mode, or 'none'."
+          },
+          "reasoning": {
+            "type": "string",
+            "description": "One or two sentences justifying the verdict, citing the specific body logic and how it does/doesn't satisfy purpose."
+          }
+        }
+      }
+    }
+  }
+}

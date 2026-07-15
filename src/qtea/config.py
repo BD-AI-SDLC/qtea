@@ -22,7 +22,7 @@ DEFAULT_STEP_TIMEOUTS: dict[int, int] = {
     4: 1500,  # strategy
     5: 500,   # xray-upload
     6: 900,   # research
-    7: 1800,  # test-architect
+    7: 1800,  # test-automation-architect
     8: 1800,  # codegen (multi-phase, multiple LLM calls)
     9: 1500,  # execute + self-heal (heal alone gets HEAL_AGENT_TIMEOUT_S)
     10: 600,  # bug-classifier
@@ -94,6 +94,7 @@ SECRET_ENV_KEYS = frozenset(
     {
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_CUSTOM_HEADERS",
         "JIRA_API_TOKEN",
         "JIRA_PAT",
         "JIRA_XRAY_CLIENT_SECRET",
@@ -289,40 +290,99 @@ def anthropic_vertex_kwargs() -> dict[str, Any]:
     return kwargs
 
 
+@dataclass(frozen=True)
+class AgentModelConfig:
+    """Per-agent LLM configuration resolved from ``agent_models.yaml``."""
+
+    model: str
+    effort: str | None = None
+    thinking: dict[str, Any] | None = None
+
+
+_THINKING_SHORTHAND: dict[str, dict[str, str]] = {
+    "adaptive": {"type": "adaptive"},
+    "disabled": {"type": "disabled"},
+}
+
+
+def _parse_agent_entry(raw: Any) -> AgentModelConfig:
+    """Parse a single YAML value — either a bare string or a dict."""
+    if isinstance(raw, str):
+        return AgentModelConfig(model=raw)
+    if isinstance(raw, dict):
+        model = str(raw.get("model", ""))
+        if not model:
+            raise ValueError(
+                f"agent_models.yaml: dict entry requires 'model' key, got {raw!r}"
+            )
+        effort = raw.get("effort")
+        if effort is not None:
+            effort = str(effort)
+        thinking_raw = raw.get("thinking")
+        thinking: dict[str, Any] | None = None
+        if isinstance(thinking_raw, str):
+            thinking = _THINKING_SHORTHAND.get(thinking_raw.lower())
+            if thinking is None:
+                raise ValueError(
+                    f"agent_models.yaml: unknown thinking shorthand {thinking_raw!r}; "
+                    f"use 'adaptive', 'disabled', or a dict with 'type' + 'budget_tokens'"
+                )
+        elif isinstance(thinking_raw, dict):
+            thinking = dict(thinking_raw)
+        return AgentModelConfig(model=model, effort=effort, thinking=thinking)
+    return AgentModelConfig(model=str(raw))
+
+
 @lru_cache(maxsize=1)
-def agent_model_map() -> dict[str, str]:
-    """Return the agent->model mapping. Loaded once."""
-    # Try installed-package resource first, then dev-tree file.
+def agent_model_map() -> dict[str, AgentModelConfig]:
+    """Return the agent→model configuration mapping. Loaded once.
+
+    Supports both bare-string values (``agent: model-id``) and dict
+    values (``agent: {model: ..., effort: ..., thinking: ...}``).
+    """
+    def _load(data: dict) -> dict[str, AgentModelConfig]:
+        return {str(k): _parse_agent_entry(v) for k, v in data.items()}
+
     try:
         ref = resources.files("qtea").joinpath("agent_models.yaml")
         with ref.open("r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
             if isinstance(data, dict):
-                return {str(k): str(v) for k, v in data.items()}
+                return _load(data)
     except (FileNotFoundError, ModuleNotFoundError, AttributeError):
         pass
     fallback = Path(__file__).parent / "agent_models.yaml"
     if fallback.exists():
         data = yaml.safe_load(fallback.read_text(encoding="utf-8")) or {}
-        return {str(k): str(v) for k, v in data.items()}
+        return _load(data)
     return {}
 
 
 MODEL_FALLBACK_CHAIN: dict[str, list[str]] = {
-    "claude-haiku-4-5@20251001": ["claude-sonnet-4-6", "claude-opus-4-6"],
+    "claude-haiku-4-5@20251001": ["claude-sonnet-5", "claude-opus-4-6"],
     "claude-sonnet-4-6": ["claude-opus-4-6", "claude-haiku-4-5@20251001"],
-    "claude-opus-4-6": ["claude-sonnet-4-6", "claude-haiku-4-5@20251001"],
+    "claude-sonnet-5": ["claude-opus-4-6", "claude-sonnet-4-6"],
+    "claude-opus-4-6": ["claude-sonnet-5", "claude-haiku-4-5@20251001"],
 }
 
 
-def model_for_agent(agent_key: str) -> str | None:
-    """Lookup model id for a given agent key (e.g. 'refine-spec')."""
+def _base_model_id(model: str) -> str:
+    """Strip context-window suffix (e.g. ``[1m]``) for fallback-chain lookup."""
+    idx = model.find("[")
+    return model[:idx] if idx != -1 else model
+
+
+def model_for_agent(agent_key: str) -> AgentModelConfig | None:
+    """Lookup full model config for a given agent key (e.g. 'refine-spec')."""
     return agent_model_map().get(agent_key)
 
 
 def get_model_chain(primary: str) -> list[str]:
     """Return ``[primary, fallback1, fallback2]`` for resilient model selection."""
-    return [primary, *MODEL_FALLBACK_CHAIN.get(primary, [])]
+    chain = MODEL_FALLBACK_CHAIN.get(primary)
+    if chain is None:
+        chain = MODEL_FALLBACK_CHAIN.get(_base_model_id(primary), [])
+    return [primary, *chain]
 
 
 def step_timeout(step: int, override: int | None = None) -> int:

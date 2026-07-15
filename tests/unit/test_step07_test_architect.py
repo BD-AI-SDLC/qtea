@@ -1,4 +1,4 @@
-"""Step 7 test-architect tests."""
+"""Step 7 test-automation-architect tests."""
 
 from __future__ import annotations
 
@@ -562,8 +562,8 @@ def _ctx(tmp_path: Path, *, include_default_inventory: bool = True) -> StepConte
 def _seed_strategy(ctx: StepContext) -> None:
     step4 = ctx.workspace.step_dir(4)
     step4.mkdir(parents=True, exist_ok=True)
-    (step4 / "test-strategy.md").write_text(
-        "# Test Strategy\n\n## TC-LOGIN-1 — Log in\n", encoding="utf-8",
+    (step4 / "test-design.md").write_text(
+        "# Test Design\n\n## TC-LOGIN-1 — Log in\n", encoding="utf-8",
     )
 
 
@@ -587,7 +587,7 @@ async def test_step07_fails_without_strategy(tmp_path: Path):
     _seed_inventory(ctx)
     result = await TestArchitectStep().run(ctx)
     assert not result.success
-    assert "test-strategy" in (result.error or "")
+    assert "test-design" in (result.error or "")
 
 
 async def test_step07_fails_without_sut_inventory(tmp_path: Path):
@@ -704,7 +704,7 @@ async def test_step07_tolerates_fenced_json_response_on_vertex(
 async def test_step07_inlines_inputs_into_user_prompt(
     tmp_path: Path, monkeypatch,
 ):
-    """Inputs (test-strategy.md, sut_inventory.json) are inlined into the
+    """Inputs (test-design.md, sut_inventory.json) are inlined into the
     user message, not staged in a workdir."""
     disable_vertex_env(monkeypatch)
     ctx = _ctx(tmp_path, include_default_inventory=False)
@@ -722,7 +722,7 @@ async def test_step07_inlines_inputs_into_user_prompt(
     # Distinctive marker from _seed_strategy.
     assert "TC-LOGIN-1" in user_content
     assert "sut_inventory.json" in user_content
-    assert "test-strategy.md" in user_content
+    assert "test-design.md" in user_content
 
 
 async def test_step07_rejects_schema_invalid_plan(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import flet as ft
 
 from qtea.ui.state import AppState
-from qtea.ui.theme import DIVIDER, ON_SURFACE, ON_SURFACE_DIM, PHASE_COLORS, PHASE_LABELS
+from qtea.ui.theme import DIVIDER, ON_SURFACE, ON_SURFACE_DIM, PHASE_COLORS, PHASE_LABELS, sz
 
 from .step_card import build_step_card
 
@@ -40,7 +40,7 @@ def build_phase_group(phase: str, state: AppState, on_step_click=None) -> ft.Con
             ft.Container(
                 content=ft.Text(
                     phase,
-                    size=12,
+                    size=sz(12),
                     weight=ft.FontWeight.BOLD,
                     color="#FFFFFF",
                     text_align=ft.TextAlign.CENTER,
@@ -53,14 +53,14 @@ def build_phase_group(phase: str, state: AppState, on_step_click=None) -> ft.Con
             ),
             ft.Text(
                 phase_label,
-                size=13,
+                size=sz(13),
                 weight=ft.FontWeight.W_600,
                 color=ON_SURFACE,
             ),
             ft.Container(expand=True),
             ft.Text(
                 f"{completed}/{total}",
-                size=12,
+                size=sz(12),
                 color=ON_SURFACE_DIM,
             ),
         ],

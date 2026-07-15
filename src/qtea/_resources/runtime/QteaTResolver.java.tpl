@@ -213,12 +213,76 @@ final class QteaTResolver {
     }
 
     // ----------------------------------------------------------------------
-    // Snapshot
+    // Snapshot — capability-probing Locator.ariaSnapshot ladder + iframe enum
     // ----------------------------------------------------------------------
+    //
+    // Mirrors the Python + JS runtime designs. Capability ladder, probed
+    // via reflection once per JVM and cached in volatile Booleans:
+    //
+    //   Rung A (Playwright Java 1.60+): ariaSnapshot({mode:AI, boxes:true})
+    //   Rung B (Playwright Java 1.59):  ariaSnapshot({mode:AI})
+    //   Rung C (Playwright Java 1.49-1.58): ariaSnapshot() (no opts;
+    //           iframes NOT included by Playwright — enumerate page.frames()
+    //           manually and append with `# iframe: <label>` markers)
+    //   Rung D (Playwright Java <1.49): legacy page.accessibility().snapshot()
+    //           (removed in 1.57; gated by QTEA_AOM_LEGACY_OK)
+
+    /** Capability cache: null=unprobed, true/false=proven supported/not. */
+    private static volatile Boolean AOM_MODE_AI = null;
+    private static volatile Boolean AOM_BOXES = null;
+
+    private enum AomBoxesEnv { AUTO, OFF, FORCE }
+
+    private static AomBoxesEnv readBoxesEnv() {
+        String v = System.getenv("QTEA_AOM_BOXES");
+        if (v == null) return AomBoxesEnv.AUTO;
+        String lower = v.trim().toLowerCase();
+        if (lower.equals("off")) return AomBoxesEnv.OFF;
+        if (lower.equals("force")) return AomBoxesEnv.FORCE;
+        return AomBoxesEnv.AUTO;
+    }
+
+    private static Integer readDepthEnv() {
+        String s = System.getenv("QTEA_AOM_DEPTH");
+        if (s == null || s.isEmpty()) return null;
+        try { int n = Integer.parseInt(s.trim()); return n > 0 ? n : null; }
+        catch (NumberFormatException e) { return null; }
+    }
+
+    private static boolean readLegacyOkEnv() {
+        return !"0".equals(System.getenv("QTEA_AOM_LEGACY_OK"));
+    }
+
+    /**
+     * Package-external accessor for the on-failure capture path in
+     * {@link QteaT#captureAomOnFailure(Page, String)}. Returns the same
+     * text {@link #snapshotPage(Page)} produces internally for tier 3/4
+     * resolution — modern ariaSnapshot with iframe enum when supported,
+     * legacy accessibility JSON otherwise. Never throws.
+     */
+    static String snapshotPageForCapture(Page page) {
+        try { return snapshotPage(page); }
+        catch (Throwable t) {
+            log("snapshot_for_capture_failed", "error", t.toString());
+            return "";
+        }
+    }
 
     private static String snapshotPage(Page page) {
-        // Playwright-Java exposes accessibility via `page.accessibility().snapshot()`
-        // but the signature varies by version. Use reflection to stay loose.
+        AomBoxesEnv boxes = readBoxesEnv();
+        Integer depth = readDepthEnv();
+        // ---- Primary: Locator.ariaSnapshot (Playwright Java 1.49+) ----
+        String text = tryAriaSnapshot(page, depth, boxes);
+        if (text != null) {
+            // Rungs A/B include iframe subtrees automatically via mode='ai'.
+            // Rung C does NOT — enumerate manually.
+            if (Boolean.TRUE.equals(AOM_MODE_AI)) return text;
+            return appendIframeSnapshots(page, text, depth, boxes);
+        }
+
+        // ---- Legacy: page.accessibility().snapshot() (Playwright Java <1.49
+        //      or old versions where ariaSnapshot is unavailable) ----
+        if (!readLegacyOkEnv()) return "";
         try {
             Object accessibility = Page.class.getMethod("accessibility").invoke(page);
             Object snapshot = accessibility.getClass().getMethod("snapshot").invoke(accessibility);
@@ -226,8 +290,217 @@ final class QteaTResolver {
             return jsonStringifyAom(snapshot);
         } catch (Throwable t) {
             log("snapshot_failed", "error", t.toString());
-            return "{}";
+            return "";
         }
+    }
+
+    /** Try Locator.ariaSnapshot on page.locator("body") via reflection.
+     *  Returns null if the method itself is missing (older Playwright),
+     *  signalling the caller to fall through to the legacy path. */
+    private static String tryAriaSnapshot(Page page, Integer depth, AomBoxesEnv boxes) {
+        Object body;
+        try { body = page.locator("body"); }
+        catch (Throwable t) { return null; }
+        if (body == null) return null;
+        return tryAriaSnapshotOnLocator(body, depth, boxes);
+    }
+
+    /** Walk the kwarg ladder against an already-obtained body Locator.
+     *  Used both for main-frame snapshotting and per-iframe enumeration. */
+    private static String tryAriaSnapshotOnLocator(Object body, Integer depth, AomBoxesEnv boxes) {
+        Class<?> optsClass;
+        try { optsClass = Class.forName("com.microsoft.playwright.Locator$AriaSnapshotOptions"); }
+        catch (ClassNotFoundException e) { optsClass = null; }
+        java.lang.reflect.Method mWithOpts = null;
+        if (optsClass != null) {
+            try { mWithOpts = body.getClass().getMethod("ariaSnapshot", optsClass); }
+            catch (NoSuchMethodException e) { mWithOpts = null; }
+        }
+        java.lang.reflect.Method mNoArgs;
+        try { mNoArgs = body.getClass().getMethod("ariaSnapshot"); }
+        catch (NoSuchMethodException e) { mNoArgs = null; }
+        // If neither shape exists, method is genuinely absent — caller falls
+        // through to legacy.
+        if (mWithOpts == null && mNoArgs == null) return null;
+
+        Throwable lastErr = null;
+
+        // Rung A: mode='ai' + boxes=true
+        if (mWithOpts != null
+                && boxes != AomBoxesEnv.OFF
+                && !Boolean.FALSE.equals(AOM_MODE_AI)
+                && (boxes == AomBoxesEnv.FORCE || !Boolean.FALSE.equals(AOM_BOXES))) {
+            Object opts = buildOpts(optsClass, "AI", Boolean.TRUE, depth);
+            if (opts != null) {
+                try {
+                    Object result = mWithOpts.invoke(body, opts);
+                    AOM_MODE_AI = true;
+                    AOM_BOXES = true;
+                    return result == null ? "" : result.toString();
+                } catch (Throwable t) {
+                    Throwable cause = unwrapReflection(t);
+                    if (isSignatureError(cause)) {
+                        AOM_BOXES = false;
+                        lastErr = t;
+                    } else {
+                        lastErr = t;
+                    }
+                }
+            }
+        }
+
+        // Rung B: mode='ai' (no boxes)
+        if (mWithOpts != null && !Boolean.FALSE.equals(AOM_MODE_AI)) {
+            Object opts = buildOpts(optsClass, "AI", null, depth);
+            if (opts != null) {
+                try {
+                    Object result = mWithOpts.invoke(body, opts);
+                    AOM_MODE_AI = true;
+                    return result == null ? "" : result.toString();
+                } catch (Throwable t) {
+                    Throwable cause = unwrapReflection(t);
+                    if (isSignatureError(cause)) {
+                        AOM_MODE_AI = false;
+                        lastErr = t;
+                    } else {
+                        lastErr = t;
+                    }
+                }
+            }
+        }
+
+        // Rung C: no opts
+        if (mNoArgs != null) {
+            try {
+                Object result = mNoArgs.invoke(body);
+                return result == null ? "" : result.toString();
+            } catch (Throwable t) {
+                lastErr = t;
+            }
+        }
+
+        if (lastErr != null) log("snapshot_failed_aria", "error", lastErr.toString());
+        return null;
+    }
+
+    /** Build an AriaSnapshotOptions instance via reflection. Returns null
+     *  when a required setter is missing (older Playwright missing
+     *  setMode/setBoxes altogether). */
+    private static Object buildOpts(Class<?> optsClass, String modeName, Boolean boxes, Integer depth) {
+        if (optsClass == null) return null;
+        Object opts;
+        try {
+            opts = optsClass.getDeclaredConstructor().newInstance();
+        } catch (Throwable t) {
+            return null;
+        }
+        if (modeName != null) {
+            boolean modeSet = false;
+            // Try AriaSnapshotMode enum first (typical Playwright Java shape).
+            try {
+                Class<?> modeClass = Class.forName("com.microsoft.playwright.options.AriaSnapshotMode");
+                @SuppressWarnings({"unchecked", "rawtypes"})
+                Object modeValue = Enum.valueOf((Class<? extends Enum>) modeClass, modeName);
+                optsClass.getMethod("setMode", modeClass).invoke(opts, modeValue);
+                modeSet = true;
+            } catch (Throwable ignored) {}
+            if (!modeSet) {
+                try {
+                    optsClass.getMethod("setMode", String.class).invoke(opts, modeName);
+                    modeSet = true;
+                } catch (Throwable ignored) {}
+            }
+            if (!modeSet) return null;
+        }
+        if (boxes != null) {
+            try {
+                optsClass.getMethod("setBoxes", boolean.class).invoke(opts, boxes.booleanValue());
+            } catch (Throwable e) {
+                if (boxes.booleanValue()) return null;  // requested but setter missing
+            }
+        }
+        if (depth != null) {
+            try {
+                optsClass.getMethod("setDepth", int.class).invoke(opts, depth.intValue());
+            } catch (Throwable ignored) {
+                // depth is best-effort — silently drop when unavailable.
+            }
+        }
+        return opts;
+    }
+
+    /** Enumerate non-main-frames and append each frame's AOM snapshot to
+     *  {@code mainText} with a `# iframe: <label>` marker. Silently skips
+     *  frames whose snapshot raises. */
+    private static String appendIframeSnapshots(Page page, String mainText, Integer depth, AomBoxesEnv boxes) {
+        StringBuilder sb = new StringBuilder(mainText);
+        List<?> frames;
+        try {
+            frames = (List<?>) Page.class.getMethod("frames").invoke(page);
+        } catch (Throwable t) {
+            return mainText;
+        }
+        if (frames == null) return mainText;
+        Object mainFrame = null;
+        try {
+            mainFrame = Page.class.getMethod("mainFrame").invoke(page);
+        } catch (Throwable ignored) {}
+        for (Object frame : frames) {
+            if (frame == mainFrame) continue;
+            try {
+                Object body = frame.getClass().getMethod("locator", String.class).invoke(frame, "body");
+                if (body == null) continue;
+                String sub = tryAriaSnapshotOnLocator(body, depth, boxes);
+                if (sub == null || sub.isEmpty()) continue;
+                sb.append("\n# iframe: ").append(iframeLabel(frame)).append("\n").append(sub);
+            } catch (Throwable t) {
+                log("iframe_snapshot_skip", "error", t.toString());
+            }
+        }
+        return sb.toString();
+    }
+
+    /** Best-effort iframe label: url() → name() → "unknown". */
+    private static String iframeLabel(Object frame) {
+        try {
+            Object url = frame.getClass().getMethod("url").invoke(frame);
+            if (url != null) {
+                String s = url.toString();
+                if (!s.isEmpty()) return s;
+            }
+        } catch (Throwable ignored) {}
+        try {
+            Object name = frame.getClass().getMethod("name").invoke(frame);
+            if (name != null) {
+                String s = name.toString();
+                if (!s.isEmpty()) return s;
+            }
+        } catch (Throwable ignored) {}
+        return "unknown";
+    }
+
+    /** Unwrap InvocationTargetException — the real cause is in getCause(). */
+    private static Throwable unwrapReflection(Throwable t) {
+        if (t == null) return null;
+        if (t instanceof java.lang.reflect.InvocationTargetException && t.getCause() != null) {
+            return t.getCause();
+        }
+        return t;
+    }
+
+    /** Heuristic detection of a Playwright signature-mismatch error.
+     *  Playwright Java raises IllegalArgumentException or PlaywrightException
+     *  with schema-related message text on unknown options; older versions
+     *  raise NoSuchMethodException from the reflection layer directly. */
+    private static boolean isSignatureError(Throwable t) {
+        if (t == null) return false;
+        if (t instanceof NoSuchMethodException) return true;
+        String cls = t.getClass().getName();
+        if (cls.endsWith(".IllegalArgumentException")) return true;
+        String msg = t.getMessage() == null ? "" : t.getMessage().toLowerCase();
+        return msg.contains("unknown") || msg.contains("unexpected")
+            || msg.contains("invalid") || msg.contains("no such")
+            || msg.contains("unrecognized");
     }
 
     private static String safePageUrl(Page page) {

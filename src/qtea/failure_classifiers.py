@@ -68,6 +68,7 @@ class FailureCategory(Enum):
     SCHEMA_TYPE_MISMATCH = "schema_type_mismatch"
     SCHEMA_MISSING_REQUIRED_FIELD = "schema_missing_required_field"
     JSON_UNPARSEABLE = "json_unparseable"
+    PLAN_GATE_VIOLATION = "plan_gate_violation"
 
     # Non-recoverable — surface for human, auto-firing fix-proposal still fires
     API_FATAL = "api_fatal"
@@ -86,6 +87,7 @@ _RECOVERABLE_CATEGORIES: frozenset[FailureCategory] = frozenset({
     FailureCategory.SCHEMA_TYPE_MISMATCH,
     FailureCategory.SCHEMA_MISSING_REQUIRED_FIELD,
     FailureCategory.JSON_UNPARSEABLE,
+    FailureCategory.PLAN_GATE_VIOLATION,
 })
 
 
@@ -190,6 +192,20 @@ def _looks_like_json_unparseable(error: str | None) -> bool:
     return any(p.search(error) for p in _JSON_UNPARSEABLE_PATTERNS)
 
 
+# Step 7's business-rule phase gate (`_validate_plan_against_inventory` in
+# s07_test_architect.py) — schema-valid plan that still violates a project
+# rule (e.g. a `kind: "assertion"` missing_method with a void-shaped
+# signature). The step arms the FULL violation list into
+# `ctx.extras["prompt_clarification"]` itself before returning the failed
+# `StepResult` (same pattern as TRUNCATION_RECOVERABLE below) because
+# `result.notes` is truncated to 5 entries / 500 chars for human display —
+# too lossy to hand back to the model as a fix instruction.
+def _looks_like_plan_gate_violation(error: str | None) -> bool:
+    if not error:
+        return False
+    return "phase-gate failed" in error.lower()
+
+
 # Agent produced nothing usable.
 def _looks_like_agent_no_output(error: str | None) -> bool:
     if not error:
@@ -250,11 +266,13 @@ def classify_failure(
       3. Schema type mismatch (recoverable: prompt clarification)
       4. Schema missing field (recoverable: prompt clarification)
       5. JSON unparseable (recoverable: prompt clarification)
-      6. Agent produced no output (non-recoverable)
-      7. Locator unresolved (non-recoverable; defer to JIT/heal)
-      8. SUT git failure (non-recoverable)
-      9. Test runner error (non-recoverable)
-     10. UNKNOWN (catch-all)
+      6. Plan phase-gate violation (recoverable: prompt clarification,
+         armed by the step itself)
+      7. Agent produced no output (non-recoverable)
+      8. Locator unresolved (non-recoverable; defer to JIT/heal)
+      9. SUT git failure (non-recoverable)
+     10. Test runner error (non-recoverable)
+     11. UNKNOWN (catch-all)
     """
     err = result.error
 
@@ -336,7 +354,23 @@ def classify_failure(
             fix_hint={"prompt_clarification": clarification},
         )
 
-    # 6. Agent no output
+    # 6. Plan phase-gate violation — the step already armed the full
+    # violation list into ctx.extras["prompt_clarification"] before
+    # returning, so there's nothing to extract here (mirrors
+    # TRUNCATION_RECOVERABLE's fix_hint=None convention).
+    if _looks_like_plan_gate_violation(err):
+        return ClassificationResult(
+            category=FailureCategory.PLAN_GATE_VIOLATION,
+            explanation=(
+                "plan passed schema validation but violated a business "
+                "rule (phase gate); next attempt retries with the "
+                "specific violations as a prompt clarification"
+            ),
+            safe_to_auto_retry=True,
+            fix_hint=None,
+        )
+
+    # 7. Agent no output
     if _looks_like_agent_no_output(err):
         return ClassificationResult(
             category=FailureCategory.AGENT_NO_OUTPUT,
@@ -344,7 +378,7 @@ def classify_failure(
             safe_to_auto_retry=False,
         )
 
-    # 7. Locator unresolved
+    # 8. Locator unresolved
     if _looks_like_locator_unresolved(err):
         return ClassificationResult(
             category=FailureCategory.LOCATOR_RESOLUTION_TIMEOUT,
@@ -352,7 +386,7 @@ def classify_failure(
             safe_to_auto_retry=False,
         )
 
-    # 8. SUT git failure
+    # 9. SUT git failure
     if _looks_like_sut_git_failure(err):
         return ClassificationResult(
             category=FailureCategory.SUT_GIT_FAILURE,
@@ -360,7 +394,7 @@ def classify_failure(
             safe_to_auto_retry=False,
         )
 
-    # 9. Test runner error
+    # 10. Test runner error
     if _looks_like_test_runner_error(err):
         return ClassificationResult(
             category=FailureCategory.TEST_RUNNER_ERROR,
@@ -368,7 +402,7 @@ def classify_failure(
             safe_to_auto_retry=False,
         )
 
-    # 10. Catch-all
+    # 11. Catch-all
     return ClassificationResult(
         category=FailureCategory.UNKNOWN,
         explanation="failure did not match any known category",

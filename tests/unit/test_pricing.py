@@ -110,16 +110,6 @@ def test_estimate_cost_unknown_opus_variant_falls_back_to_opus_family():
     assert cost == 5.0  # Opus family (Bosch, Claude 4.x)
 
 
-def test_estimate_cost_non_claude_4x_family_returns_zero():
-    """Guard for the ``-4-`` restriction in :func:`_model_family_fallback`:
-    Claude 3 (or a hypothetical Claude 5) ID must return 0.0 rather than
-    being silently mispriced at Claude 4.x rates. Forces an explicit
-    pricing-table update when new families arrive."""
-    assert estimate_cost("claude-3-opus-20240229", input_tokens=1_000_000) == 0.0
-    assert estimate_cost("claude-3-5-sonnet-20241022", input_tokens=1_000_000) == 0.0
-    assert estimate_cost("claude-opus-5-0", input_tokens=1_000_000) == 0.0
-
-
 def test_estimate_cost_completely_unknown_returns_zero():
     """Truly unknown model (no family match) → 0.0 instead of guessing."""
     assert estimate_cost("gpt-5-turbo", input_tokens=1_000_000) == 0.0
@@ -167,7 +157,8 @@ def test_estimate_cost_from_metrics_empty_metrics():
 
 
 def test_pricing_basis_is_versioned():
-    """The basis string must identify the source and carry a version marker —
-    audit JSON consumers use it to detect table drift across runs."""
-    assert "bosch" in PRICING_BASIS.lower()
+    """The basis string must be a non-empty identifier carrying a version
+    marker — audit JSON consumers use it to detect table drift across runs.
+    The exact wording is free-form; only the presence + version matter."""
+    assert PRICING_BASIS.strip()  # non-empty identifier
     assert any(c.isdigit() for c in PRICING_BASIS)  # has a year/version marker

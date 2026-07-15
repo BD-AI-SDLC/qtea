@@ -3,19 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 import sys
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from collections.abc import Awaitable
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, TypeVar
 
 from rich.console import Console
 from rich.prompt import Prompt
 
-from qtea.checkpoints import RunState, StepRecord, hash_paths
+from qtea.checkpoints import AuxiliaryAgentRecord, RunState, StepRecord, hash_paths
 from qtea.claude_runner import AgentResult, run_agent
 from qtea.config import (
     DEBUG_AGENT_MAX_TURNS,
@@ -42,7 +44,9 @@ from qtea.workspace import Workspace
 
 log = get_logger(__name__)
 
-MAX_ATTEMPTS = 2
+_T = TypeVar("_T")
+
+MAX_ATTEMPTS = max(1, min(5, int(os.environ.get("QTEA_MAX_ATTEMPTS", "2"))))
 HITL_MAX_ITERATIONS = 3
 
 # Sentinel string that the claude_runner.`_ApiRetryStorm` exception text
@@ -419,24 +423,30 @@ async def _run_fix_proposal(
         ct_debug_rca = thinking_workdir / "debug-rca.md"
         ct_debug_rca.write_text(debug_rca_text, encoding="utf-8")
         try:
-            ct_result = await run_agent(
-                ct_agent,
-                workdir=thinking_workdir,
-                inputs={
-                    "debug-rca.md": ct_debug_rca,
-                    "failure-context.md": context_file,
-                },
-                user_prompt=(
-                    "The debug agent has identified the root cause of a "
-                    "test/step failure in ./debug-rca.md (raw failure context "
-                    "in ./failure-context.md). Think critically about HOW to "
-                    "fix this problem: challenge assumptions about the fix "
-                    "approach, consider alternative fixes and their tradeoffs, "
-                    "and identify risks. Write your fix-strategy to "
-                    "./fix-strategy.md"
+            ct_result = await _record_aux_agent(
+                ctx,
+                step_num,
+                "critical_thinking",
+                "critical-thinking.agent.md",
+                run_agent(
+                    ct_agent,
+                    workdir=thinking_workdir,
+                    inputs={
+                        "debug-rca.md": ct_debug_rca,
+                        "failure-context.md": context_file,
+                    },
+                    user_prompt=(
+                        "The debug agent has identified the root cause of a "
+                        "test/step failure in ./debug-rca.md (raw failure context "
+                        "in ./failure-context.md). Think critically about HOW to "
+                        "fix this problem: challenge assumptions about the fix "
+                        "approach, consider alternative fixes and their tradeoffs, "
+                        "and identify risks. Write your fix-strategy to "
+                        "./fix-strategy.md"
+                    ),
+                    timeout_s=FIX_AGENT_TIMEOUT_S,
+                    max_turns=FIX_AGENT_MAX_TURNS,
                 ),
-                timeout_s=FIX_AGENT_TIMEOUT_S,
-                max_turns=FIX_AGENT_MAX_TURNS,
             )
             strategy_file = thinking_workdir / "fix-strategy.md"
             if strategy_file.exists():
@@ -482,22 +492,34 @@ async def _run_fix_proposal(
         eng_strategy.write_text(strategy_text, encoding="utf-8")
 
         try:
-            eng_result = await run_agent(
-                fix_agent,
-                workdir=eng_workdir,
-                inputs={
-                    "debug-rca.md": eng_debug_rca,
-                    "fix-strategy.md": eng_strategy,
-                },
-                user_prompt=(
-                    "The debug agent's root-cause analysis is in "
-                    "./debug-rca.md. The critical-thinking analysis of fix "
-                    "approaches is in ./fix-strategy.md. Produce a concrete "
-                    "fix proposal at ./fix-proposal.md. Do NOT edit any "
-                    "source code directly."
+            eng_result = await _record_aux_agent(
+                ctx,
+                step_num,
+                "principal_engineer",
+                "principal-software-engineer.agent.md",
+                run_agent(
+                    fix_agent,
+                    workdir=eng_workdir,
+                    inputs={
+                        "debug-rca.md": eng_debug_rca,
+                        "fix-strategy.md": eng_strategy,
+                    },
+                    user_prompt=(
+                        "The debug agent's root-cause analysis is in "
+                        "./debug-rca.md — its \"Affected Surface\" section is "
+                        "the file/symbol list the investigation already "
+                        "confirmed; cite it directly rather than re-deriving "
+                        "it. You have no filesystem access beyond these two "
+                        "input files, so do not attempt Glob/Grep/Read calls "
+                        "outside this workdir — they will fail and only burn "
+                        "turns. The critical-thinking analysis of fix "
+                        "approaches is in ./fix-strategy.md. Produce a concrete "
+                        "fix proposal at ./fix-proposal.md. Do NOT edit any "
+                        "source code directly."
+                    ),
+                    timeout_s=FIX_AGENT_TIMEOUT_S,
+                    max_turns=FIX_AGENT_MAX_TURNS,
                 ),
-                timeout_s=FIX_AGENT_TIMEOUT_S,
-                max_turns=FIX_AGENT_MAX_TURNS,
             )
             produced = eng_workdir / "fix-proposal.md"
             if produced.exists():
@@ -913,8 +935,12 @@ class Step(ABC):
             ctx, has_more_attempts=record.attempts < MAX_ATTEMPTS
         ):
             fc = _build_failure_context(self.number, self.name, record, result)
-            rca = await _run_debug_rca(
-                self.number, ctx, fc, attempt=record.attempts
+            rca = await _record_aux_agent(
+                ctx,
+                self.number,
+                "debug",
+                "debug.agent.md",
+                _run_debug_rca(self.number, ctx, fc, attempt=record.attempts),
             )
             if rca:
                 ctx.extras[f"step{self.number}_rca_path"] = str(rca)
@@ -1067,8 +1093,12 @@ class Step(ABC):
                 ctx, has_more_attempts=False
             ):
                 fc = _build_failure_context(self.number, self.name, record, result)
-                rca = await _run_debug_rca(
-                    self.number, ctx, fc, attempt=record.attempts
+                rca = await _record_aux_agent(
+                    ctx,
+                    self.number,
+                    "debug",
+                    "debug.agent.md",
+                    _run_debug_rca(self.number, ctx, fc, attempt=record.attempts),
                 )
                 if rca:
                     ctx.extras[f"step{self.number}_rca_path"] = str(rca)
@@ -1081,6 +1111,10 @@ class Step(ABC):
         # Fix-proposal chain auto-fires on final failure (chain: debug RCA
         # from the just-completed _run_debug_rca → critical-thinking →
         # principal-software-engineer). Suppressed by ``--no-fix``.
+        # No outer cost wrapper here — `_run_fix_proposal` wraps each
+        # constituent agent (critical-thinking, principal-engineer) with
+        # `_record_aux_agent` individually so each surfaces as its own row
+        # in the summary table.
         if not result.success and not getattr(ctx.options, "no_fix", False):
             failure_context = _build_failure_context(
                 self.number, self.name, record, result
@@ -1127,6 +1161,8 @@ class Step(ABC):
                     outputs=[],
                     tokens_input=record.tokens_input,
                     tokens_output=record.tokens_output,
+                    tokens_cache_read=record.tokens_cache_read,
+                    tokens_cache_write=record.tokens_cache_creation,
                     agent_calls=record.agent_calls,
                     error=str(e),
                 )
@@ -1150,6 +1186,8 @@ class Step(ABC):
                 outputs=[str(p) for p in result.outputs],
                 tokens_input=record.tokens_input,
                 tokens_output=record.tokens_output,
+                tokens_cache_read=record.tokens_cache_read,
+                tokens_cache_write=record.tokens_cache_creation,
                 agent_calls=record.agent_calls,
                 # Surface error + notes so structured-log consumers can see
                 # *why* a step failed without grepping the console transcript.
@@ -1178,3 +1216,83 @@ def _accumulate_metrics_into_record(
     record.tokens_cache_read += t.cache_read_input_tokens
     record.cost_usd = round(record.cost_usd + t.cost_usd, 6)
     record.agent_calls += accumulator.agent_calls
+
+
+async def _record_aux_agent(
+    ctx: StepContext,
+    step_num: int,
+    phase: str,
+    agent: str,
+    coro: Awaitable[_T],
+) -> _T:
+    """Run a helper-agent coroutine (debug RCA / critical-thinking / PSE)
+    under its own metrics accumulator and persist the spend as its OWN row
+    in ``ctx.state.auxiliary_records`` — NOT folded into the parent step's
+    ``StepRecord``.
+
+    Before this split, ``_run_cost_tracked`` added the aux spend onto the
+    parent step's cost cell, so a $3.75 Spec-Refinement failure showed as
+    a monolithic $3.75 with no way to tell that $1.76 was the debug agent,
+    $0.76 critical-thinking, and $0.62 principal-software-engineer. The
+    numbers were only in raw log lines. Now each helper appears as its own
+    row in the pipeline summary table (after Step 11) and totals still
+    reconcile because the summary layer sums steps + aux.
+
+    ``_attempt`` tears down ``CURRENT_STEP_METRICS`` in its ``finally``
+    before returning to ``execute()``, so we set our own accumulator here;
+    the runner writes into it while ``coro`` runs, and the totals are
+    materialised into an ``AuxiliaryAgentRecord`` in the ``finally`` block
+    — including on exception, so a failed agent still shows up as a row
+    with ``status="failed"`` (its partial billing is still real spend).
+
+    Also emits an ``aux_agent.recorded`` structured log event so the live
+    desktop UI can pick up the delta — the UI only reacts to log events,
+    not the final state file, and ``step.end`` was already emitted by
+    ``_attempt`` before this chain runs.
+    """
+    accumulator = StepMetricsAccumulator()
+    token = CURRENT_STEP_METRICS.set(accumulator)
+    started_at = datetime.now(UTC).isoformat()
+    start = time.monotonic()
+    status = "completed"
+    try:
+        try:
+            result = await coro
+            return result
+        except Exception:
+            status = "failed"
+            raise
+    finally:
+        CURRENT_STEP_METRICS.reset(token)
+        duration = round(time.monotonic() - start, 3)
+        t = accumulator.totals
+        aux = AuxiliaryAgentRecord(
+            step=step_num,
+            agent=agent,
+            phase=phase,
+            status=status,
+            started_at=started_at,
+            finished_at=datetime.now(UTC).isoformat(),
+            duration_s=duration,
+            tokens_input=t.input_tokens,
+            tokens_output=t.output_tokens,
+            tokens_cache_creation=t.cache_creation_input_tokens,
+            tokens_cache_read=t.cache_read_input_tokens,
+            cost_usd=round(t.cost_usd, 6),
+            agent_calls=accumulator.agent_calls,
+        )
+        ctx.state.auxiliary_records.append(aux)
+        log.info(
+            "aux_agent.recorded",
+            step=step_num,
+            phase=phase,
+            agent=agent,
+            status=status,
+            duration_s=duration,
+            tokens_input=aux.tokens_input,
+            tokens_output=aux.tokens_output,
+            tokens_cache_read=aux.tokens_cache_read,
+            tokens_cache_write=aux.tokens_cache_creation,
+            agent_calls=aux.agent_calls,
+            cost_usd=aux.cost_usd,
+        )

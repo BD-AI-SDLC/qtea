@@ -11,7 +11,7 @@ from qtea.ui.components.metrics_panel import build_metrics_panel
 from qtea.ui.components.phase_group import build_phase_group
 from qtea.ui.components.progress_header import build_progress_header
 from qtea.ui.state import AppState
-from qtea.ui.theme import BACKGROUND, CARD_BG, DIVIDER
+from qtea.ui.theme import BACKGROUND, CARD_BG, DIVIDER, sz
 
 
 def _find_live_step_widget(controls: list[ft.Control]) -> ft.Text | None:
@@ -74,7 +74,7 @@ def build_pipeline_view(page: ft.Page, state: AppState) -> ft.Container:
             controls=[
                 ft.Text(
                     "PIPELINE",
-                    size=10,
+                    size=sz(10),
                     weight=ft.FontWeight.BOLD,
                     color="#9E9E9E",
                 ),
@@ -150,7 +150,7 @@ def build_pipeline_view(page: ft.Page, state: AppState) -> ft.Container:
 
     live_elapsed = ft.Text(
         fmt_elapsed(state.elapsed_s),
-        size=14,
+        size=sz(14),
         weight=ft.FontWeight.W_600,
     )
     # Publish so app.py's tick task can find it without importing this view.
@@ -212,12 +212,12 @@ def build_pipeline_view(page: ft.Page, state: AppState) -> ft.Container:
                     from qtea.ui.components.log_viewer import (
                         MAX_DISPLAY_LINES,
                         _build_log_line,
+                        scroll_to_end,
                     )
 
                     recent = state.log_lines[-MAX_DISPLAY_LINES:]
                     log_list.controls = [_build_log_line(l) for l in recent]
-                    with contextlib.suppress(Exception):
-                        log_list.scroll_to(offset=-1, duration=0)
+                    scroll_to_end(log_list)
                     header_row = cols[0]
                     if hasattr(header_row, "controls") and len(header_row.controls) >= 5:
                         header_row.controls[-1].value = f"{len(state.log_lines)} lines"

@@ -42,6 +42,7 @@
         "failed": { "type": "integer", "minimum": 0 },
         "skipped": { "type": "integer", "minimum": 0 },
         "errors": { "type": "integer", "minimum": 0 },
+        "infrastructure_errors": { "type": "integer", "minimum": 0 },
         "total_bugs": { "type": "integer", "minimum": 0 },
         "duration_s": { "type": ["number", "null"], "minimum": 0 },
         "pass_rate": { "type": "number", "minimum": 0, "maximum": 1 },
@@ -63,6 +64,28 @@
         "properties": {
           "step": { "type": "integer", "minimum": 1 },
           "name": { "type": "string" },
+          "status": { "type": "string" },
+          "duration_s": { "type": ["number", "null"], "minimum": 0 },
+          "tokens_input": { "type": "integer", "minimum": 0 },
+          "tokens_output": { "type": "integer", "minimum": 0 },
+          "tokens_cache_creation": { "type": "integer", "minimum": 0 },
+          "tokens_cache_read": { "type": "integer", "minimum": 0 },
+          "cost_usd": { "type": "number", "minimum": 0 },
+          "agent_calls": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "auxiliary_summary": {
+      "type": "array",
+      "description": "Per-agent rows for the debug / critical-thinking / principal-software-engineer chain that fires on retry exhaustion. One entry per agent invocation; the parent step's cost cell no longer bundles these.",
+      "items": {
+        "type": "object",
+        "required": ["step", "agent", "phase", "status"],
+        "additionalProperties": false,
+        "properties": {
+          "step": { "type": "integer", "minimum": 1 },
+          "agent": { "type": "string" },
+          "phase": { "type": "string", "enum": ["debug", "critical_thinking", "principal_engineer"] },
           "status": { "type": "string" },
           "duration_s": { "type": ["number", "null"], "minimum": 0 },
           "tokens_input": { "type": "integer", "minimum": 0 },

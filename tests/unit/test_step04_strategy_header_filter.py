@@ -71,7 +71,7 @@ def test_scenario_heading_with_body_markers_accepted():
 def test_project_strategy_excludes_test_cases_header():
     """End-to-end: a realistic strategy doc must not emit a TC-test-cases entry."""
     md = """\
-# Test Strategy
+# Test Design
 
 ## Scope
 

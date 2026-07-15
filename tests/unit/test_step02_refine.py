@@ -5,11 +5,23 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from qtea.checkpoints import RunState
 from qtea.pipeline import PipelineOptions
 from qtea.steps.base import StepContext
 from qtea.steps.s02_refine import RefineStep, _project_to_json
 from qtea.workspace import create_workspace
+
+
+@pytest.fixture(autouse=True)
+def _isolate_coverage_audit(monkeypatch):
+    """These tests exercise refine MECHANICS, not the coverage audit (which now
+    defaults ON — finding 21). Cross-artifact coverage for Step 2 is covered by
+    test_coverage_retry_steps_2_3.py; disable the audit here so its
+    traceability checks don't fail these minimal fixtures."""
+    monkeypatch.setenv("QTEA_COVERAGE_AUDIT", "0")
+
 
 from ._fake_anthropic import (
     FakeResponse,

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://qtea/schemas/code-modification-plan.schema.json",
   "title": "CodeModificationPlan",
-  "description": "Structural mapping from test-strategy.md test cases to the SUT's existing code. Produced by Step 7 (test-architect) and consumed by Step 8 (TDD codegen). Authoritative for placement decisions (which fixtures to reuse, where new POM methods go, what TBD intents to emit). The writer agent transpiles the plan into code; it does not redo placement reasoning.",
+  "description": "Structural mapping from test-design.md test cases to the SUT's existing code. Produced by Step 7 (test-automation-architect) and consumed by Step 8 (TDD codegen). Authoritative for placement decisions (which fixtures to reuse, where new POM methods go, what TBD intents to emit). The writer agent transpiles the plan into code; it does not redo placement reasoning.",
   "type": "object",
   "required": ["plan_version", "active_module", "test_cases"],
   "additionalProperties": true,
@@ -89,7 +89,7 @@
         },
         "manual_step_ref": {
           "type": ["string", "null"],
-          "description": "Short reference to the originating manual step in test-strategy.md (e.g. 'step 2: click sign-in')."
+          "description": "Short reference to the originating manual step in test-design.md (e.g. 'step 2: click sign-in')."
         },
         "pom": {
           "type": "string",
@@ -114,7 +114,7 @@
         "args_hint": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Optional non-authoritative hints for the argument values (e.g. ['valid email', 'EXPECTED_URL']). Prefer the authoritative `args` field; the writer sources exact values from `args` first, then test-strategy.md."
+          "description": "Optional non-authoritative hints for the argument values (e.g. ['valid email', 'EXPECTED_URL']). Prefer the authoritative `args` field; the writer sources exact values from `args` first, then test-design.md."
         },
         "locator": {
           "type": ["string", "null"],
@@ -149,7 +149,7 @@
         "reuse_justification": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 200,
+          "maxLength": 300,
           "description": "Required by the s07 phase gate when source=reuse. One sentence naming the matching dimension that justifies reusing this fixture (e.g. 'yields Page already authenticated as admin')."
         }
       }
@@ -174,19 +174,130 @@
           "description": "Methods that the test cases need but don't exist on the (reused or created) POM. The codegen step adds these to the POM file with the given signatures.",
           "items": {
             "type": "object",
-            "required": ["name", "signature"],
+            "required": ["name", "signature", "kind"],
             "additionalProperties": true,
             "properties": {
               "name": { "type": "string", "minLength": 1 },
               "signature": { "type": "string", "minLength": 1 },
-              "purpose": { "type": ["string", "null"] }
+              "kind": {
+                "enum": ["action", "assertion", "query"],
+                "description": "REQUIRED semantic role (omitting it previously let the assertion-oracle mandate be silently bypassed). `action` performs a state change (fill/click/navigate). `assertion` verifies a fact from the strategy — MUST populate `purpose` and `acceptance_criteria`. `query` returns a raw value for the test to assert against."
+              },
+              "purpose": {
+                "type": ["string", "null"],
+                "description": "1-3 sentences from the strategy's Expected Result clause — verbatim, not paraphrased. Required when kind='assertion'."
+              },
+              "acceptance_criteria": {
+                "type": "array",
+                "description": "Structured oracle for the method body. Required when kind='assertion' (min 1 entry).",
+                "items": {
+                  "type": "object",
+                  "required": ["check"],
+                  "additionalProperties": true,
+                  "allOf": [
+                    {
+                      "description": "Element-targeting checks must name the locator they inspect.",
+                      "if": {
+                        "required": ["check"],
+                        "properties": {
+                          "check": {
+                            "enum": [
+                              "exact_text", "exact_count", "exact_attribute",
+                              "value_equals", "visible", "focusable",
+                              "boundingbox_below", "boundingbox_above"
+                            ]
+                          }
+                        }
+                      },
+                      "then": { "required": ["locator"] }
+                    },
+                    {
+                      "description": "Positional bounding-box checks need a sibling to compare against.",
+                      "if": {
+                        "required": ["check"],
+                        "properties": {
+                          "check": { "enum": ["boundingbox_below", "boundingbox_above"] }
+                        }
+                      },
+                      "then": { "required": ["reference_locator"] }
+                    },
+                    {
+                      "description": "Value-comparing checks must carry an expected value (literal or symbol). Non-null-ness is enforced by the s07 phase gate.",
+                      "if": {
+                        "required": ["check"],
+                        "properties": {
+                          "check": {
+                            "enum": [
+                              "exact_text", "exact_count", "exact_attribute",
+                              "value_equals", "url_matches"
+                            ]
+                          }
+                        }
+                      },
+                      "then": {
+                        "anyOf": [
+                          { "required": ["expected_literal"] },
+                          { "required": ["expected_symbol"] }
+                        ]
+                      }
+                    }
+                  ],
+                  "properties": {
+                    "check": {
+                      "enum": [
+                        "exact_text", "exact_count", "exact_attribute",
+                        "visible", "focusable",
+                        "boundingbox_below", "boundingbox_above",
+                        "url_matches", "value_equals",
+                        "custom"
+                      ]
+                    },
+                    "locator": {
+                      "type": "string",
+                      "description": "Constant name (from `locators[]` in this TC) the assertion targets."
+                    },
+                    "reference_locator": {
+                      "type": "string",
+                      "description": "Only for boundingbox_* — the sibling to compare against."
+                    },
+                    "expected_literal": {
+                      "type": ["string", "number", "boolean", "null"],
+                      "description": "Verbatim expected value from the strategy."
+                    },
+                    "expected_symbol": {
+                      "type": "string",
+                      "description": "Name of a constant the test file will declare (e.g. EXPECTED_MARKETING_CONSENT_LABEL). Preferred when the value is long."
+                    },
+                    "source_tc": {
+                      "type": "string",
+                      "description": "TC-* id whose Expected Result this criterion derives from."
+                    }
+                  }
+                }
+              }
+            },
+            "if": {
+              "properties": {
+                "kind": { "const": "assertion" }
+              },
+              "required": ["kind"]
+            },
+            "then": {
+              "properties": {
+                "purpose": { "type": "string", "minLength": 20 },
+                "acceptance_criteria": {
+                  "type": "array",
+                  "minItems": 1
+                }
+              },
+              "required": ["purpose", "acceptance_criteria"]
             }
           }
         },
         "reuse_justification": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 200,
+          "maxLength": 300,
           "description": "Required by the s07 phase gate when source=reuse. One sentence naming the matching dimension (e.g. 'ChatPage already models the side-nav route this TC exercises')."
         }
       }
@@ -204,7 +315,7 @@
         "reuse_justification": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 200,
+          "maxLength": 300,
           "description": "Required by the s07 phase gate when source=reuse. One sentence naming why this helper fits (matching signature, side-effect-free, etc)."
         }
       }
@@ -238,7 +349,7 @@
         "reuse_justification": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 200,
+          "maxLength": 300,
           "description": "Required by the s07 phase gate when source=reuse. One sentence naming why this locator constant fits (matching selector intent, owning-page coherence)."
         }
       }

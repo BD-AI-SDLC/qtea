@@ -12,12 +12,15 @@ Also owns ``_failing_tests`` (a one-liner filter over ``RunResult``) and
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from datetime import UTC, datetime
 from pathlib import Path
 
 from qtea.test_runner import RunResult, TestRunEntry
+
+log = logging.getLogger(__name__)
 
 
 def _failing_tests(run: RunResult) -> list[TestRunEntry]:
@@ -201,19 +204,28 @@ def _classify_failure(entry: TestRunEntry) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Layer 2: AOM-at-failure cross-check
+# Layer 2: AOM-at-failure cross-check (bi-directional)
 #
-# When Layer 1 classifies a failure as element_not_in_dom, that could be:
+# Layer 2 fires on either ``element_not_in_dom`` OR ``locator_timeout``
+# tentative classifications. The ambiguity to resolve:
 #   (a) element genuinely absent from the DOM  →  real DEV bug, no heal
 #   (b) locator is wrong / stale but element exists  →  heal can fix
 #
-# Layer 2 resolves the ambiguity by reading the AOM snapshot captured by
-# the runtime plugin at the moment of failure
-# (<workspace>/aom-at-failure/<entry_id>.txt) and searching for a
+# Reads the AOM snapshot captured by the runtime plugin at the moment of
+# failure (<workspace>/aom-at-failure/<entry_id>.txt) and searches for a
 # distinctive token extracted from the Playwright call-log locator
-# expression. If the token appears in the AOM, the element is present on
-# the page and the failure is reclassified as locator_timeout (healable).
-# If absent, element_not_in_dom is confirmed.
+# expression.
+#
+# Behavior matrix:
+#   element_not_in_dom + token in AOM  →  locator_timeout    (upgrade — healable)
+#   element_not_in_dom + token absent  →  element_not_in_dom (unchanged — real bug)
+#   locator_timeout    + token in AOM  →  locator_timeout    (unchanged — healable)
+#   locator_timeout    + token absent  →  element_not_in_dom (downgrade — real bug)
+#
+# The locator_timeout downgrade branch is short-circuited in
+# ``_partition_failures`` when Playwright's own call log contains
+# ``"locator resolved to <"`` (positive DOM-presence signal) — that
+# signal is more authoritative than an AOM substring search.
 # ---------------------------------------------------------------------------
 
 # Regex to pull the locator expression out of a Playwright call log.
@@ -273,45 +285,65 @@ def _extract_locator_search_term(haystack: str) -> str | None:
     return None
 
 
-def _refine_element_not_in_dom(
+def _refine_locator_absence(
     entry: TestRunEntry,
     aom_dir: Path | None,
+    *,
+    tentative: str = "element_not_in_dom",
 ) -> str:
-    """Validate an element_not_in_dom classification against the AOM snapshot
-    captured at failure time (Layer 2).
+    """Cross-check a locator-related classification against the AOM snapshot
+    captured at failure time (Layer 2). Bi-directional refinement.
 
-    If a distinctive token from the locator expression is found in the AOM,
-    the element exists on the page under a different selector
-    (wrong/stale locator) → reclassify as ``locator_timeout`` so the heal
-    agent gets the chance to find the correct selector.
+    Behavior matrix (``tentative`` × AOM search result):
 
-    If the token is absent (or no AOM is available), the element is
-    confirmed absent → keep ``element_not_in_dom``.
+    - ``element_not_in_dom`` + token in AOM → ``locator_timeout`` (healable)
+    - ``locator_timeout``    + token in AOM → ``locator_timeout`` (healable)
+    - either                 + token absent → ``element_not_in_dom`` (real bug)
+    - no signal (no AOM, no file, no token) → ``tentative`` unchanged
+
+    Playwright positive-signal short-circuit: when ``tentative`` is
+    ``locator_timeout`` and the call log contains ``"locator resolved to <"``,
+    Layer 2 is skipped — Playwright's own DOM query is more authoritative
+    than an AOM substring search.
     """
     if aom_dir is None:
-        return "element_not_in_dom"
-    # Import here to avoid a hard dependency on pathlib at module import time
-    # in contexts where only the regex helpers are needed.
-    from pathlib import Path as _Path
-    aom_path = _Path(aom_dir) / f"{entry.id}.txt"
+        return tentative
+
+    haystack = "\n".join(filter(None, (entry.message, entry.traceback)))
+
+    # Playwright positive signal: call log confirms element was in the DOM
+    # (just not yet visible/enabled/stable). Trust that over AOM search.
+    if tentative == "locator_timeout" and _ELEMENT_IN_DOM_RE.search(haystack):
+        return tentative
+
+    aom_path = Path(aom_dir) / f"{entry.id}.txt"
     if not aom_path.exists():
-        return "element_not_in_dom"
+        return tentative
     try:
         aom_text = aom_path.read_text(encoding="utf-8")
     except OSError:
-        return "element_not_in_dom"
+        return tentative
     if not aom_text.strip():
-        return "element_not_in_dom"
+        return tentative
 
-    haystack = "\n".join(filter(None, (entry.message, entry.traceback)))
     term = _extract_locator_search_term(haystack)
     if not term:
-        return "element_not_in_dom"
+        return tentative
 
     if term.lower() in aom_text.lower():
         return "locator_timeout"
 
+    if tentative == "locator_timeout":
+        log.info(
+            "qtea.step9.layer2.downgrade_locator_timeout test_id=%s token=%s",
+            entry.id,
+            term,
+        )
     return "element_not_in_dom"
+
+
+# Backwards-compat alias — preserves imports of the old name.
+_refine_element_not_in_dom = _refine_locator_absence
 
 
 def _partition_failures(
@@ -327,11 +359,11 @@ def _partition_failures(
     skips classification and heals everything. Use when the classifier
     itself is suspected of false-positively excluding a real heal target.
 
-    ``aom_dir`` — when provided (``<workspace>/aom-at-failure``), any
-    tentative ``element_not_in_dom`` result is refined via Layer 2:
-    if the locator's distinctive token appears in the AOM snapshot
-    captured at failure time, the element exists under a wrong selector
-    and the class is upgraded to ``locator_timeout`` (healable).
+    ``aom_dir`` — when provided (``<workspace>/aom-at-failure``), Layer 2
+    AOM cross-check fires bi-directionally for ``element_not_in_dom``
+    and ``locator_timeout`` starting classes (see
+    :func:`_refine_locator_absence` for the behavior matrix and
+    Playwright positive-signal short-circuit).
     """
     if os.environ.get("QTEA_HEAL_ALL") == "1":
         return list(failing), []
@@ -339,8 +371,8 @@ def _partition_failures(
     real_bugs: list[tuple[TestRunEntry, str]] = []
     for entry in failing:
         cls = _classify_failure(entry)
-        if cls == "element_not_in_dom" and aom_dir is not None:
-            cls = _refine_element_not_in_dom(entry, aom_dir)
+        if aom_dir is not None and cls in ("element_not_in_dom", "locator_timeout"):
+            cls = _refine_locator_absence(entry, aom_dir, tentative=cls)
         if cls in _FAILURE_CLASS_HEALABLE:
             healable.append(entry)
         else:
@@ -381,5 +413,6 @@ __all__ = [
     "_extract_locator_search_term",
     "_failing_tests",
     "_partition_failures",
-    "_refine_element_not_in_dom",
+    "_refine_element_not_in_dom",  # backwards-compat alias for _refine_locator_absence
+    "_refine_locator_absence",
 ]

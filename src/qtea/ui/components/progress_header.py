@@ -15,6 +15,7 @@ from qtea.ui.theme import (
     PRIMARY,
     SECONDARY,
     STATUS_COLORS,
+    sz,
 )
 
 
@@ -67,7 +68,7 @@ def build_progress_header(
     status_badge = ft.Container(
         content=ft.Text(
             status_text,
-            size=11,
+            size=sz(11),
             weight=ft.FontWeight.BOLD,
             color="#FFFFFF",
         ),
@@ -79,7 +80,7 @@ def build_progress_header(
     # Run ID badge
     run_id_badge = ft.Text(
         state.run_id or "",
-        size=11,
+        size=sz(11),
         color=ON_SURFACE_DIM,
         font_family="Courier New",
     )
@@ -93,7 +94,7 @@ def build_progress_header(
     else:
         elapsed_text = ft.Text(
             _fmt_elapsed(state.elapsed_s),
-            size=14,
+            size=sz(14),
             weight=ft.FontWeight.W_600,
             color=ON_SURFACE,
         )
@@ -114,13 +115,22 @@ def build_progress_header(
             with contextlib.suppress(Exception):
                 loop.call_soon_threadsafe(task.cancel)
 
-        # Kill child processes (pytest workers, MCP/npx server, allure, etc.)
-        # so blocking subprocess.run / Popen calls in the worker return.
+        # Kill ONLY the pipeline's subprocesses (pytest workers, MCP/npx
+        # server, browsers, allure, etc.) so blocking subprocess.run / Popen
+        # calls in the worker return. Critically, do NOT kill children that
+        # existed before the run — above all the flet-desktop Flutter GUI
+        # process, which is a child of this Python process. The previous
+        # "kill all children recursively" killed the GUI too, so Stop *closed*
+        # qtea instead of stopping the run. We diff against the pre-pipeline
+        # snapshot (state.baseline_child_pids) and spare anything in it.
         try:
             import psutil
 
+            baseline = state.baseline_child_pids or set()
             me = psutil.Process()
             for child in me.children(recursive=True):
+                if child.pid in baseline:
+                    continue  # GUI / pre-existing — never kill
                 with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
                     child.kill()
         except Exception:
@@ -128,17 +138,56 @@ def build_progress_header(
 
         # If the worker is parked inside HitlBridge.prompt_user waiting on a
         # threading.Event, release it now so the worker thread can exit.
+        # Unlike the normal Submit/Cancel path, this bypasses the dialog's
+        # own button handlers entirely — so we must pop its AlertDialog
+        # ourselves. Dialogs live on page._dialogs, a stack completely
+        # separate from page.views; the "/results" rebuild that follows
+        # never touches it, so a stuck dialog would otherwise sit on top of
+        # the summary screen forever.
         pending = state.pending_hitl
         if pending is not None and pending.completion_event is not None:
             with contextlib.suppress(Exception):
                 pending.completion_event.set()
+            if getattr(pending, "_dialog_open", False):
+                with contextlib.suppress(Exception):
+                    page.pop_dialog()
         pending_rg = state.pending_review_gate
         if pending_rg is not None and pending_rg.completion_event is not None:
             with contextlib.suppress(Exception):
                 pending_rg.completion_event.set()
+            if getattr(pending_rg, "_dialog_open", False):
+                with contextlib.suppress(Exception):
+                    page.pop_dialog()
 
         state.notify()
+
+        # Snap to the results view NOW — don't wait for the still-cancelling
+        # pipeline task to hit its finally block. Otherwise every trailing
+        # log event (step.end from the cancelled step, bridge cleanup, etc.)
+        # keeps calling state.notify(), which rebuilds pipeline_view's
+        # phase groups / metrics / header / log in place. The user sees a
+        # visible flicker of the /run view mutating for the duration of
+        # cancellation instead of an immediate summary. Clearing the state
+        # listeners first cuts the old pipeline_view's on_state_change
+        # subscription so those trailing notify()s no-op. The worker's own
+        # finally block will re-navigate to /results — same route, so the
+        # rebuild is idempotent.
+        navigate_to = None
+        if isinstance(page.data, dict):
+            navigate_to = page.data.get("navigate_to")
         with contextlib.suppress(Exception):
+            if navigate_to is not None:
+                state._listeners.clear()
+                page.route = "/results"
+                navigate_to("/results")
+                # Signal to the pipeline worker's finally block (in
+                # app.py's _run_pipeline) that the results view is
+                # already up — it should skip its own rebuild instead
+                # of doing a second page.views.clear()+build. Two
+                # rebuilds in rapid succession orphan the Flet client's
+                # widget-id map, leaving the summary rendered but every
+                # button dead-on-click.
+                state.results_navigated = True
             page.update()
 
     stop_button = ft.OutlinedButton(
@@ -152,10 +201,10 @@ def build_progress_header(
     # Top bar
     top_row = ft.Row(
         controls=[
-            ft.Icon(ft.Icons.ROCKET_LAUNCH, color=PRIMARY, size=22),
+            ft.Icon(ft.Icons.ROCKET_LAUNCH, color=PRIMARY, size=sz(22)),
             ft.Text(
                 "qtea",
-                size=18,
+                size=sz(18),
                 weight=ft.FontWeight.BOLD,
                 color=PRIMARY,
             ),
@@ -163,7 +212,7 @@ def build_progress_header(
             status_badge,
             run_id_badge,
             ft.Container(expand=True),
-            ft.Icon(ft.Icons.TIMER_OUTLINED, color=ON_SURFACE_DIM, size=18),
+            ft.Icon(ft.Icons.TIMER_OUTLINED, color=ON_SURFACE_DIM, size=sz(18)),
             elapsed_text,
             ft.Container(width=8),
             stop_button,
@@ -179,14 +228,14 @@ def build_progress_header(
                 controls=[
                     ft.Text(
                         current_name,
-                        size=12,
+                        size=sz(12),
                         color=ON_SURFACE_DIM,
                         weight=ft.FontWeight.W_500,
                     ),
                     ft.Container(expand=True),
                     ft.Text(
                         f"{completed}/{total} steps",
-                        size=12,
+                        size=sz(12),
                         color=ON_SURFACE_DIM,
                     ),
                 ],

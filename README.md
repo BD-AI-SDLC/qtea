@@ -16,7 +16,7 @@ QTea was tested on Windows BCNC.
 ```bash
 git clone https://github.com/BD-AI-SDLC/qtea.git
 cd <path_to_qtea>
-uv tool install './qtea[ui]'
+uv tool install ./qtea[ui]
 qtea --help
 ```
 
@@ -30,7 +30,7 @@ uv tool install ./qtea
 
 ```bash
 qtea doctor                     # validate environment
-qtea run --spec ./spec.md --sut ./my-sut
+qtea run --spec <path_to_spec> --sut <path_to_sut>
 ```
 
 ## The pipeline
@@ -40,10 +40,10 @@ qtea run --spec ./spec.md --sut ./my-sut
 | 1 | Intake | `ticket-to-ai-spec` (or pure copy) | `spec.md` |
 | 2 | Refine | `refine-spec` | `refined-spec.{md,json}` |
 | 3 | Plan | `polyglot-test-planner` | `plan.{md,json}` |
-| 4 | Strategy | `test-manager` | `test-strategy.{md,json}` |
+| 4 | Design | `test-designer` (Senior SDET persona) | `test-design.{md,json}` |
 | 5 | Xray | pure code | `xray-mapping.json` |
 | 6 | Research | `polyglot-test-researcher` | `research.{md,json}` |
-| 7 | Test architect | `test-architect` | `code-modification-plan.json` |
+| 7 | Test architect | `test-automation-architect` (+ `site-explorer` live-explore pre-pass) | `code-modification-plan.json` |
 | 8 | TDD codegen | `codegen-pom-extender` (Phase A), `codegen-test-writer` (Phase B), `codegen-violation-fixer` (Phase C) | test files + `tbd-index.json` |
 | 9 | Run + heal + verify | pure code + `polyglot-test-fixer` (on failure) | `run-results.json` (+ `locator-cache.json` when JIT) |
 | 10 | Bug class. | `bug-report-classifier` | `bug-reports.{md,json}` |

@@ -619,6 +619,165 @@ def test_js_string_with_double_slash_does_not_corrupt_following_calls(tmp_path: 
     assert recon.mismatches == []
 
 
+def test_js_strip_apostrophe_in_line_comment_does_not_swallow_methods(
+    tmp_path: Path,
+):
+    """Regression for the `_js_strip` bug that broke Step 8 on 2026-07-08.
+
+    A ``//`` line comment containing an apostrophe (e.g. ``// it's about
+    missing checkbox``) was mis-processed by the string regex, which
+    treated the apostrophe as an opening quote and non-greedily consumed
+    across newlines until finding the next apostrophe (usually in a
+    later assertion like ``'/trial'`` or ``'button'``). Blanking replaced
+    all matched chars with spaces — including the newlines — so
+    downstream ``re.MULTILINE`` anchors lost every method whose defining
+    line no longer began after a ``\\n``.
+
+    On the failing SUT this collapsed 592 raw lines of ``TrialPage.ts``
+    to 214 stripped lines and reduced the extracted method count from
+    28 to 9. This test enforces the fixed behavior: both methods bracketing
+    a comment-with-apostrophe MUST be discovered by ``reconcile_codegen``.
+    """
+    pom = (
+        "export class LoginPage {\n"
+        "  submit() {\n"
+        "    // Get warning text to verify it's about missing input\n"
+        "    return true;\n"
+        "  }\n"
+        "\n"
+        "  cancel() {\n"
+        "    // don't dismiss the modal via click; it's kept as sentinel\n"
+        "    return false;\n"
+        "  }\n"
+        "\n"
+        "  reset() {\n"
+        "    return null;\n"
+        "  }\n"
+        "}\n"
+    )
+    tests = (
+        'import { LoginPage } from "./pages/login_page";\n'
+        'const loginPage = new LoginPage();\n'
+        'test("both post-apostrophe methods must resolve", async () => {\n'
+        "  await loginPage.cancel();\n"
+        "  await loginPage.reset();\n"
+        "});\n"
+    )
+    recon = _reconcile_js_pair(tmp_path, pom, tests)
+    # Both `cancel` (post-first-apostrophe-comment) and `reset` (post-
+    # second-apostrophe-comment) MUST be discovered. Under the old bug,
+    # extraction stopped at `submit` — both later calls would return
+    # `method_not_found` mismatches.
+    assert recon.mismatches == [], (
+        f"Apostrophe in line comment caused method extraction to truncate; "
+        f"mismatches={recon.mismatches!r}"
+    )
+
+
+def test_js_strip_preserves_newlines_in_block_comment(tmp_path: Path):
+    """A multi-line ``/* ... */`` block comment between two methods must
+    preserve newlines when blanked — otherwise the second method's
+    defining line loses its leading ``\\n`` and ``re.MULTILINE`` misses it.
+    """
+    pom = (
+        "export class LoginPage {\n"
+        "  first() {\n"
+        "    return 1;\n"
+        "  }\n"
+        "\n"
+        "  /*\n"
+        "   * Multi-line block comment.\n"
+        "   * Historically this collapsed to a single-space line and\n"
+        "   * pulled the next method up to share a line with `first()`.\n"
+        "   */\n"
+        "\n"
+        "  second() {\n"
+        "    return 2;\n"
+        "  }\n"
+        "}\n"
+    )
+    tests = (
+        'import { LoginPage } from "./pages/login_page";\n'
+        'const loginPage = new LoginPage();\n'
+        'test("second must resolve after multiline block comment", async () => {\n'
+        "  await loginPage.second();\n"
+        "});\n"
+    )
+    recon = _reconcile_js_pair(tmp_path, pom, tests)
+    assert recon.mismatches == []
+
+
+def test_js_strip_preserves_newlines_in_template_literal(tmp_path: Path):
+    """A multi-line template literal (backticks) between two methods
+    must also preserve newlines when blanked.
+    """
+    pom = (
+        "export class LoginPage {\n"
+        "  first() {\n"
+        "    const banner = `\n"
+        "      welcome\n"
+        "      to\n"
+        "      the app\n"
+        "    `;\n"
+        "    return banner;\n"
+        "  }\n"
+        "\n"
+        "  second() {\n"
+        "    return 2;\n"
+        "  }\n"
+        "}\n"
+    )
+    tests = (
+        'import { LoginPage } from "./pages/login_page";\n'
+        'const loginPage = new LoginPage();\n'
+        'test("second must resolve after multiline template literal", async () => {\n'
+        "  await loginPage.second();\n"
+        "});\n"
+    )
+    recon = _reconcile_js_pair(tmp_path, pom, tests)
+    assert recon.mismatches == []
+
+
+def test_js_pom_methods_extracts_all_methods_from_apostrophe_heavy_class(
+    tmp_path: Path,
+):
+    """Scale-check: a class with many methods AND multiple apostrophe-in-
+    comment lines must have every method extracted. Under the old bug,
+    only the methods before the first apostrophe comment were seen.
+    """
+    from qtea.codegen_reconcile import _js_pom_methods
+
+    src = (
+        "export class Big {\n"
+        "  m1() {}\n"
+        "  m2() {\n"
+        "    // step 1: initialise; it's a common preamble\n"
+        "  }\n"
+        "  m3() {\n"
+        "    return 'x';\n"
+        "  }\n"
+        "  m4() {\n"
+        "    // step 2: don't cache the response\n"
+        "  }\n"
+        "  m5() {}\n"
+        "  m6() {\n"
+        "    // step 3: verify the label's contents\n"
+        "  }\n"
+        "  m7() {\n"
+        "    return \"http://example.com/it's-a-url\";\n"
+        "  }\n"
+        "  m8() {}\n"
+        "}\n"
+    )
+    methods = _js_pom_methods(src, "Big")
+    names = {m.name for m in methods}
+    expected = {f"m{i}" for i in range(1, 9)}
+    assert names == expected, (
+        f"Apostrophe comments truncated extraction; missing "
+        f"{expected - names!r}, extra {names - expected!r}"
+    )
+
+
 def test_js_multiline_method_chain_matched(tmp_path: Path):
     """Playwright fluent style `page\\n  .foo()` must be discovered."""
     recon = _reconcile_js_pair(

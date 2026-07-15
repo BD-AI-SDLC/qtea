@@ -132,10 +132,6 @@ def _js_escape_single(s: str) -> str:
     return s.replace("\\", "\\\\").replace("'", "\\'")
 
 
-def _js_escape_double(s: str) -> str:
-    return s.replace("\\", "\\\\").replace('"', '\\"')
-
-
 def _has_template(s: str) -> bool:
     return "${" in s and "}" in s
 

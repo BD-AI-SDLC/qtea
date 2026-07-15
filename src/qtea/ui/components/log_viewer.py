@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import inspect
 
 import flet as ft
 
@@ -16,9 +18,47 @@ from qtea.ui.theme import (
     LOG_TOKENS_COLOR,
     ON_SURFACE,
     ON_SURFACE_DIM,
+    sz,
 )
 
 MAX_DISPLAY_LINES = 500
+
+
+def scroll_to_end(scrollable: ft.Control) -> None:
+    """Best-effort scroll to end. In newer Flet versions `scroll_to` is a
+    coroutine — calling it synchronously leaves an unawaited coroutine and
+    triggers a RuntimeWarning. Handle both APIs.
+
+    Skips unmounted controls (``.page`` raises, not None, before the control
+    is added to ``page.views``) and cancels any still-pending previous
+    scroll_to task before starting a new one — on a long, chatty run these
+    invoke_method() calls (no timeout) were piling up into hundreds of
+    never-resolving awaits, and a burst of them right as the run finished
+    destabilized the Flet session, dropping the UI back to the config screen.
+    """
+    try:
+        if not scrollable.page:
+            return
+    except Exception:
+        return
+
+    prev_task: asyncio.Task | None = getattr(scrollable, "_qtea_scroll_task", None)
+    if prev_task is not None and not prev_task.done():
+        prev_task.cancel()
+
+    try:
+        result = scrollable.scroll_to(offset=-1, duration=0)
+    except Exception:
+        return
+    if inspect.iscoroutine(result):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            result.close()
+            return
+        task = loop.create_task(result)
+        with contextlib.suppress(Exception):
+            scrollable._qtea_scroll_task = task
 
 
 def _build_log_line(line: LogLine) -> ft.Container:
@@ -31,7 +71,7 @@ def _build_log_line(line: LogLine) -> ft.Container:
         parts.append(
             ft.TextSpan(
                 f"{line.timestamp}  ",
-                style=ft.TextStyle(size=11, color=ON_SURFACE_DIM),
+                style=ft.TextStyle(size=sz(11), color=ON_SURFACE_DIM),
             )
         )
 
@@ -40,7 +80,7 @@ def _build_log_line(line: LogLine) -> ft.Container:
         ft.TextSpan(
             f"{line.level.upper():8s}",
             style=ft.TextStyle(
-                size=11,
+                size=sz(11),
                 color=level_color,
                 weight=ft.FontWeight.BOLD,
             ),
@@ -52,7 +92,7 @@ def _build_log_line(line: LogLine) -> ft.Container:
         ft.TextSpan(
             f"{line.event:36s}",
             style=ft.TextStyle(
-                size=11,
+                size=sz(11),
                 color=ON_SURFACE,
                 weight=ft.FontWeight.W_600,
             ),
@@ -74,7 +114,7 @@ def _build_log_line(line: LogLine) -> ft.Container:
             ft.TextSpan(
                 f"agent={agent_name}",
                 style=ft.TextStyle(
-                    size=11,
+                    size=sz(11),
                     color=LOG_AGENT_COLOR,
                     weight=ft.FontWeight.BOLD,
                 ),
@@ -94,7 +134,7 @@ def _build_log_line(line: LogLine) -> ft.Container:
                 parts.append(
                     ft.TextSpan(
                         f"{prefix}{k}={v}",
-                        style=ft.TextStyle(size=11, color=color),
+                        style=ft.TextStyle(size=sz(11), color=color),
                     )
                 )
             else:
@@ -102,7 +142,7 @@ def _build_log_line(line: LogLine) -> ft.Container:
                 parts.append(
                     ft.TextSpan(
                         f"{prefix}{k}={v}",
-                        style=ft.TextStyle(size=11, color=ON_SURFACE_DIM),
+                        style=ft.TextStyle(size=sz(11), color=ON_SURFACE_DIM),
                     )
                 )
             need_comma = True
@@ -110,7 +150,7 @@ def _build_log_line(line: LogLine) -> ft.Container:
         parts.append(
             ft.TextSpan(
                 line.message,
-                style=ft.TextStyle(size=11, color=ON_SURFACE_DIM),
+                style=ft.TextStyle(size=sz(11), color=ON_SURFACE_DIM),
             )
         )
 
@@ -163,8 +203,7 @@ def build_log_viewer(page: ft.Page, state: AppState) -> ft.Container:
     def refresh_log_list() -> None:
         filtered = _get_filtered_lines()
         log_list.controls = [_build_log_line(l) for l in filtered]
-        with contextlib.suppress(Exception):
-            log_list.scroll_to(offset=-1, duration=0)
+        scroll_to_end(log_list)
 
     refresh_log_list()
 
@@ -180,7 +219,7 @@ def build_log_viewer(page: ft.Page, state: AppState) -> ft.Container:
         ],
         width=140,
         height=36,
-        text_size=12,
+        text_size=sz(12),
         content_padding=ft.Padding.symmetric(horizontal=8, vertical=0),
         border_color=DIVIDER,
         on_select=lambda e: (
@@ -195,7 +234,7 @@ def build_log_viewer(page: ft.Page, state: AppState) -> ft.Container:
         hint_text="Filter logs...",
         width=180,
         height=36,
-        text_size=12,
+        text_size=sz(12),
         content_padding=ft.Padding.symmetric(horizontal=8, vertical=0),
         border_color=DIVIDER,
         prefix_icon=ft.Icons.SEARCH,
@@ -209,7 +248,7 @@ def build_log_viewer(page: ft.Page, state: AppState) -> ft.Container:
     # Line count
     count_text = ft.Text(
         f"{len(state.log_lines)} lines",
-        size=11,
+        size=sz(11),
         color=ON_SURFACE_DIM,
     )
 
@@ -218,7 +257,7 @@ def build_log_viewer(page: ft.Page, state: AppState) -> ft.Container:
         controls=[
             ft.Text(
                 "LOGS",
-                size=10,
+                size=sz(10),
                 weight=ft.FontWeight.BOLD,
                 color=ON_SURFACE_DIM,
             ),

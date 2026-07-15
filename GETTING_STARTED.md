@@ -12,31 +12,7 @@
 | npx | Yes | `npx --version` | Bundled with Node.js (install nodejs.org) |
 | Allure CLI | Auto (via npx) | `allure --version` | Bundled automatically via npx — no manual install needed |
 
-## 1. Install qtea
-
-```bash
-git clone https://github.com/BD-AI-SDLC/qtea.git
-cd qtea
-uv tool install '.[ui]'
-qtea --help
-qtea ui          # opens the desktop configuration window
-```
-
-This installs both the CLI (`qtea run`, `qtea doctor`, …) and the Flet-based desktop UI (`qtea ui`).
-
-**CLI only** (headless / CI environments):
-
-```bash
-uv tool install .
-```
-
-### Quick example of using QTea CLI
-
-```bash
-qtea run --spec ./feature-spec.md --sut ./my-app
-```
-
-## 2. Configure environment
+## 1. Configure environment
 
 ### User / system environment variables
 
@@ -74,6 +50,13 @@ Forwarded to both Claude Code CLI subprocesses and direct Anthropic SDK calls (r
 HTTP_PROXY=http://localhost:3128
 HTTPS_PROXY=http://localhost:3128
 ```
+
+> **BCNC devices:** `px` must be running before qtea is invoked. In `px.ini`, set `idle = 300` under the `[Client]` section so the proxy keeps connections alive long enough for agent steps:
+>
+> ```ini
+> [Client]
+> idle = 300
+> ```
 
 **Jira** (needed when `--spec` is `jira:KEY` or a Jira URL):
 
@@ -160,7 +143,7 @@ steps:
 
 **Note:** Variables marked **secret** in Azure DevOps cannot be retrieved via REST (API returns `null`) — set them in the pipeline definition or use `--env-file`.
 
-> **`--no-hitl` skips the review gates at steps 4, 7, and 8** (test strategy, code-modification plan, TBD intents). qtea is designed for interactive, operator-driven use — those gates are where you catch AI mistakes before they generate or run code. Only use `--no-hitl` for the SUT env-var prompt suppression use case (pre-set all vars via `--env-file`) or in unattended scenarios where you accept the output without review.
+> **`--no-hitl` skips the review gates at steps 4, 7, and 8** (test design, code-modification plan, TBD intents). qtea is designed for interactive, operator-driven use — those gates are where you catch AI mistakes before they generate or run code. Only use `--no-hitl` for the SUT env-var prompt suppression use case (pre-set all vars via `--env-file`) or in unattended scenarios where you accept the output without review.
 
 ### Jira integration
 
@@ -172,6 +155,31 @@ steps:
 | `JIRA_PAT` | Jira Server / Data Center (on-prem) | Bearer | Personal Access Token from Jira → Profile → Personal Access Tokens. Not used on Cloud. |
 
 qtea auto-detects the scheme from the hostname: `*.atlassian.net` → Cloud (Basic); any other host → Server/DC (Bearer). Override with `JIRA_AUTH_TYPE=cloud` or `JIRA_AUTH_TYPE=datacenter` if auto-detection is wrong.
+
+## 2. Install qtea
+
+```bash
+git clone https://github.com/BD-AI-SDLC/qtea.git
+cd <path_to_qtea>
+uv tool install .[ui]
+qtea --help
+qtea ui          # opens the desktop configuration window
+```
+
+This installs both the CLI (`qtea run`, `qtea doctor`, …) and the Flet-based desktop UI (`qtea ui`).
+
+**CLI only** (headless / CI environments):
+
+```bash
+cd <path_to_qtea>
+uv tool install .
+```
+
+### Quick example of using QTea CLI
+
+```bash
+qtea run --spec <path_to_spec> --sut <path_to_sut>
+```
 
 ## 3. Validate your setup
 
@@ -250,6 +258,8 @@ Shows all workspaces under `~/.qtea`, newest first:
  20260522-091500-b3c4d5   failed    7     7      2026-05-22 09:15:00  jira-PROJ-123
 ```
 
+`status` is one of `running`, `finished`, `failed`, `interrupted` (clean Ctrl-C / UI stop), `crashed` (uncaught exception), `aborted` (process died without a clean exit), or `empty` — derived from PID liveness so a dead run is never mistaken for one still in progress.
+
 Use the `run-id` column with `--run-id` to resume a specific run:
 
 ```bash
@@ -266,7 +276,7 @@ All artifacts are under `.qtea/<run-id>/artifacts/`:
 │   ├── step01/   spec.md, jira-spec.md
 │   ├── step02/   refined-spec.md, refined-spec.json
 │   ├── step03/   plan.md, plan.json
-│   ├── step04/   test-strategy.md, test-strategy.json
+│   ├── step04/   test-design.md, test-design.json
 │   ├── step05/   xray-mapping.json (skipped if no creds)
 │   ├── step06/   research.md, research.json
 │   ├── step07/   code-modification-plan.json
@@ -293,6 +303,9 @@ open .qtea/<run-id>/artifacts/step11/index.html
 qtea run --spec ./spec.md --sut ./app --only-step 11
 
 # Resume after a failure — pipeline auto-resumes from the last completed step
+# (resuming by --run-id never wipes already-generated test code; if the SUT
+# genuinely needs re-cloning, the affected code-writing steps 7-9 are
+# automatically re-queued instead of silently skipping against an empty tree)
 qtea run --spec ./spec.md --sut ./app
 
 # Force a clean re-run (ignore checkpoints)
@@ -317,6 +330,8 @@ On TTY runs (not `--no-hitl`), the pipeline pauses at several points to ask for 
 **Clarification questions — Steps 2 & 3**
 The agent may surface a `[CLARIFICATION NEEDED]` question mid-generation when it encounters a missing required fact. You answer inline; the answer is recorded in `user-answers.md` and propagated to all later steps so the same question is never asked twice.
 
+Step 2 also runs a traceability/coverage audit by default (every AC/EC/NFR must map to a refined-spec section), auto-rescued by a `refine-format-fixer` pass on failure. Set `QTEA_COVERAGE_AUDIT=0` to disable for a deliberately partial run, or `QTEA_NO_FORMAT_FIXER=1` to disable the auto-rescue.
+
 **Missing SUT env vars — Step 6**
 If the SUT requires environment variables that are not set (credentials, base URLs, feature flags), the pipeline prompts for them one by one. Answers are stored and re-used on resume. Pre-set them via `--env-file` to skip this entirely.
 
@@ -325,7 +340,7 @@ The pipeline pauses after generating a key artifact and asks you to approve befo
 
 | Gate | Artifact reviewed | Options |
 | --- | --- | --- |
-| Step 4 — Test Strategy | `test-strategy.md` | `[y]` approve, `[n]` reject (abort), `[f]` open in `$EDITOR` to revise |
+| Step 4 — Test Design | `test-design.md` | `[y]` approve, `[n]` reject (abort), `[f]` open in `$EDITOR` to revise |
 | Step 7 — Code-modification plan | `code-modification-plan.md` | `[y]` approve, `[n]` reject (abort), `[f]` open in `$EDITOR` to revise |
 | Step 8 — TBD intents | `tbd-index.json` intent quality | `[y]` approve, `[n]` reject (abort) |
 

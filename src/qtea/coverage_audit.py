@@ -30,7 +30,44 @@ _AUTOMATION_TAGS = frozenset({"AUTOMATABLE", "MANUAL_ONLY", "NEEDS_INVESTIGATION
 _HIGH_SEVERITIES = frozenset({"critical", "high"})
 _ASSUMPTIONS_HEADER_RE = re.compile(r"^##\s+Assumptions\b", re.MULTILINE)
 
-_REQUIRES_TC_RE = re.compile(r"\[requires\s+TC\]", re.I)
+_REQUIRES_TC_RE = re.compile(
+    r"\[requires\s+TC"
+    r"(?::\s*((?:AC|EC|NFR)[\w-]*(?:\s*,\s*(?:AC|EC|NFR)[\w-]*)*))?"
+    r"\s*\]",
+    re.I,
+)
+
+# Matches an AC / EC / NFR id reference in any phrasing — bare `(AC-10)`,
+# `(see EC-1)`, `(covered by NFR-PERF-1)` all yield the same token. An
+# in-scope bullet whose coverage is really about an edge-case scenario is
+# legitimately traced by an EC-id; the audit accepts any defined structured
+# id, then resolves it against the union set below.
+_ID_REF_RE = re.compile(r"\b(?:AC|EC|NFR)-[A-Za-z0-9][A-Za-z0-9\-_]*\b")
+
+
+def _requires_tc_marker(bullet: str) -> tuple[bool, list[str]]:
+    """Detect the `[requires TC]` escape-hatch marker on a bullet.
+
+    Returns (marker_present, named_ids). `named_ids` is empty for the bare
+    `[requires TC]` form or when no marker is present at all. IDs may be
+    AC-*, EC-*, or NFR-* — validated against the spec's structured id set
+    by the caller.
+    """
+    m = _REQUIRES_TC_RE.search(bullet)
+    if not m:
+        return False, []
+    named = [a.strip() for a in (m.group(1) or "").split(",") if a.strip()]
+    return True, named
+
+
+# A `Steps` entry phrased as a verification is an assertion in disguise —
+# it has no home in Step 7's Steps->action-method / Expected-Result->
+# assertion-oracle mapping. "Check" is deliberately excluded: it is
+# commonly a UI action ("Check the checkbox"), not a verification.
+_STEP_VERIFICATION_VERB_RE = re.compile(
+    r"^(?:verify|confirm|observe|inspect|monitor|ensure|assert|validate)\b",
+    re.I,
+)
 
 
 def _coverage_note_ids(coverage_notes: list[dict] | None) -> set[str]:
@@ -52,23 +89,27 @@ def _coverage_note_ids_with_resolution(
     }
 
 
-def _ec_severity_rank(severity: str) -> int:
-    return {"critical": 0, "high": 1, "medium": 2, "low": 3}.get(
-        severity.lower(), 99
-    )
-
-
-def _format_violations_for_agent(artifact: str, violations: list[str]) -> str:
+def _format_violations_for_agent(
+    artifact: str, violations: list[str], *, hint: str | None = None
+) -> str:
     """Wrap the violation list with instructions that the agent re-prompts on
     retry. The wording is calibrated for an LLM that has just produced the
-    failing artifact and is being given a second attempt."""
-    return (
+    failing artifact and is being given a second attempt.
+
+    `hint`, if given, is an artifact-specific, copy-pasteable exemplar
+    appended after the violation list, to prevent non-convergent retries
+    where the model restates prose instead of matching the accepted form.
+    """
+    base = (
         f"Coverage audit failed for {artifact}: {len(violations)} violation(s). "
         "On retry, fix EACH item below by editing the markdown to add the "
         "missing field or correct the cited issue, then resubmit. "
         "Do NOT drop a TC unless you also add a `## Coverage Notes` entry "
         "explaining why. Violations:\n- " + "\n- ".join(violations)
     )
+    if hint:
+        base += f"\n\n{hint}"
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -80,18 +121,35 @@ def audit_refined_spec(spec: dict[str, Any]) -> list[str]:
     violations: list[str] = []
     coverage_ids = _coverage_note_ids(spec.get("coverage_notes"))
 
-    # 1. Every AC bullet in the legacy free-text list should also have a
-    #    structured counterpart (i.e. carry an AC-ID).
+    # 1. Every AC bullet in the legacy free-text list must carry an AC-ID
+    #    that is also present in the structured list.
+    #
+    #    Match by ID, NOT by text-substring against the structured `text`.
+    #    The structured parser now stores the Given/When/Then *sentence* in
+    #    `text` (e.g. "Given X, When Y, Then Z"), while a legacy bullet is
+    #    just the AC header ("[ ] **AC-1:** `[AUTOMATABLE]`"). The two never
+    #    overlap textually, so the old substring check flagged every AC as
+    #    "has no AC-ID" even though the header plainly contains `**AC-1**`.
+    #    The AC-ID *is* the traceability handle — checking for its presence
+    #    is both the correct semantics and immune to G/W/T-format churn.
     legacy = spec.get("acceptance_criteria") or []
     structured = spec.get("acceptance_criteria_structured") or []
-    structured_texts = {(a.get("text") or "").strip().lower() for a in structured}
     structured_ids = {a.get("id") for a in structured if a.get("id")}
+    # Coverage markers may legitimately reference an EC-id (an in-scope
+    # bullet whose real coverage is an edge-case scenario) or an NFR-id
+    # (perf/security bullet traced to the non-functional requirement).
+    # All three id families are accepted; validation is against the union.
+    ec_ids = {e.get("id") for e in spec.get("edge_cases_structured") or [] if e.get("id")}
+    nfr_ids = {n.get("id") for n in spec.get("nfrs_structured") or [] if n.get("id")}
+    all_structured_ids = structured_ids | ec_ids | nfr_ids
     for bullet in legacy:
         text = (bullet or "").strip()
-        # If a structured entry's `text` contains this bullet verbatim
-        # (or vice versa), treat it as covered.
-        norm = text.lower()
-        if any(norm in t or t in norm for t in structured_texts if t):
+        # Covered if the bullet names an AC-ID that exists in the structured
+        # list — colon placement inside/outside the bold token is irrelevant
+        # (`_ID_REF_RE` keys off the token, not the surrounding markup). The
+        # intersection is against AC-only `structured_ids`, so an incidental
+        # EC-/NFR- mention in the header can't spuriously satisfy the check.
+        if set(_ID_REF_RE.findall(text)) & structured_ids:
             continue
         # Cited in Coverage Notes? Exempt.
         if any(cid and cid in text for cid in coverage_ids):
@@ -165,10 +223,16 @@ def audit_refined_spec(spec: dict[str, Any]) -> list[str]:
         norm = bullet.strip().lower()
         if not norm:
             return True
-        if _REQUIRES_TC_RE.search(bullet):
-            return True
+        has_marker, named_ids = _requires_tc_marker(bullet)
+        if has_marker and not named_ids:
+            return True  # bare `[requires TC]` escape hatch
+        if has_marker and any(a in all_structured_ids for a in named_ids):
+            return True  # marker names at least one defined AC/EC/NFR
         if any(cid and cid in bullet for cid in coverage_ids):
             return True
+        referenced_ids = set(_ID_REF_RE.findall(bullet))
+        if referenced_ids & all_structured_ids:
+            return True  # inline reference to a defined id, any phrasing
         if any(norm in t or (t and t in norm) for t in ac_texts):
             return True
         return bool(any(norm in f or (f and f in norm) for f in ac_user_flows))
@@ -194,10 +258,19 @@ def audit_refined_spec(spec: dict[str, Any]) -> list[str]:
                 continue
             snippet = bullet[:60] + ("..." if len(bullet) > 60 else "")
             kind = "alt-flow step" if is_alt else "in-scope bullet"
-            violations.append(
-                f"{kind} '{snippet}' is not covered by any AC and has no "
-                "[requires TC] marker; promote to an AC or annotate"
-            )
+            has_marker, named_ids = _requires_tc_marker(bullet)
+            if has_marker and named_ids:
+                violations.append(
+                    f"{kind} '{snippet}' `[requires TC]` marker references "
+                    f"unknown id(s) {', '.join(named_ids)} not defined in "
+                    "acceptance_criteria_structured, edge_cases_structured, "
+                    "or nfrs_structured"
+                )
+            else:
+                violations.append(
+                    f"{kind} '{snippet}' is not covered by any AC/EC/NFR and "
+                    "has no [requires TC] marker; promote to an AC or annotate"
+                )
 
     return violations
 
@@ -332,7 +405,7 @@ def audit_strategy(
     *,
     raw_md: str = "",
 ) -> list[str]:
-    """Audit test-strategy against plan + refined-spec. Returns violations."""
+    """Audit test-design against plan + refined-spec. Returns violations."""
     violations: list[str] = []
     strategy_tcs = strategy.get("test_cases") or []
     plan_tcs = plan.get("test_cases") or []
@@ -360,8 +433,11 @@ def audit_strategy(
         violations.append(
             f"plan {plan_tc_id} has no corresponding strategy TC "
             "(derived_from missing in all strategy TCs); add a strategy TC "
-            "with derived_from: ["
-            f"{plan_tc_id}] or record an accepted_risk drop in ## Coverage Notes"
+            f"with derived_from: [{plan_tc_id}], or if the drop is intentional "
+            "record it in ## Coverage Notes using the exact form:\n"
+            f"  - **{plan_tc_id}:** accepted_risk — <reason>\n"
+            "Recognized accepted-risk keywords: accepted_risk | accepted risk "
+            "| dropped (accepted risk)."
         )
 
     # 2. Legitimate consolidation only.
@@ -399,6 +475,23 @@ def audit_strategy(
             "`## Coverage Notes` and ensure dropped items have an "
             "explicit resolution (dropped|scope_excluded|accepted_risk)"
         )
+
+    # 4. Steps must be actions, not disguised assertions. A step phrased
+    #    as a verification belongs in Expected Result instead — Step 7
+    #    maps Steps 1:1 onto POM action methods and Expected Result
+    #    bullets 1:1 onto assertion oracles, so a verification left in
+    #    Steps has no correct home downstream.
+    for stc in strategy_tcs:
+        tc_id = stc.get("id", "TC-?")
+        for step in stc.get("steps") or []:
+            if _STEP_VERIFICATION_VERB_RE.match(step.strip()):
+                snippet = step[:60] + ("..." if len(step) > 60 else "")
+                violations.append(
+                    f"{tc_id}: step '{snippet}' is a verification, not an "
+                    "action; move this fact to Expected Result and keep "
+                    "Steps to state-changing actions only "
+                    "(open/click/fill/select/submit)"
+                )
 
     return violations
 
@@ -544,8 +637,11 @@ def audit_traceability_matrix(matrix: dict[str, Any]) -> list[str]:
     for plan_tc_id in summary.get("orphan_plan_tcs") or []:
         violations.append(
             f"matrix orphan: plan {plan_tc_id} has no strategy TC and no "
-            "accepted-risk drop; add a strategy TC or record the drop in "
-            "## Coverage Notes"
+            "accepted-risk drop. Add a strategy TC, or if the drop is "
+            "intentional record it in ## Coverage Notes using the exact form:\n"
+            f"  - **{plan_tc_id}:** accepted_risk — <reason>\n"
+            "Recognized accepted-risk keywords: accepted_risk | accepted risk "
+            "| dropped (accepted risk). A plain `Dropped` is NOT accepted risk."
         )
     for ac_id in summary.get("orphan_acs") or []:
         violations.append(

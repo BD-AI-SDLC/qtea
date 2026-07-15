@@ -12,7 +12,7 @@ and prompts the user with:
 Auto-approved (no prompt) when stdin is not a TTY or ``--no-hitl`` is set.
 
 Currently implemented gates:
-- **Step 4** — test strategy (``test-strategy.md`` / ``.json``)
+- **Step 4** — test design (``test-design.md`` / ``.json``)
 - **Step 7** — code-modification plan (``code-modification-plan.json`` / ``.md``)
 - **Step 8** — TBD intent quality (WARN/FAIL entries)
 """
@@ -126,7 +126,7 @@ async def review_step_4_strategy(
     result: StepResult,
     console: Console,
 ) -> bool:
-    """Post-step-4 review gate for the test strategy.
+    """Post-step-4 review gate for the test design.
 
     Auto-approves when stdin is not a TTY or ``--no-hitl`` is set.
     """
@@ -134,12 +134,20 @@ async def review_step_4_strategy(
 
     opts = ctx.options
     if getattr(opts, "no_hitl", False) or not (sys.stdin.isatty() or getattr(opts, "ui_mode", False)):
-        log.info("step04.review_gate.skip", reason="non_tty_or_no_hitl")
+        step_dir = ctx.workspace.step_dir(4)
+        json_path = step_dir / "test-design.json"
+        if json_path.exists():
+            from qtea.schemas import is_valid
+            ok, err = is_valid(json.loads(json_path.read_text(encoding="utf-8")), "test-design")
+            if not ok:
+                log.error("step04.review_gate.schema_fail_no_hitl", error=err)
+                return False
+        log.warning("step04.review_gate.auto_approved", reason="no_hitl")
         return True
 
     step_dir = ctx.workspace.step_dir(4)
-    md_path = step_dir / "test-strategy.md"
-    json_path = step_dir / "test-strategy.json"
+    md_path = step_dir / "test-design.md"
+    json_path = step_dir / "test-design.json"
 
     if not md_path.exists():
         log.warning("step04.review_gate.no_md", path=str(md_path))
@@ -159,7 +167,7 @@ async def review_step_4_strategy(
             summary_text = _capture_render(_render_strategy, strategy)
             decision, edit_instructions = _UI_PROMPT_HOOK(
                 step=4,
-                title="Test Strategy Review",
+                title="Test Design Review",
                 summary_text=summary_text,
                 kind="strategy",
                 data=strategy,
@@ -210,9 +218,9 @@ async def review_step_4_strategy(
 
 
 def _render_strategy(strategy: dict, console: Console) -> None:
-    """Render test-strategy summary as a Rich table."""
+    """Render test-design summary as a Rich table."""
     test_cases = strategy.get("test_cases") or []
-    title_text = strategy.get("title") or "Test Strategy"
+    title_text = strategy.get("title") or "Test Design"
 
     table = Table(
         title=f"Step 4 — {title_text} ({len(test_cases)} test cases)",
@@ -275,7 +283,7 @@ async def _apply_strategy_file_edit(
     ctx: StepContext,
     console: Console,
 ) -> dict | None:
-    """Open test-strategy.md in $EDITOR, re-project JSON on save."""
+    """Open test-design.md in $EDITOR, re-project JSON on save."""
     if not _open_in_editor(md_path, console):
         console.print("[dim]file unchanged or editor failed — skipping[/]")
         return {}  # non-None signals "stay in loop"
@@ -290,7 +298,7 @@ async def _apply_strategy_nlp_edit(
     console: Console,
     instructions: str | None = None,
 ) -> dict | None:
-    """Apply free-text instructions to test-strategy.md via LLM.
+    """Apply free-text instructions to test-design.md via LLM.
 
     *instructions* is optional: ``None`` triggers the CLI ``Prompt.ask`` flow
     (used by the terminal review gate). UI callers pass the user-typed text
@@ -321,8 +329,8 @@ async def _apply_strategy_nlp_edit(
         console.print("[dim]empty input — skipping edit[/]")
         return {}
 
-    agent = package_resource_root() / "agents" / "strategy-editor.agent.md"
-    workdir = ctx.workspace.step_dir(4) / "strategy-editor"
+    agent = package_resource_root() / "agents" / "design-editor.agent.md"
+    workdir = ctx.workspace.step_dir(4) / "design-editor"
     workdir.mkdir(parents=True, exist_ok=True)
 
     current_md = md_path.read_text(encoding="utf-8")
@@ -332,7 +340,7 @@ async def _apply_strategy_nlp_edit(
         agent,
         workdir=workdir,
         user_prompt=instructions,
-        inputs={"test-strategy.md": current_md},
+        inputs={"test-design.md": current_md},
         output_schema=None,
         step=4,
     )
@@ -365,7 +373,7 @@ def _reproject_strategy(
     console: Console,
     ui_mode: bool = False,
 ) -> dict | None:
-    """Re-project test-strategy.md → .json, validate, persist.
+    """Re-project test-design.md → .json, validate, persist.
 
     *ui_mode* suppresses the interactive ``Prompt.ask`` recover prompts so
     the worker thread doesn't hang on stdin the UI user can't reach.
@@ -389,7 +397,7 @@ def _reproject_strategy(
         )
         return None if recover == "q" else {}
 
-    ok, err = is_valid(projection, "test-strategy")
+    ok, err = is_valid(projection, "test-design")
     if not ok:
         console.print(f"[red]edited strategy failed schema validation:[/] {err}")
         if ui_mode:
@@ -432,7 +440,15 @@ async def review_step_7_plan(
     """
     opts = ctx.options
     if getattr(opts, "no_hitl", False) or not (sys.stdin.isatty() or getattr(opts, "ui_mode", False)):
-        log.info("step07.review_gate.skip", reason="non_tty_or_no_hitl")
+        step_dir = ctx.workspace.step_dir(7)
+        plan_path = step_dir / "code-modification-plan.json"
+        if plan_path.exists():
+            from qtea.schemas import is_valid
+            ok, err = is_valid(json.loads(plan_path.read_text(encoding="utf-8")), "code-modification-plan")
+            if not ok:
+                log.error("step07.review_gate.schema_fail_no_hitl", error=err)
+                return False
+        log.warning("step07.review_gate.auto_approved", reason="no_hitl")
         return True
 
     step_dir = ctx.workspace.step_dir(7)
@@ -852,7 +868,7 @@ async def review_step_8_intents(
     """
     opts = ctx.options
     if getattr(opts, "no_hitl", False) or not (sys.stdin.isatty() or getattr(opts, "ui_mode", False)):
-        log.info("step08.intent_review_gate.skip", reason="non_tty_or_no_hitl")
+        log.warning("step08.intent_review_gate.auto_approved", reason="no_hitl")
         return True
 
     warnings = ctx.extras.get("step8_intent_warnings") or []

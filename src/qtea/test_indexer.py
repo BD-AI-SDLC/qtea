@@ -304,6 +304,15 @@ _VIOLATION_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
         re.compile(r"""(?P<snippet>catch\s*(?:\([^)]*\))?\s*\{\s*\})"""),
         "error",
     ),
+    # Dangerous code: os.system, subprocess, eval, exec, __import__, importlib
+    # in generated test files. Prevents prompt-injection → RCE via codegen.
+    (
+        "dangerous-code",
+        re.compile(
+            r"""(?P<snippet>(?:os\.system|subprocess\.(?:run|Popen|call|check_output|check_call)|(?<!\w)eval\s*\(|(?<!\w)exec\s*\(|__import__\s*\(|importlib\.(?:import_module|util\.spec_from_file_location)))""",
+        ),
+        "error",
+    ),
     # NOTE: `invalid-escape` is NOT in this list. A line-regex scan can't
     # distinguish raw strings (`r"\s+"` is valid Python) from non-raw, so it
     # produces false positives the violation-fixer cannot satisfy. The rule
@@ -1123,13 +1132,289 @@ def _scan_zero_assertion_tests(
     return out
 
 
+# JS/TS zero-assertion scan (finding 9). Playwright-ts / jest / vitest / mocha
+# / cypress had NO assertion enforcement — an `expect()`-less spec passed the
+# quality gate as a meaningless green. Best-effort, token-based, error-tier,
+# with a `qtea-setup` opt-out mirroring @pytest.mark.qtea_setup. Deliberately
+# does NOT strip comments/strings: that biases toward UNDER-detection
+# (a commented-out expect is ignored) rather than false-reds on real tests.
+_JSTS_TEST_DECL_RE = re.compile(r"\b(?:test|it)\s*(?:\.\s*\w+\s*)?\(")
+_JSTS_ASSERT_RE = re.compile(r"\bexpect\s*\(|\.\s*should\s*[\.\(]|\bassert(?:\.\w+)?\s*\(")
+_JSTS_SETUP_OPT_OUT = re.compile(r"qtea[-:]setup", re.IGNORECASE)
+_JSTS_SKIP_DECL_RE = re.compile(r"\b(?:test|it)\s*\.\s*(?:skip|fixme|todo)\s*\(")
+
+
+def _find_balanced_paren(s: str, open_idx: int) -> int:
+    """Index of the `)` matching the `(` at ``open_idx``, or -1."""
+    depth = 0
+    for i in range(open_idx, len(s)):
+        c = s[i]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _scan_zero_assertion_tests_jsts(
+    text: str, rel_path: str, framework: str,
+) -> list[Violation]:
+    """Flag JS/TS ``test(...)`` / ``it(...)`` blocks with no assertion.
+
+    An `expect()`-less spec would otherwise pass the Step-8 quality gate and
+    run green in Step 9 while verifying nothing (finding 9). Opt out with a
+    ``qtea-setup`` marker (comment or title) for legitimate setup/navigation
+    smoke tests, mirroring the Python ``@pytest.mark.qtea_setup`` escape.
+    """
+    if _family_for(framework) != "_js_ts":
+        return []
+    out: list[Violation] = []
+    for m in _JSTS_TEST_DECL_RE.finditer(text):
+        open_idx = m.end() - 1
+        close = _find_balanced_paren(text, open_idx)
+        if close == -1:
+            continue
+        span = text[open_idx : close + 1]
+        if _JSTS_SETUP_OPT_OUT.search(span):
+            continue
+        # `test.skip(...)` etc. are intentionally not executed — skip.
+        if _JSTS_SKIP_DECL_RE.match(text[m.start() : m.end()]):
+            continue
+        if _JSTS_ASSERT_RE.search(span):
+            continue
+        line = text.count("\n", 0, m.start()) + 1
+        out.append(
+            Violation(
+                rule="zero-assertions",
+                file=rel_path,
+                line=line,
+                snippet=(
+                    "test/it block has no expect()/should/assert call. Add an "
+                    "assertion or mark it with a `qtea-setup` comment to opt out."
+                ),
+                severity="error",
+            )
+        )
+    return out
+
+
+# Escape-hatch scan (finding 26). The violation-fixer decides pass/fail on the
+# type/parse checker's error COUNT — which any of these hatches zeroes without
+# fixing the defect: `# type: ignore` / `@ts-nocheck` silence the type gate,
+# and the skip/only family removes a test from execution entirely (evading even
+# Step 9). qtea's own generated tests must never carry them. Scoped to
+# qtea-generated files so the SUT's own legitimate skips are untouched.
+_ESCAPE_HATCH_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("type-ignore", re.compile(r"#\s*type:\s*ignore\b")),
+    ("pyright-ignore", re.compile(r"#\s*pyright:\s*ignore\b")),
+    ("ts-nocheck", re.compile(r"//\s*@ts-nocheck\b")),
+    ("ts-ignore", re.compile(r"//\s*@ts-(?:ignore|expect-error)\b")),
+    ("pytest-skip", re.compile(r"@pytest\.mark\.(?:skip|skipif|xfail)\b|\bpytest\.(?:skip|xfail)\s*\(")),
+    ("test-only", re.compile(r"\b(?:it|test|describe|context)\s*\.\s*only\s*\(")),
+    ("test-skip", re.compile(r"\b(?:it|test|describe|context)\s*\.\s*(?:skip|todo|fixme)\s*\(")),
+    ("java-disabled", re.compile(r"@Disabled\b|@Ignore\b")),
+)
+
+
+def _is_qtea_generated_file(rel_path: str) -> bool:
+    base = rel_path.replace("\\", "/").rsplit("/", 1)[-1]
+    return base.startswith("qtea_") or base.startswith("Qtea")
+
+
+def _scan_escape_hatches(text: str, rel_path: str) -> list[Violation]:
+    """Flag gate-silencing / test-skipping escape hatches in GENERATED tests.
+
+    These let the violation-fixer clear the type/parse gate (or evade Step 9
+    execution) without fixing the defect — a false-green channel (finding 26).
+    Only fires on qtea-generated files so the SUT's own tests are untouched.
+    Comments/strings are not stripped: err toward under-detection over a
+    false-red on the SUT's own code (which we don't scan anyway).
+    """
+    if not _is_qtea_generated_file(rel_path):
+        return []
+    out: list[Violation] = []
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        for name, pat in _ESCAPE_HATCH_PATTERNS:
+            if pat.search(line):
+                out.append(
+                    Violation(
+                        rule=f"escape-hatch-{name}",
+                        file=rel_path,
+                        line=line_no,
+                        snippet=(
+                            f"generated test uses a gate-silencing / "
+                            f"test-skipping hatch ({name!r}): "
+                            f"{line.strip()[:120]}. Fix the underlying defect "
+                            f"instead of suppressing the gate."
+                        ),
+                        severity="error",
+                    )
+                )
+    return out
+
+
 def _id_for(rel_path: str, name: str, occurrence: int) -> str:
     base = slugify(f"{Path(rel_path).stem}-{name}")
     return f"T-{base}" if occurrence == 0 else f"T-{base}-{occurrence + 1}"
 
 
-def index_tests(tests_root: Path, *, framework: str) -> IndexResult:
+# ---------------------------------------------------------------------------
+# pom-assertion rule (RCA-D): assertions must live in TEST methods, never in
+# page-object support files. Path-scoped + method-aware — severity depends on
+# whether the enclosing method was added by qtea codegen (per the plan's
+# `missing_methods`) or pre-existed on the SUT's own POM.
+# ---------------------------------------------------------------------------
+
+# Path fragments that identify a page-object support file. Matched against
+# the POSIX-style relative path (leading + trailing `/` on both sides so that
+# `pages` at the top of the tree still catches).
+_POM_PATH_FRAGMENTS: tuple[str, ...] = (
+    "/pages/", "/pageobjects/", "/page_objects/", "/page-objects/",
+    "/pom/", "/poms/",
+)
+
+# Assertion-shaped call patterns. Kept intentionally narrow — false positives
+# on this rule (which can fail an agent-authored method) are worse than
+# occasional under-detection (the pre-existing warning tier catches those).
+_POM_ASSERTION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bexpect\s*\("),                     # Playwright / Jest / Vitest
+    re.compile(r"^\s*assert\b", re.MULTILINE),        # Python bare assert
+    re.compile(r"\bassertThat\s*\("),                 # AssertJ / Hamcrest
+    re.compile(r"\bAssertions\s*\.\s*assert\w+\("),   # JUnit 5 / TestNG
+    re.compile(r"\.should\s*\("),                     # Cypress chainable
+)
+
+# Method-header patterns per family. Reused shape from codegen_reconcile —
+# each captures the method name in group 1. `_JS_METHOD_HEAD_RE_MULTILINE`
+# is our own copy scoped to indented (class-body) methods only.
+_JS_METHOD_HEAD_RE_LOCAL = re.compile(
+    r"^[ \t]*(?:(?:public|private|protected|static|async|readonly|override|get|set)\s+)*"
+    r"([A-Za-z_$][\w$]*)\s*"
+    r"(?:(?:<[^<>]*>)?\s*\(|=\s*(?:async\s+)?\()",
+    re.MULTILINE,
+)
+_PY_METHOD_HEAD_RE_LOCAL = re.compile(
+    r"^[ \t]+(?:async\s+)?def\s+([A-Za-z_][\w]*)\s*\(",
+    re.MULTILINE,
+)
+_JAVA_METHOD_HEAD_RE_LOCAL = re.compile(
+    r"^[ \t]*(?:public|private|protected)\s+"
+    r"(?:(?:static|final|abstract|synchronized|native|default)\s+)*"
+    r"(?:<[^<>]*>\s+)?"
+    r"(?:void|[\w$][\w$.]*(?:<[^<>]*>)?(?:\[\])*)\s+"
+    r"([\w$]+)\s*\(",
+    re.MULTILINE,
+)
+
+
+def _looks_like_pom_file(rel_path: str) -> bool:
+    """True when the file's path indicates a page-object module."""
+    p = "/" + rel_path.replace("\\", "/").strip("/") + "/"
+    return any(frag in p for frag in _POM_PATH_FRAGMENTS)
+
+
+def _method_head_re_for(rel_path: str) -> re.Pattern[str] | None:
+    """Pick the right method-header regex based on the file's extension."""
+    lower = rel_path.lower()
+    if lower.endswith((".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")):
+        return _JS_METHOD_HEAD_RE_LOCAL
+    if lower.endswith(".py"):
+        return _PY_METHOD_HEAD_RE_LOCAL
+    if lower.endswith(".java"):
+        return _JAVA_METHOD_HEAD_RE_LOCAL
+    return None
+
+
+def _enclosing_method_name(
+    text: str, offset: int, head_re: re.Pattern[str],
+) -> str | None:
+    """Return the name of the method whose body contains ``offset``, or
+    None if the position is at module scope (outside any method)."""
+    last_name: str | None = None
+    for m in head_re.finditer(text):
+        if m.start() > offset:
+            break
+        last_name = m.group(1)
+    return last_name
+
+
+def _scan_pom_assertions(
+    text: str, rel_path: str,
+    *,
+    agent_authored_methods: set[str] | None = None,
+) -> list[Violation]:
+    """Flag every ``expect()``/``assert``-shaped call inside a page-object
+    support file. Assertions belong in TEST methods, not POMs.
+
+    Severity split:
+
+    - **error**: the enclosing method name is in ``agent_authored_methods``
+      (the current plan's ``missing_methods``) — this is code qtea just
+      wrote and MUST comply. Hard-fails Step 8.
+    - **warning**: the enclosing method is pre-existing SUT code (or the
+      enclosing method can't be determined). Logged to violations.log for
+      migration triage without breaking the build.
+    """
+    if not _looks_like_pom_file(rel_path):
+        return []
+    head_re = _method_head_re_for(rel_path)
+    if head_re is None:
+        return []
+    agent_methods = agent_authored_methods or set()
+
+    out: list[Violation] = []
+    seen: set[tuple[int, str]] = set()  # dedup by (line, method-name)
+    for pat in _POM_ASSERTION_PATTERNS:
+        for m in pat.finditer(text):
+            line = _line_of(text, m.start())
+            method_name = _enclosing_method_name(text, m.start(), head_re)
+            key = (line, method_name or "")
+            if key in seen:
+                continue
+            seen.add(key)
+            snippet_head = _snippet_at(text, m.start(), length=80).strip()
+            if method_name and method_name in agent_methods:
+                severity = "error"
+                msg = (
+                    f"{method_name}(...) contains assertion in POM. "
+                    f"Assertions belong in test methods, not page objects "
+                    f"(RCA-D). Rewrite as a getter/probe returning the raw "
+                    f"value; move the assertion to the test."
+                )
+            else:
+                severity = "warning"
+                msg = (
+                    f"{(method_name or '<module>')}(...) contains assertion "
+                    f"in POM (pre-existing SUT code; advisory only). Consider "
+                    f"migrating to a getter + test-side assertion."
+                )
+            out.append(Violation(
+                rule="pom-assertion",
+                file=rel_path,
+                line=line,
+                snippet=f"{msg} [{snippet_head}]",
+                severity=severity,
+            ))
+    return out
+
+
+def index_tests(
+    tests_root: Path,
+    *,
+    framework: str,
+    agent_authored_methods: set[str] | None = None,
+) -> IndexResult:
     """Walk `tests_root`, return a populated IndexResult.
+
+    ``agent_authored_methods`` — set of method names that qtea codegen
+    just added to POM files (the union of
+    ``code-modification-plan.missing_methods[*].name`` across all POMs).
+    Enables the ``pom-assertion`` rule to distinguish assertions the
+    agent wrote (error) from pre-existing SUT code (warning). Pass
+    ``None`` to skip the rule entirely — used by legacy callers that
+    don't have a current plan in scope.
 
     Errors during file I/O are surfaced as violations with rule=`raw-secret`-
     style noise are NOT swallowed here; callers should treat any returned
@@ -1155,8 +1440,22 @@ def index_tests(tests_root: Path, *, framework: str) -> IndexResult:
         # zero-assertions + interaction-pattern + invalid-escape checks are
         # Python-only (AST / tokenize based). Skipped silently on other stacks.
         violations.extend(_scan_zero_assertion_tests(text, rel, framework))
+        # JS/TS analogue of the zero-assertion gate (finding 9) — an
+        # expect()-less spec would otherwise ship as a meaningless green.
+        violations.extend(_scan_zero_assertion_tests_jsts(text, rel, framework))
+        # Gate-silencing / test-skipping escape hatches in generated files
+        # (finding 26): type:ignore, ts-nocheck, pytest.skip/xfail, it.only, ...
+        violations.extend(_scan_escape_hatches(text, rel))
         violations.extend(_scan_interaction_patterns(text, rel, framework))
         violations.extend(_scan_invalid_escape_python(text, rel, framework))
+        # pom-assertion rule (RCA-D) — only runs when the caller passed
+        # the plan's authored-method set. Path-scoped internally so
+        # test files themselves are skipped.
+        if agent_authored_methods is not None:
+            violations.extend(_scan_pom_assertions(
+                text, rel,
+                agent_authored_methods=agent_authored_methods,
+            ))
 
         blocks = _split_test_blocks(text, family)
         if not blocks:

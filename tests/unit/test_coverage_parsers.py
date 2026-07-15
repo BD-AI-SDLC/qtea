@@ -59,6 +59,110 @@ def test_extract_acceptance_criteria_legacy_no_id_falls_through() -> None:
     assert len(proj["acceptance_criteria"]) == 2  # legacy preserved
 
 
+def test_extract_acceptance_criteria_nested_bold_gwt_single_ac() -> None:
+    md = """# Spec
+## Acceptance Criteria
+- [ ] **AC-1:** `[AUTOMATABLE]`
+  - **Given** user is on the login page
+  - **When** they submit valid credentials
+  - **Then** the dashboard is displayed
+"""
+    root = parse_markdown(md)
+    out = _extract_acceptance_criteria_structured(root)
+    assert len(out) == 1
+    ac = out[0]
+    assert ac["id"] == "AC-1"
+    assert ac["given"] == "user is on the login page"
+    assert ac["when"] == "they submit valid credentials"
+    assert ac["then"] == "the dashboard is displayed"
+    assert ac["automation"] == "AUTOMATABLE"
+    # Header body is just the automation tag; text must be the synthesized
+    # sentence, not the raw tag markup.
+    assert ac["text"] == (
+        "Given user is on the login page, "
+        "When they submit valid credentials, "
+        "Then the dashboard is displayed"
+    )
+
+
+def test_extract_acceptance_criteria_nested_bold_gwt_multiple_acs() -> None:
+    md = """# Spec
+## Acceptance Criteria
+- [ ] **AC-1:** `[AUTOMATABLE]`
+  - **Given** precondition one
+  - **When** action one
+  - **Then** expected one
+- [ ] **AC-2:** `[MANUAL ONLY]`
+  - **Given** precondition two
+  - **When** action two
+  - **Then** expected two
+"""
+    root = parse_markdown(md)
+    out = _extract_acceptance_criteria_structured(root)
+    assert [a["id"] for a in out] == ["AC-1", "AC-2"]
+    assert out[0]["given"] == "precondition one"
+    assert out[0]["when"] == "action one"
+    assert out[0]["then"] == "expected one"
+    assert out[0]["automation"] == "AUTOMATABLE"
+    assert out[1]["given"] == "precondition two"
+    assert out[1]["when"] == "action two"
+    assert out[1]["then"] == "expected two"
+    assert out[1]["automation"] == "MANUAL_ONLY"
+
+
+def test_extract_acceptance_criteria_mixed_legacy_and_nested_formats() -> None:
+    md = """# Spec
+## Acceptance Criteria
+- [ ] AC-1: Given old style, When submit, Then result shown. `[AUTOMATABLE]`
+- [ ] **AC-2:** `[MANUAL ONLY]`
+  - **Given** new style precondition
+  - **When** new style action
+  - **Then** new style expected
+"""
+    root = parse_markdown(md)
+    out = _extract_acceptance_criteria_structured(root)
+    assert [a["id"] for a in out] == ["AC-1", "AC-2"]
+    assert out[0]["given"] == "old style"
+    assert out[0]["when"] == "submit"
+    assert out[0]["then"] == "result shown."
+    assert out[0]["automation"] == "AUTOMATABLE"
+    assert out[1]["given"] == "new style precondition"
+    assert out[1]["when"] == "new style action"
+    assert out[1]["then"] == "new style expected"
+    assert out[1]["automation"] == "MANUAL_ONLY"
+
+
+def test_s02_full_projection_validates_against_schema_nested_bold_gwt() -> None:
+    md = """# Login
+
+**Requirement ID:** REQ-LOGIN
+
+## Acceptance Criteria
+- [ ] **AC-1:** `[AUTOMATABLE]`
+  - **Given** user
+  - **When** login
+  - **Then** dashboard.
+
+## Edge Cases & Risks
+| ID | Edge Case | Severity | Automation | Mitigation |
+|----|-----------|----------|------------|------------|
+| EC-1 | drop | high | [AUTOMATABLE] | retry |
+
+## Non-Functional Requirements
+- **Performance:** p95 <= 2.5s.
+
+## Coverage Notes
+- **AC-7:** Dropped - reason.
+"""
+    proj = _project_to_json(md)
+    ok, err = is_valid(proj, "refined-spec")
+    assert ok, err
+    ac = proj["acceptance_criteria_structured"][0]
+    assert ac["given"] == "user"
+    assert ac["when"] == "login"
+    assert ac["then"] == "dashboard."
+
+
 def test_extract_edge_cases_from_table_normalizes_severity_and_automation() -> None:
     md = """# Spec
 ## Edge Cases & Risks
@@ -138,6 +242,46 @@ def test_extract_coverage_notes_maps_resolutions() -> None:
         "mobile": "scope_excluded",
         "EC-12": "accepted_risk",
     }
+
+
+def test_coverage_notes_accepted_risk_qualified_and_underscore_forms() -> None:
+    """Regression: `Dropped (accepted risk)` and `accepted_risk` must parse as
+    accepted_risk. Before the fix the `(accepted risk)` parenthetical (and the
+    `_` in `accepted_risk`) broke the regex entirely, silently discarding the
+    bullet so the accepted-risk drop never reached the traceability matrix."""
+    md = """# Design
+## Coverage Notes
+- **TC-SVP-014:** Dropped (accepted risk) — perf has no numeric oracle (EC-3 `[NEEDS INVESTIGATION]`).
+- **TC-SVP-015:** accepted_risk — `/prices` (EBASBBM-16937) has no automatable oracle.
+- **AC-7:** Dropped — genuine unaccepted orphan, no resolution.
+- **mobile:** Excluded — dropped the whole area, out of scope.
+"""
+    root = parse_markdown(md)
+    res_by_id = {n["item_id"]: n["resolution"] for n in extract_coverage_notes(root)}
+    assert res_by_id == {
+        "TC-SVP-014": "accepted_risk",
+        "TC-SVP-015": "accepted_risk",
+        # plain `Dropped` stays an orphan — the parenthetical is the discriminator
+        "AC-7": "dropped",
+        # anti-over-match: "dropped" only in the reason text must not flip it
+        "mobile": "scope_excluded",
+    }
+
+
+def test_coverage_notes_unrecognized_keyword_defaults_to_dropped() -> None:
+    """A structural bullet with an unknown keyword resolves to `dropped` (a
+    loud orphan) rather than `accepted_risk`, so parser drift surfaces as an
+    audit failure instead of silently exempting a TC."""
+    md = """# Design
+## Coverage Notes
+- **TC-99:** Deferred — some novel keyword the map does not know.
+"""
+    root = parse_markdown(md)
+    out = extract_coverage_notes(root)
+    assert out == [
+        {"item_id": "TC-99", "reason": "some novel keyword the map does not know.",
+         "resolution": "dropped"},
+    ]
 
 
 def test_s02_full_projection_validates_against_schema() -> None:
@@ -321,5 +465,5 @@ def test_s04_full_projection_validates_against_schema() -> None:
 - **TC-PLAN-002:** Accepted risk — dup.
 """
     proj = _project_strategy(md)
-    ok, err = is_valid(proj, "test-strategy")
+    ok, err = is_valid(proj, "test-design")
     assert ok, err

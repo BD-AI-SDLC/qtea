@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qtea/schemas/assertion-verdict.schema.json",
+  "title": "AssertionJudgeVerdicts",
+  "description": "Output of the Stage-3 assertion-intent judge (Step 8, shadow mode). One verdict per generated test function: does its assertion set logically verify a derivative of the test title + the methods it calls, pinned to the Step-4 oracle?",
+  "type": "object",
+  "required": ["verdicts"],
+  "additionalProperties": false,
+  "properties": {
+    "verdicts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["test", "verifies_intent", "binds_oracle", "weakness"],
+        "additionalProperties": false,
+        "properties": {
+          "test": {
+            "type": "string",
+            "description": "Test function name (or file::name) this verdict is about."
+          },
+          "verifies_intent": {
+            "type": "boolean",
+            "description": "True iff the assertions would FAIL if the product regressed on the behaviour the test's title + called methods imply."
+          },
+          "binds_oracle": {
+            "type": "boolean",
+            "description": "True iff at least one assertion checks the Step-4 pinned expected value/element (not an incidental/unrelated assertion)."
+          },
+          "weakness": {
+            "type": "string",
+            "enum": [
+              "none",
+              "tautology",
+              "wrong_element",
+              "missing_oracle",
+              "incidental_assertion",
+              "weak_matcher"
+            ],
+            "description": "Primary false-green weakness, or 'none'."
+          },
+          "reasoning": {
+            "type": "string",
+            "description": "One or two sentences justifying the verdict, citing the specific assertion/oracle."
+          }
+        }
+      }
+    }
+  }
+}

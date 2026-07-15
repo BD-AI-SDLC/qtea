@@ -1137,7 +1137,7 @@ def test_snapshot_page_threads_depth_env(runtime, monkeypatch):
 
 
 def test_snapshot_page_legacy_disabled_via_env(runtime, monkeypatch):
-    """``QTEA_AOM_LEGACY_OK=0`` prevents the pre-1.40
+    """``QTEA_AOM_LEGACY_OK=0`` prevents the pre-1.49
     ``accessibility.snapshot()`` fallback from running."""
 
     legacy_called = []
@@ -1156,6 +1156,312 @@ def test_snapshot_page_legacy_disabled_via_env(runtime, monkeypatch):
     assert text == ""
     assert tree == {}
     assert legacy_called == []
+
+
+# ---------------------------------------------------------------------------
+# Iframe enumeration (Rung C — Playwright 1.49-1.58 where mode='ai' is
+# unavailable and iframes must be enumerated manually via page.frames()).
+# ---------------------------------------------------------------------------
+
+
+def _make_frame(url=None, name=None, body_snapshot=None, raise_on_snapshot=None):
+    """Build a fake frame that mimics Playwright's Frame API surface used
+    by _iframe_label + _append_iframe_snapshots_sync."""
+
+    class _FakeFrameBody:
+        def aria_snapshot(self, **kwargs):
+            if raise_on_snapshot is not None:
+                raise raise_on_snapshot
+            return body_snapshot or ""
+
+    class _FakeFrame:
+        def __init__(self):
+            # url/name as METHODS (Playwright Python sync API exposes both
+            # as callables on Frame).
+            if url is not None:
+                self.url = lambda: url
+            if name is not None:
+                self.name = lambda: name
+
+        def locator(self, selector):
+            assert selector == "body"
+            return _FakeFrameBody()
+
+    return _FakeFrame()
+
+
+def test_snapshot_page_enumerates_iframes_on_no_kwargs_rung(runtime):
+    """When only the no-kwargs rung succeeds (Playwright 1.49-1.58), the
+    main-frame snapshot lacks iframe subtrees — we must enumerate
+    ``page.frames()`` and append each non-main frame's snapshot with a
+    ``# iframe: <label>`` marker."""
+
+    class _FakeBodyLocator:
+        def aria_snapshot(self, **kwargs):
+            if "mode" in kwargs or "boxes" in kwargs:
+                raise TypeError("older Playwright — no mode/boxes kwargs")
+            return '- main\n  - button "Home"'
+
+    main_body = _FakeBodyLocator()
+    main_frame = object()  # opaque sentinel — no locator/aria_snapshot needed
+    subframe_a = _make_frame(
+        url="https://payments.example.com/checkout",
+        body_snapshot='- form\n  - textbox "Card number"',
+    )
+    subframe_b = _make_frame(
+        url="https://helpdesk.example.com/chat",
+        body_snapshot='- region\n  - button "Send"',
+    )
+
+    class _FakePage:
+        # Ordering matters: main_frame in the list; helper must skip it.
+        frames = [main_frame, subframe_a, subframe_b]
+
+        def __init__(self):
+            self.main_frame = main_frame
+
+        def locator(self, selector):
+            assert selector == "body"
+            return main_body
+
+    text, tree = runtime._snapshot_page(_FakePage())
+    # Main-frame content preserved.
+    assert "- main" in text
+    assert 'button "Home"' in text
+    # Both non-main frames appended, main_frame skipped.
+    assert "# iframe: https://payments.example.com/checkout" in text
+    assert 'textbox "Card number"' in text
+    assert "# iframe: https://helpdesk.example.com/chat" in text
+    assert 'button "Send"' in text
+    # Main-frame-only dict — heuristic tier must NOT see iframe elements.
+    top_children = {c["name"] for c in tree["children"][0]["children"]}
+    assert top_children == {"Home"}
+
+
+def test_snapshot_page_skips_iframe_enumeration_when_mode_ai_wins(runtime):
+    """On Rung A/B (mode='ai' succeeds), Playwright already includes
+    iframe subtrees in the snapshot. The manual enumeration path must be
+    skipped entirely — no access to ``page.frames`` at all."""
+
+    frames_accessed: list[bool] = []
+
+    class _FakeBodyLocator:
+        def aria_snapshot(self, **kwargs):
+            # Accept mode='ai' (Rung B) at minimum.
+            return '- button "Save"'
+
+    class _FakePage:
+        @property
+        def frames(self):
+            frames_accessed.append(True)
+            raise AssertionError("page.frames must NOT be accessed when mode='ai' wins")
+
+        @property
+        def main_frame(self):
+            raise AssertionError("page.main_frame must NOT be accessed when mode='ai' wins")
+
+        def locator(self, selector):
+            return _FakeBodyLocator()
+
+    text, _ = runtime._snapshot_page(_FakePage())
+    assert text == '- button "Save"'
+    assert frames_accessed == []
+    # Sanity: mode_ai capability was cached True by the snapshot.
+    assert runtime._AOM_CAPS["mode_ai"] is True
+
+
+def test_snapshot_page_iframe_skip_on_failure(runtime):
+    """When one iframe's snapshot raises, the failure must NOT abort the
+    whole enumeration — other frames and the main snapshot are preserved."""
+
+    class _FakeBodyLocator:
+        def aria_snapshot(self, **kwargs):
+            if "mode" in kwargs or "boxes" in kwargs:
+                raise TypeError("no kwargs supported")
+            return '- main\n  - link "Home"'
+
+    main_frame = object()
+    good_frame = _make_frame(url="https://ok.example.com", body_snapshot='- button "OK"')
+    bad_frame = _make_frame(url="https://bad.example.com", raise_on_snapshot=RuntimeError("frame detached"))
+    good_frame2 = _make_frame(url="https://also-ok.example.com", body_snapshot='- link "More"')
+
+    class _FakePage:
+        frames = [main_frame, good_frame, bad_frame, good_frame2]
+
+        def __init__(self):
+            self.main_frame = main_frame
+
+        def locator(self, selector):
+            return _FakeBodyLocator()
+
+    text, _ = runtime._snapshot_page(_FakePage())
+    # Main preserved.
+    assert 'link "Home"' in text
+    # Good frames both included.
+    assert "# iframe: https://ok.example.com" in text
+    assert 'button "OK"' in text
+    assert "# iframe: https://also-ok.example.com" in text
+    assert 'link "More"' in text
+    # Bad frame's marker was NOT emitted — we skip the marker+snapshot pair
+    # entirely on failure so the reader can't be confused by an empty
+    # subtree.
+    assert "# iframe: https://bad.example.com" not in text
+
+
+def test_snapshot_page_iframe_label_prefers_url_over_name(runtime):
+    """When a frame exposes both ``url`` and ``name``, the label should
+    prefer the URL — more discriminative and useful for debugging."""
+
+    class _FakeBodyLocator:
+        def aria_snapshot(self, **kwargs):
+            if "mode" in kwargs or "boxes" in kwargs:
+                raise TypeError("older PW")
+            return '- main'
+
+    main_frame = object()
+
+    class _FakeFrameBody:
+        def aria_snapshot(self, **kwargs):
+            return '- form'
+
+    class _FrameWithBoth:
+        # url() returns something, name() returns something — url wins.
+        def url(self):
+            return "https://iframe.example.com/embed"
+
+        def name(self):
+            return "embedded-widget"
+
+        def locator(self, selector):
+            return _FakeFrameBody()
+
+    class _FakePage:
+        frames = [main_frame, _FrameWithBoth()]
+
+        def __init__(self):
+            self.main_frame = main_frame
+
+        def locator(self, selector):
+            return _FakeBodyLocator()
+
+    text, _ = runtime._snapshot_page(_FakePage())
+    assert "# iframe: https://iframe.example.com/embed" in text
+    # The fallback name value must NOT appear as a label.
+    assert "# iframe: embedded-widget" not in text
+
+
+def test_snapshot_page_iframe_marker_does_not_pollute_yaml_parser(runtime):
+    """The ``# iframe: <label>`` marker starts with ``#``, which is NOT a
+    valid AOM line prefix (``- ``). Feeding the concatenated text back
+    through ``_parse_aria_snapshot_yaml`` must produce a tree identical
+    to what the main-frame-only content would produce — marker lines are
+    silently skipped."""
+    yaml_with_markers = (
+        '- main\n'
+        '  - button "Save"\n'
+        '# iframe: https://sub.example.com\n'
+        '- region\n'
+        '  - textbox "Query"\n'
+    )
+    tree = runtime._parse_aria_snapshot_yaml(yaml_with_markers)
+    # The parser reads BOTH top-level nodes because the marker line is
+    # skipped, not treated as a boundary. This documents the current
+    # behavior: parser doesn't segment on markers, it just ignores them.
+    # In _snapshot_page's flow this is fine because we parse the
+    # main-frame text BEFORE appending markers/iframe subtrees, so the
+    # returned dict is unaffected.
+    roles = [c["role"] for c in tree["children"]]
+    assert roles == ["main", "region"]
+
+
+def test_snapshot_page_returns_main_frame_only_dict(runtime):
+    """Critical safeguard: the returned ``dict`` (used by the tier-3
+    heuristic) must contain ONLY main-frame elements even when the
+    ``text`` (used by Layer 2 + LLM) includes iframe content. Prevents
+    the heuristic from returning an iframe-scoped selector that
+    Playwright can't resolve in main-frame scope."""
+
+    class _FakeBodyLocator:
+        def aria_snapshot(self, **kwargs):
+            if "mode" in kwargs or "boxes" in kwargs:
+                raise TypeError("no kwargs supported")
+            return '- main\n  - button "MainOnly"'
+
+    main_frame = object()
+    iframe_with_button = _make_frame(
+        url="https://iframe.example.com",
+        body_snapshot='- region\n  - button "IframeOnly"',
+    )
+
+    class _FakePage:
+        frames = [main_frame, iframe_with_button]
+
+        def __init__(self):
+            self.main_frame = main_frame
+
+        def locator(self, selector):
+            return _FakeBodyLocator()
+
+    text, tree = runtime._snapshot_page(_FakePage())
+    # Text contains BOTH main and iframe content.
+    assert "MainOnly" in text
+    assert "IframeOnly" in text
+    # Dict tree contains ONLY main-frame content — walk it to collect names.
+
+    def _collect_names(node):
+        out = []
+        if node.get("name"):
+            out.append(node["name"])
+        for c in node.get("children", []):
+            out.extend(_collect_names(c))
+        return out
+
+    names = _collect_names(tree)
+    assert "MainOnly" in names
+    assert "IframeOnly" not in names
+
+
+async def test_snapshot_page_async_enumerates_iframes_on_no_kwargs_rung(runtime):
+    """Async counterpart of the primary iframe test. Same assertions:
+    iframe subtrees appended with markers, main-frame-only dict returned.
+    """
+
+    class _FakeBodyLocator:
+        async def aria_snapshot(self, **kwargs):
+            if "mode" in kwargs or "boxes" in kwargs:
+                raise TypeError("older PW async — no mode/boxes")
+            return '- main\n  - button "Home"'
+
+    main_body = _FakeBodyLocator()
+    main_frame = object()
+
+    class _FakeFrameBody:
+        async def aria_snapshot(self, **kwargs):
+            return '- region\n  - textbox "Query"'
+
+    class _FakeSubFrame:
+        def url(self):
+            return "https://widget.example.com"
+
+        def locator(self, selector):
+            return _FakeFrameBody()
+
+    class _FakePage:
+        frames = [main_frame, _FakeSubFrame()]
+
+        def __init__(self):
+            self.main_frame = main_frame
+
+        def locator(self, selector):
+            return main_body
+
+    text, tree = await runtime._snapshot_page_async(_FakePage())
+    assert 'button "Home"' in text
+    assert "# iframe: https://widget.example.com" in text
+    assert 'textbox "Query"' in text
+    # Main-frame-only dict again.
+    top_children = {c["name"] for c in tree["children"][0]["children"]}
+    assert top_children == {"Home"}
 
 
 def test_parse_aria_snapshot_strips_box_annotation(runtime):

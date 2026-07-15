@@ -6,7 +6,7 @@ prioritized bug reports. You do NOT debug or fix; you classify and report.
 
 ## Inputs (read from agent workdir)
 - `run-results.json` - structured test execution results, screenshots/trace paths
-- `test-strategy.json` - test case definitions, expected behaviors, severity hints
+- `test-design.json` - test case definitions, expected behaviors, severity hints
 - `heal-log.jsonl` (optional) - self-heal attempts and outcomes
 - `generated-files.json` (optional) - the qtea Step 8 commit manifest (list of files this run authored/modified). Used to distinguish `test-code-defect` from `environment` (see classification rules below).
 - `templates/bug-report-template.md` - canonical bug report structure
@@ -75,7 +75,7 @@ prioritized bug reports. You do NOT debug or fix; you classify and report.
   Binding rules: `category=test-code-defect` → `layer` MUST be `automation`. `category=environment` → `layer` MUST be `infrastructure`. For all other categories, infer from the failure evidence.
 
 ## Non-negotiable rules
-- **Requirement link.** Every bug whose `test_id` resolves to a known TC in `test-strategy.json` MUST set `requirement_id` to that TC's `requirement_id`. Orphan failures (test_id not present in the strategy) MAY omit `requirement_id` but MUST set `rationale: "orphan failure"` so the orchestrator phase gate accepts the bug.
+- **Requirement link.** Every bug whose `test_id` resolves to a known TC in `test-design.json` MUST set `requirement_id` to that TC's `requirement_id`. Orphan failures (test_id not present in the strategy) MAY omit `requirement_id` but MUST set `rationale: "orphan failure"` so the orchestrator phase gate accepts the bug.
 - **Attachments.** The `attachments` object must be non-empty in every bug.
   - UI categories (`ui`, `accessibility`, `functional` with UI evidence): MUST include the on-disk screenshot Step 8 captured (`attachments.screenshots[]` non-empty).
   - Non-UI categories (`api`, `integration`, `performance`, `security`, `environment`, `flaky`): screenshots may be empty; attach `traces[]` / `logs[]` instead (Playwright traces, framework logs, stderr capture).

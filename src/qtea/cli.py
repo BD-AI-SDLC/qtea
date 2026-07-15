@@ -78,7 +78,8 @@ def list_workspaces(
 ) -> None:
     """List workspaces under the base dir, newest first.
 
-    For each workspace shows: run-id, status (running/finished/failed/empty),
+    For each workspace shows: run-id, status (running/finished/failed/
+    interrupted/crashed/aborted/empty),
     last completed step (1-11), step count, started timestamp, and source spec.
     By default, empty workspaces (zero completed steps) are hidden; pass
     --all to include them. Use the run-id with `qtea run --run-id ...`.
@@ -86,7 +87,7 @@ def list_workspaces(
 
     from rich.table import Table
 
-    from qtea.checkpoints import load_state
+    from qtea.checkpoints import derive_status, load_state
     from qtea.config import get_settings
 
     base = workspace or get_settings().default_workspace
@@ -120,15 +121,7 @@ def list_workspaces(
                 if v.status in ("completed", "skipped")
             )
             last_step = completed[-1] if completed else None
-            any_failed = any(v.status == "failed" for v in state.steps.values())
-            if state.finished_at is None and state.steps:
-                status = "running"
-            elif any_failed:
-                status = "failed"
-            elif state.finished_at is not None:
-                status = "finished"
-            else:
-                status = "empty"
+            status = derive_status(state)
             row = {
                 "run_id": state.run_id,
                 "status": status,
@@ -168,6 +161,9 @@ def list_workspaces(
         "running": "yellow",
         "finished": "green",
         "failed": "red",
+        "interrupted": "yellow",
+        "crashed": "red",
+        "aborted": "red",
         "empty": "dim",
         "no-state": "dim",
     }

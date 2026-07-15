@@ -118,6 +118,7 @@ from qtea.steps.s09.context_loaders import (
     _clean_sut_artifacts,
     _detected_command,
     _framework,
+    _load_assertion_oracle,
     _load_generated_files,
     _load_index,
     _load_stack_profile,
@@ -142,7 +143,8 @@ from qtea.steps.s09.failure_class import (
     _extract_locator_search_term,  # noqa: F401 — re-exported for tests
     _failing_tests,
     _partition_failures,
-    _refine_element_not_in_dom,  # noqa: F401 — re-exported for tests
+    _refine_element_not_in_dom,  # noqa: F401 — backwards-compat alias, re-exported for tests
+    _refine_locator_absence,  # noqa: F401 — bi-directional Layer 2, re-exported for tests
 )
 
 # Fixer-agent prompt builder, patch application, and runner-narrowing helpers
@@ -160,6 +162,8 @@ from qtea.steps.s09.fixer_prompt import (
 # Re-exported here so tests using `monkeypatch.setattr("qtea.steps.s09_execute._foo", ...)`
 # and callers using `from qtea.steps.s09_execute import _foo` keep working.
 from qtea.steps.s09.heal_scope import (
+    _git_revert_path,
+    _git_show_bytes,
     _git_status_porcelain,
     _heal_allowlist_dirs,
     _heal_revert_all_uncommitted,
@@ -194,6 +198,7 @@ from qtea.steps.s09.overlay_sweep import (
 )
 from qtea.steps.s09.patch_gates import (
     _count_xpath_markers,
+    _patch_diverges_from_oracle,
     _patch_has_anti_patterns,
     _patch_introduces_xpath,
     _patch_weakens_assertions,
@@ -208,6 +213,54 @@ from qtea.steps.s09.tbd_promotion import (
     _format_promoted_substitution,
     _promote_resolved_tbds,
 )
+
+
+# Code file extensions the Step-9 content gates inspect. Non-code heal outputs
+# (screenshots, junit/json report files) are skipped — the XPath /
+# assertion-weakening / anti-pattern gates only make sense on source.
+_HEAL_GATE_CODE_EXTS = (
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".java",
+)
+
+
+def _gate_heal_touched_files(
+    sut_root: "Path",
+    base_sha: str | None,
+    changed_paths: list[str],
+    oracle_values: set[str] | None = None,
+) -> tuple[str, list[str]]:
+    """Run the Step-9 content gates over EVERY code file a heal changed.
+
+    The heal agent's dominant action is editing POMs / helpers / fixtures /
+    sibling generated tests — NOT the failing test file. Gating only the test
+    file (the prior behaviour) let XPath in a healed POM, assertion-weakening
+    in a sibling generated test, and exception-swallowing in a helper bypass
+    all three gates (finding 6). Here we diff each changed code file against its
+    PRE-heal content (``base_sha``) and return the first violation as
+    ``(reason, details)``; ``("", [])`` when every touched file is clean.
+
+    ``reason`` ∈ {"xpath", "assertion_weakened", "anti_pattern"} so the caller
+    maps it to the existing rejection flags / heal-log reasons.
+    """
+    for rel in changed_paths:
+        if not rel.endswith(_HEAL_GATE_CODE_EXTS):
+            continue
+        post_path = sut_root / rel
+        try:
+            post = post_path.read_bytes() if post_path.exists() else None
+        except OSError:
+            post = None
+        pre = _git_show_bytes(sut_root, base_sha, rel)
+        if _patch_introduces_xpath(pre, post):
+            return "xpath", [rel]
+        if _patch_weakens_assertions(pre, post):
+            return "assertion_weakened", [rel]
+        if _patch_diverges_from_oracle(pre, post, oracle_values):
+            return "oracle_divergence", [rel]
+        ap = _patch_has_anti_patterns(pre, post)
+        if ap:
+            return "anti_pattern", [f"{rel}: {a}" for a in ap]
+    return "", []
 
 
 def _hitl_request_env_vars(var_names: list[str]) -> dict[str, str]:
@@ -1785,32 +1838,47 @@ class ExecuteStep(Step):
                 heal_relevant_sut_files = _auth_relevant_sut_files(active_module)
                 heal_allowlist = _heal_allowlist_dirs(active_module)
                 generated_files = _load_generated_files(ctx)
+                # Step-4 pinned assertion values (finding 28) — a heal may
+                # correct an assertion TOWARD one of these but never swap to an
+                # unsanctioned value. Empty set → the divergence gate no-ops.
+                _oracle = _load_assertion_oracle(ctx)
+                heal_oracle_values = _oracle.get("expected_values") or set()
 
-                # Task 1: parallelize heal agents via asyncio.gather. The
-                # LLM call (run_agent) dominates each heal's wall time
-                # (~1–10 min on Opus); running them concurrently nearly
-                # halves the total when 2+ tests fail. Bounded by
-                # ``QTEA_HEAL_CONCURRENCY`` (default 3) to cap memory
-                # — each agent spawns a Playwright MCP browser process.
+                # Heal agents run via asyncio.gather, but concurrency now
+                # DEFAULTS TO 1 (serial) — finding 7. Concurrent heals share a
+                # single SUT git working tree and index: (a) two agents editing
+                # the same POM in acceptEdits mode last-writer-wins; (b) a
+                # failed heal's `_heal_revert_all_uncommitted` reverts EVERY
+                # uncommitted change, wiping a sibling's in-flight fix; and
+                # (c) `commit_step` does `git add -A`, so one heal's commit
+                # sweeps another's edits under the wrong test id
+                # (mis-attribution). None of these are safe without per-heal
+                # worktree isolation, which is not yet implemented. Until then
+                # the corruption-free default is serial execution.
                 #
-                # Concurrent SUT edits: agents may write to the same POM
-                # file in ``acceptEdits`` mode; the agent whose write
-                # completes second wins. We accept this race for v1; the
-                # post-heal verify re-run catches incorrect patches and
-                # the existing scope guards / quality gates protect
-                # against most catastrophic outcomes. The git commit
-                # itself is sync (blocks the event loop briefly) and so
-                # is naturally serialized — concurrent commits can't
-                # race because Python won't preempt mid-subprocess.
+                # ``QTEA_HEAL_CONCURRENCY`` > 1 re-enables parallelism for
+                # operators who accept the race (faster when 2+ tests fail on
+                # DISTINCT files) — EXPERIMENTAL; do not use where two failing
+                # tests may share a POM/helper. The proper fix (isolated git
+                # worktree per heal, merged back under a lock) is tracked
+                # separately.
                 #
-                # ``patches_applied`` / ``patches_rejected`` increments
-                # and ``self_heal_meta`` writes are asyncio-safe: they
-                # happen between awaits within each coroutine, and
-                # asyncio guarantees no preemption inside an await-free
-                # span. Same for the per-line heal-log appends.
+                # ``patches_applied`` / ``patches_rejected`` increments and
+                # ``self_heal_meta`` / heal-log writes remain asyncio-safe
+                # (they happen in await-free spans).
                 _heal_concurrency = max(
-                    1, int(os.environ.get("QTEA_HEAL_CONCURRENCY", "3")),
+                    1, int(os.environ.get("QTEA_HEAL_CONCURRENCY", "1")),
                 )
+                if _heal_concurrency > 1:
+                    log.warning(
+                        "step09.heal_concurrency_experimental",
+                        concurrency=_heal_concurrency,
+                        hint=(
+                            "QTEA_HEAL_CONCURRENCY>1 shares one SUT git tree "
+                            "across heals; unsafe when 2+ failing tests touch "
+                            "the same POM/helper (finding 7). Prefer 1."
+                        ),
+                    )
                 _heal_sem = asyncio.Semaphore(_heal_concurrency)
                 log.info(
                     "step09.heal_parallel_start",
@@ -2009,94 +2077,54 @@ class ExecuteStep(Step):
                                 entry.file,
                             )
 
+                    # --- Content gates over EVERY heal-touched file ---
+                    # (finding 6) The heal agent's PRIMARY action is editing
+                    # POMs / helpers / fixtures / sibling generated tests, not
+                    # the failing test file. Gating only that one file let XPath
+                    # in a healed POM, assertion-weakening in a sibling test,
+                    # and exception-swallowing in a helper slip through. So we
+                    # diff EVERY code file the heal changed against its pre-heal
+                    # (base_sha) content and reject+revert the WHOLE heal on the
+                    # first violation. The old assertion gate was also guarded
+                    # by `and generated_files`, silently disabling it when the
+                    # manifest was empty (finding 30) — that guard is gone; the
+                    # gate now runs unconditionally on any applied heal.
                     xpath_rejected = False
-                    if applied:
-                        # Step 9 quality gate: a heal that introduces an XPath
-                        # selector is rejected. Revert the SUT file to its
-                        # pre-heal state (restore bytes if it existed, delete
-                        # if the heal created it from scratch) and mark the
-                        # patch unapplied. See `docs/qa-orchestrator.instructions.md`
-                        # §6 "No XPath (self-heal)".
-                        post_bytes_check = (
-                            target_in_sut.read_bytes() if target_in_sut.exists() else None
-                        )
-                        if _patch_introduces_xpath(pre_bytes, post_bytes_check):
-                            xpath_rejected = True
-                            try:
-                                if pre_bytes is not None:
-                                    target_in_sut.write_bytes(pre_bytes)
-                                elif target_in_sut.exists():
-                                    target_in_sut.unlink()
-                            except OSError as exc:
-                                log.warning(
-                                    "step09.xpath_revert_failed",
-                                    test_id=entry.id,
-                                    file=entry.file,
-                                    error=str(exc),
-                                )
-                            log.warning(
-                                "step09.heal_rejected_xpath",
-                                test_id=entry.id,
-                                file=entry.file,
-                            )
-                            applied = False
-
                     assertion_rejected = False
-                    if applied and generated_files:
-                        post_bytes_assert = (
-                            target_in_sut.read_bytes() if target_in_sut.exists() else None
-                        )
-                        if _patch_weakens_assertions(pre_bytes, post_bytes_assert):
-                            assertion_rejected = True
-                            try:
-                                if pre_bytes is not None:
-                                    target_in_sut.write_bytes(pre_bytes)
-                                elif target_in_sut.exists():
-                                    target_in_sut.unlink()
-                            except OSError as exc:
-                                log.warning(
-                                    "step09.assertion_revert_failed",
-                                    test_id=entry.id,
-                                    file=entry.file,
-                                    error=str(exc),
-                                )
-                            log.warning(
-                                "step09.heal_rejected_assertion_modified",
-                                test_id=entry.id,
-                                file=entry.file,
-                            )
-                            applied = False
-
                     anti_pattern_rejected = False
                     anti_pattern_violations: list[str] = []
                     if applied:
-                        post_bytes_ap = (
-                            target_in_sut.read_bytes() if target_in_sut.exists() else None
+                        heal_changed_entries = [
+                            (sc, p)
+                            for sc, p in _git_status_porcelain(ctx.workspace.sut)
+                            if p not in pre_heal_dirty
+                        ]
+                        gate_reason, gate_details = _gate_heal_touched_files(
+                            ctx.workspace.sut,
+                            base_sha,
+                            [p for _, p in heal_changed_entries],
+                            oracle_values=heal_oracle_values,
                         )
-                        anti_pattern_violations = _patch_has_anti_patterns(
-                            pre_bytes, post_bytes_ap,
-                        )
-                        if anti_pattern_violations:
-                            anti_pattern_rejected = True
-                            try:
-                                if pre_bytes is not None:
-                                    target_in_sut.write_bytes(pre_bytes)
-                                elif target_in_sut.exists():
-                                    target_in_sut.unlink()
-                            except OSError as exc:
-                                log.warning(
-                                    "step09.anti_pattern_revert_failed",
-                                    test_id=entry.id,
-                                    file=entry.file,
-                                    error=str(exc),
-                                )
-                            log.warning(
-                                "step09.heal_rejected_anti_pattern",
-                                test_id=entry.id,
-                                file=entry.file,
-                                violations=anti_pattern_violations,
-                            )
+                        if gate_reason:
+                            # Revert the ENTIRE heal to its pre-heal state — the
+                            # patch is rejected as a whole, not file-by-file.
+                            for _sc, _p in heal_changed_entries:
+                                _git_revert_path(ctx.workspace.sut, _p, _sc)
                             applied = False
+                            if gate_reason == "xpath":
+                                xpath_rejected = True
+                            elif gate_reason in ("assertion_weakened", "oracle_divergence"):
+                                assertion_rejected = True
+                            elif gate_reason == "anti_pattern":
+                                anti_pattern_rejected = True
+                                anti_pattern_violations = gate_details
+                            log.warning(
+                                "step09.heal_rejected_content_gate",
+                                test_id=entry.id,
+                                reason=gate_reason,
+                                details=gate_details,
+                                files=[p for _, p in heal_changed_entries],
+                            )
 
                     if applied:
                         patches_applied += 1
@@ -2111,6 +2139,30 @@ class ExecuteStep(Step):
                         )
                     else:
                         patches_rejected += 1
+
+                    # Promote the heal agent's live-diagnosis snapshot (if it
+                    # captured one before giving up) into artifacts/step09 so
+                    # a later debug-agent RCA can cite live DOM state instead
+                    # of the traceback alone. Only meaningful when the test
+                    # stayed unhealed — a successful patch needs no RCA.
+                    if not applied:
+                        _unhealed_snapshot = heal_wd / "unhealed-snapshot.md"
+                        if _unhealed_snapshot.exists():
+                            try:
+                                _snapshot_dst = (
+                                    out_dir / "self-heal" / f"snapshot-{entry.id}.md"
+                                )
+                                _snapshot_dst.parent.mkdir(parents=True, exist_ok=True)
+                                _snapshot_dst.write_text(
+                                    _unhealed_snapshot.read_text(encoding="utf-8"),
+                                    encoding="utf-8",
+                                )
+                            except OSError as e:
+                                log.warning(
+                                    "step09.heal_snapshot_persist_failed",
+                                    test_id=entry.id,
+                                    error=str(e),
+                                )
 
                     if scope_violation:
                         summary_text = (

@@ -1,10 +1,10 @@
-# Test Strategy Template
+# Test Design Template
 
-Use this template when creating test strategies for new features.
+Use this template when designing test cases for new features (Step 4, Senior SDET persona).
 
 ---
 
-## Test Strategy: [Feature Name]
+## Test Design: [Feature Name]
 
 **Created**: [Date]
 
@@ -33,12 +33,13 @@ Use this template when creating test strategies for new features.
 - **Preconditions**:
   - [Precondition 1]
   - [Precondition 2]
-- **Steps**:
+- **Steps** (state-changing actions only — never "Verify/Confirm/Observe/Inspect/Monitor/Ensure/Assert/Validate ..."):
   1. [Step 1]
   2. [Step 2]
   3. [Step 3]
-- **Expected Result**:
-  - [Expected outcome]
+- **Expected Result** (every checkable fact the steps must produce, one bullet each — mini verifications first, main verification last; never repeat a fact already worded as a step):
+  - [Expected outcome 1]
+  - [Expected outcome 2]
 - **Tags**: [tag1, tag2]
 
 #### TC-002: [Next Test Case]
@@ -49,7 +50,7 @@ Use this template when creating test strategies for new features.
 
 ### Coverage Notes
 
-> Required when any TC was dropped or excluded — by upstream HITL (`plan.md` / `refined-spec.md` Coverage Notes), or by the test-manager in non-interactive mode when a fact required by a TC was missing. List each dropped TC ID and the reason. Omit ONLY if no drops have been recorded for this run.
+> Required when any TC was dropped or excluded — by upstream HITL (`plan.md` / `refined-spec.md` Coverage Notes), or by the test-designer in non-interactive mode when a fact required by a TC was missing. List each dropped TC ID and the reason. Omit ONLY if no drops have been recorded for this run.
 >
 > **Never** add an Assumptions section. Assumptions cause hallucinations; we test facts only. Missing facts mean missing tests, recorded here — not invented tests.
 

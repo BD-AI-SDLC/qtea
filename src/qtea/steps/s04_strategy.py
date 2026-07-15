@@ -1,13 +1,13 @@
-"""Step 4: Test strategy generation via test-manager agent.
+"""Step 4: Test strategy generation via test-designer agent.
 
-Reads plan.md + refined-spec.md, invokes test-manager via the direct-SDK
-transport with the test-strategy template + edge-case checklist inlined
-into the prompt. Parses output into test-strategy.json with extracted
+Reads plan.md + refined-spec.md, invokes test-designer via the direct-SDK
+transport with the test-design template + edge-case checklist inlined
+into the prompt. Parses output into test-design.json with extracted
 test cases.
 
 Outputs (artifacts/step04/):
-  - test-strategy.md
-  - test-strategy.json
+  - test-design.md
+  - test-design.json
 
 Transport: ``qtea.llm.reasoning.call_reasoning_llm`` (direct SDK, no
 HITL — Step 4 does not currently emit clarification questions).
@@ -39,7 +39,8 @@ from qtea.steps.base import Step, StepContext, StepResult
 
 
 def _coverage_audit_enabled() -> bool:
-    return os.environ.get("QTEA_COVERAGE_AUDIT", "0") == "1"
+    # Finding 21: default ON (was "0"). Set QTEA_COVERAGE_AUDIT=0 to disable.
+    return os.environ.get("QTEA_COVERAGE_AUDIT", "1") == "1"
 
 log = get_logger(__name__)
 
@@ -103,7 +104,7 @@ def _normalize_automation_type(raw: str | None) -> str:
     return "UNKNOWN"
 
 
-# Section headers the test-manager agent uses to organise the markdown
+# Section headers the test-designer agent uses to organise the markdown
 # (Scope / Test Cases / Assumptions / etc.). Without this guard, the
 # permissive `^(test\s*case|tc\b|scenario)` regex below matches the
 # literal "Test Cases" header and emits a noise `TC-test-cases` entry
@@ -192,7 +193,7 @@ def _project_test_case(section: Section) -> dict:
 
 def _project_strategy(md: str) -> dict:
     root = parse_markdown(md)
-    title = root.children[0].title if root.children else "Test Strategy"
+    title = root.children[0].title if root.children else "Test Design"
     cases: list[dict] = []
     seen_ids: set[str] = set()
     duplicates: list[str] = []
@@ -246,7 +247,7 @@ class StrategyStep(Step):
 
         docs_root = package_resource_root()
         for doc in (
-            "templates/test-strategy-template.md",
+            "templates/test-design-template.md",
             "templates/edge-case-checklist.md",
         ):
             p = docs_root / doc
@@ -254,17 +255,17 @@ class StrategyStep(Step):
                 inputs[p.name] = p.read_text(encoding="utf-8")
 
         agents_root = package_resource_root() / "agents"
-        agent = agents_root / "test-manager.agent.md"
+        agent = agents_root / "test-designer.agent.md"
 
         base_user_prompt = (
             "The plan (and refined spec, if present) are provided in the "
-            "inputs section below, along with the test-strategy template "
+            "inputs section below, along with the test-design template "
             "and edge-case checklist. Follow your workflow and "
             "decision-making guidance, then consult "
-            "`test-manager.prompt.md` for TC templates and decision trees. "
-            "Produce a focused test strategy document. Every test case "
+            "`test-designer.prompt.md` for TC templates and decision trees. "
+            "Produce a focused test design document. Every test case "
             "must have an id of the form `TC-<slug>` and a priority "
-            "(`P0`-`P3`). Return only the test-strategy markdown body — "
+            "(`P0`-`P3`). Return only the test-design markdown body — "
             "no preamble, no code fences."
         )
         prior_log = out_dir / "audit-violations.log"
@@ -294,10 +295,10 @@ class StrategyStep(Step):
                 success=False,
                 status="failed",
                 outputs=[],
-                error=result.error or "test-strategy.md not produced",
+                error=result.error or "test-design.md not produced",
             )
 
-        md_dst = out_dir / "test-strategy.md"
+        md_dst = out_dir / "test-design.md"
         md_dst.write_text(result.final_text, encoding="utf-8")
         projection = _project_strategy(md_dst.read_text(encoding="utf-8"))
 
@@ -308,14 +309,14 @@ class StrategyStep(Step):
                 outputs=[md_dst],
                 error=(
                     f"duplicate TC IDs in strategy: {', '.join(dup_ids)}. "
-                    f"The test-manager agent must produce unique IDs."
+                    f"The test-designer agent must produce unique IDs."
                 ),
             )
 
-        json_dst = out_dir / "test-strategy.json"
+        json_dst = out_dir / "test-design.json"
         json_dst.write_text(json.dumps(projection, indent=2, ensure_ascii=False), encoding="utf-8")
 
-        ok, err = is_valid(projection, "test-strategy")
+        ok, err = is_valid(projection, "test-design")
         status = "completed" if ok else "warned"
         notes = f"test_cases={len(projection['test_cases'])}"
         outputs: list = [md_dst, json_dst]
@@ -409,7 +410,7 @@ class StrategyStep(Step):
                     status="failed",
                     outputs=outputs,
                     error=_format_violations_for_agent(
-                        "test-strategy", all_violations,
+                        "test-design", all_violations,
                     ),
                     notes=notes + f"; audit_violations={len(all_violations)}",
                 )

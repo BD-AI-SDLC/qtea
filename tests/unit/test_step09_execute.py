@@ -2047,6 +2047,7 @@ def test_element_not_in_dom_is_not_healable():
 from qtea.steps.s09_execute import (
     _extract_locator_search_term,
     _refine_element_not_in_dom,
+    _refine_locator_absence,
 )
 
 
@@ -2219,3 +2220,146 @@ def test_partition_empty_input_returns_empty_lists():
     healable, real_bugs = _partition_failures([])
     assert healable == []
     assert real_bugs == []
+
+
+# ---------------------------------------------------------------------------
+# Layer 2: bi-directional refinement (locator_timeout starting class)
+# ---------------------------------------------------------------------------
+
+
+def test_refine_locator_absence_locator_timeout_token_absent_downgrades(tmp_path):
+    """Starting locator_timeout, AOM present but token absent → downgrade
+    to element_not_in_dom (real DEV bug — element genuinely missing)."""
+    aom_text = (
+        "- navigation\n"
+        "  - link \"Home\"\n"
+        "- main\n"
+        "  - heading \"ROPA Entry\"\n"
+        "  - textbox \"Search\"\n"
+    )
+    (tmp_path / "T-ghost.txt").write_text(aom_text, encoding="utf-8")
+    entry = _mk_entry(
+        id_="T-ghost",
+        message=(
+            "playwright._impl._errors.TimeoutError: Locator.click: "
+            "Timeout 30000ms exceeded.\nCall log:\n"
+            "  - waiting for locator('[data-testid=\"release-gate-button\"]')"
+        ),
+    )
+    assert _refine_locator_absence(entry, aom_dir=tmp_path, tentative="locator_timeout") == "element_not_in_dom"
+
+
+def test_refine_locator_absence_locator_timeout_token_found_stays_healable(tmp_path):
+    """Starting locator_timeout, AOM contains the token → element present
+    on the page under a different selector → keep locator_timeout so heal
+    can find the correct selector."""
+    aom_text = (
+        "- main\n"
+        "  - button \"Release Gate\"\n"  # "release" matches release-gate-button
+    )
+    (tmp_path / "T-stale.txt").write_text(aom_text, encoding="utf-8")
+    entry = _mk_entry(
+        id_="T-stale",
+        message=(
+            "playwright._impl._errors.TimeoutError: Locator.click: "
+            "Timeout 30000ms exceeded.\nCall log:\n"
+            "  - waiting for locator('[data-testid=\"release-gate-button\"]')"
+        ),
+    )
+    assert _refine_locator_absence(entry, aom_dir=tmp_path, tentative="locator_timeout") == "locator_timeout"
+
+
+def test_refine_locator_absence_locator_timeout_no_aom_stays_healable(tmp_path):
+    """Starting locator_timeout, no AOM file present → preserve tentative
+    (healable). A classifier gap must never silently downgrade a healable
+    case to non-healable."""
+    entry = _mk_entry(
+        id_="T-noaom",
+        message=(
+            "playwright._impl._errors.TimeoutError: Locator.click: "
+            "Timeout 30000ms exceeded.\nCall log:\n"
+            "  - waiting for locator('[data-testid=\"release-gate-button\"]')"
+        ),
+    )
+    # tmp_path exists but no T-noaom.txt file inside it.
+    assert _refine_locator_absence(entry, aom_dir=tmp_path, tentative="locator_timeout") == "locator_timeout"
+
+
+def test_refine_locator_absence_locator_timeout_no_search_term_stays_healable(tmp_path):
+    """Starting locator_timeout on a page-event wait (no `waiting for
+    locator(...)` line to extract a token from) → preserve tentative
+    (healable). Same "no signal → don't second-guess" invariant."""
+    aom_text = "- main\n  - button \"Some Button\"\n"
+    (tmp_path / "T-pageevent.txt").write_text(aom_text, encoding="utf-8")
+    entry = _mk_entry(
+        id_="T-pageevent",
+        message='Timeout 30000ms exceeded while waiting for event "page"',
+    )
+    assert _refine_locator_absence(entry, aom_dir=tmp_path, tentative="locator_timeout") == "locator_timeout"
+
+
+def test_partition_layer2_downgrades_locator_timeout_to_real_bug(tmp_path):
+    """End-to-end: entry classified as locator_timeout (call log without
+    'locator resolved to'), AOM present but token absent → appears in
+    real_bugs list with class element_not_in_dom. This is the exact
+    incident that motivated Thread 1 (the 15-min ghost-heal case)."""
+    aom_text = (
+        "- navigation\n"
+        "  - link \"Home\"\n"
+        "- main\n"
+        "  - heading \"ROPA Entry\"\n"
+    )
+    (tmp_path / "T-devbug.txt").write_text(aom_text, encoding="utf-8")
+    # Message shape matches Playwright TypeScript locator.click timeout,
+    # WITHOUT the "locator resolved to <" positive signal AND without
+    # matching _LOCATOR_METHOD_RE (`\bLocator\.`), so Layer 1 keeps
+    # locator_timeout. Layer 2 then downgrades.
+    failing = [
+        _mk_entry(
+            id_="T-devbug",
+            message=(
+                "locator.click: Timeout 30000ms exceeded.\n"
+                "Call log:\n"
+                "  - waiting for locator('[data-testid=\"release-gate-button\"]')"
+            ),
+        ),
+    ]
+    healable, real_bugs = _partition_failures(failing, aom_dir=tmp_path)
+    assert healable == []
+    assert len(real_bugs) == 1
+    assert real_bugs[0][0].id == "T-devbug"
+    assert real_bugs[0][1] == "element_not_in_dom"
+
+
+def test_partition_skips_layer2_when_playwright_confirmed_dom_presence(tmp_path):
+    """When Playwright's own call log contains 'locator resolved to <',
+    Layer 2 is skipped — Playwright's DOM query is more authoritative
+    than an AOM substring search. Test class stays locator_timeout even
+    when the AOM lacks the token."""
+    # AOM lacks the token — Layer 2 would downgrade if it fired.
+    aom_text = "- main\n  - heading \"Not the button\"\n"
+    (tmp_path / "T-confirmed.txt").write_text(aom_text, encoding="utf-8")
+    # Message includes "locator resolved to <" — positive signal from
+    # Playwright that the element WAS in the DOM (just not visible etc.).
+    failing = [
+        _mk_entry(
+            id_="T-confirmed",
+            message=(
+                "locator.click: Timeout 30000ms exceeded.\n"
+                "Call log:\n"
+                "  - waiting for locator('[data-testid=\"release-gate-button\"]')\n"
+                "  - locator resolved to <button data-testid=\"release-gate-button\" hidden>Release</button>"
+            ),
+        ),
+    ]
+    healable, real_bugs = _partition_failures(failing, aom_dir=tmp_path)
+    assert real_bugs == []
+    assert len(healable) == 1
+    assert healable[0].id == "T-confirmed"
+
+
+def test_refine_element_not_in_dom_alias_exists():
+    """Backwards-compat alias check — external code and tests may still
+    import _refine_element_not_in_dom. It must resolve to the same
+    function object as _refine_locator_absence."""
+    assert _refine_element_not_in_dom is _refine_locator_absence

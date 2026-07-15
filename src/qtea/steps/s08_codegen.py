@@ -480,6 +480,33 @@ _RUNTIME_VENDORS = {
 }
 
 
+def _ensure_gitignore_entry(directory: Path, entry: str) -> None:
+    """Append *entry* to ``<directory>/.gitignore`` if not already listed."""
+    gitignore = directory / ".gitignore"
+    try:
+        if gitignore.exists():
+            text = gitignore.read_text(encoding="utf-8", errors="replace")
+            if any(line.strip() == entry for line in text.splitlines()):
+                return
+            if text and not text.endswith("\n"):
+                text += "\n"
+        else:
+            text = ""
+        gitignore.write_text(text + entry + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+# SUT-relative paths of vendored runtime files that must be gitignored.
+# Checked after each vendor call; only entries whose target exists on
+# disk are added (so a Python-only run won't gitignore the JS path).
+_RUNTIME_GITIGNORE_ENTRIES: tuple[str, ...] = (
+    "tests/qtea_runtime.py",
+    "tests/qtea-runtime.js",
+    "src/test/java/com/qtea/runtime/",
+)
+
+
 def _vendor_runtime_for_framework(framework: str | None, sut_root: Path) -> list[Path]:
     """Dispatch JIT runtime vendoring by framework. Returns the list of
     files written into the SUT (for inclusion in the commit manifest).
@@ -493,7 +520,13 @@ def _vendor_runtime_for_framework(framework: str | None, sut_root: Path) -> list
             hint="Step 8 will use the on-failure heal flow for this stack.",
         )
         return []
-    return vendor_fn(sut_root)
+    created = vendor_fn(sut_root)
+    if created:
+        for entry in _RUNTIME_GITIGNORE_ENTRIES:
+            target = sut_root / entry.rstrip("/")
+            if target.exists():
+                _ensure_gitignore_entry(sut_root, entry)
+    return created
 
 
 def _read_research(ctx: StepContext) -> dict:
@@ -601,10 +634,6 @@ def _framework_mismatch_message(
         f"the framework — re-run Step 6 with the correct hint, or fix "
         f"research.json by hand and retry from Step 8."
     )
-
-
-def _read_detected_stack(ctx: StepContext) -> str | None:
-    return _read_research(ctx).get("detected_stack")
 
 
 def _active_module_dict(sut_inventory_dict: dict) -> dict | None:
@@ -838,6 +867,14 @@ class _LocatorTask:
     # POM extender agent.
     location_pattern: str | None = None
     container_name: str | None = None  # e.g. "elements" for inline_object_property
+    # Outer identifier the mechanical writer searches for when inserting
+    # into an object literal. For ``export_const_object`` this is the
+    # const's name (e.g. ``TrialPageSelectors``). For
+    # ``inline_object_property`` this is the owning POM class name
+    # (e.g. ``RopaEntryPage``) — the writer then descends into the
+    # ``container_name`` property of that class body. None for linear-
+    # append patterns (``separate_class`` / ``module_const_bag``).
+    container_class_name: str | None = None
 
 
 @dataclass
@@ -863,12 +900,12 @@ def _build_pom_tasks(
 ) -> dict[str, _PomTask]:
     """Group and deduplicate page_objects with missing_methods across all TCs."""
     tasks: dict[str, _PomTask] = {}  # keyed by POM file path
-    inv_locators = {}
+    inv_entries: list[dict[str, Any]] = []
     if inventory:
         am = _active_module_dict(inventory) or {}
         for lc in am.get("existing_locators") or []:
-            if isinstance(lc, dict) and lc.get("class_name"):
-                inv_locators[lc["class_name"]] = lc
+            if isinstance(lc, dict):
+                inv_entries.append(lc)
 
     for tc in plan.get("test_cases") or []:
         for po in tc.get("page_objects") or []:
@@ -879,7 +916,9 @@ def _build_pom_tasks(
             pom_name = po.get("name", "")
 
             if file_path not in tasks:
-                loc_info = inv_locators.get(f"{pom_name}Locators") or {}
+                loc_info = _resolve_locator_inventory_entry(
+                    pom_name, inv_entries,
+                ) or {}
                 tasks[file_path] = _PomTask(
                     pom_name=pom_name,
                     pom_file=file_path,
@@ -903,6 +942,45 @@ def _build_pom_tasks(
                         method=name, pom=file_path,
                     )
     return tasks
+
+
+def _resolve_locator_inventory_entry(
+    owning: str, inv_entries: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Look up the locator-source inventory entry for an owning POM.
+
+    Priority: an ``existing_locators[]`` entry whose ``owning_pom``
+    matches (inline/readonly-property conventions), else the first
+    naming-convention fallback hit. Historical bug (fixed here for
+    good — run 20260708-121117-99f5ed): this resolution used to be
+    duplicated with only `_build_locator_tasks` carrying the
+    `{Owning}Locators`/`{Owning}Selectors`/... suffix fallback list;
+    `_build_pom_tasks` had its own copy that only tried
+    `{Owning}Locators`, so a POM named `TrialPage` with a companion
+    const `TrialPageSelectors` resolved locators for the sentinel
+    writer but NOT for the pom-extender's prompt — the extender never
+    saw `locators.py` as a separate input and the LOCATOR CONTRACT text
+    named a generic "the locator source" instead of the real file.
+    Both call sites now share this single resolver.
+    """
+    if not owning:
+        return None
+    inline_hit = next(
+        (lc for lc in inv_entries if lc.get("owning_pom") == owning),
+        None,
+    )
+    if inline_hit:
+        return inline_hit
+    for suffix in ("Locators", "Selectors", "Elements",
+                   "Locator", "Selector", "Element"):
+        name = f"{owning}{suffix}"
+        hit = next(
+            (lc for lc in inv_entries if lc.get("class_name") == name),
+            None,
+        )
+        if hit:
+            return hit
+    return None
 
 
 def _build_locator_tasks(
@@ -931,24 +1009,6 @@ def _build_locator_tasks(
             if isinstance(lc, dict):
                 inv_entries.append(lc)
 
-    def _resolve(owning: str) -> dict[str, Any] | None:
-        if not owning:
-            return None
-        # Prefer inline/readonly-property entries where owning_pom matches.
-        inline_hit = next(
-            (lc for lc in inv_entries if lc.get("owning_pom") == owning),
-            None,
-        )
-        if inline_hit:
-            return inline_hit
-        # Backwards-compat: `{Owning}Locators` separate-class match.
-        legacy_name = f"{owning}Locators"
-        legacy_hit = next(
-            (lc for lc in inv_entries if lc.get("class_name") == legacy_name),
-            None,
-        )
-        return legacy_hit
-
     tasks: list[_LocatorTask] = []
     seen: set[str] = set()
     for tc in plan.get("test_cases") or []:
@@ -960,7 +1020,7 @@ def _build_locator_tasks(
                 continue
             seen.add(name)
             owning = loc.get("owning_page", "")
-            entry = _resolve(owning)
+            entry = _resolve_locator_inventory_entry(owning, inv_entries)
             tasks.append(_LocatorTask(
                 constant_name=name,
                 intent=loc.get("intent", ""),
@@ -971,6 +1031,9 @@ def _build_locator_tasks(
                 ),
                 container_name=(
                     entry.get("container_name") if entry else None
+                ),
+                container_class_name=(
+                    entry.get("class_name") if entry else None
                 ),
             ))
     return tasks
@@ -1118,6 +1181,24 @@ async def _create_helpers(
                 target.parent.mkdir(parents=True, exist_ok=True)
                 clean = _strip_code_fences(result.final_text)
                 target.write_text(clean, encoding="utf-8")
+                # Language-agnostic truncation gate (see _extend_one). A
+                # max_tokens stop means the helper file was cut off mid-output
+                # — roll back to the original (or remove a brand-new file) so
+                # the truncated version is never accepted. Protects non-Python
+                # stacks that the ast.parse check below cannot cover.
+                if getattr(result, "stop_reason", None) == "max_tokens":
+                    if existing:
+                        with contextlib.suppress(OSError):
+                            target.write_text(existing, encoding="utf-8")
+                    else:
+                        target.unlink(missing_ok=True)
+                    log.error(
+                        "step08.helper_truncated",
+                        file=file_path,
+                        chars_written=len(clean),
+                        hint="output truncated by max_tokens",
+                    )
+                    return file_path, False
                 if target.suffix == ".py":
                     import ast as _ast
                     import warnings as _warnings
@@ -1178,6 +1259,23 @@ async def _create_helpers(
 _POM_EXTENDER_MAX_TOKENS_OVERRIDE_KEY = "s08_pom_extender_max_tokens_override"
 _POM_EXTENDER_MAX_TOKENS_HARD_CAP = 32000
 
+# Timeout scaling for the POM extender (fix-proposal Action 3 / TD-3). The
+# smart-retry doubles max_tokens; a proportionally larger generation needs
+# proportionally more wall-clock, or the retry is structurally doomed to time
+# out (run 20260708-121117-99f5ed attempt 2: 21338 tokens vs a fixed 120s ->
+# APITimeoutError at 367s). Scale the client timeout with the token budget,
+# clamped to a ceiling that leaves margin under MAX_STEP_TIMEOUT_S (1800s).
+_POM_EXTENDER_TIMEOUT_BASE_S = 120
+_POM_EXTENDER_TIMEOUT_CEILING_S = 600
+
+
+def _pom_extender_timeout_s(max_tokens: int) -> int:
+    """Client timeout scaled with the token budget, floored/capped."""
+    return max(
+        _POM_EXTENDER_TIMEOUT_BASE_S,
+        min(max_tokens // 25, _POM_EXTENDER_TIMEOUT_CEILING_S),
+    )
+
 
 async def _extend_poms(
     pom_tasks: dict[str, _PomTask],
@@ -1187,6 +1285,7 @@ async def _extend_poms(
     step: int,
     rules_content: str = "",
     ctx: StepContext | None = None,
+    locator_tasks: list[_LocatorTask] | None = None,
 ) -> list[tuple[str, bool]]:
     """Phase A2: extend each POM with missing_methods via call_reasoning_llm.
 
@@ -1196,10 +1295,26 @@ async def _extend_poms(
     attempt 2 doesn't leak the override into unrelated POMs or subsequent
     Step 8 phases. The override is armed by ``_extend_one`` itself on
     syntax-validation failure (truncation signal) — see the rollback block.
+
+    ``locator_tasks`` (RCA-B) — the list of ``create_tbd`` locators the
+    pipeline pre-wrote (Phase A2) into the SUT's locator sources. The
+    extender's per-POM prompt then lists the pre-written constant names
+    explicitly, instructing the agent to reference them by name and
+    fail loud with ``[CLARIFICATION NEEDED]`` if a referenced constant
+    is missing — closing the coherence trap that let the extender
+    invent raw XPath selectors on run 20260708-121117-99f5ed.
     """
     agent_path = agents_root / "codegen-pom-extender.agent.md"
     sem = asyncio.Semaphore(_MAX_CONCURRENT_LLM_CALLS)
     results: list[tuple[str, bool]] = []
+
+    # Group pre-written locator constants by owning_page so we can tell
+    # the extender exactly which constants exist for its POM.
+    prewritten_by_page: dict[str, list[str]] = {}
+    for lt in locator_tasks or []:
+        prewritten_by_page.setdefault(lt.owning_page, []).append(
+            lt.constant_name,
+        )
 
     # Smart-retry override is per-_extend_poms-call. Consume once at the top:
     # all POMs in this call share the same budget multiplier (when armed),
@@ -1261,6 +1376,51 @@ async def _extend_poms(
                 existing_chars=len(existing_source),
                 max_tokens=dynamic_max_tokens,
             )
+            # Build the state-aware LOCATOR CONTRACT for this POM (RCA-B).
+            # The prompt lists every constant the pipeline pre-wrote for
+            # THIS POM's locator source so the extender knows which
+            # sentinel identifiers are guaranteed to exist — and can be
+            # instructed to fail loud on anything else.
+            prewritten = prewritten_by_page.get(task.pom_name, [])
+            if prewritten:
+                prewritten_lines = "\n".join(
+                    f"    - {c}" for c in prewritten
+                )
+                locator_contract = (
+                    f"LOCATOR CONTRACT — this is the ONLY correct behavior:\n"
+                    f"The pipeline has PRE-WRITTEN the following TBD sentinel "
+                    f"constants into `{task.locator_file or 'the locator source'}`. "
+                    f"They are guaranteed to exist. Reference each one by name — "
+                    f"via `self.locators.<CONSTANT>` (Python), "
+                    f"`<ContainerName>.<CONSTANT>` (TS), or the equivalent for "
+                    f"your stack. Do NOT redefine, reassign, or duplicate them:\n"
+                    f"{prewritten_lines}\n\n"
+                    f"If a method specification references a locator constant "
+                    f"NOT in the pre-written list above AND NOT already present "
+                    f"in the file, DO NOT INVENT a selector — hardcoding is a "
+                    f"contract violation that Phase A3.5 will hard-fail. "
+                    f"Instead emit `throw new Error(\"[CLARIFICATION NEEDED]: "
+                    f"locator <NAME> was not pre-written\")` (TS) or "
+                    f"`raise RuntimeError(\"[CLARIFICATION NEEDED]: locator "
+                    f"<NAME> was not pre-written\")` (Python) and move on. "
+                    f"The pipeline will surface the gap via HITL."
+                )
+            else:
+                # No create_tbd locators for this POM — either everything
+                # was reused (fine) or the plan expects the extender to
+                # place tbd() inline in method bodies. Keep the historical
+                # instruction wording.
+                locator_contract = (
+                    f"LOCATOR RULE: All locator constants referenced by these "
+                    f"methods either already exist in `{task.locator_file or 'the POM file'}` "
+                    f"or must be added inline as `tbd(\"intent\")` sentinels — "
+                    f"NEVER as hardcoded selector strings (see §3 of "
+                    f"`codegen-rules.md`). Reference existing constants via "
+                    f"`self.locators.<CONSTANT>` (Python) or the equivalent for "
+                    f"your stack. If a required constant is not defined anywhere, "
+                    f"DO NOT INVENT one — emit `[CLARIFICATION NEEDED]` and stop."
+                )
+
             result = await call_reasoning_llm(
                 agent_path,
                 workdir=workdir,
@@ -1271,15 +1431,11 @@ async def _extend_poms(
                     f"specifications are in `missing_methods.json` — each has `name`, "
                     f"`signature`, and optionally `purpose`. Return the complete "
                     f"updated file content.\n\n"
-                    f"LOCATOR RULE: The locator class already contains TBD sentinel "
-                    f"constants (e.g. `NAME = tbd(\"...\")`) for every unresolved "
-                    f"element. Reference them via `self.locators.<CONSTANT>` — "
-                    f"do NOT use inline `tbd(...)` calls in method bodies. "
-                    f"Do NOT import `tbd` into this file."
+                    f"{locator_contract}"
                 ),
                 inputs=inputs,
                 step=step,
-                timeout_s=120,
+                timeout_s=_pom_extender_timeout_s(dynamic_max_tokens),
                 max_tokens=dynamic_max_tokens,
             )
 
@@ -1298,12 +1454,64 @@ async def _extend_poms(
             log.error("step08.pom_write_failed", pom=task.pom_name, error=str(e))
             return file_path, False
 
-        # Validate Python syntax post-write. Catches mid-`def` truncation
-        # (max_tokens overrun) and other broken output BEFORE Phase B.5
-        # reconciliation chokes on it. Without this check, the reconciler
-        # would AST-parse a SyntaxError file, conclude the POM has zero
-        # methods, and report 30+ misleading "method_not_found" mismatches
-        # — masking the real failure (file corrupted by truncation).
+        def _rollback() -> None:
+            # Restore the untouched original so Phase B.5 sees a parseable
+            # file with a meaningful mismatch list instead of truncated
+            # garbage (which would AST-parse to zero methods and produce
+            # 30+ misleading "method_not_found" mismatches).
+            with contextlib.suppress(OSError):
+                abs_path.write_text(existing_source, encoding="utf-8")
+
+        def _arm_smart_retry(signal: str) -> None:
+            # Stash a 2× budget on ctx.extras so the step's retry
+            # (MAX_ATTEMPTS=2 in base.py) picks it up at the top of the next
+            # _extend_poms call. Capped at the hard limit; only armed when
+            # ctx is available.
+            if ctx is None:
+                return
+            new_budget = min(
+                dynamic_max_tokens * 2, _POM_EXTENDER_MAX_TOKENS_HARD_CAP,
+            )
+            if new_budget > dynamic_max_tokens:
+                ctx.extras[_POM_EXTENDER_MAX_TOKENS_OVERRIDE_KEY] = new_budget
+                log.info(
+                    "step08.pom_extender.smart_retry_armed",
+                    pom=task.pom_name,
+                    prev_max_tokens=dynamic_max_tokens,
+                    next_max_tokens=new_budget,
+                    signal=signal,
+                )
+
+        # Language-agnostic truncation gate. `stop_reason == "max_tokens"` is
+        # a definitive "the model was cut off mid-output" signal from the API
+        # — it needs no language-specific parser, so it protects EVERY SUT
+        # stack (TS/JS, Java, Robot, Python, ...). Without this, a truncated
+        # non-Python POM (e.g. TrialPage.ts on run 20260708-121117-99f5ed) is
+        # written to disk and accepted as success, because call_reasoning_llm
+        # sets success=True for any non-empty response regardless of
+        # stop_reason. The Python-only ast.parse below never runs for .ts, so
+        # this gate is the only truncation defense those stacks have.
+        if getattr(result, "stop_reason", None) == "max_tokens":
+            _rollback()
+            _arm_smart_retry("stop_reason=max_tokens")
+            log.error(
+                "step08.pom_truncated",
+                pom=task.pom_name,
+                file=file_path,
+                chars_written=len(new_content),
+                max_tokens=dynamic_max_tokens,
+                hint=(
+                    "output truncated by max_tokens; "
+                    "smart-retry armed with doubled budget"
+                ),
+            )
+            return file_path, False
+
+        # Python-only syntax validation (secondary signal). Catches
+        # truncation the stop_reason gate missed (older SDKs may not surface
+        # stop_reason) and genuine mid-file logic bugs, BEFORE Phase B.5
+        # reconciliation chokes on the broken file. No free stdlib parser
+        # exists for TS/Java/Robot — those rely on the stop_reason gate above.
         if abs_path.suffix == ".py":
             import ast as _ast
             import warnings as _warnings
@@ -1312,56 +1520,16 @@ async def _extend_poms(
                     _warnings.simplefilter("ignore", SyntaxWarning)
                     _ast.parse(new_content)
             except SyntaxError as e:
-                # Roll back the corrupted write so Phase B.5 sees the
-                # untouched original file (still missing the methods, but
-                # parseable — gives a meaningful mismatch list).
-                with contextlib.suppress(OSError):
-                    abs_path.write_text(existing_source, encoding="utf-8")
-                # Arm smart-retry: stash a 2× budget on ctx.extras so the
-                # step's retry (MAX_ATTEMPTS=2 in base.py) picks it up at
-                # the top of the next _extend_poms call. Capped at the
-                # hard limit; only armed when ctx is available.
-                # Two truncation signals are checked, strongest first:
-                #   (a) result.stop_reason == "max_tokens" — definitive
-                #       signal from the LLM that it wanted to keep going
-                #       but hit the budget. Always arms when present.
-                #   (b) syntax error position — when stop_reason is missing
-                #       or "end_turn", fall back to the heuristic: if the
-                #       broken line lies in the back third of the file, it
-                #       looks like truncation. Otherwise it's likely a real
-                #       logic bug the agent emitted mid-file, and bumping
-                #       the budget won't help.
-                stop_reason = getattr(result, "stop_reason", None)
-                truncation_likely = False
-                if ctx is not None:
-                    line_no = getattr(e, "lineno", 0) or 0
-                    written_lines = max(new_content.count("\n"), 1)
-                    if stop_reason == "max_tokens":
-                        truncation_likely = True
-                    elif stop_reason in (None, "end_turn"):
-                        truncation_likely = line_no >= int(written_lines * 0.66)
-                    if truncation_likely:
-                        new_budget = min(
-                            dynamic_max_tokens * 2,
-                            _POM_EXTENDER_MAX_TOKENS_HARD_CAP,
-                        )
-                        if new_budget > dynamic_max_tokens:
-                            ctx.extras[
-                                _POM_EXTENDER_MAX_TOKENS_OVERRIDE_KEY
-                            ] = new_budget
-                            log.info(
-                                "step08.pom_extender.smart_retry_armed",
-                                pom=task.pom_name,
-                                prev_max_tokens=dynamic_max_tokens,
-                                next_max_tokens=new_budget,
-                                error_line=line_no,
-                                written_lines=written_lines,
-                                signal=(
-                                    "stop_reason=max_tokens"
-                                    if stop_reason == "max_tokens"
-                                    else "syntax_error_at_eof"
-                                ),
-                            )
+                _rollback()
+                # stop_reason was NOT "max_tokens" here (handled above), so
+                # use the position heuristic: a syntax error in the back
+                # third of the file looks like truncation (bump budget);
+                # elsewhere it's likely a real logic bug (bumping won't help).
+                line_no = getattr(e, "lineno", 0) or 0
+                written_lines = max(new_content.count("\n"), 1)
+                truncation_likely = line_no >= int(written_lines * 0.66)
+                if truncation_likely:
+                    _arm_smart_retry("syntax_error_at_eof")
                 log.error(
                     "step08.pom_syntax_invalid",
                     pom=task.pom_name,
@@ -1497,12 +1665,390 @@ def _detect_init_placement(lines: list[str]) -> tuple[bool, str, int]:
     return True, body_indent, insert_at
 
 
+def _find_matching_close_brace(text: str, open_idx: int) -> int:
+    """Return the index of the ``}`` matching the ``{`` at ``open_idx``,
+    or -1 if unbalanced. String-aware so ``{`` inside a string literal
+    doesn't count toward depth.
+
+    Mirror of ``qtea.sut_inventory._find_matching_brace`` — duplicated
+    locally to avoid an import cycle (sut_inventory imports codegen bits
+    in some codepaths).
+    """
+    if open_idx >= len(text) or text[open_idx] != "{":
+        return -1
+    depth = 0
+    quote: str | None = None
+    i = open_idx
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if quote:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "\"'`":
+            quote = ch
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _locate_export_const_object_body(
+    text: str, const_name: str,
+) -> tuple[int, int] | None:
+    """Locate the ``{...}`` body of ``export const <const_name> = {...}``.
+
+    Returns ``(open_brace_idx, close_brace_idx)`` or ``None`` if not
+    found / unbalanced. The type-annotation form
+    ``export const Foo: SomeType = {...}`` is accepted.
+    """
+    pat = _re.compile(
+        rf"export\s+const\s+{_re.escape(const_name)}\b"
+        r"(?:\s*:\s*[\w<>\[\],\s.]+?)?\s*=\s*\{",
+    )
+    m = pat.search(text)
+    if not m:
+        return None
+    open_brace = m.end() - 1  # position of the opening `{`
+    close_brace = _find_matching_close_brace(text, open_brace)
+    if close_brace == -1:
+        return None
+    return open_brace, close_brace
+
+
+def _locate_inline_object_prop_body(
+    text: str, class_name: str, prop_name: str,
+) -> tuple[int, int] | None:
+    """Locate the ``{...}`` body of a class property object literal:
+
+    ::
+
+        class <class_name> { ... <prop_name>[: <type>] = { ... } ... }
+
+    Returns ``(open_brace_idx, close_brace_idx)`` of the inner object
+    or ``None``.
+    """
+    class_pat = _re.compile(
+        rf"(?:export\s+)?class\s+{_re.escape(class_name)}\b[^{{]*\{{",
+    )
+    cm = class_pat.search(text)
+    if not cm:
+        return None
+    class_open = cm.end() - 1
+    class_close = _find_matching_close_brace(text, class_open)
+    if class_close == -1:
+        return None
+    class_body_start = class_open + 1
+    prop_pat = _re.compile(
+        rf"(?:public\s+|private\s+|protected\s+|readonly\s+|static\s+)*"
+        rf"{_re.escape(prop_name)}\s*"
+        rf"(?::\s*(?:Record<[^>]*>|\{{[^}}]*\}}|[\w<>\[\],\s.]+?))?"
+        rf"\s*=\s*\{{",
+    )
+    pm = prop_pat.search(text, class_body_start, class_close)
+    if not pm:
+        return None
+    prop_open = pm.end() - 1
+    prop_close = _find_matching_close_brace(text, prop_open)
+    if prop_close == -1 or prop_close > class_close:
+        return None
+    return prop_open, prop_close
+
+
+_OBJECT_LITERAL_KEY_RE = _re.compile(
+    r"^(?P<indent>[ \t]*)[\w$]+\s*:",
+    _re.MULTILINE,
+)
+
+
+def _detect_object_literal_indent(body_text: str, fallback: str = "  ") -> str:
+    """Sniff the indentation of existing keys inside an object literal.
+
+    Returns the fallback (two spaces) when the object is empty or
+    contains no key-like lines.
+    """
+    for m in _OBJECT_LITERAL_KEY_RE.finditer(body_text):
+        indent = m.group("indent")
+        if indent:
+            return indent
+    return fallback
+
+
+def _ts_runtime_import_specifier(abs_path: Path, sut_root: Path) -> str:
+    """Module specifier for the vendored TS/JS runtime, relative to the
+    importing file.
+
+    The runtime is vendored at ``<sut>/tests/qtea-runtime.js`` (single
+    fixed location — see ``_vendor_typescript_playwright_runtime``), so a
+    POM at ``src/pages/X.ts`` must import it as ``../../tests/qtea-runtime``.
+    A hardcoded ``./qtea-runtime`` is compile-fatal and invisible to both
+    the compliance and body-verify gates (only ``tsc --noEmit`` catches it)
+    — the H2 defect on run 20260708-121117-99f5ed.
+    """
+    runtime = (sut_root / "tests" / "qtea-runtime").resolve()
+    rel = os.path.relpath(runtime, abs_path.parent.resolve())
+    spec = rel.replace(os.sep, "/")
+    if not spec.startswith("."):
+        spec = "./" + spec
+    return spec
+
+
+def _inject_tbd_import_ts(content: str, abs_path: Path, sut_root: Path) -> str:
+    """Insert ``import { tbd } from "<relpath>";`` after the last existing
+    import line, or at file top if no imports exist, where ``<relpath>`` is
+    computed relative to ``abs_path`` by ``_ts_runtime_import_specifier``.
+    Returns the modified content.
+    """
+    stmt = f'import {{ tbd }} from "{_ts_runtime_import_specifier(abs_path, sut_root)}";'
+    import_re = _re.compile(r"^(?:import\s.+?;|import\s+[^;]+?;)\s*$", _re.MULTILINE)
+    last: _re.Match[str] | None = None
+    for m in import_re.finditer(content):
+        last = m
+    if last is None:
+        return stmt + "\n" + content
+    insert_at = last.end()
+    return content[:insert_at] + "\n" + stmt + content[insert_at:]
+
+
+def _locator_constant_defined(content: str, constant_name: str) -> bool:
+    """True if ``constant_name`` has an actual definition in ``content``.
+
+    Deliberately stricter than a substring check. A dangling *reference*
+    to a constant (e.g. ``TrialPageSelectors.CHECKBOX_LEGAL_PROTECTION``
+    inside a method body, with no ``TrialPageSelectors`` entry defining
+    it) must NOT count as "already present" — that exact confusion
+    caused a `tbd_locators_written` 3-to-2 drift across retries on run
+    20260708-121117-99f5ed: attempt 1's write-back left the constant
+    name as a bare reference, and attempt 2's plain `name in content`
+    check treated that reference as a valid definition and skipped
+    re-inserting the sentinel. Matches the same shape the compliance
+    gate (`_verify_tbd_compliance`) already accepts as a definition:
+    ``NAME:``/``NAME =`` (object-literal or assignment form).
+    """
+    name_esc = _re.escape(constant_name)
+    return bool(_re.search(rf"\b{name_esc}\b\s*[:=]", content))
+
+
+def _write_object_literal_tbd_locators(
+    abs_path: Path,
+    tasks: list[_LocatorTask],
+    dev_locators: dict[str, DevLocator],
+    sut_root: Path,
+) -> int:
+    """Insert ``KEY: tbd("intent")`` (or dev-locator selector) entries
+    into a TS/JS object literal container.
+
+    Returns the number of NEW entries written. Zero if every task's
+    constant is already present in the file. Safe to call more than
+    once against the same file (idempotent, structural detection) —
+    used both as the pre-agent mechanical write and as a post-agent
+    re-assert (see ``_extend_poms`` caller).
+    """
+    if not abs_path.is_file():
+        log.warning("step08.tbd_locator_file_missing", path=str(abs_path))
+        return 0
+
+    content = abs_path.read_text(encoding="utf-8")
+    written = 0
+    any_needs_tbd = False
+
+    for task in tasks:
+        if _locator_constant_defined(content, task.constant_name):
+            continue  # already present — respect prior state
+        target = _resolve_object_literal_body(content, task)
+        if target is None:
+            log.warning(
+                "step08.object_literal_container_not_found",
+                constant=task.constant_name,
+                container_class=task.container_class_name,
+                container_property=task.container_name,
+                pattern=task.location_pattern,
+                file=str(abs_path),
+            )
+            continue
+
+        open_brace, close_brace = target
+        body_text = content[open_brace + 1: close_brace]
+        indent = _detect_object_literal_indent(body_text)
+        dev_match = _match_dev_locator(task, dev_locators)
+        if dev_match:
+            value_expr = f'"{dev_match.selector}"'
+            log.info(
+                "step08.tbd_locator_dev_match",
+                constant=task.constant_name,
+                selector=dev_match.selector[:80],
+                source=dev_match.constant_name,
+            )
+        else:
+            value_expr = f'tbd("{task.intent}")'
+            any_needs_tbd = True
+
+        new_entry = f"{indent}{task.constant_name}: {value_expr},"
+
+        # Ensure the previous non-whitespace char is a comma / open-brace /
+        # semicolon so the inserted entry lands in valid position. If
+        # missing, inject a comma at that spot.
+        j = close_brace - 1
+        while j >= 0 and content[j] in " \t\r\n":
+            j -= 1
+        needs_prior_comma = j >= 0 and content[j] not in ",{;"
+        insert_text = f"\n{new_entry}"
+        if needs_prior_comma:
+            content = (
+                content[: j + 1]
+                + ","
+                + content[j + 1: close_brace]
+                + insert_text
+                + content[close_brace:]
+            )
+        else:
+            content = content[:close_brace] + insert_text + content[close_brace:]
+        written += 1
+
+    if any_needs_tbd and not _re.search(
+        r"""from\s+['"][^'"]*qtea-runtime['"]""", content
+    ):
+        content = _inject_tbd_import_ts(content, abs_path, sut_root)
+
+    if written or any_needs_tbd:
+        abs_path.write_text(content, encoding="utf-8")
+        log.info(
+            "step08.tbd_locators_written_object_literal",
+            file=str(abs_path),
+            count=written,
+        )
+    return written
+
+
+def _resolve_object_literal_body(
+    content: str, task: _LocatorTask,
+) -> tuple[int, int] | None:
+    """Locate the object-literal ``{...}`` body this task's sentinel belongs
+    in. Pattern-directed first; then a content-driven fallback.
+
+    The fallback makes the writer robust to a Step-6 inventory *mislabel*:
+    on run 20260708-121117-99f5ed a TS ``export const TrialPageSelectors =
+    {…}`` object was classified ``separate_class`` (a Python-Selenium idiom),
+    which routed it to the LLM-defer path with no mechanical writer. The task
+    still carries ``container_class_name``, so if the file actually contains a
+    matching ``export const <name> = {…}`` (or class-field object literal), we
+    detect and write into it deterministically regardless of the label.
+    """
+    if task.location_pattern == "export_const_object":
+        container = task.container_class_name or ""
+        if not container:
+            return None
+        return _locate_export_const_object_body(content, container)
+    if task.location_pattern == "inline_object_property":
+        class_name = task.container_class_name or task.owning_page
+        prop = task.container_name or ""
+        if not class_name or not prop:
+            return None
+        return _locate_inline_object_prop_body(content, class_name, prop)
+
+    # Content-driven fallback for any other (or mislabeled) pattern.
+    if task.container_class_name:
+        body = _locate_export_const_object_body(content, task.container_class_name)
+        if body is not None:
+            return body
+    class_name = task.container_class_name or task.owning_page
+    if class_name and task.container_name:
+        body = _locate_inline_object_prop_body(
+            content, class_name, task.container_name,
+        )
+        if body is not None:
+            return body
+    return None
+
+
+def _verify_tbd_compliance(
+    locator_tasks: list[_LocatorTask],
+    sut_root: Path,
+    *,
+    dev_locators: dict[str, DevLocator] | None = None,
+) -> list[str]:
+    """Phase A3.5 — verify pom-extender obeyed the TBD contract.
+
+    For every ``create_tbd`` locator the plan sent to the extender, the
+    resulting file must contain either:
+
+      1. A sentinel: ``<CONST> = tbd("intent")`` or the object-literal
+         form ``<CONST>: tbd("intent")`` (Python / TS) OR
+         ``<CONST> = Tbd.of("intent")`` (Java), OR
+      2. A raw string whose value EXACTLY matches a dev-locator selector
+         (dev-supplied override — legitimate).
+
+    Any other value is an INVENTED selector — the extender ignored
+    §3 of ``codegen-rules.md`` and hardcoded a locator. This is the
+    exact failure mode that produced the marketing-consent XPath
+    selectors on run 20260708-121117-99f5ed. Returns a list of
+    violation messages; empty list means compliant.
+
+    Contract violations are unrecoverable by retry (identical inputs
+    produce identical outputs), so the caller should hard-fail Step 8
+    rather than loop the extender.
+    """
+    dev_selectors = {d.selector for d in (dev_locators or {}).values()}
+    violations: list[str] = []
+    for task in locator_tasks:
+        if not task.locator_file:
+            # No locator source in inventory — extender placed the value
+            # inline in a method body. That path has its own scrutiny
+            # (Phase C xpath / hard-wait gates + the pom-assertion rule).
+            continue
+        abs_path = sut_root / task.locator_file
+        if not abs_path.is_file():
+            continue
+        content = abs_path.read_text(encoding="utf-8")
+        name_esc = _re.escape(task.constant_name)
+        # Branch 1 — sentinel form: `CONSTANT: tbd("intent")` (object),
+        # `CONSTANT = tbd("intent")` (module/class attr), or
+        # `CONSTANT = Tbd.of("intent")` (Java).
+        sentinel_pat = _re.compile(
+            rf"\b{name_esc}\b\s*[:=]\s*(?:tbd\s*\(|Tbd\.of\s*\()",
+        )
+        if sentinel_pat.search(content):
+            continue
+
+        # Branch 2 — raw string literal. Non-greedy value match with
+        # backref-terminated close quote handles selectors like
+        # `"[data-testid='foo']"` (apostrophes inside a double-quoted
+        # string) that a naive negated-class would trip on.
+        string_pat = _re.compile(
+            rf"""\b{name_esc}\b\s*[:=]\s*(?P<q>['"`])(?P<val>[^\n]*?)(?P=q)""",
+        )
+        m = string_pat.search(content)
+        if not m:
+            violations.append(
+                f"{task.constant_name} not found in {task.locator_file} "
+                f"— pom-extender failed to add the create_tbd locator"
+            )
+            continue
+        raw_val = m.group("val") or ""
+        if raw_val in dev_selectors:
+            continue  # dev-locator selector match — compliant
+        violations.append(
+            f"{task.constant_name} in {task.locator_file} contains raw "
+            f"selector {raw_val[:80]!r} — must be tbd() sentinel or a "
+            f"dev-locator match (RCA-B: pom-extender invented a selector)"
+        )
+    return violations
+
+
 def _write_tbd_locators(
     locator_tasks: list[_LocatorTask],
     sut_root: Path,
     language: str | None,
     *,
     dev_locators: dict[str, DevLocator] | None = None,
+    deferral_seen: set[tuple[str, str]] | None = None,
 ) -> int:
     """Phase A2: mechanical append of TBD locator constants (pure Python).
 
@@ -1514,23 +2060,44 @@ def _write_tbd_locators(
     attributes (``self.X = ...`` inside ``__init__``) and places new
     constants accordingly.
 
-    **Convention dispatch.** Only the historical ``separate_class`` /
-    ``module_const_bag`` patterns are written mechanically here. Inline
-    patterns (``inline_object_property``, ``readonly_locator_props``,
-    ``export_const_object``) are DEFERRED to the POM extender agent in
-    Phase A3 — the extender has the POM source loaded and can add
-    entries in the SUT's own style (append to ``elements = {...}``,
-    add a ``readonly`` Locator property, etc.). Deferred tasks are
-    logged at INFO level (not WARNING) — the previous behaviour of
-    warning "tbd_locator_no_file" for a well-detected inline pattern
-    was misleading.
+    **Convention dispatch.** Mechanical writing covers:
+      - ``separate_class`` / ``module_const_bag`` — historical
+        Python-Selenium convention (line-appended constants).
+      - ``export_const_object`` / ``inline_object_property`` — TS/JS
+        object-literal conventions (inserted before the object's
+        closing ``}``). These are the shapes the pom-extender used to
+        mis-handle: without pre-writing, the extender was told
+        "sentinels are pre-declared" while looking at a file with none,
+        and invented raw selectors to satisfy the prompt. Pre-writing
+        makes that prompt invariant true.
+
+    ``readonly_locator_props`` remains DEFERRED to the POM extender —
+    each entry is a call expression (``readonly submitBtn = () =>
+    this.page.getByRole(...)``), not a key-value pair, so a mechanical
+    ``tbd()`` sentinel would need extra structural work (the extender
+    handles this today with its live view of the class body).
     """
     if not locator_tasks:
         return 0
 
+    # Run-scoped dedup: this function runs up to 4× per run (Phase A2
+    # pre-write + Phase A3.25 re-assert, × MAX_ATTEMPTS), each pass logging
+    # the same deferral for every non-mechanical constant. Suppress repeats
+    # so a given (constant, file) deferral is logged once per run. When the
+    # caller passes no set (e.g. unit tests) dedup is disabled.
+    def _first_deferral(constant: str, file_key: str) -> bool:
+        if deferral_seen is None:
+            return True
+        key = (constant, file_key)
+        if key in deferral_seen:
+            return False
+        deferral_seen.add(key)
+        return True
+
     by_file: dict[str, list[_LocatorTask]] = {}
     _MECHANICAL_PATTERNS: frozenset[str | None] = frozenset({
         None, "separate_class", "module_const_bag",
+        "export_const_object", "inline_object_property",
     })
     for task in locator_tasks:
         mechanical = task.location_pattern in _MECHANICAL_PATTERNS
@@ -1539,18 +2106,19 @@ def _write_tbd_locators(
         elif task.locator_file and not mechanical:
             # Convention detected but this function's mechanical writer
             # doesn't yet know how to append to it — POM extender handles.
-            log.info(
-                "step08.tbd_locator_deferred_to_extender",
-                constant=task.constant_name,
-                owning_page=task.owning_page,
-                pattern=task.location_pattern,
-                container=task.container_name,
-                file=task.locator_file,
-                reason=(
-                    f"SUT uses {task.location_pattern!r} convention; "
-                    f"POM extender will add the constant in the same style"
-                ),
-            )
+            if _first_deferral(task.constant_name, task.locator_file):
+                log.info(
+                    "step08.tbd_locator_deferred_to_extender",
+                    constant=task.constant_name,
+                    owning_page=task.owning_page,
+                    pattern=task.location_pattern,
+                    container=task.container_name,
+                    file=task.locator_file,
+                    reason=(
+                        f"SUT uses {task.location_pattern!r} convention; "
+                        f"POM extender will add the constant in the same style"
+                    ),
+                )
         else:
             # No matching locator source in inventory. The POM extender
             # will emit the locator inline in the method body (Playwright
@@ -1569,12 +2137,82 @@ def _write_tbd_locators(
 
     written = 0
     is_java = (language or "").lower() == "java"
+    is_ts_like = (language or "").lower() in {"typescript", "javascript"}
     dev_locs = dev_locators or {}
+
+    _OBJECT_LITERAL_PATTERNS = frozenset({
+        "export_const_object", "inline_object_property",
+    })
 
     for file_path, tasks in by_file.items():
         abs_path = sut_root / file_path
         if not abs_path.is_file():
             log.warning("step08.tbd_locator_file_missing", path=file_path)
+            continue
+
+        # Partition tasks by dispatch mode: object-literal insertion (TS
+        # object shapes) vs linear append (Python / Java historical
+        # patterns). Object-literal writing MUTATES THE FILE first so
+        # that any subsequent linear-append pass sees the updated
+        # content and doesn't misdetect placement.
+        object_tasks = [
+            t for t in tasks if t.location_pattern in _OBJECT_LITERAL_PATTERNS
+        ]
+        linear_tasks = [
+            t for t in tasks if t.location_pattern not in _OBJECT_LITERAL_PATTERNS
+        ]
+
+        # The linear/mechanical writer below only knows two placement
+        # idioms: Java (`public static final String X = ...`) and Python
+        # (`self.X = ...` inside `__init__`, via `_detect_init_placement`,
+        # which only recognises `def __init__`/`self.`). A TS/JS locator
+        # task that isn't object-literal-shaped has no linear idiom this
+        # writer understands — defer to the POM extender (which has a
+        # live view of the class body) instead of guessing Python and
+        # emitting a bare module-scope `CONST = tbd(...)` plus a Python
+        # `from tests.qtea_runtime import tbd` import into a `.ts` file
+        # (the exact H2 defect from run 20260708-121117-99f5ed).
+        if linear_tasks and is_ts_like:
+            # A TS/JS task labeled with a non-object-literal pattern (e.g. a
+            # Step-6 `separate_class` mislabel on an `export const <X> = {…}`
+            # object) has no linear idiom this writer understands. Before
+            # deferring to the LLM extender, probe the file: if it actually
+            # contains a resolvable object-literal container, PROMOTE the task
+            # to the deterministic object-literal writer — this is what closes
+            # the coherence trap (the extender then sees the sentinel already
+            # present and can't invent a selector). Only genuinely
+            # unresolvable shapes stay deferred.
+            probe = abs_path.read_text(encoding="utf-8")
+            for t in linear_tasks:
+                if _resolve_object_literal_body(probe, t) is not None:
+                    object_tasks.append(t)
+                    continue
+                if not _first_deferral(t.constant_name, file_path):
+                    continue
+                log.info(
+                    "step08.tbd_locator_deferred_to_extender",
+                    constant=t.constant_name,
+                    owning_page=t.owning_page,
+                    pattern=t.location_pattern,
+                    file=file_path,
+                    reason=(
+                        f"{language} locator file uses a non-object-literal "
+                        f"convention {t.location_pattern!r} and no object-"
+                        f"literal container was found in the file; the linear "
+                        f"mechanical writer only supports Python (self.X) / "
+                        f"Java (public static final) placement idioms — "
+                        f"POM extender will add the constant in the file's "
+                        f"own style"
+                    ),
+                )
+            linear_tasks = []
+
+        if object_tasks:
+            written += _write_object_literal_tbd_locators(
+                abs_path, object_tasks, dev_locs, sut_root,
+            )
+
+        if not linear_tasks:
             continue
 
         content = abs_path.read_text(encoding="utf-8")
@@ -1588,8 +2226,8 @@ def _write_tbd_locators(
         # by dev-locators — no tbd() calls will be emitted.
         any_needs_tbd = any(
             _match_dev_locator(t, dev_locs) is None
-            for t in tasks
-            if t.constant_name not in content
+            for t in linear_tasks
+            if not _locator_constant_defined(content, t.constant_name)
         )
 
         tbd_import = "from tests.qtea_runtime import tbd"
@@ -1630,8 +2268,8 @@ def _write_tbd_locators(
         const_indent = self_indent if use_self else _detect_const_indent(lines, is_java)
 
         new_lines: list[str] = []
-        for task in tasks:
-            if task.constant_name in content:
+        for task in linear_tasks:
+            if _locator_constant_defined(content, task.constant_name):
                 log.debug(
                     "step08.tbd_locator_exists",
                     constant=task.constant_name,
@@ -1703,11 +2341,11 @@ def _write_tbd_locators(
 
 
 _HARDCODED_LOCATOR_RE = _re.compile(
-    r"^(\s*(?:self\.)?)"          # optional indent + optional self.
+    r"^(\s*(?:self\.|this\.)?)"   # optional indent + optional self./this.
     r"([A-Z][A-Z_0-9]*)"         # UPPERCASE constant name
     r"\s*=\s*"                    # assignment
     r"""(["'])(.+?)\3"""          # quoted string value
-    r"\s*$",                      # end of line
+    r";?\s*$",                    # optional trailing `;` (TS/JS), end of line
 )
 
 
@@ -1794,6 +2432,7 @@ def _scan_and_convert_hardcoded_locators(
     sut_root: Path,
     codegen_modified: set[Path],
     dev_locators: dict[str, DevLocator] | None,
+    language: str | None = None,
 ) -> int:
     """Safety net: find hardcoded selector assignments in codegen-modified
     locator/POM files and convert them to ``tbd()`` sentinels.
@@ -1806,6 +2445,9 @@ def _scan_and_convert_hardcoded_locators(
     dev_locs = dev_locators or {}
     dev_selectors = {e.selector for e in dev_locs.values()}
     converted = 0
+    is_java = (language or "").lower() == "java"
+    is_ts_like = (language or "").lower() in {"typescript", "javascript"}
+    _pages_suffixes = (".py", ".ts", ".tsx", ".js", ".jsx")
 
     for abs_path in sorted(codegen_modified):
         if not abs_path.is_file():
@@ -1819,7 +2461,7 @@ def _scan_and_convert_hardcoded_locators(
         is_locator_file = (
             "locator" in name_low
             or "locators" in parts_low
-            or ("pages" in parts_low and name_low.endswith(".py"))
+            or ("pages" in parts_low and name_low.endswith(_pages_suffixes))
         )
         if not is_locator_file:
             continue
@@ -1854,11 +2496,15 @@ def _scan_and_convert_hardcoded_locators(
             if selector in dev_selectors:
                 continue
             has_self = "self." in prefix
-            indent = prefix.replace("self.", "")
+            has_this = "this." in prefix
+            indent = prefix.replace("self.", "").replace("this.", "")
+            trailing_semi = ";" if is_ts_like and line.rstrip().endswith(";") else ""
             if has_self:
-                lines[i] = f'{indent}self.{const_name} = tbd("{const_name}")'
+                lines[i] = f'{indent}self.{const_name} = tbd("{const_name}"){trailing_semi}'
+            elif has_this:
+                lines[i] = f'{indent}this.{const_name} = tbd("{const_name}"){trailing_semi}'
             else:
-                lines[i] = f'{indent}{const_name} = tbd("{const_name}")'
+                lines[i] = f'{indent}{const_name} = tbd("{const_name}"){trailing_semi}'
             file_converted += 1
             log.warning(
                 "step08.hardcoded_locator_converted",
@@ -1869,14 +2515,32 @@ def _scan_and_convert_hardcoded_locators(
 
         converted += file_converted
         if file_converted:
-            tbd_import = "from tests.qtea_runtime import tbd"
-            if tbd_import not in content and "import tbd" not in content.lower():
-                for j, ln in enumerate(lines):
-                    if ln.startswith("import ") or ln.startswith("from "):
-                        lines.insert(j, tbd_import)
-                        break
+            if is_java:
+                tbd_import = "import com.qtea.runtime.Tbd;"
+            elif is_ts_like:
+                tbd_import = (
+                    f'import {{ tbd }} from '
+                    f'"{_ts_runtime_import_specifier(abs_path, sut_root)}";'
+                )
+            else:
+                tbd_import = "from tests.qtea_runtime import tbd"
+            joined = "\n".join(lines)
+            already_imported = (
+                _re.search(r"""from\s+['"][^'"]*qtea-runtime['"]""", joined)
+                if is_ts_like
+                else (tbd_import in joined or "import tbd" in joined.lower())
+            )
+            if not already_imported:
+                if is_ts_like:
+                    joined = _inject_tbd_import_ts(joined, abs_path, sut_root)
+                    lines = joined.split("\n")
                 else:
-                    lines.insert(0, tbd_import)
+                    for j, ln in enumerate(lines):
+                        if ln.startswith("import ") or ln.startswith("from "):
+                            lines.insert(j, tbd_import)
+                            break
+                    else:
+                        lines.insert(0, tbd_import)
             abs_path.write_text("\n".join(lines), encoding="utf-8")
 
     if converted:
@@ -2328,8 +2992,11 @@ async def _generate_test_files(
             f"`{abs_target}`. The plan contains {len(tcs)} test case(s): "
             f"{', '.join(tc_ids)}. "
             f"Use `plan.json` for structure (test functions, fixtures, markers) "
-            f"and `strategy.md` for assertion values (expected strings, URLs, "
-            f"counts — lift them VERBATIM into equality assertions). "
+            f"and `strategy.md` only to source the exact VALUES (expected strings, "
+            f"URLs, counts) named in the plan's `kind: \"assertion\"` "
+            f"`acceptance_criteria` — do not add an assertion for an Expected-Result "
+            f"bullet that has no corresponding `kind: \"assertion\"` method in "
+            f"`plan.json`. "
             f"Use `imports.json` to know what POM classes, locators, and "
             f"fixtures are available to import (see `pom_files[].methods_added_detail` "
             f"for method signatures). "
@@ -2339,8 +3006,9 @@ async def _generate_test_files(
             f"exact argument values from `strategy.md`. Do NOT re-derive the "
             f"action sequence from prose when `steps[]` is present. Only fall "
             f"back to inferring the sequence from `strategy.md` when a "
-            f"test_function has no `steps[]`. Assertions are always lifted from "
-            f"`strategy.md`, appended after the choreographed actions."
+            f"test_function has no `steps[]`. Emit exactly one assertion call per "
+            f"plan-classified `kind: \"assertion\"` method, appended after the "
+            f"choreographed actions — never one per Expected-Result bullet."
             f"{env_hint}{runtime_hint}{reuse_hint}"
         )
 
@@ -2357,7 +3025,7 @@ async def _generate_test_files(
                 inputs=inputs,
                 step=step,
                 timeout_s=180,
-                max_tokens=16000,
+                max_tokens=32000,
             )
 
         if result.success and result.final_text.strip():
@@ -3023,7 +3691,7 @@ class CodegenStep(Step):
                 ),
             )
 
-        strategy_md = ctx.workspace.step_dir(4) / "test-strategy.md"
+        strategy_md = ctx.workspace.step_dir(4) / "test-design.md"
         sut_inv_json = ctx.workspace.step_dir(6) / "sut_inventory.json"
         plan_json = ctx.workspace.step_dir(7) / "code-modification-plan.json"
 
@@ -3052,7 +3720,7 @@ class CodegenStep(Step):
                 ),
             )
 
-        # C2: step 7 (test-architect) must have run. The plan is the
+        # C2: step 7 (test-automation-architect) must have run. The plan is the
         # authoritative placement contract — without it, this step has no
         # mapping from test cases to file paths / fixture decisions / TBD
         # intents and would have to re-derive everything from inventory +
@@ -3458,9 +4126,14 @@ class CodegenStep(Step):
         # Runs BEFORE POM extension so the locator file already contains
         # TBD constants when the POM extender reads it — methods then
         # reference self.locators.<CONSTANT> instead of inline tbd() calls.
+        # Run-scoped across attempts: ctx.extras is the same object for every
+        # attempt of this step, so a deferral logged in attempt 1 stays
+        # suppressed in attempt 2's re-run of this same phase sequence.
+        deferral_seen = ctx.extras.setdefault("s08_tbd_deferral_logged", set())
         tbd_written = _write_tbd_locators(
             locator_tasks, sut_root, language,
             dev_locators=dev_locators_map,
+            deferral_seen=deferral_seen,
         )
         if tbd_written:
             log.info("step08.tbd_locators.total", count=tbd_written)
@@ -3471,6 +4144,7 @@ class CodegenStep(Step):
                 pom_tasks, sut_root, wd, agents_root, step=8,
                 rules_content=rules_content,
                 ctx=ctx,
+                locator_tasks=locator_tasks,
             )
             pom_failures = [fp for fp, ok in pom_results if not ok]
             if pom_failures:
@@ -3478,6 +4152,202 @@ class CodegenStep(Step):
                     "step08.pom_extend.partial_failure",
                     failed=pom_failures,
                 )
+
+            # Phase A3.25: structural TBD re-assert.
+            #
+            # The pom-extender contract has it return the COMPLETE updated
+            # file (full replace, no merge — see `_extend_one`'s
+            # `abs_path.write_text`). Its persona frames "the POM" and its
+            # "companion locator class" as separate deliverables, with no
+            # instruction to preserve non-method top-level declarations —
+            # so when a POM and its locator object share one physical file
+            # (e.g. `TrialPage.ts` containing both `class TrialPage` and
+            # `export const TrialPageSelectors`), the agent can reproduce
+            # the class and silently drop the locator object, clobbering
+            # the sentinels this same writer inserted in Phase A2. That is
+            # exactly what happened on run 20260708-121117-99f5ed. Re-run
+            # the identical structural writer here: it is idempotent
+            # (`_locator_constant_defined` is a real definition check, not
+            # a substring match) so it only restores what the agent
+            # dropped and never duplicates what's already valid.
+            tbd_reasserted = _write_tbd_locators(
+                locator_tasks, sut_root, language,
+                dev_locators=dev_locators_map,
+                deferral_seen=deferral_seen,
+            )
+            if tbd_reasserted:
+                log.warning(
+                    "step08.tbd_locators_reasserted",
+                    count=tbd_reasserted,
+                    hint=(
+                        "pom-extender's write-back dropped pre-written "
+                        "tbd() sentinel(s); restored structurally"
+                    ),
+                )
+
+        # Phase A3.5: TBD-compliance gate.
+        #
+        # Verify the pom-extender emitted tbd() sentinels (or dev-locator
+        # matches) for every create_tbd locator the plan asked for.
+        # Hard-fails when the extender invented raw selector strings —
+        # the specific failure mode from run 20260708-121117-99f5ed where
+        # the coherence trap (mechanical pre-write gap + unconditional
+        # "sentinels exist" prompt) forced the LLM to hardcode XPath. No
+        # retry: identical inputs would produce the same output.
+        tbd_violations = _verify_tbd_compliance(
+            locator_tasks, sut_root, dev_locators=dev_locators_map,
+        )
+        if tbd_violations:
+            log.error(
+                "step08.tbd_compliance_failed",
+                count=len(tbd_violations),
+            )
+            (out_dir / "tbd-compliance-violations.log").write_text(
+                "\n".join(tbd_violations), encoding="utf-8",
+            )
+            # The two `_verify_tbd_compliance` violation shapes are
+            # opposite failure modes ("not found" = a sentinel was never
+            # (re-)defined; "contains raw selector" = a real value was
+            # hardcoded in its place) — collapsing both into "invented"
+            # misdirected the run-20260708-121117-99f5ed RCA/fix chain,
+            # whose actual failure was 3/3 "not found". Report each
+            # bucket by its own name.
+            missing = [v for v in tbd_violations if " not found in " in v]
+            invented = [v for v in tbd_violations if v not in missing]
+            if invented and missing:
+                headline = (
+                    f"pom-extender left {len(missing)} tbd() sentinel(s) "
+                    f"undefined and invented {len(invented)} raw "
+                    f"selector(s) instead"
+                )
+            elif invented:
+                headline = (
+                    f"pom-extender invented {len(invented)} "
+                    f"selector(s) instead of using tbd() sentinels"
+                )
+            else:
+                headline = (
+                    f"pom-extender left {len(missing)} pre-written "
+                    f"tbd() sentinel(s) undefined"
+                )
+            return StepResult(
+                success=False, status="failed",
+                outputs=[out_dir / "tbd-compliance-violations.log"],
+                error=headline,
+                notes="\n".join(tbd_violations[:5])[:500],
+            )
+
+        # Phase A3.5 (body-verifier half) — RCA-C — used to run HERE for
+        # TS/JS, but Phase B2 (test-file generation) hasn't executed yet at
+        # this point, so the companion test file the criterion is allowed
+        # to be satisfied from (Fix 5: assertion may live in the POM OR the
+        # test) never exists at check time. That made any TS/JS
+        # `kind=assertion` criterion requiring exact_text/count/attribute/
+        # value_equals structurally unsatisfiable — the only way to satisfy
+        # it was an assertion inside the POM, which the very next gate
+        # (pom-assertion, below) then hard-fails. Moved to run once EVERY
+        # stack's test files exist — see the unified body-verify gate after
+        # Phase B2 (Phase B2.5) further down, which now covers
+        # python/typescript/javascript/java identically.
+
+        # Phase A3.5 (pom-assertion structural gate) — run the same regex
+        # battery as `test_indexer._scan_pom_assertions` but at the earliest
+        # possible point, so a Phase B.5 abort can't leave broken POMs on
+        # disk unchecked (as happened on run 20260708-121117-99f5ed where
+        # `expect(marketingCheckbox).toBeAttached(...)` shipped inside
+        # `verifyMarketingConsentPositionAndLabel`). Not autopatchable —
+        # identical inputs would produce identical output; the fix is
+        # prompt/persona review. Covers Java too (Playwright-Java
+        # `assertThat(...)` / JUnit `Assertions.assertEquals(...)` inside a
+        # POM method is the same anti-pattern). Python isn't wired into
+        # this EARLY half yet — see `find_pom_assertion_violations`'s
+        # docstring.
+        if (language or "").lower() in {"typescript", "javascript", "java"}:
+            from qtea.codegen_pom_hygiene import find_pom_assertion_violations
+            agent_authored_by_pom: dict[str, set[str]] = {}
+            for _pt in pom_tasks.values():
+                names = {
+                    _mm.get("name") for _mm in (_pt.missing_methods or [])
+                    if isinstance(_mm, dict) and _mm.get("name")
+                }
+                if names:
+                    agent_authored_by_pom[_pt.pom_file] = names
+            assert_violations: list[str] = []
+            for pom_task in pom_tasks.values():
+                names = agent_authored_by_pom.get(pom_task.pom_file, set())
+                if not names:
+                    continue
+                pom_abs = sut_root / pom_task.pom_file
+                if not pom_abs.is_file():
+                    continue
+                for v in find_pom_assertion_violations(
+                    pom_abs, pom_task.pom_name, names, language=language,
+                ):
+                    assert_violations.append(v.format())
+            if assert_violations:
+                log.error(
+                    "step08.pom_assertion_gate_failed",
+                    count=len(assert_violations),
+                )
+                (out_dir / "pom-assertion-violations.log").write_text(
+                    "\n".join(assert_violations), encoding="utf-8",
+                )
+                return StepResult(
+                    success=False, status="failed",
+                    outputs=[out_dir / "pom-assertion-violations.log"],
+                    error=(
+                        f"pom-extender wrote assertions inside "
+                        f"{len(assert_violations)} POM method(s); "
+                        f"assertions belong in tests only"
+                    ),
+                    notes="\n".join(assert_violations[:5])[:500],
+                )
+
+        # Phase A3.6: purpose-fidelity judge — shadow by default
+        # (QTEA_PURPOSE_JUDGE=shadow), logs verdicts on whether each
+        # generated POM method's body actually implements its own
+        # `purpose` for the blind spot the deterministic body-verifier
+        # (Phase B2.5, below) cannot cover: kind=action/query methods
+        # (no acceptance_criteria) and kind=assertion methods with a
+        # check="custom" criterion. Runs before Phase A4/A5/B2 spend
+        # further LLM calls building on top of a possibly-broken POM.
+        # QTEA_PURPOSE_JUDGE=block additionally enforces one auto-repair
+        # retry then a hard-fail; QTEA_PURPOSE_JUDGE=off skips entirely.
+        try:
+            from qtea.purpose_judge import (
+                _mode as _pf_mode_fn,
+                judge_and_repair_blocking,
+                judge_purpose_fidelity,
+            )
+            pf_mode = _pf_mode_fn()
+            if pf_mode != "off":
+                pf_result = await judge_purpose_fidelity(
+                    pom_tasks=pom_tasks, sut_root=sut_root, out_dir=out_dir,
+                    agents_root=agents_root, workdir=wd, language=language,
+                    locator_tasks=locator_tasks,
+                )
+                if pf_mode == "block" and pf_result and pf_result["summary"]["flagged"]:
+                    still_flagged = await judge_and_repair_blocking(
+                        pf_result, pom_tasks=pom_tasks, sut_root=sut_root,
+                        out_dir=out_dir, wd=wd, agents_root=agents_root,
+                        step=8, rules_content=rules_content, ctx=ctx,
+                        language=language, locator_tasks=locator_tasks,
+                    )
+                    if still_flagged:
+                        (out_dir / "purpose-fidelity-violations.log").write_text(
+                            "\n".join(still_flagged), encoding="utf-8",
+                        )
+                        return StepResult(
+                            success=False, status="failed",
+                            outputs=[out_dir / "purpose-fidelity-violations.log"],
+                            error=(
+                                f"{len(still_flagged)} method(s) failed "
+                                f"purpose-fidelity review after auto-repair"
+                            ),
+                            notes="\n".join(still_flagged[:5])[:500],
+                        )
+        except Exception as _pf_exc:
+            log.warning("step08.purpose_judge.wiring_error", error=str(_pf_exc))
 
         # Phase A4: create fixtures
         if fixture_tasks:
@@ -3589,6 +4459,159 @@ class CodegenStep(Step):
             or plan_data.get("language")
             or "python"
         ).lower()
+
+        # Phase B2.5 (body-verifier) — RCA-C, run HERE (post-generation) for
+        # EVERY stack because assertions may live in the generated TEST file
+        # (Fix 5), which does not exist yet at Phase A3.5. For every
+        # kind=assertion POM method, confirm the POM getter + its generated
+        # test encode the acceptance-criteria oracle (exact text/count/attr/
+        # value, visible, bounding-box) and reject the count-drift /
+        # tautology anti-patterns from run 20260708-121117-99f5ed. Python was
+        # the first stack wired here (findings 4 & 5); TS/JS previously ran
+        # this same check too early (Phase A3.5, see the removed block
+        # above) and Java had no semantic assertion gate at all — both are
+        # now wired into this single post-B2 call so all four supported
+        # languages get an identical contract.
+        _BODY_VERIFY_TEST_GLOBS: dict[str, tuple[str, ...]] = {
+            "python": ("qtea_*.py",),
+            "pytest": ("qtea_*.py",),
+            "playwright-py": ("qtea_*.py",),
+            "selenium-py": ("qtea_*.py",),
+            "typescript": ("qtea_*.spec.ts", "qtea_*.test.ts", "qtea_*.spec.js", "qtea_*.test.js"),
+            "javascript": ("qtea_*.spec.js", "qtea_*.test.js", "qtea_*.spec.ts", "qtea_*.test.ts"),
+            "java": ("Qtea*Test.java", "Qtea*Tests.java"),
+        }
+        _body_verify_globs = _BODY_VERIFY_TEST_GLOBS.get(language)
+        if _body_verify_globs:
+            from qtea.codegen_body_verify import verify_method_bodies
+
+            bv_test_files: list[Path] = sorted({
+                p
+                for pattern in _body_verify_globs
+                for p in sut_root.rglob(pattern)
+                if p.is_file() and ".git" not in p.parts
+            })
+
+            # Pre-verify parse-check — body-verify below does an AST/regex
+            # scan of method *bodies*; that scan is unreliable (and its
+            # violations are noise) if the file doesn't even parse/compile.
+            # Phase B.6.5 already exists (below, ~line 4853) but runs AFTER
+            # this block, which returns early on body_violations — so a
+            # file with a compile-fatal defect (e.g. a Python-idiom leak
+            # into a `.ts` POM) never reached it and body-verify's
+            # assertion-coverage failure became the only, misleading,
+            # signal. Run the same gate here first, scoped to just the
+            # files body-verify is about to inspect. Motivating incident:
+            # run 20260708-121117-99f5ed (`this.locators` referenced on a
+            # class with no such field, `from tests.qtea_runtime import
+            # tbd` in a `.ts` file — both invisible to body-verify).
+            pre_verify_files = {
+                sut_root / pom_task.pom_file for pom_task in pom_tasks.values()
+                if (sut_root / pom_task.pom_file).is_file()
+            } | set(bv_test_files)
+            if pre_verify_files:
+                pre_parse_result = await _run_phase_b65_parse_check(
+                    sut_root=sut_root,
+                    qtea_files=pre_verify_files,
+                    agents_root=agents_root,
+                    workdir=wd,
+                    timeout_s=self.timeout_s,
+                )
+                ppc_path = out_dir / "parse-check-pre-verify-result.json"
+                ppc_path.write_text(
+                    json.dumps(pre_parse_result.as_dict(), indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                ok_ppc, ppc_err = is_valid(pre_parse_result.as_dict(), "parse-check-result")
+                if not ok_ppc:
+                    log.warning("step08.pre_verify_parse_schema_invalid", error=ppc_err)
+                if (
+                    pre_parse_result.ran
+                    and pre_parse_result.autofix_attempted
+                    and pre_parse_result.post_fix_errors > 0
+                ):
+                    return StepResult(
+                        success=False, status="failed",
+                        outputs=[ppc_path],
+                        error=(
+                            f"parse-check (pre-body-verify): "
+                            f"{pre_parse_result.post_fix_errors} parse error(s) "
+                            f"remain after one autofix pass — file doesn't "
+                            f"compile, so body-verify's method-body scan would "
+                            f"be unreliable"
+                        ),
+                        notes=parse_check_format_for_fixer(pre_parse_result)[:500],
+                    )
+                if (
+                    pre_parse_result.ran
+                    and has_degraded_violations(pre_parse_result)
+                ):
+                    missing = ", ".join(pre_parse_result.missing_tools) or "unknown"
+                    return StepResult(
+                        success=False, status="failed",
+                        outputs=[ppc_path],
+                        error=(
+                            f"parse-check (pre-body-verify): running in "
+                            f"degraded (regex-smoke) mode for language(s) "
+                            f"{', '.join(pre_parse_result.degraded_languages)} "
+                            f"and found parse violation(s) that can't be "
+                            f"verified without a real parser. Install: "
+                            f"{missing} — then re-run Step 8."
+                        ),
+                        notes=parse_check_format_for_fixer(pre_parse_result)[:500],
+                    )
+
+            body_violations: list[str] = []
+            for pom_task in pom_tasks.values():
+                pom_abs = sut_root / pom_task.pom_file
+                if not pom_abs.is_file():
+                    continue
+                for bv in verify_method_bodies(
+                    pom_abs, pom_task.pom_name, pom_task.missing_methods,
+                    test_files=bv_test_files, language=language,
+                ):
+                    body_violations.append(bv.format(pom_file=pom_task.pom_file))
+            if body_violations:
+                log.error(
+                    "step08.body_verify_failed",
+                    count=len(body_violations),
+                    language=language,
+                )
+                (out_dir / "body-verify-violations.log").write_text(
+                    "\n".join(body_violations), encoding="utf-8",
+                )
+                return StepResult(
+                    success=False, status="failed",
+                    outputs=[out_dir / "body-verify-violations.log"],
+                    error=(
+                        f"generated assertions fail {len(body_violations)} "
+                        f"acceptance-criteria check(s) — a passing test would not "
+                        f"actually verify the Step-4 expected value (false-green)"
+                    ),
+                    notes="\n".join(body_violations[:5])[:500],
+                )
+
+        # Stage-3 assertion-intent judge (SHADOW) — the semantic backstop the
+        # deterministic gates can't be: does each generated test's assertions
+        # verify a derivative of its title + the methods it calls, pinned to the
+        # oracle? Runs an independent LLM (different model/persona than the
+        # writer), logs verdicts to assertion-judge-shadow.json, and NEVER
+        # blocks the step (QTEA_ASSERTION_JUDGE=off to disable). Promoted to
+        # blocking only once shadow data supports it (SDET-agreed rollout).
+        try:
+            from qtea.assertion_judge import judge_assertions_shadow
+            await judge_assertions_shadow(
+                plan_data=plan_data,
+                strategy_text=strategy_text,
+                sut_root=sut_root,
+                out_dir=out_dir,
+                agents_root=agents_root,
+                workdir=wd,
+                language=language,
+            )
+        except Exception as _judge_exc:  # never let the shadow judge break codegen
+            log.warning("step08.assertion_judge.wiring_error", error=str(_judge_exc))
+
         b5_skipped_reason: str | None = None
         if language not in _B5_SUPPORTED_LANGUAGES:
             b5_skipped_reason = language
@@ -3787,6 +4810,57 @@ class CodegenStep(Step):
             skipped=b5_skipped_reason,
         )
 
+        # Phase B.5.5 (return-consumption gate) — the pom-extender
+        # promoted a `Promise<void>` signature to `Promise<{...}>` on
+        # run 20260708-121117-99f5ed and the test-writer emitted
+        # `await pom.foo();` (discarded return), so the German-label
+        # assertion the plan required was never executed. This gate
+        # catches that shape by requiring every non-void POM method
+        # call in the generated tests to consume its return value
+        # (assign, destructure, wrap in expect(), return, throw, or
+        # use as a sub-expression). Not autopatchable — the fix is a
+        # semantic choice between "add expect(...)" vs "revert POM
+        # signature to void".
+        if (
+            (language or "").lower() in {"typescript", "javascript"}
+            and b5_skipped_reason is None
+        ):
+            from qtea.codegen_pom_hygiene import find_return_consumption_violations
+            rc_violations: list[str] = []
+            for pom_task in pom_tasks.values():
+                names = {
+                    _mm.get("name") for _mm in (pom_task.missing_methods or [])
+                    if isinstance(_mm, dict) and _mm.get("name")
+                }
+                if not names:
+                    continue
+                pom_abs = sut_root / pom_task.pom_file
+                if not pom_abs.is_file():
+                    continue
+                for v in find_return_consumption_violations(
+                    pom_abs, pom_task.pom_name, names, b5_test_files,
+                    language=language,
+                ):
+                    rc_violations.append(v.format())
+            if rc_violations:
+                log.error(
+                    "step08.return_consumption_gate_failed",
+                    count=len(rc_violations),
+                )
+                (out_dir / "return-consumption-violations.log").write_text(
+                    "\n".join(rc_violations), encoding="utf-8",
+                )
+                return StepResult(
+                    success=False, status="failed",
+                    outputs=[out_dir / "return-consumption-violations.log"],
+                    error=(
+                        f"{len(rc_violations)} test call site(s) discard "
+                        f"the return value of a non-void POM method — "
+                        f"assertion is missing"
+                    ),
+                    notes="\n".join(rc_violations[:5])[:500],
+                )
+
         # Safety-net scan: catch any hardcoded selector strings the agent
         # wrote into locator/POM files despite the tbd()-only instruction.
         # Runs BEFORE indexing so the converted tbd() sentinels appear in
@@ -3812,7 +4886,7 @@ class CodegenStep(Step):
             )
 
         _scan_and_convert_hardcoded_locators(
-            sut_root, codegen_modified, dev_locators_map,
+            sut_root, codegen_modified, dev_locators_map, language=language,
         )
 
         # -------------------------------------------------------------------
@@ -3857,7 +4931,21 @@ class CodegenStep(Step):
                     jit_files_added.append(p)
             jit_resolved.update(p.resolve() for p in late_added)
 
-        full_index = index_tests(sut_root, framework=framework)
+        # Build the union of agent-authored method names across all POM
+        # tasks so `pom-assertion` (test_indexer RCA-D) can distinguish
+        # "qtea just wrote this" (error) from pre-existing SUT code
+        # (warning).
+        agent_authored_methods: set[str] = set()
+        for _pt in pom_tasks.values():
+            for _mm in _pt.missing_methods or []:
+                name = _mm.get("name") if isinstance(_mm, dict) else None
+                if name:
+                    agent_authored_methods.add(name)
+
+        full_index = index_tests(
+            sut_root, framework=framework,
+            agent_authored_methods=agent_authored_methods,
+        )
         index = _filter_index_to_qtea(
             full_index, sut_root,
             exclude=jit_resolved, include=codegen_modified,
@@ -4071,7 +5159,10 @@ class CodegenStep(Step):
                 max_turns=AUTOFIX_MAX_TURNS,
             )
 
-            full_index = index_tests(sut_root, framework=framework)
+            full_index = index_tests(
+                sut_root, framework=framework,
+                agent_authored_methods=agent_authored_methods,
+            )
             index = _filter_index_to_qtea(
                 full_index, sut_root,
                 exclude=jit_resolved, include=codegen_modified,

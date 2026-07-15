@@ -300,9 +300,9 @@ class BugClassifierStep(Step):
         if heal_src.exists():
             inputs["heal-log.jsonl"] = heal_src.read_text(encoding="utf-8")
 
-        strategy_src = ctx.workspace.step_dir(4) / "test-strategy.json"
+        strategy_src = ctx.workspace.step_dir(4) / "test-design.json"
         if strategy_src.exists():
-            inputs["test-strategy.json"] = strategy_src.read_text(encoding="utf-8")
+            inputs["test-design.json"] = strategy_src.read_text(encoding="utf-8")
 
         # The traceability matrix (emitted by Step 4 when QTEA_COVERAGE_AUDIT=1)
         # lets the classifier attach AC-level context to each bug — useful
@@ -339,7 +339,7 @@ class BugClassifierStep(Step):
             f"Classify the {len(candidates)} failing test(s) provided in "
             f"`bug-candidates.json` into structured bug reports. Use "
             f"`run-results.json`, `heal-log.jsonl` (if present), "
-            f"`test-strategy.json`, and `traceability-matrix.json` (if present, "
+            f"`test-design.json`, and `traceability-matrix.json` (if present, "
             f"for AC-level context per failing TC) for additional context. "
             f"The required output shape is enforced by JSON schema — respond "
             f"with the JSON object only. Use run id `{run_id}` in the output."

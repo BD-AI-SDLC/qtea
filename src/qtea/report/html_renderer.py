@@ -7,7 +7,7 @@ from pathlib import Path
 from string import Template
 
 from qtea.metrics import format_cost, format_tokens
-from qtea.report.data_builder import RunReport, StepTiming
+from qtea.report.data_builder import AuxTiming, RunReport, StepTiming
 
 _STATUS_COLORS = {
     "passed": "#22c55e",
@@ -372,7 +372,7 @@ def _render_plan_section(report: RunReport) -> str:
             f"<pre>{_escape(str(len(phases)))} phases defined</pre></details>"
         )
     if report.strategy:
-        title = _escape(report.strategy.get("title", "Test Strategy"))
+        title = _escape(report.strategy.get("title", "Test Design"))
         tcs = report.strategy.get("test_cases", [])
         parts.append(
             f"<details><summary>Strategy: {title} ({len(tcs)} test cases)</summary>"
@@ -383,7 +383,24 @@ def _render_plan_section(report: RunReport) -> str:
     return ""
 
 
-def _render_pipeline_section(steps: list[StepTiming], summary) -> str:
+_AUX_PHASE_LABELS = {
+    "debug": "Debug agent",
+    "critical_thinking": "Critical thinking",
+    "principal_engineer": "Principal SW engineer",
+}
+
+_AUX_PHASE_CODES = {
+    "debug": "D",
+    "critical_thinking": "C",
+    "principal_engineer": "P",
+}
+
+
+def _render_pipeline_section(
+    steps: list[StepTiming],
+    aux: list[AuxTiming],
+    summary,
+) -> str:
     if not steps:
         return ""
 
@@ -416,6 +433,47 @@ def _render_pipeline_section(steps: list[StepTiming], summary) -> str:
             f"<td>{_escape(format_cost(st.cost_usd))}</td>"
             f"</tr>"
         )
+
+    # Aux rows (debug / critical-thinking / principal-engineer) go BETWEEN
+    # the last step row and the totals row so the reader can see step
+    # attempts + helper agents grouped together, with the TOTAL summing
+    # both. Muted background differentiates them from real pipeline steps.
+    if aux:
+        rows.append(
+            "<tr style='background:#eef2ff'>"
+            "<td colspan='10' style='font-size:.75rem;color:#4338ca;"
+            "text-transform:uppercase;letter-spacing:.05em;padding:.5rem .75rem'>"
+            "Fix Chain (helper agents that fired on retry exhaustion)"
+            "</td></tr>"
+        )
+        for a in aux:
+            code = _AUX_PHASE_CODES.get(a.phase, "?")
+            label = _AUX_PHASE_LABELS.get(a.phase, a.phase or a.agent)
+            status_color = _STEP_STATUS_COLORS.get(
+                a.status if a.status in _STEP_STATUS_COLORS else "completed",
+                "#6b7280",
+            )
+            badge = (
+                f'<span class="badge" style="background:{status_color}">'
+                f'{_escape(a.status)}</span>'
+            )
+            dur = f"{a.duration_s:.1f}s" if a.duration_s is not None else "-"
+            cache_read = _escape(format_tokens(a.tokens_cache_read)) if a.tokens_cache_read else "-"
+            cache_write = _escape(format_tokens(a.tokens_cache_creation)) if a.tokens_cache_creation else "-"
+            rows.append(
+                f"<tr style='background:#f5f7ff'>"
+                f"<td>{code}{a.step:d}</td>"
+                f"<td>{_escape(label)} <span style='color:#64748b'>(step {a.step:02d})</span></td>"
+                f"<td>{badge}</td>"
+                f"<td>{dur}</td>"
+                f"<td>{_escape(format_tokens(a.tokens_input))}</td>"
+                f"<td>{_escape(format_tokens(a.tokens_output))}</td>"
+                f"<td>{cache_read}</td>"
+                f"<td>{cache_write}</td>"
+                f"<td>{a.agent_calls}</td>"
+                f"<td>{_escape(format_cost(a.cost_usd))}</td>"
+                f"</tr>"
+            )
 
     total_cache_read = _escape(format_tokens(summary.total_tokens_cache_read)) if summary.total_tokens_cache_read else "-"
     total_cache_write = _escape(format_tokens(summary.total_tokens_cache_creation)) if summary.total_tokens_cache_creation else "-"
@@ -474,7 +532,9 @@ def render_html(report: RunReport, *, inline_images: bool = False) -> str:
             'agent-assessed.</div>'
         ) + bug_section
     plan_section = _render_plan_section(report)
-    pipeline_section = _render_pipeline_section(report.steps_summary, s)
+    pipeline_section = _render_pipeline_section(
+        report.steps_summary, report.auxiliary_summary, s,
+    )
 
     return _PAGE_TEMPLATE.substitute(
         run_id=_escape(report.run_id),

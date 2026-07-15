@@ -256,6 +256,77 @@ def test_load_mcp_config_threads_env_overlay(tmp_path: Path):
     ]
 
 
+def test_load_mcp_config_http_type(tmp_path: Path):
+    """HTTP-type MCP servers must have their type and url fields populated."""
+    from qtea.mcp_manager import load_mcp_config
+    cfg = tmp_path / ".mcp.json"
+    cfg.write_text(json.dumps({
+        "mcpServers": {
+            "context7": {
+                "type": "http",
+                "url": "https://mcp.context7.com/mcp",
+            }
+        }
+    }), encoding="utf-8")
+    servers = load_mcp_config(cfg)
+    assert servers["context7"].type == "http"
+    assert servers["context7"].url == "https://mcp.context7.com/mcp"
+    assert servers["context7"].command == ""
+
+
+def test_probe_server_http_type_reachable(monkeypatch):
+    """probe_server routes http-type servers through _probe_http, not subprocess spawn."""
+    import urllib.request
+    from qtea.mcp_manager import McpServer, probe_server
+
+    class FakeResp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+
+    # _probe_http uses a proxy-aware opener (build_opener().open()), NOT the
+    # module-level urlopen — patch the OpenerDirector method the code actually
+    # calls, or the probe silently hits the real network.
+    monkeypatch.setattr(
+        urllib.request.OpenerDirector, "open", lambda self, *a, **kw: FakeResp()
+    )
+    server = McpServer(name="context7", command="", args=[], env={}, type="http", url="https://mcp.context7.com/mcp")
+    ok, detail = probe_server(server)
+    assert ok
+    assert "http endpoint reachable" in detail
+
+
+def test_probe_server_http_type_unreachable(monkeypatch):
+    """probe_server reports FAIL for unreachable http endpoints."""
+    import urllib.request
+    from qtea.mcp_manager import McpServer, probe_server
+
+    def fail_open(self, *a, **kw):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", fail_open)
+    server = McpServer(name="context7", command="", args=[], env={}, type="http", url="https://mcp.context7.com/mcp")
+    ok, detail = probe_server(server)
+    assert not ok
+    assert "unreachable" in detail
+
+
+def test_probe_server_http_4xx_counts_as_reachable(monkeypatch):
+    """A 4xx response means the server answered — it's reachable even without auth."""
+    import urllib.error
+    import urllib.request
+    from qtea.mcp_manager import McpServer, probe_server
+
+    def raise_404(self, *a, **kw):
+        raise urllib.error.HTTPError(url="u", code=404, msg="Not Found", hdrs=None, fp=None)
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", raise_404)
+    server = McpServer(name="context7", command="", args=[], env={}, type="http", url="https://mcp.context7.com/mcp")
+    ok, detail = probe_server(server)
+    assert ok
+    assert "HTTP 404" in detail
+
+
 def test_stage_mcp_config_threads_env_overlay_and_filters_empty(
     tmp_path: Path, monkeypatch,
 ):

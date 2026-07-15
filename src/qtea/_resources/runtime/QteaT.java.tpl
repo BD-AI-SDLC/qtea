@@ -4,10 +4,15 @@ import com.microsoft.playwright.Frame;
 import com.microsoft.playwright.Locator;
 import com.microsoft.playwright.Page;
 
+import java.io.IOException;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
@@ -93,6 +98,96 @@ public final class QteaT {
         } catch (Throwable t) {
             // logging must never throw
         }
+    }
+
+    // ----------------------------------------------------------------------
+    // On-failure AOM capture — writes
+    // <QTEA_WORKSPACE_DIR>/aom-at-failure/<entry_id>.txt so Step 9 Layer 2
+    // can cross-check the failure against the live page AOM.
+    //
+    // Wire from @AfterEach (JUnit 5) / @AfterMethod (TestNG):
+    //   QteaT.captureAomOnFailure(page, "ClassName", "methodName");
+    // Best-effort — capture failures never propagate.
+    // ----------------------------------------------------------------------
+
+    /**
+     * Match Python {@code md_parser.slugify} — ascii-alnum + hyphens,
+     * lowercased. Public so operators can build their own IDs.
+     */
+    public static String slugify(String s) {
+        if (s == null) return "untitled";
+        String base = s.replaceAll("[^A-Za-z0-9]+", "-");
+        base = base.replaceAll("^-+", "").replaceAll("-+$", "").toLowerCase();
+        return base.isEmpty() ? "untitled" : base;
+    }
+
+    /**
+     * Match Python {@code test_runner._normalize_id(file_rel, name)}. When
+     * {@code fileRel} is non-null, the file's stem is prefixed to
+     * {@code name}; otherwise {@code name} is slugified directly. Result
+     * format: {@code T-<slug>}. Same output shape as the Python and JS
+     * runtimes, so the parent qtea process reads the same entry_id from
+     * JUnit XML and from our on-failure capture.
+     */
+    public static String normalizeTestId(String fileRel, String name) {
+        String combined;
+        if (fileRel != null && !fileRel.isEmpty()) {
+            Path p = Paths.get(fileRel);
+            String stem = p.getFileName() != null ? p.getFileName().toString() : "";
+            int dot = stem.lastIndexOf('.');
+            if (dot > 0) stem = stem.substring(0, dot);
+            combined = stem + "-" + (name == null ? "" : name);
+        } else {
+            combined = name == null ? "" : name;
+        }
+        return "T-" + slugify(combined);
+    }
+
+    /**
+     * Snapshot the page AOM and write it to
+     * {@code <QTEA_WORKSPACE_DIR>/aom-at-failure/<entryId>.txt}. Silently
+     * no-ops when the workspace env-var is unset or the page is unusable —
+     * capture failures must never affect the test outcome.
+     *
+     * @param page       the wrapped or raw Page instance
+     * @param entryId    a {@code T-<slug>} identifier; use
+     *                   {@link #normalizeTestId(String, String)} to build one
+     */
+    public static void captureAomOnFailure(Page page, String entryId) {
+        try {
+            String workspace = System.getenv("QTEA_WORKSPACE_DIR");
+            if (workspace == null || workspace.isEmpty()) return;
+            if (page == null) return;
+            if (entryId == null || entryId.isEmpty()) return;
+            String snap = QteaTResolver.snapshotPageForCapture(page);
+            if (snap == null || snap.isEmpty()) return;
+            Path outDir = Paths.get(workspace, "aom-at-failure");
+            Files.createDirectories(outDir);
+            Path outFile = outDir.resolve(entryId + ".txt");
+            Files.write(outFile, snap.getBytes(StandardCharsets.UTF_8));
+        } catch (Throwable t) {
+            try { System.err.println("qtea aom_capture_on_failure_failed: " + t); }
+            catch (Throwable ignored) {}
+        }
+    }
+
+    /**
+     * Convenience overload — builds the entry_id from class + method name
+     * using the same format the parent qtea process uses when parsing
+     * JUnit XML output. Passing {@code null} class or method falls back to
+     * {@code "unknown"} for that segment.
+     *
+     * <p>Note: the parent process's {@code _normalize_id(file_rel, name)}
+     * uses the source-file's stem, not the class name. For JUnit, class
+     * name and source-file stem usually match (Java convention). For
+     * TestNG with multiple test classes per file, the operator may need to
+     * build the entry_id manually via {@link #normalizeTestId} to match
+     * the parent's expected file_rel.
+     */
+    public static void captureAomOnFailure(Page page, String className, String methodName) {
+        String cls = className == null ? "unknown" : className;
+        String mth = methodName == null ? "unknown" : methodName;
+        captureAomOnFailure(page, normalizeTestId(cls, mth));
     }
 
     // ----------------------------------------------------------------------

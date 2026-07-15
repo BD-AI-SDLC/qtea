@@ -40,7 +40,7 @@ sut_inventory.json
 
 ## POM Ownership Decision Tree
 
-For each new UI element the test strategy mentions, determine which POM class owns it:
+For each new UI element the test design mentions, determine which POM class owns it:
 
 1. **Identify the screen.** Which URL / route / view does the element render on? A "page" in the POM sense is a screen the user navigates to, not a feature.
 

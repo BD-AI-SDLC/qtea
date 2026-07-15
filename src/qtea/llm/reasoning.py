@@ -198,7 +198,7 @@ async def call_reasoning_llm(
     output_schema: dict | None = None,
     inputs: dict[str, str] | None = None,
     model: str | None = None,
-    max_tokens: int = 32000,
+    max_tokens: int = 64000,
     timeout_s: int | None = None,
     step: int | None = None,
     hitl_history: list[dict] | None = None,
@@ -254,7 +254,9 @@ async def call_reasoning_llm(
         raise FileNotFoundError(f"agent file not found: {agent_path}")
 
     # Model resolution: explicit arg → agent_models.yaml → error.
-    requested_model = model or model_for_agent(_agent_key(agent_path))
+    agent_config = model_for_agent(_agent_key(agent_path))
+    requested_model = model or (agent_config.model if agent_config else None)
+    resolved_thinking = agent_config.thinking if agent_config else None
     if not requested_model:
         raise ValueError(
             f"No model resolved for agent {agent_path.name}. Pass "
@@ -321,16 +323,23 @@ async def call_reasoning_llm(
             }
             schema_enforced_server_side = True
 
+    if resolved_thinking:
+        create_kwargs["thinking"] = resolved_thinking
+        budget = resolved_thinking.get("budget_tokens")
+        if budget and isinstance(budget, int):
+            create_kwargs["max_tokens"] = max(max_tokens, budget + 1024)
+
     log.info(
         "reasoning.start",
         agent=agent_path.name,
         model=requested_model,
-        max_tokens=max_tokens,
+        max_tokens=create_kwargs["max_tokens"],
         timeout_s=resolved_timeout,
         has_schema=output_schema is not None,
         schema_enforced_server_side=schema_enforced_server_side,
         backend="vertex" if is_vertex else "anthropic",
         hitl_history_len=len(hitl_history or []),
+        thinking=resolved_thinking,
     )
 
     started = time.monotonic()

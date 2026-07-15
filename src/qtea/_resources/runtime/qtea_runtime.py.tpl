@@ -764,8 +764,9 @@ def _read_aom_env() -> tuple[int | None, bool, bool, bool]:
       snapshots, no tie-breaking signal); ``force`` ignores a cached
       negative result and re-attempts on every call (debug only).
     - ``QTEA_AOM_LEGACY_OK`` (``"1"`` default): set to ``"0"`` to
-      disable the pre-1.40 ``page.accessibility.snapshot()`` fallback for
-      SUTs that should never silently degrade.
+      disable the pre-1.49 ``page.accessibility.snapshot()`` fallback for
+      SUTs that should never silently degrade. ``Locator.aria_snapshot``
+      was introduced in Playwright 1.49; older SUTs need the legacy API.
     """
     depth: int | None = None
     raw_depth = os.environ.get("QTEA_AOM_DEPTH")
@@ -806,7 +807,8 @@ def _aom_kwargs_ladder(
         if depth is not None:
             kw["depth"] = depth
         rungs.append(kw)
-    # Rung C: no kwargs — Playwright 1.40-1.58
+    # Rung C: no kwargs — Playwright 1.49-1.58 (iframes NOT included by
+    # Playwright; caller must enumerate page.frames() to snapshot them).
     rungs.append({})
     return rungs
 
@@ -841,7 +843,7 @@ def _call_aria_snapshot_sync(
     """Call ``Locator.aria_snapshot()`` with the richest supported kwarg-set.
 
     Ladder: ``mode="ai", boxes=True`` (Playwright 1.60+) → ``mode="ai"``
-    (1.59) → no-kwargs (1.40-1.58). Capabilities are probed once per
+    (1.59) → no-kwargs (1.49-1.58). Capabilities are probed once per
     process via :data:`_AOM_CAPS` and cached; subsequent calls skip
     proven-unsupported rungs. Returns the empty string on a falsy return.
     """
@@ -858,7 +860,7 @@ def _call_aria_snapshot_sync(
         _update_aom_caps_from_success(kw)
         return result or ""
     # All rungs raised TypeError — re-raise so the caller logs it. Cannot
-    # happen on Playwright 1.40+, which accepts the no-kwargs call.
+    # happen on Playwright 1.49+, which accepts the no-kwargs call.
     if last_err is not None:
         raise last_err
     return ""
@@ -888,6 +890,96 @@ async def _call_aria_snapshot_async(
     return ""
 
 
+def _iframe_label(frame: Any) -> str:
+    """Best-effort label for an iframe: url → name → 'unknown'."""
+    for attr in ("url", "name"):
+        try:
+            v = getattr(frame, attr, None)
+            if callable(v):
+                v = v()
+            if v:
+                return str(v)
+        except Exception:  # noqa: BLE001
+            continue
+    return "unknown"
+
+
+def _iter_non_main_frames(page: Any) -> list[Any]:
+    """Return the list of iframes attached to ``page``, excluding the main
+    frame. Absorbs any exception (page closed, frames attribute missing)
+    and returns ``[]`` — the caller uses this to gate iframe enumeration.
+    """
+    try:
+        frames = page.frames
+        if callable(frames):
+            frames = frames()
+    except Exception:  # noqa: BLE001
+        return []
+    if not frames:
+        return []
+    main_frame = None
+    try:
+        main_frame = page.main_frame
+    except Exception:  # noqa: BLE001
+        pass
+    return [f for f in frames if f is not main_frame]
+
+
+def _append_iframe_snapshots_sync(
+    page: Any, main_text: str, *,
+    depth: int | None, want_boxes: bool, force_boxes: bool,
+) -> str:
+    """Enumerate iframes and append their AOM snapshots to ``main_text``.
+
+    Called on Rung C (``aria_snapshot()`` without ``mode='ai'``) where
+    Playwright does NOT include iframe subtrees in the main snapshot.
+    Uses ``# iframe: <label>`` markers between subtrees; the ``#`` prefix
+    is ignored by :func:`_parse_aria_snapshot_yaml` (which only reads
+    lines starting with ``- ``), so the marker cannot pollute the parsed
+    tree used by the tier-3 heuristic.
+
+    Silently skips any individual frame whose snapshot raises (debug-log
+    the reason). Returns ``main_text`` unchanged if enumeration fails.
+    """
+    parts: list[str] = [main_text]
+    for frame in _iter_non_main_frames(page):
+        try:
+            body = frame.locator("body")
+            sub = _call_aria_snapshot_sync(
+                body, depth=depth, want_boxes=want_boxes, force_boxes=force_boxes,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.debug("qtea.iframe_snapshot_skip %s", e)
+            continue
+        if not sub:
+            continue
+        parts.append(f"# iframe: {_iframe_label(frame)}")
+        parts.append(sub)
+    return "\n".join(parts)
+
+
+async def _append_iframe_snapshots_async(
+    page: Any, main_text: str, *,
+    depth: int | None, want_boxes: bool, force_boxes: bool,
+) -> str:
+    """Async counterpart of :func:`_append_iframe_snapshots_sync`."""
+    parts: list[str] = [main_text]
+    for frame in _iter_non_main_frames(page):
+        try:
+            body = frame.locator("body")
+            sub = await _call_aria_snapshot_async(
+                body, depth=depth, want_boxes=want_boxes, force_boxes=force_boxes,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.debug("qtea.iframe_snapshot_skip_async %s", e)
+            continue
+        if not sub:
+            continue
+        parts.append(f"# iframe: {_iframe_label(frame)}")
+        parts.append(sub)
+    return "\n".join(parts)
+
+
 def _snapshot_page(page: Any) -> tuple[str, dict[str, Any]]:
     """Capture the page AOM as ``(text, parsed_dict_tree)``.
 
@@ -898,23 +990,45 @@ def _snapshot_page(page: Any) -> tuple[str, dict[str, Any]]:
          names by :func:`_parse_aria_snapshot_yaml` and retained on the
          parsed node dict as ``node["box"]`` for tie-breaking.
       2. ``aria_snapshot(mode="ai")`` — Playwright 1.59.
-      3. ``aria_snapshot()`` — Playwright 1.40-1.58 (no kwargs).
-      4. ``page.accessibility.snapshot()`` — pre-1.40 fallback. Gated by
+      3. ``aria_snapshot()`` — Playwright 1.49-1.58 (no kwargs).
+      4. ``page.accessibility.snapshot()`` — pre-1.49 fallback. Gated by
          ``QTEA_AOM_LEGACY_OK`` (default on).
+
+    Iframe handling: rungs 1 and 2 include iframe subtrees automatically
+    via ``mode='ai'``. Rung 3 does NOT — iframes are enumerated manually
+    via :func:`_append_iframe_snapshots_sync` and appended to the returned
+    text with ``# iframe: <url>`` markers.
+
+    Return-value split: the ``text`` includes iframe content; the
+    ``parsed_dict_tree`` is **main-frame only** (parsed BEFORE iframe
+    text is appended). This prevents the tier-3 heuristic from returning
+    an iframe-scoped selector that Playwright then tries to resolve in
+    main-frame scope.
 
     Returns ``("", {})`` on total failure so the resolver still receives a
     well-formed input (the LLM tier then cleanly returns "no candidates"
     instead of crashing). Errors are logged but never propagate.
     """
     depth, want_boxes, force_boxes, legacy_ok = _read_aom_env()
-    # ---- Primary: Locator.aria_snapshot (Playwright 1.40+) ----
+    # ---- Primary: Locator.aria_snapshot (Playwright 1.49+) ----
     try:
         body = page.locator("body")
-        snapshot_text = _call_aria_snapshot_sync(
+        main_text = _call_aria_snapshot_sync(
             body, depth=depth, want_boxes=want_boxes, force_boxes=force_boxes,
         )
-        snapshot_dict = _parse_aria_snapshot_yaml(snapshot_text)
-        return snapshot_text, snapshot_dict
+        # Parse the MAIN-FRAME dict BEFORE any iframe text is appended so
+        # the tier-3 heuristic never sees iframe-scoped elements.
+        snapshot_dict = _parse_aria_snapshot_yaml(main_text)
+        # Enumerate iframes only when Playwright didn't include them
+        # automatically (Rung C — mode='ai' unavailable).
+        if _AOM_CAPS.get("mode_ai") is not True:
+            full_text = _append_iframe_snapshots_sync(
+                page, main_text,
+                depth=depth, want_boxes=want_boxes, force_boxes=force_boxes,
+            )
+        else:
+            full_text = main_text
+        return full_text, snapshot_dict
     except AttributeError:
         # `Page.locator` or `Locator.aria_snapshot` not present — fall through.
         pass
@@ -922,7 +1036,7 @@ def _snapshot_page(page: Any) -> tuple[str, dict[str, Any]]:
         log.warning("qtea.snapshot_failed_aria %s", e)
         # Fall through to legacy API — older Playwright might still work.
 
-    # ---- Legacy: page.accessibility.snapshot() (Playwright <1.40) ----
+    # ---- Legacy: page.accessibility.snapshot() (Playwright <1.49) ----
     if not legacy_ok:
         return "", {}
     try:
@@ -1557,25 +1671,35 @@ def _resolve_tiers_3_4(
 
 
 async def _snapshot_page_async(page: Any) -> tuple[str, dict[str, Any]]:
-    """Async counterpart of :func:`_snapshot_page`. Same capability ladder
-    and env-var contract; differs only in the ``await`` on the snapshot
-    call and on the legacy ``accessibility.snapshot()``.
+    """Async counterpart of :func:`_snapshot_page`. Same capability ladder,
+    same iframe handling, same env-var contract; differs only in the
+    ``await`` on the snapshot call and on the legacy
+    ``accessibility.snapshot()``.
     """
     depth, want_boxes, force_boxes, legacy_ok = _read_aom_env()
-    # ---- Primary: Locator.aria_snapshot (Playwright 1.40+) ----
+    # ---- Primary: Locator.aria_snapshot (Playwright 1.49+) ----
     try:
         body = page.locator("body")
-        snapshot_text = await _call_aria_snapshot_async(
+        main_text = await _call_aria_snapshot_async(
             body, depth=depth, want_boxes=want_boxes, force_boxes=force_boxes,
         )
-        snapshot_dict = _parse_aria_snapshot_yaml(snapshot_text)
-        return snapshot_text, snapshot_dict
+        # Parse the MAIN-FRAME dict BEFORE any iframe text is appended so
+        # the tier-3 heuristic never sees iframe-scoped elements.
+        snapshot_dict = _parse_aria_snapshot_yaml(main_text)
+        if _AOM_CAPS.get("mode_ai") is not True:
+            full_text = await _append_iframe_snapshots_async(
+                page, main_text,
+                depth=depth, want_boxes=want_boxes, force_boxes=force_boxes,
+            )
+        else:
+            full_text = main_text
+        return full_text, snapshot_dict
     except AttributeError:
         pass
     except Exception as e:  # noqa: BLE001
         log.warning("qtea.snapshot_failed_aria_async %s", e)
 
-    # ---- Legacy: page.accessibility.snapshot() (Playwright <1.40) ----
+    # ---- Legacy: page.accessibility.snapshot() (Playwright <1.49) ----
     if not legacy_ok:
         return "", {}
     try:
