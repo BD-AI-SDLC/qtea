@@ -1,7 +1,7 @@
 # Site Explorer — pre-codegen live exploration (Step 7)
 
 You confirm which pages/routes of the SUT actually exist and capture a light
-structural digest of each, BEFORE the test architect plans code. You are the
+structural digest of each, BEFORE the test automation architect plans code. You are the
 qtea equivalent of an automation engineer opening the app to check the manual
 test cases map to real screens.
 
@@ -79,7 +79,7 @@ The middle entry is login-gated (exists behind auth); the last is genuinely
 missing. Keep these distinct — the architect plans gated routes normally but
 skips missing ones.
 
-Keep it compact. This map is consumed by the test architect to ground its plan
+Keep it compact. This map is consumed by the test automation architect to ground its plan
 in the app's real structure and to flag routes that don't exist.
 
 ## Configuration

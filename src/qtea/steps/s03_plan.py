@@ -35,7 +35,8 @@ from qtea.steps.s02_refine import _extract_acceptance_criteria_structured
 
 
 def _coverage_audit_enabled() -> bool:
-    return os.environ.get("QTEA_COVERAGE_AUDIT", "0") == "1"
+    # Finding 21: default ON (was "0"). Set QTEA_COVERAGE_AUDIT=0 to disable.
+    return os.environ.get("QTEA_COVERAGE_AUDIT", "1") == "1"
 
 log = get_logger(__name__)
 
@@ -341,7 +342,7 @@ class PlanStep(Step):
         if not ok:
             # CLAUDE.md classifies Step 3 failure as "abort": a malformed
             # plan (no extractable phases or missing required fields)
-            # silently propagates to Step 4's test-manager agent, which
+            # silently propagates to Step 4's test-designer agent, which
             # then plans against garbage. Fail-fast so the retry path
             # (attempt 2 with debug agent co-running) gets a chance.
             log.warning("step03.schema_invalid", error=err)

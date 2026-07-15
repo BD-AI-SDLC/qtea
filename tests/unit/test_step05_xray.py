@@ -52,7 +52,7 @@ def _sample_strategy():
 def _seed_strategy(ctx: StepContext, strategy=None):
     s4 = ctx.workspace.step_dir(4)
     s4.mkdir(parents=True, exist_ok=True)
-    (s4 / "test-strategy.json").write_text(
+    (s4 / "test-design.json").write_text(
         json.dumps(strategy or _sample_strategy()), encoding="utf-8",
     )
 

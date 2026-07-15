@@ -78,7 +78,7 @@ def _ctx(tmp_path: Path) -> StepContext:
 async def test_step2_passes_without_audit_when_gate_off(tmp_path: Path, monkeypatch):
     """Default (gate OFF) preserves existing behavior — broken markdown is
     accepted via the warned-only schema path."""
-    monkeypatch.delenv("QTEA_COVERAGE_AUDIT", raising=False)
+    monkeypatch.setenv("QTEA_COVERAGE_AUDIT", "0")  # off is no longer default (finding 21)
     install_fake_anthropic(monkeypatch, text=_REFINED_BROKEN)
     result = await RefineStep().run(_ctx(tmp_path))
     assert result.success, result.error
@@ -106,6 +106,10 @@ async def test_step2_audit_log_consumed_and_deleted_on_next_run(
     """The next `run()` reads the prior log, prepends it to the user prompt,
     deletes it, then succeeds when the agent emits a clean artifact."""
     monkeypatch.setenv("QTEA_COVERAGE_AUDIT", "1")
+    # Exercise the raw refine -> audit -> retry path; the format-fixer rescue
+    # is tested separately and would otherwise consume the _REFINED_CLEAN
+    # text on attempt 1 and rescue before the retry ever happens.
+    monkeypatch.setenv("QTEA_NO_FORMAT_FIXER", "1")
     captured: list[dict] = []
     install_fake_anthropic(
         monkeypatch,
@@ -175,7 +179,7 @@ async def _seed_refined_spec(ctx: StepContext, *, clean: bool = True) -> None:
 
 
 async def test_step3_passes_without_audit_when_gate_off(tmp_path: Path, monkeypatch):
-    monkeypatch.delenv("QTEA_COVERAGE_AUDIT", raising=False)
+    monkeypatch.setenv("QTEA_COVERAGE_AUDIT", "0")  # off is no longer default (finding 21)
     ctx = _ctx(tmp_path)
     await _seed_refined_spec(ctx, clean=True)
     install_fake_anthropic(monkeypatch, text=_PLAN_BROKEN)

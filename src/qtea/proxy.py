@@ -146,6 +146,28 @@ def mask_secrets(env: Mapping[str, str]) -> dict[str, str]:
     return {k: ("***REDACTED***" if k in SECRET_ENV_KEYS else v) for k, v in env.items()}
 
 
+def set_owner_only_perms(path: Path) -> None:
+    """Best-effort owner-only read/write on both Unix and Windows."""
+    if sys.platform != "win32":
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        return
+    try:
+        import subprocess as _sp
+        username = os.environ.get("USERNAME") or os.environ.get("USER", "")
+        if not username:
+            return
+        _sp.run(
+            ["icacls", str(path), "/inheritance:r",
+             "/grant:r", f"{username}:(R,W)", "/remove", "Everyone"],
+            capture_output=True, timeout=10, check=False,
+        )
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # BoschProxyTransport — Windows NTLM proxy fallback
 # ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@ Two channels:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import time
@@ -16,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import flet as ft
 
-from qtea.ui.state import AppState, LogLine
+from qtea.ui.state import AppState, AuxAgentUIState, LogLine
 
 if TYPE_CHECKING:
     pass
@@ -25,10 +26,22 @@ if TYPE_CHECKING:
 class _UILogHandler(logging.Handler):
     """Intercept structlog records and push updates to AppState."""
 
-    def __init__(self, state: AppState, page: ft.Page) -> None:
+    def __init__(
+        self, state: AppState, page: ft.Page, loop: asyncio.AbstractEventLoop,
+    ) -> None:
         super().__init__()
         self.state = state
         self.page = page
+        # The pipeline runs on a worker thread (see app.py's _worker()); this
+        # is the Flet event loop, captured on the main thread, so every
+        # state.notify()/page.update() call below can be marshaled back onto
+        # it via call_soon_threadsafe instead of running unsynchronized on
+        # the worker thread — matching hitl_bridge.py / review_gate_bridge.py.
+        # Without this, a page.update() landing concurrently with a main-
+        # thread page.views.clear()+rebuild (as happens in _run_pipeline's
+        # finally block) can corrupt Flet's rendered state, dropping the
+        # summary view and leaving only the initial "/" view on screen.
+        self._loop = loop
         self._last_update = 0.0
         self._throttle_ms = 250  # min ms between page.update() calls
 
@@ -48,16 +61,17 @@ class _UILogHandler(logging.Handler):
             state.pipeline_started_at = time.monotonic()
             self._notify()
 
-        elif event == "pipeline.finished":
-            exit_code = event_dict.get("exit_code", 1)
-            state.run_status = "completed" if exit_code == 0 else "failed"
-            state.exit_code = exit_code
+        elif event == "pipeline.end":
+            # pipeline.py emits "pipeline.end" with a `status` field
+            # ("ok"/"failed") — not "pipeline.finished" with an `exit_code`,
+            # which this branch used to (incorrectly) match on and therefore
+            # never fired. app.py's _run_pipeline sets state.run_status /
+            # exit_code independently once the worker thread returns, so
+            # this branch is a secondary path — kept for early UI feedback
+            # (status badge) before that happens.
+            status = event_dict.get("status", "failed")
+            state.run_status = "completed" if status == "ok" else "failed"
             state.update_elapsed()
-            self._notify()
-
-        elif event == "pipeline.aborted":
-            state.run_status = "failed"
-            state.exit_code = 2
             self._notify()
 
         # ── Step lifecycle ───────────────────────────────────────────────
@@ -80,7 +94,7 @@ class _UILogHandler(logging.Handler):
                 s.tokens_in = event_dict.get("tokens_input", s.tokens_in)
                 s.tokens_out = event_dict.get("tokens_output", s.tokens_out)
                 s.cache_read = event_dict.get("tokens_cache_read", s.cache_read)
-                s.cache_write = event_dict.get("token_cache_write", s.cache_write)
+                s.cache_write = event_dict.get("tokens_cache_write", s.cache_write)
                 # steps/base.py emits cost under a step-numbered key
                 # (e.g. ``step03_total_cost_usd``) — not a plain
                 # ``cost_usd``. Look up by the correct key, otherwise the
@@ -94,6 +108,40 @@ class _UILogHandler(logging.Handler):
                 s.sub_status = event_dict.get("sub_status", s.sub_status)
                 s.notes = event_dict.get("notes", s.notes)
                 s.error = event_dict.get("error", s.error)
+                state.recalculate_totals()
+                self._notify()
+
+        elif event == "aux_agent.recorded":
+            # Emitted by steps/base.py's `_record_aux_agent` when a helper
+            # agent (debug / critical-thinking / principal-engineer) fires
+            # on retry exhaustion. That chain runs strictly after
+            # `step.end` (see base.py's `execute()`), so without this
+            # event the sidebar would never reflect its billed cost — the
+            # UI only reacts to structured log events, not the final state
+            # file.
+            #
+            # Aux costs are NO LONGER folded into the parent step's cost
+            # cell (unlike the pre-split `step.debug_fix_cost` event this
+            # replaced) — updating the step would double-count against the
+            # aux row that will render in results_view.
+            step_num = event_dict.get("step")
+            phase = event_dict.get("phase", "")
+            agent = event_dict.get("agent", "")
+            if step_num is not None:
+                aux = AuxAgentUIState(
+                    step=int(step_num),
+                    phase=str(phase),
+                    agent=str(agent),
+                    status=str(event_dict.get("status", "completed")),
+                    duration_s=event_dict.get("duration_s"),
+                    tokens_in=int(event_dict.get("tokens_input", 0) or 0),
+                    tokens_out=int(event_dict.get("tokens_output", 0) or 0),
+                    cache_read=int(event_dict.get("tokens_cache_read", 0) or 0),
+                    cache_write=int(event_dict.get("tokens_cache_write", 0) or 0),
+                    cost_usd=float(event_dict.get("cost_usd", 0.0) or 0.0),
+                    agent_calls=int(event_dict.get("agent_calls", 0) or 0),
+                )
+                state.auxiliary_records.append(aux)
                 state.recalculate_totals()
                 self._notify()
 
@@ -141,7 +189,12 @@ class _UILogHandler(logging.Handler):
         self._throttled_update()
 
     def _notify(self) -> None:
-        """Push state change + page update."""
+        """Schedule state change + page update on the Flet event loop
+        (never call it directly — this handler runs on the pipeline's
+        worker thread)."""
+        self._loop.call_soon_threadsafe(self._do_notify)
+
+    def _do_notify(self) -> None:
         self.state.notify()
         with contextlib.suppress(Exception):
             self.page.update()
@@ -151,9 +204,7 @@ class _UILogHandler(logging.Handler):
         now = time.monotonic() * 1000
         if now - self._last_update > self._throttle_ms:
             self._last_update = now
-            self.state.notify()
-            with contextlib.suppress(Exception):
-                self.page.update()
+            self._notify()
 
     def _extract_event_dict(self, record: logging.LogRecord) -> dict[str, Any]:
         """Extract the structured event dict from a structlog LogRecord.
@@ -171,9 +222,18 @@ class _UILogHandler(logging.Handler):
         if record.args and isinstance(record.args, tuple) and isinstance(record.args[0], dict):
             return dict(record.args[0])
 
-        # Fall back: treat the formatted message as the event name.
+        # Fall back: foreign (stdlib) records — e.g. httpx's
+        # ``log.info("HTTP Request: %s %s ...", method, url, ...)`` — arrive
+        # with the ``%s`` format string on ``record.msg`` and the values in
+        # ``record.args``, UN-interpolated. ``getMessage()`` performs the
+        # deferred ``msg % args`` so the log line shows the real values
+        # instead of literal ``%s`` placeholders.
+        try:
+            event = record.getMessage()
+        except Exception:
+            event = str(record.msg)
         return {
-            "event": str(record.msg),
+            "event": event,
             "level": record.levelname.lower(),
         }
 
@@ -181,13 +241,16 @@ class _UILogHandler(logging.Handler):
 class UIEventBridge:
     """Installs/uninstalls the UI log handler on the root logger."""
 
-    def __init__(self, state: AppState, page: ft.Page) -> None:
+    def __init__(
+        self, state: AppState, page: ft.Page, loop: asyncio.AbstractEventLoop,
+    ) -> None:
         self.state = state
         self.page = page
+        self._loop = loop
         self._handler: _UILogHandler | None = None
 
     def install(self) -> None:
-        self._handler = _UILogHandler(self.state, self.page)
+        self._handler = _UILogHandler(self.state, self.page, self._loop)
         self._handler.setLevel(logging.DEBUG)
         # Tag so configure_logging() doesn't strip us when the pipeline
         # reconfigures structlog at startup.

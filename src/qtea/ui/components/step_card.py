@@ -13,6 +13,7 @@ from qtea.ui.theme import (
     PHASE_COLORS,
     STATUS_COLORS,
     STATUS_ICONS,
+    sz,
 )
 
 
@@ -46,13 +47,13 @@ def build_step_card(step: StepUIState, on_click=None) -> ft.Container:
     # Status icon
     status_icon = ft.Icon(icon_name,
         color=status_color,
-        size=22,
+        size=sz(22),
     )
 
     # Step number + name
     step_label = ft.Text(
         f"{step.number:02d}  {step.name}",
-        size=14,
+        size=sz(14),
         weight=ft.FontWeight.W_600 if is_active else ft.FontWeight.W_400,
         color=ON_SURFACE if step.status != "pending" else ON_SURFACE_DIM,
     )
@@ -61,7 +62,7 @@ def build_step_card(step: StepUIState, on_click=None) -> ft.Container:
     phase_badge = ft.Container(
         content=ft.Text(
             step.phase,
-            size=10,
+            size=sz(10),
             weight=ft.FontWeight.BOLD,
             color="#FFFFFF",
         ),
@@ -84,7 +85,7 @@ def build_step_card(step: StepUIState, on_click=None) -> ft.Container:
     if step.status in ("in_progress", "completed", "failed", "warned"):
         elapsed_text = ft.Text(
             _fmt_elapsed(step.elapsed_s),
-            size=12,
+            size=sz(12),
             color=ON_SURFACE_DIM,
             data="live_step_elapsed" if step.status == "in_progress" else None,
         )
@@ -95,7 +96,7 @@ def build_step_card(step: StepUIState, on_click=None) -> ft.Container:
             ft.Container(
                 content=ft.Text(
                     f"attempt {step.attempts}",
-                    size=10,
+                    size=sz(10),
                     color="#FFB74D",
                 ),
                 bgcolor="#3E2E00",
@@ -107,7 +108,7 @@ def build_step_card(step: StepUIState, on_click=None) -> ft.Container:
     cost_str = _fmt_cost(step.cost_usd)
     if cost_str:
         detail_parts.append(
-            ft.Text(cost_str, size=12, color="#FF5252"),
+            ft.Text(cost_str, size=sz(12), color="#FF5252"),
         )
 
     if step.sub_status:
@@ -115,7 +116,7 @@ def build_step_card(step: StepUIState, on_click=None) -> ft.Container:
         sub_color = "#66BB6A" if step.sub_status == "all_passed" else "#FFB74D"
         detail_parts.append(
             ft.Container(
-                content=ft.Text(label, size=10, color=sub_color),
+                content=ft.Text(label, size=sz(10), color=sub_color),
                 bgcolor="#1B2E1B" if step.sub_status == "all_passed" else "#3E2E00",
                 border_radius=4,
                 padding=ft.Padding.symmetric(horizontal=6, vertical=1),
@@ -126,7 +127,7 @@ def build_step_card(step: StepUIState, on_click=None) -> ft.Container:
         detail_parts.append(
             ft.Text(
                 step.agent_name,
-                size=11,
+                size=sz(11),
                 color="#00BFA5",
                 italic=True,
             )
@@ -143,7 +144,7 @@ def build_step_card(step: StepUIState, on_click=None) -> ft.Container:
     if step.error and step.status == "failed":
         error_row = ft.Text(
             step.error[:120],
-            size=11,
+            size=sz(11),
             color="#FF5252",
             max_lines=2,
             overflow=ft.TextOverflow.ELLIPSIS,

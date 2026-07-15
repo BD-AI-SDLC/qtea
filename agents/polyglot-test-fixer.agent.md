@@ -176,6 +176,28 @@ When the user prompt includes a "LIVE DIAGNOSIS" section, treat it as authoritat
 3. **Patch based on the live observation**, not the traceback text alone. The traceback tells you *which* assertion failed; the snapshot tells you *what changed in the DOM*.
 4. **Match the active module's language** when writing the patched file. Never emit a Python patch for a TypeScript test or vice versa. If the staged auth helper is missing, refuses to import, or returns an error, abort the heal attempt with the literal token `AUTH_PATH_UNAVAILABLE` — the orchestrator handles bug-report classification from there.
 
+## Unhealed snapshot hand-off
+
+If you captured a live snapshot (Live Diagnosis step 2) but end up NOT
+applying a patch — `OUT_OF_SCOPE`, no viable selector found, or any other
+abort — write it to `./unhealed-snapshot.md` in your workdir before
+finishing, with:
+
+- The URL you navigated to and the failure class from the prompt.
+- The AOM snapshot content (role + accessible name + visible text only —
+  same discipline as your patch reasoning).
+- One paragraph on what you observed vs. what the traceback expected.
+
+This is the only live evidence of the failure state that survives past
+this heal attempt. If the test is still failing after this attempt, the
+orchestrator promotes this file into `artifacts/step09/self-heal/` so the
+debug agent's RCA can cite the actual DOM state instead of the traceback
+alone. Apply the same redaction discipline as **Network-capture
+redaction** above — never write header/cookie/token or form-field values
+into this file verbatim. Skip it entirely if you never reached a live
+snapshot (e.g. an `assertion_value` failure resolved from the traceback
+alone).
+
 ## Process
 
 1. Read the failed test source. Resolve its POM/locator file from the failing test's

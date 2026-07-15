@@ -12,7 +12,7 @@ from pathlib import Path
 import flet as ft
 
 from qtea.ui.components.log_viewer import build_log_viewer
-from qtea.ui.state import STEP_DEFINITIONS, AppState
+from qtea.ui.state import STEP_DEFINITIONS, AppState, AuxAgentUIState
 from qtea.ui.theme import (
     BACKGROUND,
     CARD_BG,
@@ -22,10 +22,15 @@ from qtea.ui.theme import (
     PHASE_COLORS,
     PRIMARY,
     STATUS_COLORS,
+    sz,
 )
 
 
-def _fmt_elapsed(seconds: float) -> str:
+def _fmt_elapsed(seconds: float | None) -> str:
+    # None-safe: a step that errored/never-emitted may carry None elapsed;
+    # `None < 60` raises TypeError, which used to blow up the whole results
+    # view and strand the user on the initial screen.
+    seconds = seconds or 0
     if seconds < 60:
         return f"{seconds:.0f}s"
     m, s = divmod(int(seconds), 60)
@@ -35,7 +40,9 @@ def _fmt_elapsed(seconds: float) -> str:
     return f"{h}h {m:02d}m"
 
 
-def _fmt_tokens(n: int) -> str:
+def _fmt_tokens(n: int | None) -> str:
+    # None-safe (see _fmt_elapsed): step.end may carry null token counts.
+    n = n or 0
     if n < 1000:
         return str(n)
     if n < 1_000_000:
@@ -51,21 +58,37 @@ def build_results_view(
     """Build the post-run results dashboard."""
 
     is_success = state.exit_code == 0
+    # A user-initiated Stop (exit 130 / cancel_requested) is not a failure —
+    # label it distinctly so the summary reads as "stopped at step N", not a
+    # crash.
+    is_stopped = (
+        not is_success
+        and (state.exit_code == 130 or getattr(state, "cancel_requested", False))
+    )
 
     # ── Status banner ────────────────────────────────────────────────────
-    banner_icon = ft.Icons.CHECK_CIRCLE if is_success else ft.Icons.ERROR
-    banner_color = "#66BB6A" if is_success else "#FF5252"
-    banner_text = "Pipeline Completed Successfully" if is_success else "Pipeline Failed"
+    if is_success:
+        banner_icon, banner_color, banner_text = (
+            ft.Icons.CHECK_CIRCLE, "#66BB6A", "Pipeline Completed Successfully"
+        )
+    elif is_stopped:
+        banner_icon, banner_color, banner_text = (
+            ft.Icons.STOP_CIRCLE_OUTLINED, "#FFB74D", "Pipeline Stopped"
+        )
+    else:
+        banner_icon, banner_color, banner_text = (
+            ft.Icons.ERROR, "#FF5252", "Pipeline Failed"
+        )
 
     banner = ft.Container(
         content=ft.Row(
             controls=[
-                ft.Icon(banner_icon, color=banner_color, size=36),
+                ft.Icon(banner_icon, color=banner_color, size=sz(36)),
                 ft.Column(
                     controls=[
                         ft.Text(
                             banner_text,
-                            size=22,
+                            size=sz(22),
                             weight=ft.FontWeight.BOLD,
                             color=banner_color,
                         ),
@@ -73,20 +96,20 @@ def build_results_view(
                             controls=[
                                 ft.Text(
                                     f"Run: {state.run_id or 'N/A'}",
-                                    size=12,
+                                    size=sz(12),
                                     color=ON_SURFACE_DIM,
                                     font_family="Courier New",
                                 ),
-                                ft.Text("|", size=12, color=DIVIDER),
+                                ft.Text("|", size=sz(12), color=DIVIDER),
                                 ft.Text(
                                     f"Duration: {_fmt_elapsed(state.elapsed_s)}",
-                                    size=12,
+                                    size=sz(12),
                                     color=ON_SURFACE_DIM,
                                 ),
-                                ft.Text("|", size=12, color=DIVIDER),
+                                ft.Text("|", size=sz(12), color=DIVIDER),
                                 ft.Text(
-                                    f"Cost: ${state.total_cost:.2f}",
-                                    size=12,
+                                    f"Cost: ${state.total_cost or 0:.2f}",
+                                    size=sz(12),
                                     color="#FF5252",
                                 ),
                             ],
@@ -117,13 +140,13 @@ def build_results_view(
         table_rows.append(
             ft.DataRow(
                 cells=[
-                    ft.DataCell(ft.Text(str(num), size=12, color=ON_SURFACE)),
-                    ft.DataCell(ft.Text(name, size=12, color=ON_SURFACE)),
+                    ft.DataCell(ft.Text(str(num), size=sz(12), color=ON_SURFACE)),
+                    ft.DataCell(ft.Text(name, size=sz(12), color=ON_SURFACE)),
                     ft.DataCell(
                         ft.Container(
                             content=ft.Text(
                                 s.status,
-                                size=10,
+                                size=sz(10),
                                 color="#FFFFFF",
                                 weight=ft.FontWeight.BOLD,
                             ),
@@ -133,41 +156,61 @@ def build_results_view(
                         )
                     ),
                     ft.DataCell(
-                        ft.Text(_fmt_elapsed(s.elapsed_s), size=12, color=ON_SURFACE_DIM)
+                        ft.Text(_fmt_elapsed(s.elapsed_s), size=sz(12), color=ON_SURFACE_DIM)
                     ),
                     ft.DataCell(
-                        ft.Text(_fmt_tokens(s.tokens_in), size=12, color=ON_SURFACE_DIM)
+                        ft.Text(_fmt_tokens(s.tokens_in), size=sz(12), color=ON_SURFACE_DIM)
                     ),
                     ft.DataCell(
-                        ft.Text(_fmt_tokens(s.tokens_out), size=12, color=ON_SURFACE_DIM)
-                    ),
-                    ft.DataCell(
-                        ft.Text(str(s.agent_calls), size=12, color=ON_SURFACE_DIM)
+                        ft.Text(_fmt_tokens(s.tokens_out), size=sz(12), color=ON_SURFACE_DIM)
                     ),
                     ft.DataCell(
                         ft.Text(
-                            f"${s.cost_usd:.2f}" if s.cost_usd > 0 else "-",
-                            size=12,
-                            color="#FF5252" if s.cost_usd > 0 else ON_SURFACE_DIM,
+                            _fmt_tokens(s.cache_read) if s.cache_read else "-",
+                            size=sz(12),
+                            color=ON_SURFACE_DIM,
+                        )
+                    ),
+                    ft.DataCell(
+                        ft.Text(
+                            _fmt_tokens(s.cache_write) if s.cache_write else "-",
+                            size=sz(12),
+                            color=ON_SURFACE_DIM,
+                        )
+                    ),
+                    ft.DataCell(
+                        ft.Text(str(s.agent_calls), size=sz(12), color=ON_SURFACE_DIM)
+                    ),
+                    ft.DataCell(
+                        ft.Text(
+                            f"${s.cost_usd:.2f}" if (s.cost_usd or 0) > 0 else "-",
+                            size=sz(12),
+                            color="#FF5252" if (s.cost_usd or 0) > 0 else ON_SURFACE_DIM,
                         )
                     ),
                 ],
             )
         )
 
+    # Aux rows — one per helper agent (debug / critical-thinking /
+    # principal-engineer) that fired on retry exhaustion. Sit between the
+    # step rows and TOTAL so the TOTAL visibly sums both groups.
+    for aux in state.auxiliary_records:
+        table_rows.append(_aux_row(aux))
+
     # Totals row
     table_rows.append(
         ft.DataRow(
             cells=[
-                ft.DataCell(ft.Text("", size=12)),
+                ft.DataCell(ft.Text("", size=sz(12))),
                 ft.DataCell(
-                    ft.Text("TOTAL", size=12, weight=ft.FontWeight.BOLD, color=ON_SURFACE)
+                    ft.Text("TOTAL", size=sz(12), weight=ft.FontWeight.BOLD, color=ON_SURFACE)
                 ),
-                ft.DataCell(ft.Text("", size=12)),
+                ft.DataCell(ft.Text("", size=sz(12))),
                 ft.DataCell(
                     ft.Text(
                         _fmt_elapsed(state.elapsed_s),
-                        size=12,
+                        size=sz(12),
                         weight=ft.FontWeight.BOLD,
                         color=ON_SURFACE,
                     )
@@ -175,7 +218,7 @@ def build_results_view(
                 ft.DataCell(
                     ft.Text(
                         _fmt_tokens(state.total_tokens_in),
-                        size=12,
+                        size=sz(12),
                         weight=ft.FontWeight.BOLD,
                         color=ON_SURFACE,
                     )
@@ -183,7 +226,23 @@ def build_results_view(
                 ft.DataCell(
                     ft.Text(
                         _fmt_tokens(state.total_tokens_out),
-                        size=12,
+                        size=sz(12),
+                        weight=ft.FontWeight.BOLD,
+                        color=ON_SURFACE,
+                    )
+                ),
+                ft.DataCell(
+                    ft.Text(
+                        _fmt_tokens(state.total_cache_read),
+                        size=sz(12),
+                        weight=ft.FontWeight.BOLD,
+                        color=ON_SURFACE,
+                    )
+                ),
+                ft.DataCell(
+                    ft.Text(
+                        _fmt_tokens(state.total_cache_write),
+                        size=sz(12),
                         weight=ft.FontWeight.BOLD,
                         color=ON_SURFACE,
                     )
@@ -191,15 +250,15 @@ def build_results_view(
                 ft.DataCell(
                     ft.Text(
                         str(state.total_agent_calls),
-                        size=12,
+                        size=sz(12),
                         weight=ft.FontWeight.BOLD,
                         color=ON_SURFACE,
                     )
                 ),
                 ft.DataCell(
                     ft.Text(
-                        f"${state.total_cost:.2f}",
-                        size=12,
+                        f"${state.total_cost or 0:.2f}",
+                        size=sz(12),
                         weight=ft.FontWeight.BOLD,
                         color="#FF5252",
                     )
@@ -213,21 +272,23 @@ def build_results_view(
             controls=[
                 ft.Text(
                     "STEP SUMMARY",
-                    size=10,
+                    size=sz(10),
                     weight=ft.FontWeight.BOLD,
                     color=ON_SURFACE_DIM,
                 ),
                 ft.Container(height=8),
                 ft.DataTable(
                     columns=[
-                        ft.DataColumn(ft.Text("#", size=11, color=ON_SURFACE_DIM)),
-                        ft.DataColumn(ft.Text("Step", size=11, color=ON_SURFACE_DIM)),
-                        ft.DataColumn(ft.Text("Status", size=11, color=ON_SURFACE_DIM)),
-                        ft.DataColumn(ft.Text("Duration", size=11, color=ON_SURFACE_DIM)),
-                        ft.DataColumn(ft.Text("Tok In", size=11, color=ON_SURFACE_DIM)),
-                        ft.DataColumn(ft.Text("Tok Out", size=11, color=ON_SURFACE_DIM)),
-                        ft.DataColumn(ft.Text("Agents", size=11, color=ON_SURFACE_DIM)),
-                        ft.DataColumn(ft.Text("Cost", size=11, color=ON_SURFACE_DIM)),
+                        ft.DataColumn(ft.Text("#", size=sz(11), color=ON_SURFACE_DIM)),
+                        ft.DataColumn(ft.Text("Step", size=sz(11), color=ON_SURFACE_DIM)),
+                        ft.DataColumn(ft.Text("Status", size=sz(11), color=ON_SURFACE_DIM)),
+                        ft.DataColumn(ft.Text("Duration", size=sz(11), color=ON_SURFACE_DIM)),
+                        ft.DataColumn(ft.Text("Tok In", size=sz(11), color=ON_SURFACE_DIM)),
+                        ft.DataColumn(ft.Text("Tok Out", size=sz(11), color=ON_SURFACE_DIM)),
+                        ft.DataColumn(ft.Text("Cache R", size=sz(11), color=ON_SURFACE_DIM)),
+                        ft.DataColumn(ft.Text("Cache W", size=sz(11), color=ON_SURFACE_DIM)),
+                        ft.DataColumn(ft.Text("Agents", size=sz(11), color=ON_SURFACE_DIM)),
+                        ft.DataColumn(ft.Text("Cost", size=sz(11), color=ON_SURFACE_DIM)),
                     ],
                     rows=table_rows,
                     heading_row_height=32,
@@ -269,7 +330,7 @@ def build_results_view(
                             controls=[
                                 ft.Text(
                                     "TEST RESULTS",
-                                    size=10,
+                                    size=sz(10),
                                     weight=ft.FontWeight.BOLD,
                                     color=ON_SURFACE_DIM,
                                 ),
@@ -287,11 +348,11 @@ def build_results_view(
                                 ft.Container(height=8),
                                 ft.Row(
                                     controls=[
-                                        ft.Text("Pass Rate", size=13, color=ON_SURFACE_DIM),
+                                        ft.Text("Pass Rate", size=sz(13), color=ON_SURFACE_DIM),
                                         ft.Container(expand=True),
                                         ft.Text(
                                             f"{pass_rate:.1f}%",
-                                            size=18,
+                                            size=sz(18),
                                             weight=ft.FontWeight.BOLD,
                                             color=rate_color,
                                         ),
@@ -312,24 +373,53 @@ def build_results_view(
                         border_radius=12,
                         border=ft.Border.all(1, DIVIDER),
                     )
-                except (json.JSONDecodeError, OSError):
+                except (json.JSONDecodeError, OSError, AttributeError, TypeError):
+                    # Malformed run-results.json (e.g. unexpected root shape)
+                    # should only drop the TEST RESULTS section, not the
+                    # whole results view via the caller's fallback path.
                     pass
 
     # ── Collapsible log viewer ──────────────────────────────────────────
-    _log_height: dict[str, float] = {"h": 400.0}
+    # The summary table (+ test results) and the log panel share a fixed
+    # vertical budget once logs are opened, split by a drag handle between
+    # them — dragging up shrinks the top area and grows the log panel,
+    # dragging down does the opposite. Before logs are shown, the top area
+    # keeps its natural (unconstrained) height.
+    _split: dict[str, float] = {"top": 480.0, "log": 400.0}
+    _MIN_PANE = 150.0
+
+    # `scroll` starts as None: with logs hidden, top_section.height is None
+    # (unbounded), and a vertically-scrollable Column with unbounded height
+    # trips Flutter's "Vertical viewport was given unbounded height" render
+    # assertion — which crashes the flet-desktop client, reconnects, rebuilds
+    # this same view, and crashes again (an endless flicker loop). The OUTER
+    # Column already scrolls the whole view, so no inner scroll is needed
+    # here. Inner scroll is only turned on when logs are shown, at which point
+    # top_section gets a bounded height (see _toggle_logs) and scrolling is
+    # safe.
+    top_column = ft.Column(
+        controls=[summary_table, ft.Container(height=12), test_results_section],
+        spacing=0,
+        scroll=None,
+    )
+    top_section = ft.Container(content=top_column, height=None)
 
     log_section = ft.Container(
         content=build_log_viewer(page, state),
-        height=_log_height["h"],
+        height=_split["log"],
         visible=False,
-        border_radius=ft.BorderRadius(12, 12, 0, 0),
+        border_radius=ft.BorderRadius(0, 0, 12, 12),
     )
 
-    def _on_log_resize(e: ft.DragUpdateEvent) -> None:
+    def _on_split_drag(e: ft.DragUpdateEvent) -> None:
         delta = e.local_delta.y if e.local_delta else (e.primary_delta or 0.0)
-        new_h = max(150.0, min(900.0, _log_height["h"] + delta))
-        _log_height["h"] = new_h
-        log_section.height = new_h
+        total = _split["top"] + _split["log"]
+        new_top = max(_MIN_PANE, min(total - _MIN_PANE, _split["top"] + delta))
+        new_log = total - new_top
+        _split["top"] = new_top
+        _split["log"] = new_log
+        top_section.height = new_top
+        log_section.height = new_log
         import contextlib as _cl
         with _cl.suppress(Exception):
             page.update()
@@ -350,12 +440,12 @@ def build_results_view(
             height=14,
             bgcolor=CARD_BG,
             border=ft.Border.all(1, DIVIDER),
-            border_radius=ft.BorderRadius(0, 0, 12, 12),
-            tooltip="Drag to resize log panel",
+            border_radius=ft.BorderRadius(12, 12, 0, 0),
+            tooltip="Drag to resize the summary / logs split",
         ),
         mouse_cursor=ft.MouseCursor.RESIZE_ROW,
         drag_interval=10,
-        on_vertical_drag_update=_on_log_resize,
+        on_vertical_drag_update=_on_split_drag,
         visible=False,
     )
 
@@ -371,6 +461,14 @@ def build_results_view(
         def _toggle_logs(e: ft.ControlEvent) -> None:
             log_section.visible = not log_section.visible
             resize_handle.visible = log_section.visible
+            # Only constrain the top area's height (and make it scrollable)
+            # once the split is active — otherwise let it size naturally. The
+            # inner scroll must follow the bounded height: enabling scroll on
+            # an unbounded (height=None) Column crashes the Flutter renderer
+            # (see the top_column comment above).
+            top_section.height = _split["top"] if log_section.visible else None
+            top_column.scroll = ft.ScrollMode.AUTO if log_section.visible else None
+            log_section.height = _split["log"]
             log_btn.text = "Hide Logs" if log_section.visible else "View Logs"
             page.update()
 
@@ -437,12 +535,9 @@ def build_results_view(
                 ft.Container(height=16),
                 banner,
                 ft.Container(height=12),
-                summary_table,
-                ft.Container(height=12),
-                test_results_section,
-                ft.Container(height=12),
-                log_section,
+                top_section,
                 resize_handle,
+                log_section,
                 ft.Container(height=16),
                 actions_row,
                 ft.Container(height=24),
@@ -457,20 +552,108 @@ def build_results_view(
     )
 
 
+_AUX_PHASE_CODES = {
+    "debug": "D",
+    "critical_thinking": "C",
+    "principal_engineer": "P",
+}
+
+_AUX_PHASE_LABELS = {
+    "debug": "Debug agent",
+    "critical_thinking": "Critical thinking",
+    "principal_engineer": "Principal SW engineer",
+}
+
+
+def _aux_row(aux: AuxAgentUIState) -> ft.DataRow:
+    """One data row per helper agent, styled distinctly (dim + italic) so
+    it reads as a sub-item of the parent step rather than a real pipeline
+    step."""
+    code = _AUX_PHASE_CODES.get(aux.phase, "?")
+    label = _AUX_PHASE_LABELS.get(aux.phase, aux.phase or aux.agent)
+    status_color = STATUS_COLORS.get(aux.status, ON_SURFACE_DIM)
+    return ft.DataRow(
+        cells=[
+            ft.DataCell(
+                ft.Text(
+                    f"{code}{aux.step}",
+                    size=sz(11),
+                    color=ON_SURFACE_DIM,
+                    italic=True,
+                )
+            ),
+            ft.DataCell(
+                ft.Text(
+                    f"{label} (step {aux.step:02d})",
+                    size=sz(12),
+                    color=ON_SURFACE_DIM,
+                    italic=True,
+                )
+            ),
+            ft.DataCell(
+                ft.Container(
+                    content=ft.Text(
+                        aux.status,
+                        size=sz(10),
+                        color="#FFFFFF",
+                        weight=ft.FontWeight.BOLD,
+                    ),
+                    bgcolor=status_color,
+                    border_radius=4,
+                    padding=ft.Padding.symmetric(horizontal=8, vertical=2),
+                )
+            ),
+            ft.DataCell(
+                ft.Text(_fmt_elapsed(aux.duration_s), size=sz(12), color=ON_SURFACE_DIM)
+            ),
+            ft.DataCell(
+                ft.Text(_fmt_tokens(aux.tokens_in), size=sz(12), color=ON_SURFACE_DIM)
+            ),
+            ft.DataCell(
+                ft.Text(_fmt_tokens(aux.tokens_out), size=sz(12), color=ON_SURFACE_DIM)
+            ),
+            ft.DataCell(
+                ft.Text(
+                    _fmt_tokens(aux.cache_read) if aux.cache_read else "-",
+                    size=sz(12),
+                    color=ON_SURFACE_DIM,
+                )
+            ),
+            ft.DataCell(
+                ft.Text(
+                    _fmt_tokens(aux.cache_write) if aux.cache_write else "-",
+                    size=sz(12),
+                    color=ON_SURFACE_DIM,
+                )
+            ),
+            ft.DataCell(
+                ft.Text(str(aux.agent_calls), size=sz(12), color=ON_SURFACE_DIM)
+            ),
+            ft.DataCell(
+                ft.Text(
+                    f"${aux.cost_usd:.2f}" if (aux.cost_usd or 0) > 0 else "-",
+                    size=sz(12),
+                    color="#FF5252" if (aux.cost_usd or 0) > 0 else ON_SURFACE_DIM,
+                )
+            ),
+        ],
+    )
+
+
 def _stat_card(label: str, value: str, color: str) -> ft.Container:
     return ft.Container(
         content=ft.Column(
             controls=[
                 ft.Text(
                     value,
-                    size=24,
+                    size=sz(24),
                     weight=ft.FontWeight.BOLD,
                     color=color,
                     text_align=ft.TextAlign.CENTER,
                 ),
                 ft.Text(
                     label,
-                    size=11,
+                    size=sz(11),
                     color=ON_SURFACE_DIM,
                     text_align=ft.TextAlign.CENTER,
                 ),

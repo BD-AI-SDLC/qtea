@@ -736,6 +736,49 @@ def test_run_tests_unknown_parser_emits_synthetic_failure(
     assert "totally-fake-parser" in entry.message
 
 
+def test_run_tests_zero_results_exit_zero_is_failure(tmp_path: Path) -> None:
+    """A command that exits 0 but produces NO parseable results must be a
+    failure, not a false-green all_passed. Covers findings 10/11/12: a passing
+    Playwright/Cypress suite whose output the parser can't read.
+    """
+    # Exits 0 but never writes qtea-junit.xml -> junit parser gets [].
+    script = _write_py_script(tmp_path / "green_but_silent.py", "import sys; sys.exit(0)")
+    cmd = f'{sys.executable} {script.as_posix()}'
+    result = run_tests("pytest", cwd=tmp_path, detected_command=cmd, timeout_s=10)
+    assert result.exit_code == 0
+    assert len(result.results) == 1
+    entry = result.results[0]
+    assert entry.id == "T-runner-failure"
+    assert entry.status == "error"
+    assert entry.runner_failure is not None
+    assert entry.runner_failure["kind"] == "no_results_exit_zero"
+    # And totals must NOT read as a clean pass.
+    assert result.totals["tests"] == 0
+    assert result.totals["infrastructure_errors"] == 1
+
+
+def test_resolve_command_forces_playwright_reporter_json(tmp_path: Path) -> None:
+    """A detected bare `npx playwright test` must gain --reporter=json so its
+    stdout is parseable (finding 12)."""
+    from qtea.test_runner import resolve_command
+
+    cmd, parser = resolve_command(
+        "playwright-ts", detected="npx playwright test", cwd=tmp_path,
+    )
+    assert "--reporter=json" in cmd
+    assert parser == "playwright-json"
+
+
+def test_resolve_command_respects_explicit_playwright_reporter(tmp_path: Path) -> None:
+    """Don't double-inject when the detected command already sets a reporter."""
+    from qtea.test_runner import resolve_command
+
+    cmd, _ = resolve_command(
+        "playwright-ts", detected="npx playwright test --reporter=line", cwd=tmp_path,
+    )
+    assert cmd.count("--reporter") == 1
+
+
 def test_normalize_id_is_stable() -> None:
     a = _normalize_id("tests/test_login.py", "logs in successfully")
     b = _normalize_id("tests/test_login.py", "logs in successfully")

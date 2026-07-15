@@ -372,21 +372,12 @@ class InteractivePromptStrategy(EnvStrategy):
 
             questions: list[Question] = []
             for k in keys:
-                is_secret = bool(_SECRET_NAME_RE.search(k))
                 current = self._defaults.get(k, "")
-                if is_secret:
-                    state_str = (
-                        "secret found — leave blank to keep"
-                        if current
-                        else "secret not found — type to supply"
-                    )
-                    context = f"{state_str}"
-                else:
-                    context = (
-                        f"current: {current}"
-                        if current
-                        else "no default discovered"
-                    )
+                context = (
+                    "value found — press Enter to keep, or type new"
+                    if current
+                    else "no value found — type to supply"
+                )
                 questions.append(
                     Question(
                         id=k,
@@ -394,16 +385,6 @@ class InteractivePromptStrategy(EnvStrategy):
                         prompt_text=k,
                         context=context,
                     )
-                )
-
-            if any(_SECRET_NAME_RE.search(k) for k in keys):
-                log.warning(
-                    "env_resolver.ui_secret_input_unmasked",
-                    note=(
-                        "Secret values typed in the UI dialog are not "
-                        "password-masked yet — prefer .env / process env "
-                        "for sensitive keys."
-                    ),
                 )
 
             answers = prompt_user(questions, agent_label="env-resolver")
@@ -440,27 +421,19 @@ class InteractivePromptStrategy(EnvStrategy):
 
         out = {}
         for k in keys:
-            is_secret = bool(_SECRET_NAME_RE.search(k))
             current = self._defaults.get(k, "")
+            suffix = (
+                "[dim](found — Enter to keep, or type new)[/]"
+                if current
+                else "[dim](not found — type to supply)[/]"
+            )
             console.print()
-            if is_secret:
-                suffix = (
-                    "[dim](found — Enter to keep, or type new)[/]"
-                    if current
-                    else "[dim](not found — type to supply)[/]"
-                )
-                val = Prompt.ask(
-                    f"  [green]{k}[/green] {suffix}",
-                    default=current,
-                    password=True,
-                    show_default=False,
-                )
-            else:
-                val = Prompt.ask(
-                    f"  [green]{k}[/green]",
-                    default=current or "",
-                    show_default=bool(current),
-                )
+            val = Prompt.ask(
+                f"  [green]{k}[/green] {suffix}",
+                default=current,
+                password=True,
+                show_default=False,
+            )
             val = (val or "").strip()
             if val:
                 out[k] = val

@@ -16,6 +16,7 @@ The JSONL file is unchanged — one ISO-timestamped JSON object per line.
 from __future__ import annotations
 
 import logging
+import re
 import sys
 import warnings
 from pathlib import Path
@@ -329,6 +330,32 @@ def _make_console_processors(use_colors: bool) -> list[Any]:
     ]
 
 
+_SECRET_VALUE_RE = re.compile(
+    r"(?:"
+    r"sk-ant-api03-[A-Za-z0-9_-]+"
+    r"|sk-[A-Za-z0-9]{20,}"
+    r"|ghp_[A-Za-z0-9]{36}"
+    r"|glpat-[A-Za-z0-9_-]+"
+    r"|xox[bpas]-[A-Za-z0-9_-]+"
+    r"|eyJ[A-Za-z0-9_-]{20,}\.eyJ[A-Za-z0-9_-]+"
+    r"|AKIA[A-Z0-9]{16}"
+    r")"
+)
+
+
+def _mask_str(val: str) -> str:
+    return _SECRET_VALUE_RE.sub("***REDACTED***", val)
+
+
+def _mask_secrets_processor(
+    logger: WrappedLogger, method_name: str, event_dict: EventDict,
+) -> EventDict:
+    for key, val in event_dict.items():
+        if isinstance(val, str):
+            event_dict[key] = _mask_str(val)
+    return event_dict
+
+
 def configure_logging(
     *,
     level: str = "info",
@@ -347,6 +374,7 @@ def configure_logging(
         structlog.processors.add_log_level,
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
+        _mask_secrets_processor,
         structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
     ]
 
@@ -357,6 +385,23 @@ def configure_logging(
         logger_factory=structlog.stdlib.LoggerFactory(),
         cache_logger_on_first_use=True,
     )
+
+    # Pre-chain for FOREIGN (stdlib) log records — i.e. logs from third-party
+    # libraries like the Anthropic SDK, httpx, etc. that were NOT emitted
+    # through structlog. Without this, a record such as the SDK's
+    # ``log.info("Retrying request to %s in %f seconds", url, timeout)`` reaches
+    # the ProcessorFormatter with its ``%s``/``%f`` message and its args
+    # UN-APPLIED, so it renders literally as "Retrying request to %s in %f
+    # seconds". ``PositionalArgumentsFormatter`` performs the deferred
+    # ``msg % args`` interpolation; add_log_level / exc-info / secret-masking
+    # keep foreign records consistent with structlog-native ones.
+    foreign_pre_chain: list[Any] = [
+        structlog.stdlib.add_log_level,
+        structlog.stdlib.PositionalArgumentsFormatter(),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+        _mask_secrets_processor,
+    ]
 
     handlers: list[logging.Handler] = []
 
@@ -371,6 +416,7 @@ def configure_logging(
         console_h.setLevel(lvl)
         console_h.setFormatter(
             structlog.stdlib.ProcessorFormatter(
+                foreign_pre_chain=foreign_pre_chain,
                 processors=_make_console_processors(use_colors),
             )
         )
@@ -383,6 +429,7 @@ def configure_logging(
         file_h.setLevel(lvl)
         file_h.setFormatter(
             structlog.stdlib.ProcessorFormatter(
+                foreign_pre_chain=foreign_pre_chain,
                 processors=[
                     structlog.stdlib.ProcessorFormatter.remove_processors_meta,
                     structlog.processors.TimeStamper(fmt="iso", utc=True),

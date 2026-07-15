@@ -113,6 +113,52 @@ def _load_generated_files(ctx: StepContext) -> set[str]:
     return {f.replace("\\", "/") for f in files if isinstance(f, str)}
 
 
+def _load_assertion_oracle(ctx: StepContext) -> dict:
+    """Load the Step-7 code-modification-plan and extract the assertion oracle.
+
+    Returns ``{"expected_values": set[str], "by_method": {name: [criteria]}}``.
+    ``expected_values`` is the union of every assertion criterion's
+    ``expected_literal`` / ``expected_symbol`` — the values the Step-4 design
+    pinned. Step 9's heal gates use it to enforce that a healed assertion moves
+    TOWARD a pinned value (a legitimate transcription-typo correction) and
+    never SWAPS to a value the design never sanctioned (bug-masking) — the
+    "corrected, never weakened" guarantee the count-based gate could not check
+    (finding 28). Empty set when the plan is missing → gates fail OPEN.
+    """
+    p = ctx.workspace.step_dir(7) / "code-modification-plan.json"
+    empty = {"expected_values": set(), "by_method": {}}
+    if not p.exists():
+        return empty
+    try:
+        plan = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return empty
+    expected: set[str] = set()
+    by_method: dict[str, list] = {}
+    for tc in plan.get("test_cases") or []:
+        if not isinstance(tc, dict):
+            continue
+        for po in tc.get("page_objects") or []:
+            if not isinstance(po, dict):
+                continue
+            for mm in po.get("missing_methods") or []:
+                if not isinstance(mm, dict) or mm.get("kind") != "assertion":
+                    continue
+                crits = mm.get("acceptance_criteria") or []
+                if mm.get("name"):
+                    by_method[mm["name"]] = crits
+                for c in crits:
+                    if not isinstance(c, dict):
+                        continue
+                    lit = c.get("expected_literal")
+                    if lit is not None:
+                        expected.add(str(lit))
+                    sym = c.get("expected_symbol")
+                    if sym:
+                        expected.add(str(sym))
+    return {"expected_values": expected, "by_method": by_method}
+
+
 def _sut_tests_dir(
     sut_root: Path,
     *,
@@ -183,6 +229,7 @@ def _clean_sut_artifacts(sut_root: Path) -> None:
 __all__ = [
     "_ISOLATED_TESTS_DIR_NAME",
     "_active_module",
+    "_load_assertion_oracle",
     "_attachment_glob",
     "_clean_sut_artifacts",
     "_detected_command",

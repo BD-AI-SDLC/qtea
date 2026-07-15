@@ -3,13 +3,6 @@
     "playwright": {
       "command": "npx",
       "args": ["-y", "@playwright/mcp@latest", "--headless", "${QTEA_MCP_USER_DATA_DIR_ARG}", "${QTEA_STORAGE_STATE_ARG}"]
-    },
-    "context7": {
-      "type": "http",
-      "url": "https://mcp.context7.com/mcp",
-      "headers": {
-        "CONTEXT7_API_KEY": "${CONTEXT7_API_KEY}"
-      }
     }
   }
 }

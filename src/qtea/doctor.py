@@ -177,10 +177,29 @@ def check_uv() -> Check:
     return Check("uv", "warn", "not installed (only needed for `uv tool install`)")
 
 
+def _find_venv_exe(name: str) -> str | None:
+    """Look for an executable in the project-local .venv (fallback for PATH misses)."""
+    venv = Path.cwd() / ".venv"
+    candidates = (
+        [venv / "Scripts" / f"{name}.exe", venv / "Scripts" / name]
+        if os.name == "nt"
+        else [venv / "bin" / name]
+    )
+    return next((str(p) for p in candidates if p.is_file()), None)
+
+
 def check_ruff() -> Check:
-    if shutil.which("ruff"):
-        ok, out = _probe_cmd(["ruff", "--version"])
-        return Check("ruff", "ok" if ok else "warn", out or "present")
+    found = shutil.which("ruff") or _find_venv_exe("ruff")
+    if found:
+        try:
+            proc = subprocess.run(
+                [found, "--version"],
+                capture_output=True, text=True, timeout=5.0, check=False,
+            )
+            out = (proc.stdout or "").strip() or (proc.stderr or "").strip()
+            return Check("ruff", "ok" if proc.returncode == 0 else "warn", out or "present")
+        except Exception as e:
+            return Check("ruff", "warn", f"found but error: {e}")
     return Check("ruff", "warn", "not installed (dev only)")
 
 

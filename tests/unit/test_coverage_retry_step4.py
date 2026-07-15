@@ -47,7 +47,7 @@ _PLAN_MD = """# Test Plan: Login
 | TC-PLAN-002 | Login bad creds | smoke | P1 | REQ-LOGIN | AC-2 | automation |
 """
 
-_STRATEGY_CLEAN = """# Test Strategy
+_STRATEGY_CLEAN = """# Test Design
 
 ## Scope
 Login.
@@ -77,7 +77,7 @@ Login.
 - **Expected**: error
 """
 
-_STRATEGY_DROPS_PLAN_002 = """# Test Strategy
+_STRATEGY_DROPS_PLAN_002 = """# Test Design
 
 ## Scope
 Login.
@@ -96,7 +96,7 @@ Login.
 - **Expected**: dashboard
 """
 
-_STRATEGY_ACCEPTS_RISK_FOR_PLAN_002 = """# Test Strategy
+_STRATEGY_ACCEPTS_RISK_FOR_PLAN_002 = """# Test Design
 
 ## Scope
 Login.
@@ -118,7 +118,7 @@ Login.
 - **TC-PLAN-002:** Accepted risk — coverage by TC-S-001's negative path branch.
 """
 
-_STRATEGY_CROSS_PRIORITY_MERGE = """# Test Strategy
+_STRATEGY_CROSS_PRIORITY_MERGE = """# Test Design
 
 ## Test Cases
 
@@ -171,7 +171,7 @@ def _seed_upstream(ctx: StepContext) -> None:
 async def test_step4_gate_off_preserves_existing_behavior(
     tmp_path: Path, monkeypatch,
 ):
-    monkeypatch.delenv("QTEA_COVERAGE_AUDIT", raising=False)
+    monkeypatch.setenv("QTEA_COVERAGE_AUDIT", "0")  # off is no longer default (finding 21)
     ctx = _ctx(tmp_path)
     _seed_upstream(ctx)
     install_fake_anthropic(monkeypatch, text=_STRATEGY_DROPS_PLAN_002)

@@ -137,6 +137,69 @@ def _count_strong_assertions(assertion_lines: list[str]) -> int:
     return sum(1 for ln in assertion_lines if _is_strong_assertion(ln))
 
 
+# ---------------------------------------------------------------------------
+# Oracle-directional gate (finding 28/29): a healed assertion may be CORRECTED
+# toward the Step-4 pinned value, but must never SWAP a pinned value for one
+# the design never sanctioned (bug-masking), nor re-point an assertion at a
+# different literal element. Conservative + fail-open: only fires when a
+# literal on an assertion line DISAPPEARED and was replaced by a literal that
+# is NOT in the oracle set. Pure additions and oracle-sanctioned corrections
+# pass; empty oracle → no-op.
+# ---------------------------------------------------------------------------
+
+_ASSERT_LINEISH_RE = re.compile(
+    r"expect\s*\(|\.\s*should\b|(?:^|\s)assert\b|to_have_|toHave|to_be_|toBe|"
+    r"assert(?:Equals|True|False|Null|NotNull|That|Same)",
+    re.IGNORECASE,
+)
+_LITERAL_TOKEN_RE = re.compile(
+    r"""(['"])(?P<s>.*?)\1|(?<![\w.])(?P<n>\d+(?:\.\d+)?)(?![\w.])""",
+)
+
+
+def _assertion_literals(source: str) -> set[str]:
+    """String + numeric literals appearing on assertion-shaped lines."""
+    out: set[str] = set()
+    for line in source.splitlines():
+        if not _ASSERT_LINEISH_RE.search(line):
+            continue
+        for m in _LITERAL_TOKEN_RE.finditer(line):
+            if m.group("s") is not None:
+                out.add(m.group("s"))
+            elif m.group("n") is not None:
+                out.add(m.group("n"))
+    return out
+
+
+def _patch_diverges_from_oracle(
+    pre: bytes | None, post: bytes | None, oracle_values: set[str] | None,
+) -> bool:
+    """True iff the heal SWAPPED an assertion literal for a value the Step-4
+    oracle never sanctioned.
+
+    Fail-open: returns False when there is no pre content, no oracle, or the
+    heal only ADDED literals (no disappearance = not a swap). A disappeared
+    literal replaced by a non-oracle literal is the bug-masking pattern the
+    count-based gate cannot see (equal counts, still "strong"). Also catches an
+    inline assertion locator/value re-point to an unsanctioned literal.
+    """
+    if pre is None or post is None or not oracle_values:
+        return False
+    try:
+        pre_src = pre.decode("utf-8", errors="replace")
+        post_src = post.decode("utf-8", errors="replace")
+    except Exception:
+        return False
+    pre_lits = _assertion_literals(pre_src)
+    post_lits = _assertion_literals(post_src)
+    disappeared = pre_lits - post_lits
+    if not disappeared:
+        return False  # pure addition / no swap
+    appeared = post_lits - pre_lits
+    # A swap is only suspicious when the NEW value is not oracle-sanctioned.
+    return any(v not in oracle_values for v in appeared)
+
+
 def _patch_weakens_assertions(pre: bytes | None, post: bytes | None) -> bool:
     """True iff the post-heal source WEAKENS the test's assertions relative to
     pre-heal — i.e. it removed an assertion, or downgraded a strong assertion
@@ -227,11 +290,13 @@ __all__ = [
     "_ASSERTION_LINE_PATTERNS",
     "_EMPTY_HANDLER_PATTERNS",
     "_XPATH_PATTERNS",
+    "_assertion_literals",
     "_count_empty_handlers",
     "_count_strong_assertions",
     "_count_xpath_markers",
     "_extract_assertion_lines",
     "_is_strong_assertion",
+    "_patch_diverges_from_oracle",
     "_patch_has_anti_patterns",
     "_patch_introduces_xpath",
     "_patch_weakens_assertions",

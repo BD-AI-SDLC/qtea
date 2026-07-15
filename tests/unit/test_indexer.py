@@ -58,7 +58,7 @@ test('should sign in with valid credentials', async ({ page }) => {
 
 it('should show error on bad password', async ({ page }) => {
   await page.getByPlaceholder('email').fill('x');
-  await page.getByText('Invalid').isVisible();
+  await expect(page.getByText('Invalid')).toBeVisible();
 });
 """,
         encoding="utf-8",
@@ -517,9 +517,21 @@ def test_x(page):
     assert not any(v.rule == "zero-assertions" for v in result.violations)
 
 
-def test_zero_assertions_skipped_on_non_python_stack(tmp_path: Path):
+def test_zero_assertions_detected_on_js_ts_stack(tmp_path: Path):
+    """Finding 9: JS/TS now gets a zero-assertion gate too. An expect()-less
+    spec must be flagged (it previously passed as a meaningless green)."""
     (tmp_path / "x.spec.ts").write_text(
         "test('x', async ({ page }) => { await page.click('#a'); });\n",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="playwright-ts")
+    assert any(v.rule == "zero-assertions" for v in result.violations)
+
+
+def test_zero_assertions_jsts_opt_out(tmp_path: Path):
+    """A `qtea-setup` marker opts a JS/TS setup/navigation test out of the gate."""
+    (tmp_path / "x.spec.ts").write_text(
+        "test('nav smoke qtea-setup', async ({ page }) => { await page.goto('/'); });\n",
         encoding="utf-8",
     )
     result = index_tests(tmp_path, framework="playwright-ts")
@@ -680,8 +692,10 @@ def test_blocking_violations_filters_to_errors(tmp_path: Path):
 
 
 def test_no_false_positive_for_env_password(tmp_path: Path):
+    # Includes an assertion so the (separate) zero-assertion gate stays quiet —
+    # this test targets the raw-secret rule, not assertion presence.
     (tmp_path / "good.spec.ts").write_text(
-        """test('x', async ({ page }) => {\n  await page.fill('#pw', process.env.PW);\n});\n""",
+        """test('x', async ({ page }) => {\n  await page.fill('#pw', process.env.PW);\n  await expect(page).toHaveURL(/dashboard/);\n});\n""",
         encoding="utf-8",
     )
     result = index_tests(tmp_path, framework="playwright-ts")
@@ -941,3 +955,154 @@ class EmptyLocators:
     markers = result.support_files[0].tbd_markers
     assert len(markers) == 1
     assert markers[0].description == "real intent"
+
+
+# ---------------------------------------------------------------------------
+# pom-assertion rule (RCA-D)
+# ---------------------------------------------------------------------------
+
+
+def test_pom_assertion_flags_expect_in_agent_authored_method_as_error(
+    tmp_path: Path,
+):
+    """When an ``expect()`` sits inside a method whose name is in
+    ``agent_authored_methods``, the violation MUST be severity=error.
+    Exact regression for the marketing-consent POM assertions written on
+    run 20260708-121117-99f5ed."""
+    pom = tmp_path / "src" / "pages" / "TrialPage.ts"
+    pom.parent.mkdir(parents=True, exist_ok=True)
+    pom.write_text(
+        "export class TrialPage {\n"
+        "  async verifyMarketingConsentLabelText() {\n"
+        "    const loc = this.page.locator('#x');\n"
+        "    await expect(loc).toHaveText('label');\n"
+        "  }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    idx = index_tests(
+        tmp_path, framework="playwright-ts",
+        agent_authored_methods={"verifyMarketingConsentLabelText"},
+    )
+    pom_assertion_violations = [
+        v for v in idx.violations if v.rule == "pom-assertion"
+    ]
+    assert len(pom_assertion_violations) == 1
+    v = pom_assertion_violations[0]
+    assert v.severity == "error"
+    assert "verifyMarketingConsentLabelText" in v.snippet
+    # And it MUST block Step 8:
+    blocked = blocking_violations(idx)
+    assert v in blocked
+
+
+def test_pom_assertion_warns_on_preexisting_method_not_in_plan(
+    tmp_path: Path,
+):
+    """Same file, same assertion — but the method is pre-existing SUT
+    code (not in agent_authored_methods). Severity is warning: logged
+    but does NOT fail Step 8, giving the SUT team migration space."""
+    pom = tmp_path / "src" / "pages" / "TrialPage.ts"
+    pom.parent.mkdir(parents=True, exist_ok=True)
+    pom.write_text(
+        "export class TrialPage {\n"
+        "  async legacyPreexistingCheck() {\n"
+        "    await expect(this.page.locator('#x')).toBeVisible();\n"
+        "  }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    idx = index_tests(
+        tmp_path, framework="playwright-ts",
+        agent_authored_methods={"someOtherMethod"},  # this method NOT in set
+    )
+    pom_assertion_violations = [
+        v for v in idx.violations if v.rule == "pom-assertion"
+    ]
+    assert len(pom_assertion_violations) == 1
+    assert pom_assertion_violations[0].severity == "warning"
+    # And it MUST NOT block Step 8:
+    assert pom_assertion_violations[0] not in blocking_violations(idx)
+
+
+def test_pom_assertion_skips_files_outside_pom_paths(tmp_path: Path):
+    """Assertions in files whose path doesn't include ``/pages/`` etc.
+    are ignored by this rule — it's not the general assertion policy."""
+    utils = tmp_path / "src" / "utils" / "helpers.ts"
+    utils.parent.mkdir(parents=True, exist_ok=True)
+    utils.write_text(
+        "export class Helpers {\n"
+        "  static verifyValue() {\n"
+        "    expect(1).toBe(1);\n"
+        "  }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    idx = index_tests(
+        tmp_path, framework="playwright-ts",
+        agent_authored_methods={"verifyValue"},
+    )
+    assert not any(v.rule == "pom-assertion" for v in idx.violations)
+
+
+def test_pom_assertion_python_bare_assert(tmp_path: Path):
+    """Python POMs with bare ``assert`` in agent-authored methods
+    are flagged as error."""
+    pom = tmp_path / "src" / "pages" / "trial_page.py"
+    pom.parent.mkdir(parents=True, exist_ok=True)
+    pom.write_text(
+        "class TrialPage:\n"
+        "    def verify_something(self):\n"
+        "        assert self.count() == 3\n",
+        encoding="utf-8",
+    )
+    idx = index_tests(
+        tmp_path, framework="playwright-py",
+        agent_authored_methods={"verify_something"},
+    )
+    pom_assertion_violations = [
+        v for v in idx.violations if v.rule == "pom-assertion"
+    ]
+    assert len(pom_assertion_violations) == 1
+    assert pom_assertion_violations[0].severity == "error"
+
+
+def test_pom_assertion_disabled_when_no_authored_methods_passed(
+    tmp_path: Path,
+):
+    """Backwards-compat: callers that don't pass ``agent_authored_methods``
+    skip the pom-assertion rule entirely — legacy code paths that predate
+    the fix are unaffected."""
+    pom = tmp_path / "src" / "pages" / "TrialPage.ts"
+    pom.parent.mkdir(parents=True, exist_ok=True)
+    pom.write_text(
+        "export class TrialPage {\n"
+        "  async check() { await expect(this.page).toHaveTitle('x'); }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    idx = index_tests(tmp_path, framework="playwright-ts")
+    assert not any(v.rule == "pom-assertion" for v in idx.violations)
+
+
+def test_pom_assertion_dedups_multiple_asserts_on_same_line(tmp_path: Path):
+    """Two matching regexes both firing on the same method-line pair
+    must produce only one violation (dedup by (line, method-name))."""
+    pom = tmp_path / "src" / "pages" / "TrialPage.ts"
+    pom.parent.mkdir(parents=True, exist_ok=True)
+    pom.write_text(
+        "export class TrialPage {\n"
+        "  async verifyBoth() {\n"
+        "    expect(1).toBe(1); expect(2).toBe(2);\n"
+        "  }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    idx = index_tests(
+        tmp_path, framework="playwright-ts",
+        agent_authored_methods={"verifyBoth"},
+    )
+    pom_assertion_violations = [
+        v for v in idx.violations if v.rule == "pom-assertion"
+    ]
+    assert len(pom_assertion_violations) == 1

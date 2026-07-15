@@ -7,6 +7,7 @@ milestones remain runnable end-to-end.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import sys
@@ -178,6 +179,7 @@ def _reset_steps_from(state: RunState, from_step: int) -> None:
             del state.steps[k]
     # Re-open the run so pipeline.end can stamp a new finished_at.
     state.finished_at = None
+    state.end_reason = None
 
 
 def _kill_allure_for_workspace(ws: Workspace) -> None:
@@ -637,10 +639,27 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
             pass
     else:
         sut_path = Path(opts.sut).expanduser().resolve()
+        if sut_path.is_symlink():
+            log.warning("pipeline.sut_is_symlink", path=str(sut_path), target=str(sut_path.resolve()))
         if sut_path.is_dir():
             sut_dotenv = sut_path / ".env"
             if sut_dotenv.is_file():
                 load_env(sut_dotenv)
+
+    # On a --from-step rerun, discard the prior run's JSONL log so the fresh
+    # run starts with a clean audit trail — configure_logging opens the
+    # FileHandler in append mode, so without this the log accumulates stale
+    # entries from earlier attempts. Must happen BEFORE configure_logging, or
+    # the handler would hold the file open (Windows would refuse the unlink).
+    # Gated by no_cleanup to stay consistent with _cleanup_step_artifacts.
+    if opts.from_step is not None and not opts.no_cleanup and ws.run_log.exists():
+        try:
+            ws.run_log.unlink()
+        except OSError as e:
+            (console or Console()).print(
+                f"[yellow]cleanup:[/] could not remove prior run log "
+                f"{ws.run_log.name}: {e}"
+            )
 
     log = configure_logging(level=opts.log_level, jsonl_path=ws.run_log, run_id=ws.run_id)
 
@@ -653,6 +672,22 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
     # Refresh source pointers if user changed them.
     state.spec_source = opts.spec
     state.sut_source = opts.sut
+
+    # Claim this run for the current process. On resume this overwrites the
+    # prior (now-dead) pid — correct, since we are the live owner now. Lets
+    # `qtea list` tell a live run from one that died without cleanup.
+    # Re-open the run: resuming an interrupted/crashed run must clear the prior
+    # terminal stamp, else derive_status would report finished/failed while the
+    # resumed run is actively executing. The end-of-run path re-stamps both.
+    state.pid = os.getpid()
+    state.finished_at = None
+    state.end_reason = None
+    try:
+        import psutil
+        state.pid_create_time = psutil.Process().create_time()
+    except Exception:
+        state.pid_create_time = None
+    save_state(state, ws.state_file)
 
     # If user asked to re-enter mid-pipeline, validate prereqs and clear
     # downstream checkpoints so the requested step actually re-executes.
@@ -711,9 +746,18 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
     from qtea.steps.s06_research import _materialize_sut
 
     sut_git_exists = (ws.sut / ".git").exists()
+    # A resume is ANY invocation targeting an existing workspace by --run-id
+    # (with or without --from-step). Finding 1: previously only `--from-step>1`
+    # resumes preserved the SUT; a plain `qtea run --run-id X` re-materialized
+    # (wiped) the tree AND then skipped the already-complete codegen steps,
+    # leaving Step 9 to run against an empty tree — silently destroying the
+    # generated-test branch, the stated deliverable. Now ANY resume whose SUT
+    # branch already carries Step-8's commits preserves it; `--from-step`
+    # keeps its clean-regenerate behaviour via _rollback_sut_to_before_step.
+    resuming = opts.run_id is not None
     is_step_resume = (
-        opts.from_step is not None
-        and opts.from_step > 1
+        resuming
+        and (opts.from_step is None or opts.from_step > 1)
         and sut_git_exists
     )
     step8_rec = state.steps.get(8)
@@ -800,6 +844,37 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
         f"(branch [cyan]{expected_branch}[/cyan])"
     )
 
+    # Invariant (finding 1): the pipeline must NEVER re-materialize (wipe) the
+    # SUT and then skip a code-writing step. When resuming an existing run and
+    # the SUT WAS freshly materialized (skip_materialize is False — e.g. a
+    # branch mismatch forced a re-clone), any previously-"complete" Step 7/8/9
+    # records now point at code that no longer exists on disk. Drop those
+    # records so they regenerate against the fresh tree instead of being
+    # skipped, which would leave Step 9 running on an empty test tree. (A fresh
+    # run has no such records; a --from-step resume already reset them.)
+    if resuming and not skip_materialize and opts.from_step is None:
+        wiped_code_steps = [
+            s for s in sorted(_CODE_WRITING_STEPS)
+            if s in state.steps
+        ]
+        if wiped_code_steps:
+            for s in wiped_code_steps:
+                del state.steps[s]
+            save_state(state, ws.state_file)
+            log.warning(
+                "pipeline.resume_regenerate_after_rematerialize",
+                steps=wiped_code_steps,
+                reason=(
+                    "SUT was re-materialized on resume; code-writing steps "
+                    "reset so they regenerate rather than being skipped "
+                    "against an empty tree (finding 1 invariant)"
+                ),
+            )
+            console.print(
+                f"[yellow]resume:[/] SUT re-materialized — steps "
+                f"{wiped_code_steps} will regenerate (not skipped)"
+            )
+
     # MCP preflight is now lazy: each step declares its `mcp_servers_required`
     # (see `Step` base class) and `_mcp_preflight_for_step` probes those
     # servers just before the step runs (see the step loop below). Steps
@@ -833,133 +908,154 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
 
     selected_steps = _select_steps(opts)
 
-    exit_code = 0
-    _after_step_status = False  # True right after printing a step ok/warned/FAILED line
-    # Index-based iteration so the Step 9->8 back-edge (Gap C) can rewind to
-    # Step 8 and replay 8->9 once. ``_i`` advances at the top of each turn, so
-    # every existing bare ``continue`` moves to the next step unchanged; the
-    # back-edge overrides ``_i`` explicitly before its own ``continue``.
-    _step_list = list(selected_steps)
-    _i = 0
-    while _i < len(_step_list):
-        step_num = _step_list[_i]
-        _i += 1
-        if not opts.force and is_step_complete(state, step_num):
-            if not outputs_match(state, step_num, ws.step_dir(step_num)):
-                log.info("step.invalidated", step=step_num)
-                console.print(f"[yellow]step {step_num:02d} outputs changed - re-running[/]")
+    async def _drive_steps() -> int:
+        exit_code = 0
+        _after_step_status = False  # True right after printing a step ok/warned/FAILED line
+        # Index-based iteration so the Step 9->8 back-edge (Gap C) can rewind to
+        # Step 8 and replay 8->9 once. ``_i`` advances at the top of each turn, so
+        # every existing bare ``continue`` moves to the next step unchanged; the
+        # back-edge overrides ``_i`` explicitly before its own ``continue``.
+        _step_list = list(selected_steps)
+        _i = 0
+        while _i < len(_step_list):
+            step_num = _step_list[_i]
+            _i += 1
+            if not opts.force and is_step_complete(state, step_num):
+                if not outputs_match(state, step_num, ws.step_dir(step_num)):
+                    log.info("step.invalidated", step=step_num)
+                    console.print(f"[yellow]step {step_num:02d} outputs changed - re-running[/]")
+                else:
+                    log.info("step.skip_complete", step=step_num)
+                    console.print(f"[dim]step {step_num:02d} already complete - skipping[/]")
+                    continue
+
+            step = STEP_REGISTRY.get(step_num)
+            if step is None:
+                log.info("step.skip_unimplemented", step=step_num)
+                console.print(f"[yellow]step {step_num:02d} not yet implemented - skipping[/]")
+                continue
+
+            # Blank line before the banner. When a step-status line was just printed
+            # ("step NN ok" / "FAILED"), that line already opened the gap — skip the
+            # extra blank so the status and the next banner stay visually grouped.
+            if not _after_step_status:
+                console.print()
+            _after_step_status = False
+            console.print(f"[cyan]>>> step {step_num:02d} {step.name}[/]")
+            console.print()
+            if not _mcp_preflight_for_step(step, opts=opts, console=console):
+                log.error("step.mcp_preflight_abort", step=step_num)
+                exit_code = 2
+                break
+            result = await step.execute(ctx)
+            record = state.steps.get(step_num)
+
+            if not result.success:
+                save_state(state, ws.state_file)
+                console.print()
+                console.print(f"[red]step {step_num:02d} FAILED:[/] {result.error or result.notes}")
+                if record is not None:
+                    console.print(f"   {_format_step_metrics_line(record)}")
+                exit_code = 1
+                # Step 9 failures still have test results worth reporting.
+                # Let steps 10 (bug classification) and 11 (allure report)
+                # run so the operator gets a full report with findings.
+                if step_num == 9:
+                    # Step 9->8 back-edge (Gap C): a structural codegen defect
+                    # (zero tests collected, missing generated import) is not a
+                    # heal target — Step 9 asks to regenerate. Replay 8->9 exactly
+                    # once per run (guard prevents cycles), passing the reason to
+                    # Step 8 so it fixes the specific gap.
+                    if (
+                        ctx.extras.pop("rerun_step", None) == 8
+                        and not ctx.extras.get("_rerun8_used")
+                    ):
+                        ctx.extras["_rerun8_used"] = True
+                        _reason = ctx.extras.get("rerun_reason", "codegen defect")
+                        ctx.extras["step8_defect_feedback"] = _reason
+                        log.info(
+                            "pipeline.step_rerun_requested",
+                            from_step=9, target_step=8, reason=_reason,
+                        )
+                        console.print(
+                            f"[yellow]step 09 requested Step 8 regeneration "
+                            f"({_reason}) — replaying steps 8->9[/]"
+                        )
+                        # Reset checkpoints so 8 and 9 re-run, and rewind the
+                        # step cursor to Step 8 (when present in this run's plan).
+                        for _s in (8, 9):
+                            state.steps.pop(_s, None)
+                        if 8 in _step_list:
+                            _i = _step_list.index(8)
+                            exit_code = 0
+                            continue
+                    _after_step_status = True
+                    continue
+                break
+
+            if step_num == 4 and not await review_step_4_strategy(ctx, result, console):
+                save_state(state, ws.state_file)
+                console.print("[yellow]step 04 rejected by reviewer — aborting[/]")
+                exit_code = 1
+                break
+
+            if step_num == 7 and not await review_step_7_plan(ctx, result, console):
+                save_state(state, ws.state_file)
+                console.print("[yellow]step 07 rejected by reviewer — aborting[/]")
+                exit_code = 1
+                break
+
+            # Phase-D follow-up: when Step 8 stashed WARN/FAIL intent entries on
+            # ctx.extras, surface them for human review on TTY. FAILs that should
+            # block already aborted Step 8 itself; what reaches here is the
+            # WARN-tier (plus FAILs when QTEA_INTENT_FAIL_AS_WARN=1).
+            if (
+                step_num == 8
+                and ctx.extras.get("step8_intent_warnings")
+                and not await review_step_8_intents(ctx, result, console)
+            ):
+                save_state(state, ws.state_file)
+                console.print(
+                    "[yellow]step 08 rejected at intent-review gate — aborting[/]"
+                )
+                exit_code = 1
+                break
+
+            save_state(state, ws.state_file)
+
+            if result.status == "warned":
+                sub = f" ({result.sub_status.replace('_', ' ')})" if result.sub_status else ""
+                marker = f"warned{sub}"
+            elif result.sub_status and result.sub_status != "all_passed":
+                marker = f"ok ({result.sub_status.replace('_', ' ')})"
             else:
-                log.info("step.skip_complete", step=step_num)
-                console.print(f"[dim]step {step_num:02d} already complete - skipping[/]")
-                continue
-
-        step = STEP_REGISTRY.get(step_num)
-        if step is None:
-            log.info("step.skip_unimplemented", step=step_num)
-            console.print(f"[yellow]step {step_num:02d} not yet implemented - skipping[/]")
-            continue
-
-        # Blank line before the banner. When a step-status line was just printed
-        # ("step NN ok" / "FAILED"), that line already opened the gap — skip the
-        # extra blank so the status and the next banner stay visually grouped.
-        if not _after_step_status:
-            console.print()
-        _after_step_status = False
-        console.print(f"[cyan]>>> step {step_num:02d} {step.name}[/]")
-        console.print()
-        if not _mcp_preflight_for_step(step, opts=opts, console=console):
-            log.error("step.mcp_preflight_abort", step=step_num)
-            exit_code = 2
-            break
-        result = await step.execute(ctx)
-        record = state.steps.get(step_num)
-
-        if not result.success:
-            save_state(state, ws.state_file)
-            console.print()
-            console.print(f"[red]step {step_num:02d} FAILED:[/] {result.error or result.notes}")
+                marker = "ok"
+            line = f"[green]step {step_num:02d} {marker}[/]  -> {len(result.outputs)} outputs"
             if record is not None:
-                console.print(f"   {_format_step_metrics_line(record)}")
-            exit_code = 1
-            # Step 9 failures still have test results worth reporting.
-            # Let steps 10 (bug classification) and 11 (allure report)
-            # run so the operator gets a full report with findings.
-            if step_num == 9:
-                # Step 9->8 back-edge (Gap C): a structural codegen defect
-                # (zero tests collected, missing generated import) is not a
-                # heal target — Step 9 asks to regenerate. Replay 8->9 exactly
-                # once per run (guard prevents cycles), passing the reason to
-                # Step 8 so it fixes the specific gap.
-                if (
-                    ctx.extras.pop("rerun_step", None) == 8
-                    and not ctx.extras.get("_rerun8_used")
-                ):
-                    ctx.extras["_rerun8_used"] = True
-                    _reason = ctx.extras.get("rerun_reason", "codegen defect")
-                    ctx.extras["step8_defect_feedback"] = _reason
-                    log.info(
-                        "pipeline.step_rerun_requested",
-                        from_step=9, target_step=8, reason=_reason,
-                    )
-                    console.print(
-                        f"[yellow]step 09 requested Step 8 regeneration "
-                        f"({_reason}) — replaying steps 8->9[/]"
-                    )
-                    # Reset checkpoints so 8 and 9 re-run, and rewind the
-                    # step cursor to Step 8 (when present in this run's plan).
-                    for _s in (8, 9):
-                        state.steps.pop(_s, None)
-                    if 8 in _step_list:
-                        _i = _step_list.index(8)
-                        exit_code = 0
-                        continue
-                _after_step_status = True
-                continue
-            break
+                line += f"  [dim]{_format_step_metrics_line(record)}[/]"
+            console.print()
+            console.print(line)
+            _after_step_status = True
 
-        if step_num == 4 and not await review_step_4_strategy(ctx, result, console):
-            save_state(state, ws.state_file)
-            console.print("[yellow]step 04 rejected by reviewer — aborting[/]")
-            exit_code = 1
-            break
+        return exit_code
 
-        if step_num == 7 and not await review_step_7_plan(ctx, result, console):
-            save_state(state, ws.state_file)
-            console.print("[yellow]step 07 rejected by reviewer — aborting[/]")
-            exit_code = 1
-            break
-
-        # Phase-D follow-up: when Step 8 stashed WARN/FAIL intent entries on
-        # ctx.extras, surface them for human review on TTY. FAILs that should
-        # block already aborted Step 8 itself; what reaches here is the
-        # WARN-tier (plus FAILs when QTEA_INTENT_FAIL_AS_WARN=1).
-        if (
-            step_num == 8
-            and ctx.extras.get("step8_intent_warnings")
-            and not await review_step_8_intents(ctx, result, console)
-        ):
-            save_state(state, ws.state_file)
-            console.print(
-                "[yellow]step 08 rejected at intent-review gate — aborting[/]"
-            )
-            exit_code = 1
-            break
-
+    # Always leave the run in a terminal, truthful state. A clean return leaves
+    # ``end_reason`` None (derive_status computes finished/failed from steps).
+    # Ctrl-C / UI Stop surfaces as "interrupted"; any other exception as
+    # "crashed". A hard-kill that bypasses these handlers is caught later by the
+    # PID liveness check (derive_status -> "aborted").
+    try:
+        exit_code = await _drive_steps()
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        state.end_reason = "interrupted"
+        state.finished_at = datetime.now(UTC).isoformat()
         save_state(state, ws.state_file)
-
-        if result.status == "warned":
-            sub = f" ({result.sub_status.replace('_', ' ')})" if result.sub_status else ""
-            marker = f"warned{sub}"
-        elif result.sub_status and result.sub_status != "all_passed":
-            marker = f"ok ({result.sub_status.replace('_', ' ')})"
-        else:
-            marker = "ok"
-        line = f"[green]step {step_num:02d} {marker}[/]  -> {len(result.outputs)} outputs"
-        if record is not None:
-            line += f"  [dim]{_format_step_metrics_line(record)}[/]"
-        console.print()
-        console.print(line)
-        _after_step_status = True
+        raise
+    except Exception:
+        state.end_reason = "crashed"
+        state.finished_at = datetime.now(UTC).isoformat()
+        save_state(state, ws.state_file)
+        raise
 
     state.finished_at = datetime.now(UTC).isoformat()
     save_state(state, ws.state_file)
@@ -1006,6 +1102,19 @@ def _pipeline_totals(state: RunState) -> dict[str, float | int]:
         total_cache_read += rec.tokens_cache_read
         total_cost += rec.cost_usd
         total_calls += rec.agent_calls
+    # Aux records (debug / critical-thinking / principal-engineer, fired on
+    # retry exhaustion) are their own rows in the summary — their totals
+    # must roll into the grand TOTAL or the row cost cells won't reconcile
+    # with the header cost figure.
+    for aux in state.auxiliary_records:
+        if aux.duration_s is not None:
+            total_duration += aux.duration_s
+        total_in += aux.tokens_input
+        total_out += aux.tokens_output
+        total_cache_create += aux.tokens_cache_creation
+        total_cache_read += aux.tokens_cache_read
+        total_cost += aux.cost_usd
+        total_calls += aux.agent_calls
     return {
         "total_duration_s": round(total_duration, 3),
         "total_tokens_input": total_in,
@@ -1064,6 +1173,41 @@ def _render_summary_table(state: RunState, console: Console) -> None:
             str(rec.agent_calls),
             format_cost(rec.cost_usd),
         )
+
+    # Aux rows — one per helper agent (debug / critical-thinking /
+    # principal-engineer) that fired on retry exhaustion. Kept between the
+    # step rows and TOTAL so the TOTAL is a visible sum of both groups.
+    _aux_phase_code = {
+        "debug": "D",
+        "critical_thinking": "C",
+        "principal_engineer": "P",
+    }
+    _aux_phase_label = {
+        "debug": "Debug agent",
+        "critical_thinking": "Critical thinking",
+        "principal_engineer": "Principal SW engineer",
+    }
+    if state.auxiliary_records:
+        table.add_section()
+        for aux in state.auxiliary_records:
+            color = status_color.get(aux.status, "dim")
+            code = _aux_phase_code.get(aux.phase, "?")
+            label = _aux_phase_label.get(aux.phase, aux.phase or aux.agent)
+            duration = f"{aux.duration_s:.1f}s" if aux.duration_s is not None else "-"
+            cache_read = format_tokens(aux.tokens_cache_read) if aux.tokens_cache_read else "-"
+            cache_write = format_tokens(aux.tokens_cache_creation) if aux.tokens_cache_creation else "-"
+            table.add_row(
+                f"[dim]{code}{aux.step}[/]",
+                f"[dim]{label} (step {aux.step:02d})[/]",
+                f"[{color}]{aux.status}[/]",
+                duration,
+                format_tokens(aux.tokens_input),
+                format_tokens(aux.tokens_output),
+                cache_read,
+                cache_write,
+                str(aux.agent_calls),
+                format_cost(aux.cost_usd),
+            )
 
     totals = _pipeline_totals(state)
     total_cache_read = int(totals["total_tokens_cache_read"])

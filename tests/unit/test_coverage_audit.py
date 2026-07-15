@@ -201,6 +201,69 @@ def test_audit_spec_alt_flow_bullet_with_requires_tc_marker_passes() -> None:
     assert not any("expired session" in line for line in v)
 
 
+def test_audit_spec_alt_flow_bullet_with_ac_qualified_requires_tc_marker_passes() -> None:
+    """Regression: `[requires TC: AC-5]` (colon + AC-ID) must be recognized,
+    not just the bare `[requires TC]` escape hatch."""
+    spec = _spec(
+        acs=[_ac("AC-5")],
+        sections=[{
+            "title": "Alternative Flows",
+            "level": 2,
+            "content": "",
+            "bullets": ["User resizes a column by dragging its border. `[requires TC: AC-5]`"],
+            "tables": [],
+            "children": [],
+        }],
+    )
+    v = audit_refined_spec(spec)
+    assert v == []
+
+
+def test_audit_spec_in_scope_bullet_with_multi_ac_requires_tc_marker_passes() -> None:
+    """Regression: comma-separated AC list in the marker, e.g.
+    `[requires TC: AC-1, AC-2]`, must clear both the marker and coverage
+    clauses when at least one named AC exists."""
+    spec = _spec(
+        acs=[_ac("AC-1"), _ac("AC-2")],
+        sections=[{
+            "title": "Test Boundaries",
+            "level": 2,
+            "content": "",
+            "bullets": [],
+            "tables": [],
+            "children": [{
+                "title": "In Scope",
+                "level": 3,
+                "content": "",
+                "bullets": ["FE implementation of the sub-page. `[requires TC: AC-1, AC-2]`"],
+                "tables": [],
+                "children": [],
+            }],
+        }],
+    )
+    v = audit_refined_spec(spec)
+    assert v == []
+
+
+def test_audit_spec_requires_tc_marker_naming_unknown_ac_flagged_distinctly() -> None:
+    """A marker that names only non-existent ACs must still fail, with a
+    message distinct from 'no marker' so it doesn't silently clear."""
+    spec = _spec(
+        acs=[_ac("AC-1")],
+        sections=[{
+            "title": "Alternative Flows",
+            "level": 2,
+            "content": "",
+            "bullets": ["User does something. `[requires TC: AC-99]`"],
+            "tables": [],
+            "children": [],
+        }],
+    )
+    v = audit_refined_spec(spec)
+    assert any("unknown id" in line and "AC-99" in line for line in v)
+    assert not any("has no [requires TC] marker" in line for line in v)
+
+
 # ============================================================
 # audit_plan
 # ============================================================

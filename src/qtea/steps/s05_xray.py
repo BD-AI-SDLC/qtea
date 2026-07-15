@@ -1,4 +1,4 @@
-"""Step 5: Upload test cases from test-strategy.json to Xray Cloud.
+"""Step 5: Upload test cases from test-design.json to Xray Cloud.
 
 Auto-skips when Xray credentials (JIRA_XRAY_CLIENT_ID + JIRA_XRAY_CLIENT_SECRET,
 or JIRA_XRAY_API_KEY) are not set. Uses direct HTTPS via httpx with proxy
@@ -201,10 +201,10 @@ class XrayUploadStep(Step):
                 "xray credentials not configured; skipped",
             )
 
-        strategy = _load_json(ctx.workspace.step_dir(4) / "test-strategy.json")
+        strategy = _load_json(ctx.workspace.step_dir(4) / "test-design.json")
         if not strategy:
             return _skip_result(
-                mapping_path, "test-strategy.json not found",
+                mapping_path, "test-design.json not found",
                 "step 4 outputs missing; skipped",
             )
 

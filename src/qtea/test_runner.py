@@ -67,7 +67,12 @@ _DEFAULT_COMMANDS: dict[str, tuple[str, str]] = {
         "junit",
     ),
     "cypress": (
-        "npx cypress run --reporter json",
+        # Cypress uses Mocha's `json` reporter, which writes to STDOUT unless
+        # `--reporter-options output=<path>` is given. The `mocha-json` parser
+        # reads `qtea-results.json` from disk, so without the output option a
+        # green suite yields an unread stdout blob -> zero parsed results ->
+        # false-green. Wire the reporter to the file the parser reads.
+        "npx cypress run --reporter json --reporter-options output={json_out}",
         "mocha-json",
     ),
     "jest": (
@@ -316,6 +321,42 @@ def _inject_playwright_workers(command: str, parallelism: int) -> str:
     return command
 
 
+def _inject_playwright_reporter_json(command: str) -> str:
+    """Ensure a Playwright Test command emits the JSON reporter to stdout.
+
+    ``parse_playwright_json`` reads ``--reporter=json`` output from stdout. A
+    researcher-detected command (e.g. a bare ``npx playwright test`` lifted
+    from a README) otherwise runs with Playwright's default human-readable
+    ``list`` reporter, which the JSON parser cannot decode -> zero results ->
+    a passing suite is silently misreported as ``all_passed`` (false-green).
+    Injecting ``--reporter=json`` (only when no explicit ``--reporter`` is
+    present) makes the detected path match the framework default. A CLI
+    ``--reporter`` overrides any reporter set in playwright.config, so this is
+    safe. Pairs with the universal zero-parsed-results guard in ``run_tests``.
+    """
+    if re.search(r"(?:^|\s)--reporter(?:=|\s)", command):
+        return command
+    return f"{command} --reporter=json"
+
+
+def _inject_mocha_json_output(command: str, cwd: Path) -> str:
+    """Ensure a Mocha/Cypress ``json``-reporter command writes to the file the
+    ``mocha-json`` parser reads (``qtea-results.json``).
+
+    Mocha's ``json`` reporter writes to STDOUT unless
+    ``--reporter-options output=<path>`` is given, and ``parse_mocha_json``
+    reads a file. Without this a detected green suite yields an unread stdout
+    blob -> zero results -> false-green. Injects the ``json`` reporter when no
+    reporter is set and the output path when absent.
+    """
+    if not re.search(r"(?:^|\s)--reporter(?:=|\s)", command):
+        command = f"{command} --reporter json"
+    if "output=" not in command:
+        out = (cwd / "qtea-results.json").as_posix()
+        command = f"{command} --reporter-options output={out}"
+    return command
+
+
 def _inject_headed_flag(command: str) -> str:
     """Append ``--headed`` to a Playwright Test command.
 
@@ -379,8 +420,16 @@ def resolve_command(
             detected = _inject_strict_markers(detected)
             detected = _inject_xdist_override(detected, parallelism)
         elif apply_pw_filter:
+            # Force the JSON reporter BEFORE the file filter/workers so a
+            # detected `npx playwright test` can't run with the default human
+            # reporter (unparseable stdout -> false-green). See finding 12.
+            detected = _inject_playwright_reporter_json(detected)
             detected = _inject_playwright_file_filter(detected)
             detected = _inject_playwright_workers(detected, parallelism)
+        if parser == "mocha-json":
+            # Cypress/Mocha detected commands need the json reporter wired to
+            # the file the parser reads, or a green suite reports zero results.
+            detected = _inject_mocha_json_output(detected, cwd)
         return detected, parser
     if detected:
         log.warning(
@@ -1021,20 +1070,49 @@ def run_tests(
                 )
             )
 
-    if not results and exit_code != 0:
-        # Synthesise a single 'error' entry so callers see *something*.
-        # When the failure is a missing-module / collection error, attach
-        # the classifier output so step 8 can skip the self-heal loop —
-        # there is no per-test patch site to fix, and the user just needs
-        # to be told which dependency to install.
+    if not results:
+        # Zero parsed test results is ALWAYS a failure for qtea. We generated
+        # the tests, so a run that yields nothing parseable either never
+        # executed them or emitted output the parser could not read. This guard
+        # fires on exit_code == 0 too — the critical false-green class: a
+        # "passing" suite whose results were unparseable (Playwright JSON
+        # polluted by stdout, a Cypress/Mocha reporter writing to the wrong
+        # sink, a detected command with the wrong reporter) must NOT be
+        # reported as all_passed. Synthesise a single visible 'error' entry so
+        # downstream classifies the run as failed / infrastructure_error rather
+        # than a silent green. When the failure is a missing-module /
+        # collection error, attach the classifier output so step 8 can skip the
+        # self-heal loop — there is no per-test patch site to fix.
         runner_failure = classify_runner_failure(
             stderr,
             package_manager=profile.package_manager if profile else None,
             stdout=stdout,
         )
-        msg = f"command exited with code {exit_code}; no results parsed"
-        if runner_failure:
-            msg += f" — {runner_failure['summary']}; fix: {runner_failure['hint']}"
+        if exit_code == 0:
+            msg = (
+                "command exited 0 but produced ZERO parseable test results — "
+                "treating as a FAILED run (a passing suite with no readable "
+                "results is a false-green: likely a reporter/output "
+                "misconfiguration or a suite that executed nothing)"
+            )
+            if runner_failure is None:
+                runner_failure = {
+                    "kind": "no_results_exit_zero",
+                    "module": None,
+                    "hint": (
+                        f"framework={framework!r} parser={parser!r} exited 0 but "
+                        "wrote no parseable results; verify the test command's "
+                        "reporter writes JSON/JUnit to the path qtea reads "
+                        "(--reporter=json to stdout for Playwright; "
+                        "--outputFile / --reporter-options output= for the "
+                        "file-based parsers)"
+                    ),
+                    "summary": "zero parseable results despite exit 0",
+                }
+        else:
+            msg = f"command exited with code {exit_code}; no results parsed"
+            if runner_failure:
+                msg += f" — {runner_failure['summary']}; fix: {runner_failure['hint']}"
         results = [
             TestRunEntry(
                 id="T-runner-failure",

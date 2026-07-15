@@ -41,10 +41,10 @@ Phases: A = Requirements (1–4) · B = Research & Codegen (5–8) · C = Execut
 | 1 | Intake | `s01_intake.py` | `ticket-to-ai-spec` / file-copy | abort |
 | 2 | Spec Refinement | `s02_refine.py` | `refine-spec` | abort |
 | 3 | Test Planning | `s03_plan.py` | `polyglot-test-planner` | abort |
-| 4 | Test Strategy | `s04_strategy.py` | `test-manager` | abort |
+| 4 | Test Design | `s04_strategy.py` | `test-designer` (Senior SDET persona) | abort |
 | 5 | Xray Upload | `s05_xray.py` | pure code | compensate |
 | 6 | Repo Discovery | `s06_research.py` | `polyglot-test-researcher` | abort |
-| 7 | Test Architect | `s07_test_architect.py` | `test-architect` | abort |
+| 7 | Test Automation Architect | `s07_test_architect.py` | `test-automation-architect` (+ `site-explorer` live-explore pre-pass) | abort |
 | 8 | TDD Codegen (phased: POM → tests → quality gate) | `s08_codegen.py` | `codegen-pom-extender`, `codegen-test-writer`, `codegen-violation-fixer` | abort |
 | 9 | Execute + Self-Heal | `s09_execute.py` | `polyglot-test-fixer` (heal only) | abort |
 | 10 | Bug Classification | `s10_bug_classifier.py` | `bug-report-classifier` | compensate |
@@ -56,15 +56,16 @@ Phases: A = Requirements (1–4) · B = Research & Codegen (5–8) · C = Execut
 
 - **Schema-first.** Every artifact validated against its JSON Schema in `schemas/` before hand-off.
 - **Locator priority (generated code only):** `id > data-testid > role > text > label > placeholder > alt text > title > scoped CSS`. **Never XPath** in new/generated locators. Pre-existing SUT locators are preserved verbatim (never rewrite — risks breaking the SUT's own tests).
-- **Snapshot discipline.** AOM only — `page.content()` / raw page-source forbidden in generated tests. Raw-DOM fallback only when target is AOM-invisible (record `snapshot_source="raw_dom_fallback"` + `fallback_reason`). Capability ladder, env-var tuning: `docs/qa-orchestrator.instructions.md` § 6, § 9.
+- **Snapshot discipline.** AOM only — `page.content()` / raw page-source forbidden in generated tests, with one exception: full DOM (`page.content()` / `frame.content()`) is permitted when the target is inside an `<iframe>`. Raw-DOM fallback otherwise only when target is AOM-invisible (record `snapshot_source="raw_dom_fallback"` + `fallback_reason`). Capability ladder, env-var tuning: `docs/qa-orchestrator.instructions.md` § 6, § 9.
 - **No hard waits** in generated tests (`time.sleep`, `cy.wait(<n>)`, etc.).
 - **No secrets in code.** Env vars only. Masked in logs: `ANTHROPIC_API_KEY`, `JIRA_API_TOKEN`, `JIRA_XRAY_*`.
+- **Prompt-injection sanitization on intake.** Jira/ADO ticket text is untrusted external content — Step 1 strips prompt-injection markers (e.g. `[SYSTEM]`, `<|im_start|>`, "ignore previous instructions") before inlining it into any agent prompt.
 - **No PII / runtime secrets in artifacts.** Redact captured form values, cookies, `Authorization` headers, storage-state contents, and session-carrying query params to `<redacted:<reason>>` in all text artifacts. Mask credential fields in screenshots via `screenshot(mask=[locator])`; omit the screenshot if masking is impossible.
 - **Filesystem containment.** All agent writes MUST stay inside `<sut>/` or `<workspace>/`. Writes outside these two roots are out of scope.
 - **Git safety.** Agents may only commit to the per-run qtea isolation branch. Forbidden: `push --force`, `reset --hard`, `branch -D`, `checkout main|master|develop`, `rebase -i`, `filter-branch`, `clean -fdx`, deleting `.git/`. Never amend or rewrite user-authored commits.
 - **Self-heal scope** (Step 9): test-side code only (POMs, locators, helpers, fixtures, `conftest.py`, codegen-generated test files). Never application source, never pre-existing SUT tests. Assertions may be *corrected* to match the Step-4 expected value but never *weakened*. Path enforcement: `src/qtea/steps/s09/heal_scope.py`; full allowed/forbidden matrix: `agents/polyglot-test-fixer.agent.md`.
 - **Step 9 status semantics:** `completed/all_passed` | `completed/bugs_found` | `warned` (attempt 1 failed, attempt 2 passed) | `failed` (environment failure, zero parseable output).
-- **Retry:** `MAX_ATTEMPTS=2`.
+- **Retry:** `MAX_ATTEMPTS=2`. Independent of this: a structurally broken Step 9 run (zero tests collected, missing generated import — not a heal target) may trigger one 8→9 replay per run, requesting Step 8 regenerate the defective code.
 - **Max step timeout:** 1800 s. Single source: `src/qtea/config.py:MAX_STEP_TIMEOUT_S`.
 - **Markdown size:** 200 lines soft, 500 lines hard. Enforced by `tools/check_md_size.py`.
 - **F.I.R.S.T.** test principles (First, Independent, Repeatable, Self-Validating, Timely).

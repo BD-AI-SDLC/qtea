@@ -6,12 +6,14 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from qtea.checkpoints import RunState
+from qtea.metrics import CURRENT_STEP_METRICS, AgentMetrics
 from qtea.pipeline import PipelineOptions
 from qtea.steps.base import (
     Step,
     StepContext,
     StepResult,
     _agent_failure_placeholder,
+    _record_aux_agent,
     _run_debug_rca,
     _run_fix_proposal,
     _snapshot_debug_artifacts,
@@ -663,3 +665,369 @@ async def test_fix_proposal_uses_debug_rca_when_available(tmp_path: Path):
     eng_inputs = eng_call.kwargs["inputs"]
     assert "debug-rca.md" in eng_inputs
     assert "fix-strategy.md" in eng_inputs
+
+
+# ---------------------------------------------------------------------------
+# Auxiliary-agent record tests (per-agent cost visibility)
+#
+# Before this split, debug / critical-thinking / principal-engineer costs
+# were folded into the parent step's `StepRecord.cost_usd` cell so the
+# summary table showed one opaque number. These tests lock in the new
+# invariant: each helper agent produces its OWN row on
+# `state.auxiliary_records`, and the parent step's cost cell is untouched.
+# ---------------------------------------------------------------------------
+
+
+async def test_record_aux_agent_appends_row_and_leaves_step_untouched(tmp_path: Path):
+    """Direct-invoke test on `_record_aux_agent`: run a fake coroutine that
+    records agent metrics into the active accumulator (mirrors what
+    `run_agent` does), and confirm the aux record captures those totals
+    while any StepRecord on state is UNCHANGED.
+    """
+    ctx = _ctx(tmp_path)
+    # Seed a StepRecord so we can assert it's not touched.
+    from qtea.checkpoints import StepRecord
+    parent = StepRecord(step=5, name="fake-step", cost_usd=0.1234, tokens_input=100)
+    ctx.state.steps[5] = parent
+
+    async def fake_run_agent_call():
+        # Simulate what run_agent does: push metrics into the active
+        # accumulator that `_record_aux_agent` sets up.
+        acc = CURRENT_STEP_METRICS.get()
+        assert acc is not None, "aux tracker didn't set the accumulator"
+        acc.record(AgentMetrics(
+            input_tokens=1000,
+            output_tokens=2000,
+            cache_read_input_tokens=500,
+            cache_creation_input_tokens=300,
+            cost_usd=0.75,
+        ))
+        return "ok"
+
+    result = await _record_aux_agent(
+        ctx, 5, "debug", "debug.agent.md", fake_run_agent_call(),
+    )
+    assert result == "ok"
+
+    # Exactly one aux row appended.
+    assert len(ctx.state.auxiliary_records) == 1
+    aux = ctx.state.auxiliary_records[0]
+    assert aux.step == 5
+    assert aux.phase == "debug"
+    assert aux.agent == "debug.agent.md"
+    assert aux.status == "completed"
+    assert aux.tokens_input == 1000
+    assert aux.tokens_output == 2000
+    assert aux.tokens_cache_read == 500
+    assert aux.tokens_cache_creation == 300
+    assert aux.cost_usd == 0.75
+    assert aux.agent_calls == 1
+    assert aux.duration_s is not None and aux.duration_s >= 0
+
+    # Parent StepRecord must NOT be mutated — this is the regression that
+    # would double-count aux cost against the step's cost cell.
+    assert parent.cost_usd == 0.1234
+    assert parent.tokens_input == 100
+
+
+async def test_record_aux_agent_marks_failed_on_exception(tmp_path: Path):
+    """If the wrapped coroutine raises, the aux row must still be written
+    (partial billing is still real spend) with status='failed'.
+    """
+    ctx = _ctx(tmp_path)
+
+    async def crashing_agent_call():
+        acc = CURRENT_STEP_METRICS.get()
+        acc.record(AgentMetrics(input_tokens=42, cost_usd=0.01))
+        raise RuntimeError("upstream 500")
+
+    try:
+        await _record_aux_agent(
+            ctx, 9, "critical_thinking", "critical-thinking.agent.md",
+            crashing_agent_call(),
+        )
+    except RuntimeError:
+        pass  # expected; the tracker must not swallow it
+    else:
+        raise AssertionError("expected RuntimeError to propagate")
+
+    assert len(ctx.state.auxiliary_records) == 1
+    aux = ctx.state.auxiliary_records[0]
+    assert aux.status == "failed"
+    assert aux.tokens_input == 42
+    assert aux.cost_usd == 0.01
+
+
+async def test_fix_proposal_writes_two_aux_records(tmp_path: Path):
+    """The two-agent fix chain (critical-thinking + principal-engineer)
+    must produce exactly TWO aux rows — one per agent — with the right
+    phase labels. Locks in the split that the whole ticket asked for.
+    """
+    ctx = _ctx(tmp_path)
+    seeded_rca = tmp_path / "seeded-debug-rca.md"
+    seeded_rca.write_text("# Debug RCA\n\nroot cause: X", encoding="utf-8")
+
+    with patch("qtea.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
+        mock_agent.return_value = type("R", (), {
+            "success": True, "final_text": "text", "error": None,
+        })()
+        await _run_fix_proposal(
+            42, ctx, "# ctx", debug_rca_path=seeded_rca,
+        )
+
+    assert len(ctx.state.auxiliary_records) == 2
+    ct, pse = ctx.state.auxiliary_records
+    assert ct.phase == "critical_thinking"
+    assert ct.agent == "critical-thinking.agent.md"
+    assert ct.step == 42
+    assert pse.phase == "principal_engineer"
+    assert pse.agent == "principal-software-engineer.agent.md"
+    assert pse.step == 42
+
+
+async def test_double_failure_produces_debug_ct_pse_aux_rows(tmp_path: Path):
+    """End-to-end through Step.execute(): a step that fails both attempts
+    triggers debug RCA (attempt 2 failure) + fix chain (retry exhaustion),
+    yielding three aux rows in chronological order: debug, critical
+    thinking, principal engineer. Parent StepRecord must NOT contain any
+    of that billing.
+    """
+    ctx = _ctx(tmp_path)
+    step = _AlwaysFailStep()
+
+    with patch("qtea.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
+        mock_agent.return_value = type("R", (), {
+            "success": True, "final_text": "text", "error": None,
+        })()
+        await step.execute(ctx)
+
+    phases = [a.phase for a in ctx.state.auxiliary_records]
+    assert phases == ["debug", "critical_thinking", "principal_engineer"], (
+        f"expected debug → CT → PSE ordering, got {phases}"
+    )
+    # Parent step 98 exists with attempts=2 but ZERO helper-agent billing
+    # folded in (StepRecord cost/tokens all start at 0; the mocked
+    # run_agent contributed no metrics because the fake AgentResult
+    # doesn't push into the accumulator — so the check that step 98 has
+    # cost_usd == 0.0 confirms nothing leaked in from the aux chain).
+    step_rec = ctx.state.steps[98]
+    assert step_rec.attempts == 2
+    assert step_rec.cost_usd == 0.0
+
+
+def test_run_state_round_trips_auxiliary_records(tmp_path: Path):
+    """The workspace's state.json round-trips aux records so a resumed run
+    or a report generated by a separate `qtea report` invocation still
+    sees the aux billing.
+    """
+    from qtea.checkpoints import AuxiliaryAgentRecord, RunState
+
+    state = RunState(
+        run_id="test", workspace=str(tmp_path), spec_source="x", sut_source=".",
+    )
+    state.auxiliary_records.append(
+        AuxiliaryAgentRecord(
+            step=2,
+            agent="debug.agent.md",
+            phase="debug",
+            status="completed",
+            duration_s=42.5,
+            tokens_input=1000,
+            tokens_output=500,
+            cost_usd=0.75,
+            agent_calls=1,
+        )
+    )
+    round_tripped = RunState.from_dict(state.to_dict())
+    assert len(round_tripped.auxiliary_records) == 1
+    aux = round_tripped.auxiliary_records[0]
+    assert aux.step == 2
+    assert aux.phase == "debug"
+    assert aux.cost_usd == 0.75
+
+
+def test_run_state_backward_compat_load_without_aux_key(tmp_path: Path):
+    """State files written before this feature landed have no
+    ``auxiliary_records`` key. Loading must not raise; the list defaults
+    to empty and old workspaces render fine.
+    """
+    from qtea.checkpoints import RunState
+
+    old_shape = {
+        "run_id": "old-run",
+        "workspace": str(tmp_path),
+        "spec_source": "x",
+        "sut_source": ".",
+        "started_at": "2026-07-01T00:00:00+00:00",
+        "steps": {},
+        # no auxiliary_records key at all
+    }
+    rs = RunState.from_dict(old_shape)
+    assert rs.auxiliary_records == []
+
+
+def test_report_totals_include_aux(tmp_path: Path):
+    """Report layer: `summary.total_cost_usd` must equal
+    `sum(steps) + sum(aux)`. Without this, splitting the aux out would
+    have silently under-counted the grand total.
+    """
+    from qtea.report.data_builder import (
+        AuxTiming,
+        StepTiming,
+        _compute_summary,
+    )
+
+    steps = [
+        StepTiming(
+            step=1, name="Intake", status="completed", duration_s=1.0,
+            tokens_input=10, tokens_output=20,
+            tokens_cache_creation=0, tokens_cache_read=0,
+            cost_usd=0.10, agent_calls=1,
+        ),
+        StepTiming(
+            step=2, name="Spec Refinement", status="failed", duration_s=2.0,
+            tokens_input=100, tokens_output=200,
+            tokens_cache_creation=50, tokens_cache_read=500,
+            cost_usd=0.50, agent_calls=2,
+        ),
+    ]
+    aux = [
+        AuxTiming(
+            step=2, agent="debug.agent.md", phase="debug", status="completed",
+            duration_s=10.0,
+            tokens_input=3000, tokens_output=23000,
+            tokens_cache_creation=0, tokens_cache_read=460000,
+            cost_usd=1.76, agent_calls=1,
+        ),
+        AuxTiming(
+            step=2, agent="critical-thinking.agent.md",
+            phase="critical_thinking", status="completed", duration_s=5.0,
+            tokens_input=5000, tokens_output=9000,
+            tokens_cache_creation=0, tokens_cache_read=37000,
+            cost_usd=0.76, agent_calls=1,
+        ),
+        AuxTiming(
+            step=2, agent="principal-software-engineer.agent.md",
+            phase="principal_engineer", status="completed", duration_s=4.0,
+            tokens_input=7000, tokens_output=8500,
+            tokens_cache_creation=0, tokens_cache_read=62000,
+            cost_usd=0.62, agent_calls=1,
+        ),
+    ]
+    run_results = {"framework": "pytest", "results": [], "totals": {"tests": 0}}
+    bug_reports = {"bugs": []}
+
+    summary = _compute_summary(run_results, bug_reports, steps, aux)
+
+    # Cost equals sum of every row's cost cell — the invariant that made
+    # the whole "split aux out" ticket non-regressive at the grand-total
+    # level (0.10 + 0.50 + 1.76 + 0.76 + 0.62 = 3.74).
+    assert summary.total_cost_usd == 3.74
+    # Tokens likewise sum both.
+    assert summary.total_tokens_input == 10 + 100 + 3000 + 5000 + 7000
+    assert summary.total_tokens_output == 20 + 200 + 23000 + 9000 + 8500
+    # Pipeline duration includes aux wait time (operator waited for these).
+    assert summary.pipeline_duration_s == 1.0 + 2.0 + 10.0 + 5.0 + 4.0
+    # Agent-call count sums too.
+    assert summary.total_agent_calls == 1 + 2 + 1 + 1 + 1
+
+
+def test_html_renderer_emits_aux_rows_after_step_11(tmp_path: Path):
+    """The pipeline-execution HTML table shows aux rows between the last
+    step row and the TOTAL row, and TOTAL matches summed cost cells.
+    """
+    from qtea.report.data_builder import (
+        AuxTiming,
+        ReportSummary,
+        RunReport,
+        StepTiming,
+    )
+    from qtea.report.html_renderer import render_html
+
+    steps = [
+        StepTiming(
+            step=2, name="Spec Refinement", status="failed", duration_s=2.0,
+            tokens_input=100, tokens_output=200,
+            tokens_cache_creation=0, tokens_cache_read=0,
+            cost_usd=0.50, agent_calls=2,
+        ),
+    ]
+    aux = [
+        AuxTiming(
+            step=2, agent="debug.agent.md", phase="debug", status="completed",
+            duration_s=10.0,
+            tokens_input=3000, tokens_output=23000,
+            tokens_cache_creation=0, tokens_cache_read=0,
+            cost_usd=1.76, agent_calls=1,
+        ),
+    ]
+    summary = ReportSummary(
+        total_tests=0, passed=0, failed=0, skipped=0, errors=0,
+        total_bugs=0, duration_s=None, pass_rate=0.0,
+        pipeline_duration_s=12.0,
+        total_tokens_input=3100, total_tokens_output=23200,
+        total_tokens_cache_creation=0, total_tokens_cache_read=0,
+        total_cost_usd=2.26, total_agent_calls=3,
+    )
+    report = RunReport(
+        run_id="test-run",
+        generated_at="2026-07-14T00:00:00+00:00",
+        plan=None,
+        strategy=None,
+        run_results={"framework": "pytest", "results": []},
+        bug_reports={"bugs": []},
+        summary=summary,
+        steps_summary=steps,
+        auxiliary_summary=aux,
+    )
+
+    html = render_html(report)
+
+    # Aux section marker present.
+    assert "Fix Chain" in html
+    # Debug agent labelled.
+    assert "Debug agent" in html
+    # Aux row's cost appears in the table (formatted as $1.76).
+    assert "$1.76" in html
+    # TOTAL row shows the summed cost.
+    assert "$2.26" in html
+    # And the parent step's cost cell is its own $0.50 — no double-count.
+    assert "$0.50" in html
+
+
+def test_html_renderer_no_aux_section_when_empty():
+    """When no helper agent ever fired, the aux sub-header must NOT appear
+    — a green pipeline shouldn't gain a scary-looking "Fix Chain" header.
+    """
+    from qtea.report.data_builder import ReportSummary, RunReport, StepTiming
+    from qtea.report.html_renderer import render_html
+
+    steps = [
+        StepTiming(
+            step=1, name="Intake", status="completed", duration_s=1.0,
+            tokens_input=0, tokens_output=0,
+            tokens_cache_creation=0, tokens_cache_read=0,
+            cost_usd=0.0, agent_calls=0,
+        ),
+    ]
+    summary = ReportSummary(
+        total_tests=0, passed=0, failed=0, skipped=0, errors=0,
+        total_bugs=0, duration_s=None, pass_rate=0.0,
+        pipeline_duration_s=1.0,
+        total_tokens_input=0, total_tokens_output=0,
+        total_tokens_cache_creation=0, total_tokens_cache_read=0,
+        total_cost_usd=0.0, total_agent_calls=0,
+    )
+    report = RunReport(
+        run_id="green-run",
+        generated_at="2026-07-14T00:00:00+00:00",
+        plan=None, strategy=None,
+        run_results={"framework": "pytest", "results": []},
+        bug_reports={"bugs": []},
+        summary=summary,
+        steps_summary=steps,
+        auxiliary_summary=[],
+    )
+
+    html = render_html(report)
+    assert "Fix Chain" not in html

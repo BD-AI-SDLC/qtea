@@ -8,9 +8,8 @@ Owns the following slice of Step 9's per-failure loop:
   workflow steps referencing MCP tool names).
 - ``_apply_fixer_outputs`` — copies the agent's edited test file from the
   agent workdir back into the SUT tests dir; skips no-op writes.
-- ``_filter_command_for_tests`` + ``_narrow_command_to_ids`` — pytest ``-k`` /
-  Playwright ``--grep`` narrowing so the re-run only exercises the tests the
-  heal actually touched.
+- ``_filter_command_for_tests`` — pytest ``-k`` / Playwright ``--grep``
+  narrowing so the re-run only exercises the tests the heal actually touched.
 
 The three patch-content quality gates (XPath / assertion / anti-patterns) and
 the heal-scope revert live in ``patch_gates`` and ``heal_scope`` respectively;
@@ -42,7 +41,13 @@ def _build_fixer_prompt(
     generated_files: set[str] | None = None,
     failure_class: str | None = None,
 ) -> str:
-    snippet = (entry.traceback or entry.message or "(no traceback)")[-3000:]
+    raw_snippet = (entry.traceback or entry.message or "(no traceback)")[-3000:]
+    from qtea.hitl import _looks_like_secret_value
+    snippet = raw_snippet
+    if _looks_like_secret_value(snippet):
+        import re
+        from qtea.hitl import _LOOKS_LIKE_SECRET_RE
+        snippet = _LOOKS_LIKE_SECRET_RE.sub("<redacted>", snippet)
 
     live_block = ""
     if sut_base_url:
@@ -258,17 +263,6 @@ def _filter_command_for_tests(command: str, failing: list[TestRunEntry]) -> str:
     return f'{command} -k "{expr}"'
 
 
-def _narrow_command_to_ids(
-    command: str, all_results: list, allow_ids: set[str],
-) -> str:
-    """Restrict ``command`` to tests whose id is in ``allow_ids``. Wraps
-    :func:`_filter_command_for_tests` so the same -k / --grep narrowing
-    logic applies to attempt-2's initial test run, not just the post-heal
-    re-run."""
-    keep = [e for e in all_results if e.id in allow_ids]
-    return _filter_command_for_tests(command, keep)
-
-
 # ----------------------------------------------------------------------------
 # Cross-attempt state (Tasks 2 + 4 + 5)
 #
@@ -296,5 +290,4 @@ __all__ = [
     "_apply_fixer_outputs",
     "_build_fixer_prompt",
     "_filter_command_for_tests",
-    "_narrow_command_to_ids",
 ]

@@ -42,6 +42,30 @@ class StepTiming:
 
 
 @dataclass
+class AuxTiming:
+    """Per-helper-agent row appended after Step 11.
+
+    The debug agent (RCA) + critical-thinking + principal-software-engineer
+    all fire on retry exhaustion; they were previously invisible in the
+    summary table because their billing was folded into the parent step's
+    cost cell. This dataclass gives each one its own row so the operator
+    can see where the money went in a failed run.
+    """
+
+    step: int  # parent step this aux agent ran under
+    agent: str
+    phase: str  # "debug" | "critical_thinking" | "principal_engineer"
+    status: str
+    duration_s: float | None
+    tokens_input: int
+    tokens_output: int
+    tokens_cache_creation: int
+    tokens_cache_read: int
+    cost_usd: float
+    agent_calls: int
+
+
+@dataclass
 class ReportSummary:
     total_tests: int
     passed: int
@@ -51,6 +75,7 @@ class ReportSummary:
     total_bugs: int
     duration_s: float | None
     pass_rate: float
+    infrastructure_errors: int = 0
     pipeline_duration_s: float = 0.0
     total_tokens_input: int = 0
     total_tokens_output: int = 0
@@ -70,6 +95,7 @@ class RunReport:
     bug_reports: dict[str, Any]
     summary: ReportSummary
     steps_summary: list[StepTiming] = field(default_factory=list)
+    auxiliary_summary: list[AuxTiming] = field(default_factory=list)
     bug_classification_fallback: bool = False
 
 
@@ -104,8 +130,10 @@ def _compute_summary(
     run_results: dict,
     bug_reports: dict,
     steps_summary: list[StepTiming] | None = None,
+    auxiliary_summary: list[AuxTiming] | None = None,
 ) -> ReportSummary:
     steps_summary = steps_summary or []
+    auxiliary_summary = auxiliary_summary or []
     totals = run_results.get("totals")
     results = run_results.get("results", [])
 
@@ -115,20 +143,42 @@ def _compute_summary(
         failed = totals.get("failed", 0)
         skipped = totals.get("skipped", 0)
         errors = totals.get("errors", 0)
+        infra_errors = totals.get("infrastructure_errors", 0)
     else:
         total = len(results)
         passed = sum(1 for r in results if r.get("status") == "passed")
         failed = sum(1 for r in results if r.get("status") == "failed")
         skipped = sum(1 for r in results if r.get("status") == "skipped")
         errors = sum(1 for r in results if r.get("status") == "error")
+        infra_errors = 0
 
     total_bugs = len(bug_reports.get("bugs", []))
     duration_s = run_results.get("duration_s")
-    pass_rate = (passed / total) if total > 0 else 1.0
+    # Finding 20: a run that executed ZERO real tests must NOT render as 100%
+    # pass — that is the report-layer false-green (the old `else 1.0`). A
+    # zero-test run is a non-result; show 0%. And infrastructure_errors
+    # (collection/import failures, synthetic T-runner-failure entries) are
+    # excluded from `tests`, so they must be surfaced explicitly rather than
+    # silently vanishing behind a green headline.
+    pass_rate = (passed / total) if total > 0 else 0.0
 
+    # Debug/critical-thinking/PSE runs are wall-clock time the operator
+    # waited too, so their duration counts toward the pipeline duration
+    # even though they run outside the main step (post `step.end`).
     pipeline_duration = sum(
         st.duration_s for st in steps_summary if st.duration_s is not None
+    ) + sum(
+        aux.duration_s for aux in auxiliary_summary if aux.duration_s is not None
     )
+
+    # Totals sum steps + aux so the TOTAL row equals the sum of every
+    # visible cost cell. The parent step no longer bundles the aux cost —
+    # that split was the whole point of the aux-row change; keeping the
+    # totals correct is what makes it non-regressive at the pipeline level.
+    def _sum(field: str) -> int | float:
+        return sum(getattr(st, field) for st in steps_summary) + sum(
+            getattr(aux, field) for aux in auxiliary_summary
+        )
 
     return ReportSummary(
         total_tests=total,
@@ -139,13 +189,14 @@ def _compute_summary(
         total_bugs=total_bugs,
         duration_s=duration_s,
         pass_rate=pass_rate,
+        infrastructure_errors=infra_errors,
         pipeline_duration_s=round(pipeline_duration, 3),
-        total_tokens_input=sum(st.tokens_input for st in steps_summary),
-        total_tokens_output=sum(st.tokens_output for st in steps_summary),
-        total_tokens_cache_creation=sum(st.tokens_cache_creation for st in steps_summary),
-        total_tokens_cache_read=sum(st.tokens_cache_read for st in steps_summary),
-        total_cost_usd=round(sum(st.cost_usd for st in steps_summary), 6),
-        total_agent_calls=sum(st.agent_calls for st in steps_summary),
+        total_tokens_input=int(_sum("tokens_input")),
+        total_tokens_output=int(_sum("tokens_output")),
+        total_tokens_cache_creation=int(_sum("tokens_cache_creation")),
+        total_tokens_cache_read=int(_sum("tokens_cache_read")),
+        total_cost_usd=round(float(_sum("cost_usd")), 6),
+        total_agent_calls=int(_sum("agent_calls")),
     )
 
 
@@ -172,15 +223,40 @@ def _steps_summary_from_state(state: RunState | None) -> list[StepTiming]:
     return rows
 
 
+def _aux_summary_from_state(state: RunState | None) -> list[AuxTiming]:
+    if state is None:
+        return []
+    # Preserve insertion order (debug → critical_thinking → principal_engineer)
+    # from base.py's execute() flow; that's the natural chronology and the
+    # order operators expect to read.
+    return [
+        AuxTiming(
+            step=a.step,
+            agent=a.agent,
+            phase=a.phase,
+            status=a.status,
+            duration_s=a.duration_s,
+            tokens_input=a.tokens_input,
+            tokens_output=a.tokens_output,
+            tokens_cache_creation=a.tokens_cache_creation,
+            tokens_cache_read=a.tokens_cache_read,
+            cost_usd=a.cost_usd,
+            agent_calls=a.agent_calls,
+        )
+        for a in state.auxiliary_records
+    ]
+
+
 def build_report(ws: Workspace) -> RunReport:
     run_results = _load_json(ws.step_dir(9) / "run-results.json") or _empty_run_results()
     bug_reports = _load_json(ws.step_dir(10) / "bug-reports.json") or _empty_bug_reports(ws.run_id)
     plan = _load_json(ws.step_dir(3) / "plan.json")
-    strategy = _load_json(ws.step_dir(4) / "test-strategy.json")
-    steps_summary = _steps_summary_from_state(load_state(ws.state_file))
+    strategy = _load_json(ws.step_dir(4) / "test-design.json")
+    state = load_state(ws.state_file)
+    steps_summary = _steps_summary_from_state(state)
+    auxiliary_summary = _aux_summary_from_state(state)
 
     # Detect step 10 fallback from checkpoint notes
-    state = load_state(ws.state_file)
     step10_rec = state.steps.get(10) if state else None
     fallback = bool(
         step10_rec
@@ -195,8 +271,11 @@ def build_report(ws: Workspace) -> RunReport:
         strategy=strategy,
         run_results=run_results,
         bug_reports=bug_reports,
-        summary=_compute_summary(run_results, bug_reports, steps_summary),
+        summary=_compute_summary(
+            run_results, bug_reports, steps_summary, auxiliary_summary
+        ),
         steps_summary=steps_summary,
+        auxiliary_summary=auxiliary_summary,
         bug_classification_fallback=fallback,
     )
 
@@ -215,6 +294,7 @@ def to_dict(report: RunReport) -> dict[str, Any]:
             "failed": report.summary.failed,
             "skipped": report.summary.skipped,
             "errors": report.summary.errors,
+            "infrastructure_errors": report.summary.infrastructure_errors,
             "total_bugs": report.summary.total_bugs,
             "duration_s": report.summary.duration_s,
             "pass_rate": report.summary.pass_rate,
@@ -240,5 +320,21 @@ def to_dict(report: RunReport) -> dict[str, Any]:
                 "agent_calls": st.agent_calls,
             }
             for st in report.steps_summary
+        ],
+        "auxiliary_summary": [
+            {
+                "step": aux.step,
+                "agent": aux.agent,
+                "phase": aux.phase,
+                "status": aux.status,
+                "duration_s": aux.duration_s,
+                "tokens_input": aux.tokens_input,
+                "tokens_output": aux.tokens_output,
+                "tokens_cache_creation": aux.tokens_cache_creation,
+                "tokens_cache_read": aux.tokens_cache_read,
+                "cost_usd": aux.cost_usd,
+                "agent_calls": aux.agent_calls,
+            }
+            for aux in report.auxiliary_summary
         ],
     }

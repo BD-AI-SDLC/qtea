@@ -126,6 +126,38 @@ def _heal_allowlist_dirs(active_module: dict | None) -> set[str]:
     return dirs
 
 
+# Path segments / basename shapes that mark a file as TEST-SIDE code. Used as
+# the fail-closed fallback when no inventory allowlist is known: rather than
+# treating an unknown SUT as fully permissive (finding 8/31 — which let a heal
+# edit application/production source and mask a DEV bug), we admit only paths
+# that clearly look test-side and reject everything else (app source).
+_TEST_SIDE_SEGMENTS = frozenset({
+    "tests", "test", "__tests__", "spec", "specs", "e2e", "it",
+    "pages", "page_objects", "pageobjects", "page-objects", "pom", "poms",
+    "locators", "fixtures", "helpers", "support", "qteaests",
+})
+
+
+def _looks_test_side_shape(rel_posix: str) -> bool:
+    """Heuristic: does the path look like test-side code (POM/locator/helper/
+    fixture/spec)? Used only as the empty-allowlist fallback."""
+    p = rel_posix.replace("\\", "/")
+    segments = p.split("/")
+    if any(seg.lower() in _TEST_SIDE_SEGMENTS for seg in segments):
+        return True
+    basename = segments[-1]
+    low = basename.lower()
+    return (
+        low.startswith("test_")
+        or low.endswith((
+            "_test.py", ".spec.ts", ".spec.js", ".test.ts", ".test.js",
+        ))
+        or basename.endswith("Test.java")
+        or "page" in low or "locator" in low or "fixture" in low
+        or "conftest" in low
+    )
+
+
 def _heal_path_in_scope(
     rel_path: str,
     allowlist_dirs: set[str],
@@ -139,10 +171,13 @@ def _heal_path_in_scope(
          SUT team's tests; qtea's own tests are covered by rule 0).
       2. Test infrastructure (conftest.py / fixtures/**) → in-scope.
       3. Under an inventory allowlist dir → in-scope.
-      4. Empty allowlist (no inventory) → permissive in-scope.
+      4. Empty allowlist (no inventory): FAIL-CLOSED for app source — admit
+         only paths whose shape is clearly test-side (POM/locator/helper/
+         spec). Everything else (application/production source) is out-of-scope
+         so a heal cannot mask a DEV bug by editing the code under test even
+         when Step-6 discovery produced no inventory (finding 8/31).
       5. Otherwise (application/production source when an allowlist IS known)
-         → out-of-scope, so a heal cannot mask a DEV bug by editing the code
-         under test.
+         → out-of-scope.
     """
     p = rel_path.replace("\\", "/")
     if generated_files and p in generated_files:
@@ -152,7 +187,9 @@ def _heal_path_in_scope(
     if _heal_path_is_test_infra(p):
         return True
     if not allowlist_dirs:
-        return True
+        # Was: unconditional `return True` (permissive). Now fail-closed for
+        # anything that doesn't look test-side.
+        return _looks_test_side_shape(p)
     return any(p == d or p.startswith(d + "/") for d in allowlist_dirs)
 
 
@@ -171,6 +208,30 @@ def _git_revert_path(sut_root: Path, rel_path: str, status_code: str) -> bool:
     except (OSError, subprocess.TimeoutExpired) as e:
         log.error("step09.git_revert_failed", path=rel_path, error=str(e))
         return False
+
+
+def _git_show_bytes(sut_root: Path, sha: str | None, rel_path: str) -> bytes | None:
+    """Return the bytes of ``rel_path`` at commit ``sha``, or None if the file
+    did not exist there (newly-created by the heal) / on any git error.
+
+    Used by the Step-9 content gates to reconstruct a heal-touched file's
+    PRE-heal content so XPath / assertion-weakening / anti-pattern gates can
+    diff pre-vs-post for EVERY file the heal changed — not just the failing
+    test file (finding 6).
+    """
+    if not sha:
+        return None
+    try:
+        res = subprocess.run(
+            ["git", "show", f"{sha}:{rel_path}"],
+            cwd=sut_root, capture_output=True, check=False, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.warning("step09.git_show_failed", path=rel_path, error=str(e))
+        return None
+    if res.returncode != 0:
+        return None
+    return res.stdout
 
 
 def _git_status_porcelain(sut_root: Path) -> list[tuple[str, str]]:
@@ -267,6 +328,7 @@ def _heal_revert_all_uncommitted(
 
 __all__ = [
     "_git_revert_path",
+    "_git_show_bytes",
     "_git_status_porcelain",
     "_heal_allowlist_dirs",
     "_heal_path_in_scope",

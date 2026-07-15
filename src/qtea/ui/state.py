@@ -16,10 +16,10 @@ STEP_DEFINITIONS: list[tuple[int, str, str]] = [
     (1, "Intake", "A"),
     (2, "Spec Refinement", "A"),
     (3, "Test Planning", "A"),
-    (4, "Test Strategy", "A"),
+    (4, "Test Design", "A"),
     (5, "Xray Upload", "B"),
     (6, "Repo Discovery", "B"),
-    (7, "Test Architect", "B"),
+    (7, "Test Automation Architect", "B"),
     (8, "TDD Codegen", "B"),
     (9, "Execute + Heal", "C"),
     (10, "Bug Classification", "C"),
@@ -58,6 +58,30 @@ class StepUIState:
     agent_name: str | None = None
     notes: str | None = None
     error: str | None = None
+
+
+@dataclass
+class AuxAgentUIState:
+    """UI-side mirror of ``checkpoints.AuxiliaryAgentRecord``.
+
+    One entry per helper agent (debug / critical-thinking /
+    principal-software-engineer) that fires on retry exhaustion. Rendered
+    in the results-view table after the 11 pipeline steps so the operator
+    can see where the money went in a failed run instead of a black-box
+    "step 2 cost = $3.75" that bundled all three helpers together.
+    """
+
+    step: int  # parent step
+    phase: str  # "debug" | "critical_thinking" | "principal_engineer"
+    agent: str
+    status: str = "completed"
+    duration_s: float | None = None
+    tokens_in: int = 0
+    tokens_out: int = 0
+    cache_read: int = 0
+    cache_write: int = 0
+    cost_usd: float = 0.0
+    agent_calls: int = 0
 
 
 @dataclass
@@ -127,6 +151,7 @@ class AppState:
     skip_steps: set[int] = field(default_factory=set)
     storage_state: str = ""
     dev_locators: str = ""
+    text_scale: float = 1.0
 
     # ── Resume from a prior workspace (UI mirror of CLI --run-id / --from-step) ──
     # Empty string + None ⇒ fresh run. When ``resume_run_id`` is set, ``from_step``
@@ -142,6 +167,10 @@ class AppState:
     workspace_path: str | None = None
     current_step: int | None = None
     steps: dict[int, StepUIState] = field(default_factory=dict)
+    # Helper agents (debug / critical-thinking / principal-engineer) that
+    # fire on retry exhaustion. Appended in chronological order by the
+    # event bridge; rendered as their own rows in the results view.
+    auxiliary_records: list[AuxAgentUIState] = field(default_factory=list)
     pipeline_started_at: float | None = None
     total_cost: float = 0.0
     total_tokens_in: int = 0
@@ -156,6 +185,12 @@ class AppState:
     pending_hitl: HitlRequest | None = None
     pending_review_gate: ReviewGateRequest | None = None
 
+    # ── Open-dialog tracking (Ctrl+/Ctrl- live-resizes the open popup) ────
+    # HITL/review-gate dialogs already carry their own ``_dialog_open`` flag
+    # on the request object, so only the step-details dialog (which has no
+    # backing "pending" request) needs a field here.
+    active_step_dialog_num: int | None = None
+
     # ── Results ──────────────────────────────────────────────────────────
     exit_code: int | None = None
     report_data: dict[str, Any] | None = None
@@ -166,6 +201,19 @@ class AppState:
     pipeline_loop: Any = None
     pipeline_task: Any = None
     cancel_requested: bool = False
+    # Set True by the Stop button after it snap-navigates to /results, so
+    # the pipeline worker's finally block does NOT run its own redundant
+    # `_build_views_for_route("/results")` a moment later. Two full
+    # page.views.clear()+rebuild sequences hitting the Flutter client in
+    # rapid succession leave button widget ids orphaned — the summary
+    # renders but every button is dead. Reset in `reset_run()`.
+    results_navigated: bool = False
+    # Child PIDs that existed BEFORE the pipeline started (notably the
+    # flet-desktop Flutter GUI process, which is a child of this Python
+    # process). The Stop button kills only children NOT in this set, so it
+    # tears down pipeline subprocesses (pytest, npx/MCP, browsers, allure)
+    # WITHOUT killing the GUI window — the old "kill all children" closed qtea.
+    baseline_child_pids: set[int] = field(default_factory=set)
 
     # ── Stopwatch pause accounting (HITL waits should not count) ────────
     paused_total_s: float = 0.0
@@ -198,24 +246,43 @@ class AppState:
         self.total_agent_calls = 0
         self.elapsed_s = 0.0
         self.log_lines.clear()
+        self.auxiliary_records.clear()
         self.pending_hitl = None
         self.pending_review_gate = None
+        self.active_step_dialog_num = None
         self.exit_code = None
         self.report_data = None
         self.pipeline_loop = None
         self.pipeline_task = None
         self.cancel_requested = False
+        self.results_navigated = False
+        self.baseline_child_pids = set()
         self.paused_total_s = 0.0
         self.pause_started_at = None
         self.init_steps()
 
     def recalculate_totals(self) -> None:
-        self.total_cost = sum(s.cost_usd for s in self.steps.values())
-        self.total_tokens_in = sum(s.tokens_in for s in self.steps.values())
-        self.total_tokens_out = sum(s.tokens_out for s in self.steps.values())
-        self.total_cache_read = sum(s.cache_read for s in self.steps.values())
-        self.total_cache_write = sum(s.cache_write for s in self.steps.values())
-        self.total_agent_calls = sum(s.agent_calls for s in self.steps.values())
+        # Steps + aux — the aux rows are their own line items in the
+        # results table, so the header banner's total must sum both or it
+        # will disagree with the visible per-row cells.
+        self.total_cost = sum(s.cost_usd for s in self.steps.values()) + sum(
+            a.cost_usd for a in self.auxiliary_records
+        )
+        self.total_tokens_in = sum(s.tokens_in for s in self.steps.values()) + sum(
+            a.tokens_in for a in self.auxiliary_records
+        )
+        self.total_tokens_out = sum(s.tokens_out for s in self.steps.values()) + sum(
+            a.tokens_out for a in self.auxiliary_records
+        )
+        self.total_cache_read = sum(s.cache_read for s in self.steps.values()) + sum(
+            a.cache_read for a in self.auxiliary_records
+        )
+        self.total_cache_write = sum(s.cache_write for s in self.steps.values()) + sum(
+            a.cache_write for a in self.auxiliary_records
+        )
+        self.total_agent_calls = sum(
+            s.agent_calls for s in self.steps.values()
+        ) + sum(a.agent_calls for a in self.auxiliary_records)
 
     def _active_seconds_from(self, started_at: float) -> float:
         """Wall-clock seconds since ``started_at`` minus any paused windows."""
@@ -269,8 +336,10 @@ class AppState:
                 "report": self.report,
                 "cache": self.cache,
                 "log_level": self.log_level,
+                "skip_steps": sorted(self.skip_steps),
                 "storage_state": self.storage_state,
                 "dev_locators": self.dev_locators,
+                "text_scale": self.text_scale,
             }
         )
 
@@ -285,5 +354,9 @@ class AppState:
         self.report = prefs.get("report", self.report)
         self.cache = prefs.get("cache", self.cache)
         self.log_level = prefs.get("log_level", self.log_level)
+        raw_skip = prefs.get("skip_steps")
+        if isinstance(raw_skip, list):
+            self.skip_steps = {int(n) for n in raw_skip if isinstance(n, (int, str)) and str(n).isdigit()}
         self.storage_state = prefs.get("storage_state", self.storage_state)
         self.dev_locators = prefs.get("dev_locators", self.dev_locators)
+        self.text_scale = prefs.get("text_scale", self.text_scale)

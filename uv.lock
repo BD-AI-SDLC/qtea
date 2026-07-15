@@ -1060,6 +1060,7 @@ name = "qtea"
 version = "1.0.0rc1"
 source = { editable = "." }
 dependencies = [
+    { name = "allure-pytest" },
     { name = "anthropic" },
     { name = "claude-agent-sdk" },
     { name = "httpx" },
@@ -1076,9 +1077,6 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-allure = [
-    { name = "allure-pytest" },
-]
 ui = [
     { name = "flet" },
     { name = "flet-desktop" },
@@ -1096,7 +1094,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "allure-pytest", marker = "extra == 'allure'", specifier = ">=2.13" },
+    { name = "allure-pytest", specifier = ">=2.13" },
     { name = "anthropic", specifier = ">=0.40" },
     { name = "claude-agent-sdk", specifier = ">=0.1" },
     { name = "flet", marker = "extra == 'ui'", specifier = ">=0.28" },
@@ -1113,7 +1111,7 @@ requires-dist = [
     { name = "tenacity", specifier = ">=9" },
     { name = "typer", specifier = ">=0.12" },
 ]
-provides-extras = ["allure", "ui"]
+provides-extras = ["ui"]
 
 [package.metadata.requires-dev]
 dev = [

@@ -32,6 +32,7 @@ for the REST fetch and ``qtea.llm.reasoning.call_reasoning_llm`` (with the
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import httpx
@@ -60,6 +61,24 @@ from qtea.proxy import with_proxy_env
 from qtea.steps.base import Step, StepContext, StepResult
 
 log = get_logger(__name__)
+
+_PROMPT_INJECTION_RE = re.compile(
+    r"(?:"
+    r"\[SYSTEM\]"
+    r"|\[INSTRUCTION\]"
+    r"|<\|im_start\|>"
+    r"|<\|im_end\|>"
+    r"|ignore\s+(?:all\s+)?(?:prior|previous|above)\s+instructions"
+    r"|you\s+are\s+now\s+(?:a|an|the)\s+"
+    r"|<system>"
+    r"|</system>"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_for_prompt(text: str) -> str:
+    return _PROMPT_INJECTION_RE.sub("<sanitized>", text)
 
 
 def _is_jira(src: str) -> bool:
@@ -198,11 +217,13 @@ async def _jira_via_rest(
     linked_items = _fetch_linked_jira_safe(base_url, payload)
 
     slim = _slim_jira_payload(payload)
+    payload_text = json.dumps(slim, indent=2, ensure_ascii=False)
+    payload_text = _sanitize_for_prompt(payload_text)
     spec_path = await _enrich_jira_via_agent(
         workdir=workdir,
         out_dir=out_dir,
         source_label=f"{base_url}/browse/{ticket_id}",
-        payload_json=json.dumps(slim, indent=2, ensure_ascii=False),
+        payload_json=payload_text,
     )
 
     if linked_items:
@@ -281,11 +302,13 @@ async def _ado_via_rest(
 
     slim = slim_ado_payload(payload)
     source_label = f"https://dev.azure.com/{org}/{project}/_workitems/edit/{item_id}"
+    payload_text = json.dumps(slim, indent=2, ensure_ascii=False)
+    payload_text = _sanitize_for_prompt(payload_text)
     spec_path = await _enrich_ado_via_agent(
         workdir=workdir,
         out_dir=out_dir,
         source_label=source_label,
-        payload_json=json.dumps(slim, indent=2, ensure_ascii=False),
+        payload_json=payload_text,
     )
 
     if linked_items:

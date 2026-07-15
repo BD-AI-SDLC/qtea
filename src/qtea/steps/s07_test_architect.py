@@ -1,6 +1,6 @@
-"""Step 7: Test Architect — produces the code-modification plan.
+"""Step 7: Test Automation Architect — produces the code-modification plan.
 
-Inputs: test-strategy.md (step 4) + sut_inventory.json (step 6) + research.md
+Inputs: test-design.md (step 4) + sut_inventory.json (step 6) + research.md
 (step 6, for narrative context).
 
 Output (artifacts/step07/):
@@ -8,10 +8,10 @@ Output (artifacts/step07/):
   - code-modification-plan.md     (human-readable summary for review gate)
 
 Behavior:
-  1. Pre-flight: SUT materialized, test-strategy.md present, sut_inventory.json
+  1. Pre-flight: SUT materialized, test-design.md present, sut_inventory.json
      present with a resolved active_module. Any miss → fail in <1s.
   2. Inline the upstream artifacts into the agent's user prompt.
-  3. Invoke the `test-architect` agent via direct Anthropic SDK with the
+  3. Invoke the `test-automation-architect` agent via direct Anthropic SDK with the
      `code-modification-plan` schema enforced via structured outputs — the
      response IS the JSON object (no prose, no fences).
   4. Schema-validate (belt-and-suspenders) and parse the JSON.
@@ -97,7 +97,7 @@ def _inline_reuse_sources(
 ) -> tuple[dict[str, str], list[str]]:
     """Read POM/fixture/helper source files for the active module up to budget.
 
-    The test-architect agent has no file tools; it can only justify reuse
+    The test-automation-architect agent has no file tools; it can only justify reuse
     decisions against material that is inlined into its prompt. Without source
     visibility it can verify a symbol *exists* (the inventory tells it that)
     but not whether the symbol's actual behaviour *fits* the test case.
@@ -284,6 +284,185 @@ def _normalize_ref(ref: str) -> str:
     return ref.replace("\\", "/")
 
 
+# Per-`check` field requirements for acceptance_criteria (assertion oracles).
+# The JSON schema enforces key PRESENCE; the phase gate below enforces the
+# stronger semantics the schema can't express — non-null expected values, and
+# that a criterion's locator resolves to a locator DECLARED in the same test
+# case. Together these close finding 3 (false-green via an unpinned/guessed
+# assertion oracle): an assertion method can no longer reach Step 8 without a
+# machine-checkable oracle bound to real, planned locators + values.
+_ORACLE_CHECKS_NEED_LOCATOR = frozenset({
+    "exact_text", "exact_count", "exact_attribute", "value_equals",
+    "visible", "focusable", "boundingbox_below", "boundingbox_above",
+})
+_ORACLE_CHECKS_NEED_EXPECTED = frozenset({
+    "exact_text", "exact_count", "exact_attribute", "value_equals", "url_matches",
+})
+_ORACLE_CHECKS_NEED_REF_LOCATOR = frozenset({
+    "boundingbox_below", "boundingbox_above",
+})
+
+
+def _validate_assertion_oracle(
+    tc_id: str,
+    po_name: str,
+    mm: dict,
+    declared_locators: set,
+    violations: list[str],
+) -> bool:
+    """Enforce that an assertion ``missing_method`` carries a usable oracle.
+
+    Every ``kind=='assertion'`` method must have ≥1 acceptance_criterion, and
+    each criterion must bind the locator / expected value its ``check``
+    requires (non-null), with the locator resolving to a locator declared in
+    the same test case. This is the deterministic backstop for the JSON-schema
+    if/then — the schema can't require non-null values or cross-reference the
+    TC's own ``locators[]``.
+
+    Returns True when the method is an assertion whose criteria are ENTIRELY
+    ``custom`` — those escape deterministic body-verification, so the caller
+    routes them to the semantic assertion-judge (Stage 3) rather than letting
+    them silent-pass (the ``custom`` bypass the SDET flagged).
+    """
+    name = mm.get("name") or "<unnamed>"
+    if mm.get("kind") != "assertion":
+        return False
+    criteria = mm.get("acceptance_criteria") or []
+    if not criteria:
+        violations.append(
+            f"{tc_id}: {po_name}.{name} kind=assertion has no acceptance_criteria "
+            f"(the oracle the generated test must verify)"
+        )
+        return False
+    all_custom = True
+    for i, crit in enumerate(criteria):
+        if not isinstance(crit, dict):
+            violations.append(
+                f"{tc_id}: {po_name}.{name} acceptance_criteria[{i}] is not an object"
+            )
+            all_custom = False
+            continue
+        check = crit.get("check") or ""
+        if check != "custom":
+            all_custom = False
+        loc = crit.get("locator")
+        if check in _ORACLE_CHECKS_NEED_LOCATOR:
+            if not loc:
+                violations.append(
+                    f"{tc_id}: {po_name}.{name} criterion[{i}] check={check} "
+                    f"needs a `locator`"
+                )
+            elif declared_locators and loc not in declared_locators:
+                violations.append(
+                    f"{tc_id}: {po_name}.{name} criterion[{i}] locator `{loc}` is "
+                    f"not declared in this test case's locators[]"
+                )
+        if check in _ORACLE_CHECKS_NEED_REF_LOCATOR:
+            ref = crit.get("reference_locator")
+            if not ref:
+                violations.append(
+                    f"{tc_id}: {po_name}.{name} criterion[{i}] check={check} "
+                    f"needs a `reference_locator`"
+                )
+            elif declared_locators and ref not in declared_locators:
+                violations.append(
+                    f"{tc_id}: {po_name}.{name} criterion[{i}] reference_locator "
+                    f"`{ref}` is not declared in this test case's locators[]"
+                )
+        if check in _ORACLE_CHECKS_NEED_EXPECTED:
+            if crit.get("expected_literal") is None and not crit.get("expected_symbol"):
+                violations.append(
+                    f"{tc_id}: {po_name}.{name} criterion[{i}] check={check} needs a "
+                    f"non-null expected value (expected_literal or expected_symbol)"
+                )
+    return bool(criteria) and all_custom
+
+
+def _validate_kind_acceptance_criteria_coherence(
+    tc_id: str, po_name: str, mm: dict, violations: list[str],
+) -> None:
+    """Reject a `missing_methods` entry whose `kind` and `acceptance_criteria`
+    disagree about whether it's an assertion.
+
+    `acceptance_criteria` exists for exactly one reason: it's the oracle
+    Step 8's body-verifier (`codegen_body_verify.py`) checks the generated
+    code against — and that verifier only runs for `kind == "assertion"`
+    entries (`if m.get("kind") != "assertion": continue`). That makes
+    relabeling a `kind: "assertion"` entry to `kind: "query"` (e.g. to
+    dodge the void-signature gate above) a way to make its
+    `acceptance_criteria` invisible to EVERY downstream check — not just
+    this one — while the oracle metadata sits there looking legitimate. A
+    genuine fix either stays `assertion` (oracle still enforced) or drops
+    to `query` and sheds its `acceptance_criteria` (the actual expect()
+    call then lives in the test, per the existing phase="assert"
+    choreography check). Anything else is a fix that satisfies the gate's
+    letter without doing the work.
+    """
+    if mm.get("kind") == "assertion":
+        return  # covered by _validate_assertion_oracle
+    criteria = mm.get("acceptance_criteria") or []
+    if criteria:
+        violations.append(
+            f"{tc_id}: page_object `{po_name}` missing_method "
+            f"`{mm.get('name')}` is kind={mm.get('kind')!r} but still carries "
+            f"{len(criteria)} `acceptance_criteria` entr{'y' if len(criteria) == 1 else 'ies'}. "
+            f"acceptance_criteria is the assertion oracle — Step 8's body-verifier "
+            f"only checks it for kind=\"assertion\" methods, so leaving it here "
+            f"means that oracle is now checked by nothing. Either keep "
+            f"kind=\"assertion\" (with a non-void signature) so the oracle stays "
+            f"enforced, or genuinely make this a query: remove `acceptance_criteria` "
+            f"and `purpose`, and ensure the actual expect()/assert against these "
+            f"facts appears in the test function's phase=\"assert\" step instead."
+        )
+
+
+# Language-specific "this signature reports nothing" detectors for the
+# void-assertion gate below. A `kind: "assertion"` method can only be a
+# missing_method on a POM (the schema has no other bucket for it), and
+# `codegen-rules.md` §"Assertions Belong in Test Methods, Not POMs" bans
+# `expect()`/`assert` inside POM bodies unconditionally. A void return type
+# leaves the pom-extender no way to report the checked fact except by
+# embedding the forbidden assert/expect call directly in the POM method —
+# exactly how run `20260708-121117-99f5ed` shipped
+# `expect(marketingCheckbox).toBeAttached(...)` inside
+# `verifyMarketingConsentPositionAndLabel`. Catching the void-signature shape
+# here, at plan time, is cheaper than waiting for Step 8's `pom-assertion`
+# gate to hard-fail on the generated code.
+_PY_VOID_RETURN_RE = re.compile(r"->\s*None\b")
+_JS_VOID_RETURN_RE = re.compile(
+    r":\s*(Promise<\s*)?(void|undefined|any|unknown)\s*>?\s*;?\s*$", re.IGNORECASE,
+)
+_JAVA_VOID_RETURN_RE = re.compile(
+    r"^\s*(public|private|protected)?\s*void\s+\w+\s*\(", re.IGNORECASE,
+)
+_PY_LANGUAGES = frozenset({"python", "pytest", "playwright-py", "selenium-py"})
+_JS_LANGUAGES = frozenset({"typescript", "javascript"})
+
+
+def _assertion_signature_is_void(signature: str, language: str) -> bool:
+    """True when a `kind: "assertion"` method's signature reports nothing.
+
+    Python: no `->` annotation at all defaults to `None`, same as an
+    explicit `-> None`. TS/JS: `void`/`undefined`/`any`/`unknown`, bare or
+    `Promise<...>`-wrapped (mirrors `_VOID_RETURN_TYPES` in
+    `codegen_pom_hygiene.py`, which checks the same shapes on the EMITTED
+    code at Step 8 — this is the plan-time counterpart). Java: a leading
+    `void` return type. Unknown languages are not checked (returns False)
+    rather than risk false positives on a signature style we don't model.
+    """
+    sig = (signature or "").strip()
+    if not sig:
+        return False
+    lang = (language or "").lower()
+    if lang in _PY_LANGUAGES:
+        return "->" not in sig or bool(_PY_VOID_RETURN_RE.search(sig))
+    if lang in _JS_LANGUAGES:
+        return bool(_JS_VOID_RETURN_RE.search(sig))
+    if lang == "java":
+        return bool(_JAVA_VOID_RETURN_RE.match(sig))
+    return False
+
+
 def _validate_plan_against_inventory(
     plan: dict,
     active_module: dict | None,
@@ -295,6 +474,9 @@ def _validate_plan_against_inventory(
     violations: list[str] = []
     symbols = _inventory_symbols(active_module)
     approved = _approved_dirs(active_module)
+    language = (
+        plan.get("language") or (active_module or {}).get("language") or ""
+    ).lower()
 
     # Auth-chaining: extract the auth fixture name once for the
     # depends_on check below.  "tests/conftest.py:chat_page" → "chat_page"
@@ -422,11 +604,66 @@ def _validate_plan_against_inventory(
                         f"{tc_id}: page_object `{po.get('name')}` create target "
                         f"`{at}` not under an inventory-approved directory"
                     )
+            declared_locators = {
+                lc.get("name") for lc in (tc.get("locators") or [])
+                if isinstance(lc, dict) and lc.get("name")
+            }
             for mm in po.get("missing_methods") or []:
                 if not mm.get("signature"):
                     violations.append(
                         f"{tc_id}: page_object `{po.get('name')}` missing_method "
                         f"`{mm.get('name')}` has no signature"
+                    )
+                if not mm.get("kind"):
+                    violations.append(
+                        f"{tc_id}: page_object `{po.get('name')}` missing_method "
+                        f"`{mm.get('name')}` has no `kind` (action|assertion|query)"
+                    )
+                # Assertion methods must carry a machine-checkable oracle bound
+                # to declared locators + non-null expected values (finding 3).
+                only_custom = _validate_assertion_oracle(
+                    tc_id, po.get("name") or "<pom>", mm,
+                    declared_locators, violations,
+                )
+                # A void-returning `kind: "assertion"` method targeting a POM
+                # has no way to report its result except an embedded
+                # expect()/assert — the NON-NEGOTIABLE violation Step 8's
+                # pom-assertion gate hard-fails on. Catch the shape here,
+                # before any codegen agent runs.
+                if (
+                    mm.get("kind") == "assertion"
+                    and mm.get("signature")
+                    and _assertion_signature_is_void(mm["signature"], language)
+                ):
+                    violations.append(
+                        f"{tc_id}: page_object `{po.get('name')}` missing_method "
+                        f"`{mm.get('name')}` is kind=assertion with a void-shaped "
+                        f"signature (`{mm['signature']}`). A POM method can't "
+                        f"report a fact through a void return without embedding "
+                        f"the actual expect()/assert call in the POM body, which "
+                        f"is forbidden (codegen-rules.md §\"Assertions Belong in "
+                        f"Test Methods, Not POMs\"). Make it a probe that returns "
+                        f"the `Locator` the test asserts on (`getX(): Locator` / "
+                        f"`get_x(self) -> Locator` / `Locator getX()`) — the test "
+                        f"passes it into `expect(...)`. Never a `bool`/"
+                        f"`Promise<boolean>` verdict (that pushes the assertion "
+                        f"into the POM and yields a dead `.toBe(true)`)."
+                    )
+                # Kind/oracle coherence — catches a relabel-to-dodge fix that
+                # leaves assertion-oracle metadata on a non-assertion entry
+                # (see docstring: this is invisible to Step 8's body-verifier).
+                _validate_kind_acceptance_criteria_coherence(
+                    tc_id, po.get("name") or "<pom>", mm, violations,
+                )
+                if only_custom:
+                    # Escapes deterministic body-verify — flag for the Stage-3
+                    # semantic judge instead of letting it silent-pass.
+                    log.warning(
+                        "step07.assertion_oracle_all_custom",
+                        tc_id=tc_id,
+                        pom=po.get("name"),
+                        method=mm.get("name"),
+                        hint="custom-only oracle; routed to assertion-judge (shadow)",
                     )
 
         for h in tc.get("helpers") or []:
@@ -502,11 +739,17 @@ def _validate_plan_against_inventory(
             if isinstance(lc, dict) and lc.get("name")
         }
         tc_missing_methods: dict[str, set[str]] = {}
+        tc_method_kinds: dict[str, dict[str, str]] = {}
         for po in tc.get("page_objects") or []:
             if not isinstance(po, dict) or not po.get("name"):
                 continue
             tc_missing_methods[po["name"]] = {
                 mm.get("name") for mm in (po.get("missing_methods") or [])
+                if isinstance(mm, dict) and mm.get("name")
+            }
+            tc_method_kinds[po["name"]] = {
+                mm.get("name"): mm.get("kind")
+                for mm in (po.get("missing_methods") or [])
                 if isinstance(mm, dict) and mm.get("name")
             }
         for fn in tc.get("test_functions") or []:
@@ -540,6 +783,26 @@ def _validate_plan_against_inventory(
                         tc_id=tc_id,
                         pom=pom,
                         method=method,
+                    )
+                # An 'assert'-phase step must invoke a method that actually
+                # verifies something — kind assertion (probe+assert) or query
+                # (returns a value the test asserts on). An 'action' method in
+                # an assert step means the "specific check" is never performed
+                # (finding 3 / the user's "fulfil a specific check" rule). Only
+                # enforced for planned missing_methods (reused methods carry no
+                # kind in the plan).
+                if (
+                    st.get("phase") == "assert"
+                    and method
+                    and pom in tc_method_kinds
+                    and method in tc_method_kinds[pom]
+                    and tc_method_kinds[pom][method] not in ("assertion", "query")
+                ):
+                    violations.append(
+                        f"{tc_id}: choreography step order={st.get('order')} is "
+                        f"phase='assert' but calls `{pom}.{method}` whose kind="
+                        f"{tc_method_kinds[pom][method]!r} — an assert step must "
+                        f"call a kind=assertion or kind=query method"
                     )
 
         # Arrange-coverage gate (the "missing login" defect). When a test case
@@ -695,7 +958,7 @@ def _render_plan_markdown(plan: dict) -> str:
 
 class TestArchitectStep(Step):
     number = 7
-    name = "test-architect"
+    name = "test-automation-architect"
     timeout_s = step_timeout(7)
 
     async def run(self, ctx: StepContext) -> StepResult:
@@ -705,7 +968,7 @@ class TestArchitectStep(Step):
         sut_root = ctx.workspace.sut.resolve()
 
         # --- Pre-flight (fail in <1s) -------------------------------------
-        strategy_md = ctx.workspace.step_dir(4) / "test-strategy.md"
+        strategy_md = ctx.workspace.step_dir(4) / "test-design.md"
         if not strategy_md.exists():
             return StepResult(
                 success=False, status="failed", outputs=[],
@@ -746,7 +1009,7 @@ class TestArchitectStep(Step):
         # sections in the user prompt by call_reasoning_llm, not staged
         # as workdir files.
         inputs: dict[str, str] = {
-            "test-strategy.md": strategy_md.read_text(encoding="utf-8"),
+            "test-design.md": strategy_md.read_text(encoding="utf-8"),
             "sut_inventory.json": sut_inv_json.read_text(encoding="utf-8"),
         }
         research_md = ctx.workspace.step_dir(6) / "research.md"
@@ -768,7 +1031,7 @@ class TestArchitectStep(Step):
         live_map = None
         try:
             live_map = await explore_strategy_routes(
-                strategy_text=inputs["test-strategy.md"],
+                strategy_text=inputs["test-design.md"],
                 research=research_dict,
                 sut_root=sut_root,
                 workspace_root=ctx.workspace.root,
@@ -807,7 +1070,7 @@ class TestArchitectStep(Step):
             total_chars=sum(len(v) for v in reuse_sources.values()),
         )
 
-        agent = package_resource_root() / "agents" / "test-architect.agent.md"
+        agent = package_resource_root() / "agents" / "test-automation-architect.agent.md"
 
         active_name = active_module.get("name") or sut_inventory.get("active_module") or "?"
         language = active_module.get("language") or "unknown"
@@ -836,7 +1099,7 @@ class TestArchitectStep(Step):
             f"{clarification_block}"
             f"The inputs below are inlined: `sut_inventory.json` "
             f"(top-level `active_module` = `{active_name}`, language "
-            f"`{language}`), `test-strategy.md`, and optionally `research.md`. "
+            f"`{language}`), `test-design.md`, and optionally `research.md`. "
             f"For every test case in the strategy, decide where new code "
             f"goes and which existing fixtures / page objects / helpers / "
             f"locators get reused. Respond with the `code-modification-plan` "
@@ -947,6 +1210,30 @@ class TestArchitectStep(Step):
                 count=len(gate_violations),
                 first=gate_violations[0],
             )
+            # Arm the FULL violation list (not the 5-entry/500-char summary
+            # in `notes`, which is sized for human display) so attempt 2's
+            # `run()` can inject it verbatim via `clarification_block`
+            # (picked up through `ctx.extras["prompt_clarification"]` — see
+            # `classify_failure`'s PLAN_GATE_VIOLATION category). Capped at
+            # 60 entries as a defensive bound on prompt size; that ceiling
+            # has never been approached in practice.
+            _shown = gate_violations[:60]
+            _clarification = (
+                "On the previous attempt, your plan passed schema "
+                "validation but the phase gate rejected it for the "
+                "following specific rule violation(s). Fix ONLY these "
+                "issues — every other placement/reuse/classification "
+                "decision that didn't trigger a violation was correct and "
+                "should be preserved as-is:\n\n"
+                + "\n".join(f"- {v}" for v in _shown)
+                + (
+                    f"\n\n(+{len(gate_violations) - 60} more violation(s) "
+                    f"omitted for length — fixing the above will likely "
+                    f"resolve the same root cause repeated across cases.)"
+                    if len(gate_violations) > 60 else ""
+                )
+            )
+            ctx.extras["prompt_clarification"] = _clarification
             return StepResult(
                 success=False, status="failed",
                 outputs=[out_dir / "plan-violations.log"],

@@ -194,6 +194,13 @@ def _wrapper_script(
     """
     file_part, _, symbol = spec.entry_method.partition(":")
     helper_path = (sut_root / file_part).resolve()
+    try:
+        helper_path.relative_to(sut_root.resolve())
+    except ValueError:
+        raise ValueError(
+            f"entry_method file must be inside SUT root: {file_part!r} "
+            f"resolves to {helper_path} which is outside {sut_root}"
+        )
     headless_str = "False" if headed else "True"
     return (
         "import sys, json, inspect\n"
@@ -243,6 +250,13 @@ def _wrapper_script_node(
     """
     file_part, _, symbol = spec.entry_method.partition(":")
     helper_path = (sut_root / file_part).resolve()
+    try:
+        helper_path.relative_to(sut_root.resolve())
+    except ValueError:
+        raise ValueError(
+            f"entry_method file must be inside SUT root: {file_part!r} "
+            f"resolves to {helper_path} which is outside {sut_root}"
+        )
     headless_str = "false" if headed else "true"
     sut_root_json = json.dumps(str(sut_root).replace("\\", "/"))
     helper_json = json.dumps(str(helper_path))
@@ -308,21 +322,8 @@ def _wrapper_script_node(
 
 
 def _set_owner_only_perms(path: Path) -> None:
-    """Set file mode 0o600 on POSIX; on Windows, log a note (no reliable
-    cross-version chmod equivalent — owner-only is the default on a
-    personal Windows account, but we don't enforce it)."""
-    if os.name == "posix":
-        try:
-            path.chmod(0o600)
-        except OSError as e:
-            log.warning("auth_capture.chmod_failed %s", e)
-    else:
-        log.info(
-            "auth_capture.windows_perms_note "
-            "path=%s note='file permissions follow Windows ACL defaults; "
-            "verify owner-only access if storing tokens for shared accounts'",
-            path,
-        )
+    from qtea.proxy import set_owner_only_perms
+    set_owner_only_perms(path)
 
 
 def cmd_auth_capture(

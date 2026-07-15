@@ -67,6 +67,24 @@ _SKIP_INTENT_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
+_LOOKS_LIKE_SECRET_RE = re.compile(
+    r"(?:"
+    r"sk-ant-api03-"         # Anthropic API key prefix
+    r"|sk-[A-Za-z0-9]{20,}"  # OpenAI-style API key
+    r"|ghp_[A-Za-z0-9]{36}"  # GitHub PAT
+    r"|glpat-[A-Za-z0-9-]+"  # GitLab PAT
+    r"|xox[bpas]-"           # Slack token
+    r"|eyJ[A-Za-z0-9_-]{20,}\.eyJ"  # JWT
+    r"|AKIA[A-Z0-9]{16}"     # AWS access key
+    r"|[A-Za-z0-9+/]{40,}={0,2}$"   # long base64 blob (likely key material)
+    r"|https?://[^\s]+:[^\s]+@"      # URL with embedded credentials
+    r")"
+)
+
+
+def _looks_like_secret_value(text: str) -> bool:
+    return bool(_LOOKS_LIKE_SECRET_RE.search(text))
+
 
 # Negative / scope-exclusion phrases that LOOK like answers but mean "don't
 # test this aspect". The user types "there is no aria-label" or "mobile
@@ -146,6 +164,7 @@ def looks_like_negative_drop_intent(text: str) -> tuple[bool, str | None]:
 #                         ``[ASSUMPTION]`` framing so a resumed run honors
 #                         the contract the user answered under.
 RESOLUTION_ANSWERED = "answered"
+RESOLUTION_ANSWERED_SENSITIVE = "answered_sensitive"
 RESOLUTION_SKIPPED_DROP = "skipped_drop"
 RESOLUTION_SCOPE_EXCLUSION = "scope_exclusion"
 RESOLUTION_SKIPPED_LEGACY = "skipped"
@@ -427,6 +446,13 @@ def render_prior_decisions_md(ledger: list[HitlDecision]) -> str:
         lines.append("")
         if entry.resolution == RESOLUTION_ANSWERED:
             lines.append(f"**User answer:** {entry.answer}")
+        elif entry.resolution == RESOLUTION_ANSWERED_SENSITIVE:
+            lines.append(
+                "**User answer:** <sensitive — answered but redacted from "
+                "LLM context>. The user provided a value but it contains "
+                "sensitive data. Treat this item as resolved — do NOT "
+                "re-raise."
+            )
         elif entry.resolution == RESOLUTION_SKIPPED_DROP:
             lines.append(
                 "**User chose to skip.** DROP the corresponding AC / TC "
@@ -907,6 +933,18 @@ def _confirm_persist(console: Console, answer: str) -> tuple[str, str]:
     return resolution, answer
 
 
+def _ask_sensitive(console: Console) -> bool:
+    return (
+        Prompt.ask(
+            "  [dim]Contains sensitive data? (won't be sent to LLM)[/]",
+            choices=["y", "n"],
+            default="n",
+            show_choices=False,
+        ).strip().lower()
+        == "y"
+    )
+
+
 def prompt_user(
     questions: list[Question], *, agent_label: str
 ) -> dict[str, tuple[str, str]]:
@@ -1001,13 +1039,15 @@ def prompt_user(
                     )
                     break
                 if choice == "n":
-                    answers[q.id] = (RESOLUTION_ANSWERED, ans)
+                    res = RESOLUTION_ANSWERED_SENSITIVE if _ask_sensitive(console) else RESOLUTION_ANSWERED
+                    answers[q.id] = (res, ans)
                     break
                 # 'e' falls through to re-prompt
                 console.print("[dim]→ retype your answer[/]")
                 continue
 
-            answers[q.id] = (RESOLUTION_ANSWERED, ans)
+            res = RESOLUTION_ANSWERED_SENSITIVE if _ask_sensitive(console) else RESOLUTION_ANSWERED
+            answers[q.id] = (res, ans)
             break
     return answers
 
@@ -1049,6 +1089,10 @@ def format_answers_md(
             resolution, text = RESOLUTION_ANSWERED, raw
         if resolution == RESOLUTION_SCOPE_EXCLUSION:
             scope_excluded_items.append((q, text))
+        elif resolution == RESOLUTION_ANSWERED_SENSITIVE or _looks_like_secret_value(text):
+            answered_items.append(
+                (q, "<sensitive — answered but redacted from LLM context>")
+            )
         else:
             answered_items.append((q, text))
 
@@ -1155,6 +1199,12 @@ def format_answers_md(
             lines.append("")
             if prior.resolution == RESOLUTION_ANSWERED:
                 lines.append(f"**Prior answer (apply verbatim):** {prior.answer}")
+            elif prior.resolution == RESOLUTION_ANSWERED_SENSITIVE:
+                lines.append(
+                    "**Prior resolution:** user answered with sensitive data "
+                    "(redacted from LLM context). Treat as resolved — do NOT "
+                    "re-raise."
+                )
             elif prior.resolution == RESOLUTION_SKIPPED_DROP:
                 lines.append(
                     "**Prior resolution:** user skipped — DROP the "

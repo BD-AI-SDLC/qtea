@@ -8,7 +8,10 @@ from qtea.checkpoints import RunState, StepRecord, hash_paths, load_state, save_
 from qtea.config import (
     DEFAULT_STEP_TIMEOUTS,
     MAX_STEP_TIMEOUT_S,
+    AgentModelConfig,
+    _parse_agent_entry,
     agent_model_map,
+    get_model_chain,
     model_for_agent,
     step_timeout,
 )
@@ -34,9 +37,57 @@ def test_workspace_layout(tmp_path: Path):
 
 def test_agent_model_map_loaded():
     m = agent_model_map()
-    assert m["codegen-violation-fixer"] == "claude-sonnet-4-6"
-    assert model_for_agent("polyglot-test-fixer") == "claude-opus-4-6"
+    cfg = m["codegen-violation-fixer"]
+    assert isinstance(cfg, AgentModelConfig)
+    assert cfg.model == "claude-sonnet-5"
+    assert cfg.effort == "high"
+    assert cfg.thinking == {"type": "adaptive"}
+    cfg2 = model_for_agent("polyglot-test-fixer")
+    assert cfg2 is not None
+    assert cfg2.model == "claude-opus-4-8"
     assert model_for_agent("does-not-exist") is None
+
+
+def test_parse_agent_entry_bare_string():
+    cfg = _parse_agent_entry("claude-sonnet-4-6")
+    assert cfg.model == "claude-sonnet-4-6"
+    assert cfg.effort is None
+    assert cfg.thinking is None
+
+
+def test_parse_agent_entry_dict_with_effort_and_thinking():
+    cfg = _parse_agent_entry({
+        "model": "claude-opus-4-6",
+        "effort": "high",
+        "thinking": "adaptive",
+    })
+    assert cfg.model == "claude-opus-4-6"
+    assert cfg.effort == "high"
+    assert cfg.thinking == {"type": "adaptive"}
+
+
+def test_parse_agent_entry_thinking_dict_passthrough():
+    cfg = _parse_agent_entry({
+        "model": "claude-opus-4-6",
+        "thinking": {"type": "enabled", "budget_tokens": 32000},
+    })
+    assert cfg.thinking == {"type": "enabled", "budget_tokens": 32000}
+
+
+def test_parse_agent_entry_thinking_disabled():
+    cfg = _parse_agent_entry({"model": "claude-opus-4-6", "thinking": "disabled"})
+    assert cfg.thinking == {"type": "disabled"}
+
+
+def test_parse_agent_entry_1m_suffix():
+    cfg = _parse_agent_entry({"model": "claude-opus-4-6[1m]"})
+    assert cfg.model == "claude-opus-4-6[1m]"
+
+
+def test_model_chain_with_1m_suffix():
+    chain = get_model_chain("claude-opus-4-6[1m]")
+    assert chain[0] == "claude-opus-4-6[1m]"
+    assert len(chain) > 1
 
 
 def test_step_timeout_caps():

@@ -9,14 +9,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from qtea.checkpoints import load_state
+from qtea.checkpoints import derive_status, load_state
 from qtea.config import get_settings
 
 
 @dataclass(frozen=True)
 class WorkspaceEntry:
     run_id: str
-    status: str          # "running" | "finished" | "failed" | "empty" | "no-state"
+    # "running" | "finished" | "failed" | "interrupted" | "crashed" |
+    # "aborted" | "empty" | "no-state"
+    status: str
     last_step: int | None
     step_count: int
     started_at: str | None
@@ -66,15 +68,7 @@ def list_workspaces(
                 if v.status in ("completed", "skipped")
             )
             last_step = completed[-1] if completed else None
-            any_failed = any(v.status == "failed" for v in state.steps.values())
-            if state.finished_at is None and state.steps:
-                status = "running"
-            elif any_failed:
-                status = "failed"
-            elif state.finished_at is not None:
-                status = "finished"
-            else:
-                status = "empty"
+            status = derive_status(state)
             entry = WorkspaceEntry(
                 run_id=state.run_id,
                 status=status,
@@ -108,15 +102,7 @@ def get_workspace(run_id: str, base: Path | None = None) -> WorkspaceEntry | Non
         if v.status in ("completed", "skipped")
     )
     last_step = completed[-1] if completed else None
-    any_failed = any(v.status == "failed" for v in state.steps.values())
-    if state.finished_at is None and state.steps:
-        status = "running"
-    elif any_failed:
-        status = "failed"
-    elif state.finished_at is not None:
-        status = "finished"
-    else:
-        status = "empty"
+    status = derive_status(state)
     return WorkspaceEntry(
         run_id=state.run_id,
         status=status,

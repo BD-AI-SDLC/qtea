@@ -1,4 +1,4 @@
-"""Step 4 test-strategy tests."""
+"""Step 4 test-design tests."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from qtea.workspace import create_workspace
 from ._fake_anthropic import install_fake_anthropic
 
 STRATEGY_MD = """\
-# Test Strategy: Login
+# Test Design: Login
 
 ## Scope
 
@@ -82,7 +82,7 @@ def test_project_test_case_parses_fields():
 
 def test_project_strategy_full_shape():
     proj = _project_strategy(STRATEGY_MD)
-    assert proj["title"] == "Test Strategy: Login"
+    assert proj["title"] == "Test Design: Login"
     assert "Cover login UI" in proj["scope"]
     ids = [tc["id"] for tc in proj["test_cases"]]
     assert "TC-LOGIN-001" in ids
@@ -124,7 +124,7 @@ async def test_strategy_step_writes_md_and_validated_json(tmp_path: Path, monkey
     result = await StrategyStep().run(ctx)
     assert result.success, result.error
     out = ctx.workspace.step_dir(4)
-    proj = json.loads((out / "test-strategy.json").read_text(encoding="utf-8"))
+    proj = json.loads((out / "test-design.json").read_text(encoding="utf-8"))
     assert len(proj["test_cases"]) >= 2
 
 
@@ -167,4 +167,4 @@ async def test_strategy_step_agent_no_output_fails(tmp_path: Path, monkeypatch):
     ctx = _ctx(tmp_path)
     result = await StrategyStep().run(ctx)
     assert not result.success
-    assert "test-strategy.md" in (result.error or "")
+    assert "test-design.md" in (result.error or "")

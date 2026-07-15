@@ -330,7 +330,7 @@ def _tcs_with_navigation_expected_results(
     """Parse the strategy markdown and return the set of TC-IDs whose Expected
     Result text contains a "navigates to" / "leads to" / etc. phrase.
 
-    Format assumption (matches `test-manager` output): each TC block starts
+    Format assumption (matches `test-designer` output): each TC block starts
     with a ``#### TC-...`` heading and contains an ``Expected:`` /
     ``Expected Result:`` line or section. Tolerant of variations — when the
     parse fails on a block, that TC is silently skipped (zero false
@@ -681,7 +681,7 @@ def run_preflight(
     (empty when everything passes). Caller appends the result to
     ``IndexResult.violations`` so the existing reject machinery handles it.
 
-    ``strategy_md`` is the raw test-strategy markdown from Step 4 — required
+    ``strategy_md`` is the raw test-design markdown from Step 4 — required
     for the ``href-when-navigates`` check. Pass an empty string to skip it.
     """
     out: list[Violation] = []

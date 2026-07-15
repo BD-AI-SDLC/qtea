@@ -64,6 +64,31 @@ LOG_AGENT_COLOR = "#00E5FF"
 LOG_MODEL_COLOR = "#FFD54F"
 LOG_TOKENS_COLOR = "#FF5252"
 
+# ── Text/icon scale (Ctrl+/Ctrl- zoom) ──────────────────────────────────────
+
+MIN_SCALE = 0.7
+MAX_SCALE = 1.8
+SCALE_STEP = 0.1
+
+_scale = 1.0
+
+
+def get_scale() -> float:
+    return _scale
+
+
+def set_scale(value: float) -> float:
+    """Clamp ``value`` to [MIN_SCALE, MAX_SCALE], store it, and return it."""
+    global _scale
+    _scale = round(min(MAX_SCALE, max(MIN_SCALE, value)), 2)
+    return _scale
+
+
+def sz(base: int | float) -> int:
+    """Scale a base font/icon size by the current zoom level."""
+    return round(base * _scale)
+
+
 # ── Theme factory ────────────────────────────────────────────────────────────
 
 

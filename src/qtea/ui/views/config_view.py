@@ -16,6 +16,7 @@ from qtea.ui.theme import (
     ON_SURFACE_DIM,
     PRIMARY,
     SECONDARY,
+    sz,
 )
 
 
@@ -35,7 +36,7 @@ def build_config_view(
         value=state.spec,
         border_color=DIVIDER,
         focused_border_color=PRIMARY,
-        text_size=13,
+        text_size=sz(13),
         expand=True,
         on_change=lambda e: setattr(state, "spec", e.data or ""),
     )
@@ -72,7 +73,7 @@ def build_config_view(
         value=state.sut,
         border_color=DIVIDER,
         focused_border_color=PRIMARY,
-        text_size=13,
+        text_size=sz(13),
         expand=True,
         on_change=lambda e: setattr(state, "sut", e.data or ""),
     )
@@ -136,7 +137,7 @@ def build_config_view(
             ft.dropdown.Option("both"),
         ],
         width=160,
-        text_size=13,
+        text_size=sz(13),
         border_color=DIVIDER,
         focused_border_color=PRIMARY,
         on_select=lambda e: setattr(state, "report", e.data),
@@ -151,7 +152,7 @@ def build_config_view(
             ft.dropdown.Option("off"),
         ],
         width=130,
-        text_size=13,
+        text_size=sz(13),
         border_color=DIVIDER,
         focused_border_color=PRIMARY,
         on_select=lambda e: setattr(state, "cache", e.data),
@@ -166,7 +167,7 @@ def build_config_view(
             ft.dropdown.Option("trace"),
         ],
         width=130,
-        text_size=13,
+        text_size=sz(13),
         border_color=DIVIDER,
         focused_border_color=PRIMARY,
         on_select=lambda e: setattr(state, "log_level", e.data),
@@ -187,7 +188,7 @@ def build_config_view(
 
     workers_label = ft.Text(
         _workers_label_text(_is_auto, _manual_workers),
-        size=13,
+        size=sz(13),
         color=ON_SURFACE,
     )
 
@@ -264,7 +265,7 @@ def build_config_view(
 
     skip_row = ft.Column(
         controls=[
-            ft.Text("Skip Steps", size=13, color=ON_SURFACE_DIM),
+            ft.Text("Skip Steps", size=sz(13), color=ON_SURFACE_DIM),
             ft.Column(controls=skip_checks, spacing=2, tight=True),
         ],
         spacing=4,
@@ -277,7 +278,7 @@ def build_config_view(
         value=state.storage_state,
         border_color=DIVIDER,
         focused_border_color=PRIMARY,
-        text_size=13,
+        text_size=sz(13),
         on_change=lambda e: setattr(state, "storage_state", e.data or ""),
     )
 
@@ -287,7 +288,7 @@ def build_config_view(
         value=state.dev_locators,
         border_color=DIVIDER,
         focused_border_color=PRIMARY,
-        text_size=13,
+        text_size=sz(13),
         on_change=lambda e: setattr(state, "dev_locators", e.data or ""),
     )
 
@@ -310,7 +311,19 @@ def build_config_view(
         last = "-" if entry.last_step is None else str(entry.last_step)
         return f"{entry.run_id}  ·  {entry.status} · last={last} · {leaf}"
 
-    _workspace_entries = list_workspaces()
+    try:
+        _workspace_entries = list_workspaces()
+    except Exception as exc:
+        # list_workspaces() reads state.json for every workspace dir under
+        # the base — including the one for a run that just finished. On
+        # Windows this can hit a transient PermissionError/OSError (sharing
+        # violation) if a file was just closed by the pipeline. Never let
+        # that strand the whole view (and thus the post-run results screen,
+        # since build_config_view() is the base view for every route).
+        from qtea.logging_setup import get_logger
+
+        get_logger(__name__).warning("ui.list_workspaces_failed", error=str(exc))
+        _workspace_entries = []
     _ws_options: list[ft.dropdown.Option] = [
         ft.dropdown.Option("", "(fresh run)"),
     ] + [
@@ -322,7 +335,7 @@ def build_config_view(
         label="Resume from run",
         value=state.resume_run_id or "",
         options=_ws_options,
-        text_size=12,
+        text_size=sz(12),
         border_color=DIVIDER,
         focused_border_color=PRIMARY,
         expand=True,
@@ -335,7 +348,7 @@ def build_config_view(
             ft.dropdown.Option(str(n), f"{n:02d}. {name}")
             for n, name, _ in _STEPS
         ],
-        text_size=12,
+        text_size=sz(12),
         width=200,
         border_color=DIVIDER,
         focused_border_color=PRIMARY,
@@ -344,7 +357,7 @@ def build_config_view(
 
     resume_hint = ft.Text(
         "",
-        size=11,
+        size=sz(11),
         color=ON_SURFACE_DIM,
     )
 
@@ -407,7 +420,7 @@ def build_config_view(
     )
 
     # ── Validation + start ───────────────────────────────────────────────
-    error_text = ft.Text("", size=12, color="#FF5252", visible=False)
+    error_text = ft.Text("", size=sz(12), color="#FF5252", visible=False)
 
     def on_start_click(e: ft.ControlEvent) -> None:
         # Sync field values
@@ -462,7 +475,7 @@ def build_config_view(
         color="#FFFFFF",
         style=ft.ButtonStyle(
             padding=ft.Padding.symmetric(horizontal=32, vertical=16),
-            text_style=ft.TextStyle(size=16, weight=ft.FontWeight.BOLD),
+            text_style=ft.TextStyle(size=sz(16), weight=ft.FontWeight.BOLD),
             shape=ft.RoundedRectangleBorder(radius=10),
         ),
         on_click=on_start_click,
@@ -478,10 +491,10 @@ def build_config_view(
                         controls=[
                             ft.Row(
                                 controls=[
-                                    ft.Icon(ft.Icons.ROCKET_LAUNCH, color=PRIMARY, size=32),
+                                    ft.Icon(ft.Icons.ROCKET_LAUNCH, color=PRIMARY, size=sz(32)),
                                     ft.Text(
                                         "QTea",
-                                        size=28,
+                                        size=sz(28),
                                         weight=ft.FontWeight.BOLD,
                                         color=PRIMARY,
                                     ),
@@ -491,7 +504,7 @@ def build_config_view(
                             ),
                             ft.Text(
                                 "Autonomous QA SDLC Pipeline",
-                                size=14,
+                                size=sz(14),
                                 color=ON_SURFACE_DIM,
                                 text_align=ft.TextAlign.CENTER,
                             ),
@@ -504,7 +517,7 @@ def build_config_view(
                 # Required fields
                 ft.Text(
                     "REQUIRED",
-                    size=10,
+                    size=sz(10),
                     weight=ft.FontWeight.BOLD,
                     color=ON_SURFACE_DIM,
                 ),
@@ -514,7 +527,7 @@ def build_config_view(
                 # Options
                 ft.Text(
                     "OPTIONS",
-                    size=10,
+                    size=sz(10),
                     weight=ft.FontWeight.BOLD,
                     color=ON_SURFACE_DIM,
                 ),
@@ -526,7 +539,7 @@ def build_config_view(
                 # Optional
                 ft.Text(
                     "ADVANCED",
-                    size=10,
+                    size=sz(10),
                     weight=ft.FontWeight.BOLD,
                     color=ON_SURFACE_DIM,
                 ),
@@ -534,7 +547,7 @@ def build_config_view(
                 ft.Container(height=4),
                 ft.Text(
                     "RESUME",
-                    size=10,
+                    size=sz(10),
                     weight=ft.FontWeight.BOLD,
                     color=ON_SURFACE_DIM,
                 ),
