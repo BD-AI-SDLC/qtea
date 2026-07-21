@@ -14,7 +14,7 @@ from qtea.ui.state import AppState
 from qtea.ui.theme import BACKGROUND, CARD_BG, DIVIDER, sz
 
 
-def _find_live_step_widget(controls: list[ft.Control]) -> ft.Text | None:
+def find_live_step_widget(controls: list[ft.Control]) -> ft.Text | None:
     """Walk the control tree for the in-progress step card's elapsed widget."""
     for ctrl in controls:
         if isinstance(ctrl, ft.Text) and getattr(ctrl, "data", None) == "live_step_elapsed":
@@ -24,11 +24,11 @@ def _find_live_step_widget(controls: list[ft.Control]) -> ft.Text | None:
             if child is None:
                 continue
             if isinstance(child, list):
-                found = _find_live_step_widget(child)
+                found = find_live_step_widget(child)
                 if found:
                     return found
             elif isinstance(child, ft.Control):
-                found = _find_live_step_widget([child])
+                found = find_live_step_widget([child])
                 if found:
                     return found
     return None
@@ -63,6 +63,18 @@ def build_pipeline_view(page: ft.Page, state: AppState) -> ft.Container:
         scroll=ft.ScrollMode.AUTO,
         expand=True,
     )
+    # Publish the persistent Column so app.py's tick loop can walk its
+    # (rebuilt-in-place) .controls every second and find the current
+    # in-progress step's elapsed widget directly — rather than caching a
+    # resolved widget reference that only gets refreshed when a log line
+    # happens to trigger on_state_change(). A long single-call step (one
+    # reasoning.start ... reasoning.end with nothing in between) could
+    # otherwise leave the cached reference stale for the step's whole
+    # duration, freezing its clock.
+    if page.data is None:
+        page.data = {}
+    if isinstance(page.data, dict):
+        page.data["phase_groups_ref"] = phase_groups
 
     # Panel widths in pixels. The middle log panel fills the remaining
     # space (expand=True); the left and right panels have explicit widths
@@ -189,13 +201,6 @@ def build_pipeline_view(page: ft.Page, state: AppState) -> ft.Container:
             build_phase_group("B", state, on_step_click=_on_step_click),
             build_phase_group("C", state, on_step_click=_on_step_click),
         ]
-        # Locate the in-progress step card's elapsed Text widget so the
-        # 1-Hz tick loop can update it directly (same pattern as the
-        # header's live_elapsed widget).
-        if isinstance(page.data, dict):
-            page.data["live_step_elapsed"] = _find_live_step_widget(
-                phase_groups.controls,
-            )
         # Rebuild metrics
         metrics_panel.content = build_metrics_panel(state)
         # Rebuild progress header (reusing the live elapsed widget)

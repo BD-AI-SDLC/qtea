@@ -297,29 +297,20 @@ def _hitl_request_env_vars(var_names: list[str]) -> dict[str, str]:
 
 
 def _persist_env_vars(workspace: Any, env_vars: dict[str, str]) -> None:
-    """Append newly supplied env vars to .env.qtea and sut/.env."""
-    for target in (workspace.root / ".env.qtea", workspace.sut / ".env"):
-        if not target.exists():
-            continue
-        try:
-            lines = target.read_text(encoding="utf-8")
-            existing_keys = {
-                line.split("=", 1)[0]
-                for line in lines.splitlines()
-                if "=" in line
-            }
-            additions = [
-                f"{k}={v}"
-                for k, v in sorted(env_vars.items())
-                if k not in existing_keys
-            ]
-            if additions:
-                if not lines.endswith("\n"):
-                    lines += "\n"
-                lines += "\n".join(additions) + "\n"
-                target.write_text(lines, encoding="utf-8")
-        except OSError:
-            pass
+    """Persist HITL-recovered env vars to ``<sut>/.env``.
+
+    Creates the file if it doesn't exist yet (not just appends to an
+    existing one) — otherwise runtime-recovered values that fixed a Step 9
+    failure vanish once the workspace is cleaned up, and a test engineer who
+    later runs the SUT standalone hits the same missing-env failure this
+    HITL prompt just resolved.
+    """
+    if not env_vars:
+        return
+    from qtea.env_resolver import ensure_gitignore_entry, merge_dotenv_file
+
+    ensure_gitignore_entry(workspace.sut, ".env")
+    merge_dotenv_file(workspace.sut / ".env", env_vars)
 
 
 def _compose_runner_stream_diagnostics(
@@ -409,6 +400,57 @@ class _BootstrapResult:
     install_sig: str | None
     skip_install: bool
     no_auto_deps: bool
+
+
+def _resolve_playwright_project(
+    framework: str,
+    cwd: Path,
+    profile: StackProfile | None,
+) -> str | None:
+    """Pick the single Playwright Test project Step 9 should run on.
+
+    qtea must run the SUT's tests on exactly one browser — chromium/chrome
+    first, firefox second — never every project the SUT config defines. Lists
+    the config's projects via ``playwright test --list --reporter=json`` (only
+    needs the ``@playwright/test`` package, not browser binaries) and picks by
+    preference. Returns ``None`` when no restriction is needed/possible:
+      - non-Playwright-Test framework (pytest-family uses ``--browser``/fixtures)
+      - the config defines a single unnamed default project (nothing to pin)
+    Falls back to ``"chromium"`` when detection output can't be parsed, since
+    chromium is the near-universal default and the browser we install.
+    """
+    if framework not in _PW_TEST_FRAMEWORKS:
+        return None
+    cmd = wrap_command(profile, "npx playwright test --list --reporter=json")
+    try:
+        rc, out, err, _dur = execute_command(cmd, cwd=cwd, timeout_s=120)
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("step09.pw_project_detect_error", error=str(exc)[:200])
+        return "chromium"
+    names: list[str] = []
+    try:
+        data = json.loads(out) if out.strip() else {}
+        names = [
+            str(p.get("name", ""))
+            for p in (data.get("config", {}).get("projects", []) or [])
+            if p.get("name")
+        ]
+    except (json.JSONDecodeError, AttributeError):
+        log.warning(
+            "step09.pw_project_detect_unparseable",
+            exit_code=rc, stderr=(err or "")[:200],
+        )
+        return "chromium"
+    if not names:
+        # Single default project (no named projects) — no --project needed.
+        return None
+    lower = {n.lower(): n for n in names}
+    for pref in ("chromium", "chrome"):
+        if pref in lower:
+            return lower[pref]
+    if "firefox" in lower:
+        return lower["firefox"]
+    return names[0]
 
 
 class ExecuteStep(Step):
@@ -969,12 +1011,13 @@ class ExecuteStep(Step):
             workspace_root=ctx.workspace.root,
             cli_opt=getattr(ctx.options, "storage_state", None),
         )
-        _heal_mcp_env = {
-            "QTEA_STORAGE_STATE_ARG": _storage_state_mod.to_mcp_arg(_storage_state_path),
-            "QTEA_MCP_USER_DATA_DIR_ARG": (
-                f"--user-data-dir={ctx.workspace.root / 'playwright-mcp'}"
-            ),
-        }
+        # Isolated + storage-state when a session exists (a persistent
+        # --user-data-dir makes @playwright/mcp ignore --storage-state, so the
+        # heal agent would browse unauthenticated); persistent profile
+        # otherwise. See storage_state.mcp_browser_env.
+        _heal_mcp_env = _storage_state_mod.mcp_browser_env(
+            _storage_state_path, ctx.workspace.root / "playwright-mcp",
+        )
         if _storage_state_path is not None:
             runtime_env["QTEA_STORAGE_STATE"] = str(_storage_state_path)
             log.info(
@@ -1010,6 +1053,16 @@ class ExecuteStep(Step):
             and install_sig is not None
             and _prior_state.get("install_sig") == install_sig
         )
+        # Fast-path: a pre-Step-7 env prewarm (pipeline._prewarm_sut_env_for_auth)
+        # may have already run this exact install. Skip the redundant re-install
+        # on the first attempt when its recorded signature matches. Venv-swap +
+        # playwright-install below still run (both idempotent).
+        if not _skip_install and install_sig is not None:
+            from qtea.test_runner import read_env_prep_marker
+
+            if read_env_prep_marker(ctx.workspace.root) == install_sig:
+                _skip_install = True
+                log.info("step09.install_skipped_prewarm", install_sig=install_sig)
         if stack_profile and stack_profile.install_command and not _skip_install:
             prep = prepare_sut(
                 stack_profile,
@@ -1071,11 +1124,25 @@ class ExecuteStep(Step):
                 )
                 log.info("step09.venv_activated", bin_dir=bin_dir)
 
+        # Resolve the single browser Step 9 runs on (chromium first, firefox
+        # second) so both the browser install below and every run_tests call
+        # target one project — never two. Cached on ctx: the --list probe runs
+        # once per run, not once per attempt.
+        if not hasattr(ctx, "_pw_project"):
+            ctx._pw_project = _resolve_playwright_project(  # type: ignore[attr-defined]
+                framework, ctx.workspace.sut, stack_profile,
+            )
+            log.info("step09.pw_project_resolved", project=ctx._pw_project)
+        _pw_project = ctx._pw_project  # type: ignore[attr-defined]
+
         # Playwright stacks need browser binaries installed after the
         # package install. Idempotent — skips if already present.
         _PW_FRAMEWORKS = {"playwright-py", "playwright-ts", "playwright-js", "playwright-java"}
         if stack_profile and framework in _PW_FRAMEWORKS:
-            pw_cmd = wrap_command(stack_profile, "playwright install chromium")
+            # Install the browser matching the resolved project so a firefox
+            # fallback has its binary present; default to chromium otherwise.
+            _install_browser = _pw_project if _pw_project in ("chromium", "firefox") else "chromium"
+            pw_cmd = wrap_command(stack_profile, f"playwright install {_install_browser}")
             log.info("step09.playwright_install", command=pw_cmd)
             rc, out, err, _dur = execute_command(
                 pw_cmd, cwd=ctx.workspace.sut, timeout_s=400,
@@ -1337,7 +1404,26 @@ class ExecuteStep(Step):
                 headless=getattr(ctx.options, "headless", True),
                 marker_filter=_applied_marker_filter,
                 parallelism=getattr(ctx.options, "parallelism", 0),
+                playwright_project=getattr(ctx, "_pw_project", None),
             )
+
+            # Persist raw test-runner stdout/stderr as a standalone artifact
+            # so humans can diagnose without parsing run-results.json. Done
+            # BEFORE the empty-collection check below (not after) so a
+            # compile/collection failure that never reaches a normal test
+            # run still leaves the raw output on disk for the debug agent —
+            # previously this write was unreachable on that path entirely.
+            test_output_path = out_dir / "test-output.log"
+            with contextlib.suppress(OSError):
+                test_output_path.write_text(
+                    f"# framework: {framework}\n"
+                    f"$ {first.command}\n"
+                    f"# exit_code: {first.exit_code}\n"
+                    f"# duration: {first.duration_s:.1f}s\n\n"
+                    f"--- STDOUT ---\n{first.stdout or '(empty)'}\n\n"
+                    f"--- STDERR ---\n{first.stderr or '(empty)'}\n",
+                    encoding="utf-8",
+                )
 
             # Detect "no tests collected" — a codegen quality failure where
             # Step 8's test scoping filter matched nothing.
@@ -1352,27 +1438,61 @@ class ExecuteStep(Step):
                 )
             )
             if _is_empty_collection and _applied_marker_filter:
-                _empty_err = (
-                    f"{framework} collected 0 tests matching the qtea "
-                    f"test filter. This is a codegen defect: Step 8 must "
-                    f"generate test files with the 'qtea_' prefix "
-                    f"(Playwright Test) or add @pytest.mark.qtea_<phase> "
-                    f"to every test function (pytest). Check the test files "
-                    f"in the SUT and ensure they follow the naming convention. "
-                    f"Override with QTEA_PYTEST_MARKER='' to run without "
-                    f"scoping (runs the full SUT suite, not recommended)."
+                # Zero parsed tests has two distinct causes that both trip
+                # this condition, and the fix used to assume it was always
+                # the first one:
+                #   1. Genuinely zero tests matched the qtea marker/prefix
+                #      filter (a real naming defect).
+                #   2. The runner never got that far — a collection/compile
+                #      error (missing module, broken import, syntax error)
+                #      that `run_tests` already ran through
+                #      `classify_runner_failure` and attached to the
+                #      synthetic `T-runner-failure` entry (test_runner.py).
+                # Trusting that existing signal fixes the H2 misdiagnosis:
+                # a TS compile-fatal import error was reported as "add the
+                # qtea_ prefix" (run 20260709-083909-223772) even though
+                # the classifier had already identified the real cause.
+                _runner_failure = next(
+                    (r.runner_failure for r in first.results if r.runner_failure),
+                    None,
                 )
-                # Step 9->8 back-edge (Gap C): zero-collection is a structural
+                if _runner_failure is not None:
+                    _kind = _runner_failure.get("kind", "collection_error")
+                    _empty_err = (
+                        f"{framework} produced zero parseable test results — "
+                        f"{_runner_failure.get('summary', 'runner failure')}. "
+                        f"Fix: {_runner_failure.get('hint', 'see test-output.log')}."
+                    )
+                    ctx.extras["rerun_reason"] = (
+                        f"Step 9 produced zero parseable results due to a "
+                        f"{_kind} failure: {_runner_failure.get('summary', '')}"
+                    )
+                else:
+                    _kind = "naming_defect"
+                    _empty_err = (
+                        f"{framework} collected 0 tests matching the qtea "
+                        f"test filter. This is a codegen defect: Step 8 must "
+                        f"generate test files with the 'qtea_' prefix "
+                        f"(Playwright Test) or add @pytest.mark.qtea_<phase> "
+                        f"to every test function (pytest). Check the test files "
+                        f"in the SUT and ensure they follow the naming convention. "
+                        f"Override with QTEA_PYTEST_MARKER='' to run without "
+                        f"scoping (runs the full SUT suite, not recommended)."
+                    )
+                    ctx.extras["rerun_reason"] = (
+                        "Step 9 collected 0 tests matching the qtea marker filter "
+                        f"({_applied_marker_filter}). Generated tests are missing "
+                        "the required @pytest.mark.qtea_<phase> marker (pytest) or "
+                        "the qtea_ filename prefix (Playwright Test)."
+                    )
+                # Step 9->8 back-edge (Gap C): either cause is a structural
                 # codegen defect no heal can fix — ask the pipeline to
                 # regenerate Step 8 once with this reason, then replay Step 9.
                 # The pipeline guards against cycles (single replay per run).
+                # `rerun_kind` lets Step 8 tailor its regen feedback instead
+                # of always coaching toward the naming fix.
                 ctx.extras["rerun_step"] = 8
-                ctx.extras["rerun_reason"] = (
-                    "Step 9 collected 0 tests matching the qtea marker filter "
-                    f"({_applied_marker_filter}). Generated tests are missing "
-                    "the required @pytest.mark.qtea_<phase> marker (pytest) or "
-                    "the qtea_ filename prefix (Playwright Test)."
-                )
+                ctx.extras["rerun_kind"] = _kind
                 return StepResult(
                     success=False,
                     status="failed",
@@ -1388,20 +1508,6 @@ class ExecuteStep(Step):
                 duration_s=round(first.duration_s, 1),
                 totals=first.totals,
             )
-
-            # Persist raw test-runner stdout/stderr as a standalone artifact
-            # so humans can diagnose without parsing run-results.json.
-            test_output_path = out_dir / "test-output.log"
-            with contextlib.suppress(OSError):
-                test_output_path.write_text(
-                    f"# framework: {framework}\n"
-                    f"$ {first.command}\n"
-                    f"# exit_code: {first.exit_code}\n"
-                    f"# duration: {first.duration_s:.1f}s\n\n"
-                    f"--- STDOUT ---\n{first.stdout or '(empty)'}\n\n"
-                    f"--- STDERR ---\n{first.stderr or '(empty)'}\n",
-                    encoding="utf-8",
-                )
 
             # `test_runner_invocations` counts calls to run_tests within a
             # single Step 9 attempt (initial → optional dep-recovery →
@@ -1564,6 +1670,7 @@ class ExecuteStep(Step):
                                 headless=getattr(ctx.options, "headless", True),
                                 marker_filter=_QTEA_PYTEST_MARKER_FILTER,
                                 parallelism=getattr(ctx.options, "parallelism", 0),
+                                playwright_project=getattr(ctx, "_pw_project", None),
                             )
                             test_runner_invocations = 2
                             # Refresh install_sig: the auto-install just wrote
@@ -1626,6 +1733,7 @@ class ExecuteStep(Step):
                                 headless=getattr(ctx.options, "headless", True),
                                 marker_filter=_QTEA_PYTEST_MARKER_FILTER,
                                 parallelism=getattr(ctx.options, "parallelism", 0),
+                                playwright_project=getattr(ctx, "_pw_project", None),
                             )
                             test_runner_invocations = 2
                             failing = _failing_tests(first)
@@ -1712,8 +1820,15 @@ class ExecuteStep(Step):
                 workspace_root=ctx.workspace.root,
                 cli_opt=getattr(ctx.options, "storage_state", None),
             )
-            _heal_mcp_env["QTEA_STORAGE_STATE_ARG"] = (
-                _storage_state_mod.to_mcp_arg(_storage_state_path)
+            # Rebuild ALL browser-mode args, not just the storage-state flag:
+            # a session that only materialised post-run (auto-capture writes it
+            # after the first test pass) must flip the MCP browser into isolated
+            # mode AND drop --user-data-dir, or the freshly-captured session is
+            # still ignored. See storage_state.mcp_browser_env.
+            _heal_mcp_env.update(
+                _storage_state_mod.mcp_browser_env(
+                    _storage_state_path, ctx.workspace.root / "playwright-mcp",
+                )
             )
             if _storage_state_path is not None:
                 runtime_env["QTEA_STORAGE_STATE"] = str(_storage_state_path)
@@ -1952,13 +2067,19 @@ class ExecuteStep(Step):
                     # parallel orchestration doesn't spin up more browser
                     # processes than the host can handle.
 
-                    # Per-heal MCP env: each concurrent agent gets its own
-                    # Chromium user-data-dir so profile locks don't cause
-                    # "Browser is already in use" contention.
+                    # Per-heal MCP env: when there's no session, each concurrent
+                    # agent gets its own Chromium user-data-dir so profile locks
+                    # don't cause "Browser is already in use" contention. When a
+                    # session exists we run --isolated (in-memory profile) which
+                    # is independent per process — it both avoids that contention
+                    # AND actually loads --storage-state (a persistent
+                    # user-data-dir would silently ignore it). Rebuild via the
+                    # helper so isolated mode DROPS user-data-dir rather than
+                    # re-adding it alongside --isolated (which conflict).
                     _per_heal_mcp_env = {
                         **_heal_mcp_env,
-                        "QTEA_MCP_USER_DATA_DIR_ARG": (
-                            f"--user-data-dir={heal_wd / 'playwright-mcp'}"
+                        **_storage_state_mod.mcp_browser_env(
+                            _storage_state_path, heal_wd / "playwright-mcp",
                         ),
                     }
 
@@ -2251,6 +2372,7 @@ class ExecuteStep(Step):
                         cwd=ctx.workspace.sut,
                         profile=stack_profile,
                         marker_filter=_QTEA_PYTEST_MARKER_FILTER,
+                        playwright_project=getattr(ctx, "_pw_project", None),
                     )
                     narrowed_cmd = _filter_command_for_tests(base_cmd, failing)
                     _clean_sut_artifacts(ctx.workspace.sut)
@@ -2264,6 +2386,7 @@ class ExecuteStep(Step):
                         headless=getattr(ctx.options, "headless", True),
                         marker_filter=_QTEA_PYTEST_MARKER_FILTER,
                         parallelism=getattr(ctx.options, "parallelism", 0),
+                        playwright_project=getattr(ctx, "_pw_project", None),
                     )
                     test_runner_invocations = 2
                     # The narrowed re-run only reports the healed subset, so

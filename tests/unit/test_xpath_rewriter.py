@@ -48,8 +48,8 @@ from qtea.xpath_rewriter import (
     ),
     # heading role via `<h1>` + normalize-space contains
     (
-        '//h1[contains(normalize-space(.), "GRC HOME")]',
-        "this.page.getByRole('heading', { name: 'GRC HOME' })",
+        '//h1[contains(normalize-space(.), "AppHome")]',
+        "this.page.getByRole('heading', { name: 'AppHome' })",
     ),
     # link role
     (
@@ -63,8 +63,8 @@ from qtea.xpath_rewriter import (
     ),
     # exact text on <p>
     (
-        '//p[text()="Record of Processing Activities - ROPA"]',
-        "this.page.getByText('Record of Processing Activities - ROPA', { exact: true })",
+        '//p[text()="Entity Directory - Reports"]',
+        "this.page.getByText('Entity Directory - Reports', { exact: true })",
     ),
     # exact text on <span> via normalize-space()
     (
@@ -115,15 +115,15 @@ def test_rewrite_xpath_data_testid_uses_css() -> None:
 
 def test_rewrite_xpath_union_simple() -> None:
     xpath = (
-        '//h1[contains(normalize-space(.), "GRC HOME")] '
-        '| //p[contains(normalize-space(.), "GRC HOME")]'
+        '//h1[contains(normalize-space(.), "AppHome")] '
+        '| //p[contains(normalize-space(.), "AppHome")]'
     )
     rw = rewrite_xpath(xpath)
     assert rw is not None
     assert rw.kind == RewriteKind.UNION
     assert ".or(" in rw.expression
     assert "getByRole('heading'" in rw.expression
-    assert "getByText('GRC HOME')" in rw.expression
+    assert "getByText('AppHome')" in rw.expression
 
 
 def test_rewrite_xpath_template_interpolation_preserved() -> None:
@@ -204,7 +204,7 @@ export class BasePage {
         inpUsername: '//input[@data-test="username-input"]',
         inpPassword: '//input[@data-test="password-input"]',
         btnLogin: '//input[@data-test="submit-button"]',
-        btnHomeHeading: '//h1[contains(normalize-space(.), "GRC HOME")]',
+        btnHomeHeading: '//h1[contains(normalize-space(.), "AppHome")]',
         btnLogout: '//span[text()="Logout"]',
     };
 
@@ -241,7 +241,7 @@ def test_rewrite_file_container_migration(tmp_path: Path) -> None:
     # Container migrated from `Record<string, string>` to arrow-factories
     assert "() => this.page.getByTestId('username-input')" in new_text
     assert "// was: '//input[@data-test=\"username-input\"]'" in new_text
-    assert "() => this.page.getByRole('heading', { name: 'GRC HOME' })" in new_text
+    assert "() => this.page.getByRole('heading', { name: 'AppHome' })" in new_text
     # Call sites collapsed
     assert "this.elements.inpUsername()" in new_text
     assert "this.elements.btnLogin()" in new_text

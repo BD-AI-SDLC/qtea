@@ -33,10 +33,11 @@ dependencies = [
     "nodeenv>=1.8",
     "psutil>=5.9",
     "allure-pytest>=2.13",
+    "playwright>=1.40",
 ]
 
 [project.optional-dependencies]
-ui = ["flet>=0.28", "flet-desktop>=0.28"]
+ui = ["flet==0.86.1", "flet-desktop==0.86.1"]
 
 [project.scripts]
 qtea = "qtea.cli:app"
@@ -99,4 +100,6 @@ addopts = "-ra --strict-markers -n auto"
 asyncio_mode = "auto"
 markers = [
     "integration: spawns real subprocesses / git or does heavy filesystem work (slower). Run the fast inner loop with `-m 'not integration'`; CI runs everything.",
+    "no_stub_aux_agents: opt out of the autouse aux-agent (debug-RCA / fix-proposal) transport stub in tests/conftest.py.",
+    "use_ambient_playwright_mcp: opt out of the autouse Playwright-MCP install isolation in tests/conftest.py (for tests exercising the npx→node rewrite / resolver).",
 ]

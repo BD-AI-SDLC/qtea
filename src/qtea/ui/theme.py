@@ -63,6 +63,8 @@ LOG_LEVEL_COLORS: dict[str, str] = {
 LOG_AGENT_COLOR = "#00E5FF"
 LOG_MODEL_COLOR = "#FFD54F"
 LOG_TOKENS_COLOR = "#FF5252"
+# Orange highlight for a leading step token (e.g. "step08") in an event name.
+LOG_STEP_COLOR = "#FF9800"
 
 # ── Text/icon scale (Ctrl+/Ctrl- zoom) ──────────────────────────────────────
 

@@ -33,7 +33,7 @@ import subprocess
 import sys
 import tomllib
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -321,6 +321,25 @@ def _inject_playwright_workers(command: str, parallelism: int) -> str:
     return command
 
 
+def _inject_playwright_project(command: str, project: str | None) -> str:
+    """Pin a Playwright Test command to a single ``--project``.
+
+    qtea Step 9 must run the SUT's tests on exactly one browser (chromium
+    first, firefox second) — never both. A SUT ``playwright.config.ts`` that
+    defines multiple projects (e.g. ``chromium`` + ``firefox``) otherwise runs
+    every project, doubling the run and opening two browser windows.
+
+    Idempotent: if the command already carries an explicit ``--project`` (e.g.
+    a researcher-detected command that already selects one), it is left alone.
+    No-op when ``project`` is falsy (no project could be resolved).
+    """
+    if not project:
+        return command
+    if re.search(r"(?:^|\s)--project(?:\s|=)", command):
+        return command
+    return f"{command} --project={project}"
+
+
 def _inject_playwright_reporter_json(command: str) -> str:
     """Ensure a Playwright Test command emits the JSON reporter to stdout.
 
@@ -376,6 +395,7 @@ def resolve_command(
     profile: StackProfile | None = None,
     marker_filter: str | None = None,
     parallelism: int = 2,
+    playwright_project: str | None = None,
 ) -> tuple[str, str]:
     """Pick command + parser id.
 
@@ -408,6 +428,11 @@ def resolve_command(
     pytest gets ``-n <value>`` (xdist), Playwright Test gets
     ``--workers <value>``. ``0`` runs pytest in-process (``-n 0``)
     and is a no-op for Playwright Test.
+
+    `playwright_project` (Playwright Test frameworks only): pins the run to a
+    single ``--project=<name>`` so Step 9 runs on exactly one browser
+    (chromium first, firefox second) instead of every project the SUT config
+    defines. No-op when ``None`` or when the command already selects a project.
     """
     apply_marker = framework in _PYTEST_FRAMEWORKS
     apply_pw_filter = framework in _PW_TEST_FRAMEWORKS
@@ -426,6 +451,7 @@ def resolve_command(
             detected = _inject_playwright_reporter_json(detected)
             detected = _inject_playwright_file_filter(detected)
             detected = _inject_playwright_workers(detected, parallelism)
+            detected = _inject_playwright_project(detected, playwright_project)
         if parser == "mocha-json":
             # Cypress/Mocha detected commands need the json reporter wired to
             # the file the parser reads, or a green suite reports zero results.
@@ -450,6 +476,7 @@ def resolve_command(
         elif apply_pw_filter:
             wrapped = _inject_playwright_file_filter(wrapped)
             wrapped = _inject_playwright_workers(wrapped, parallelism)
+            wrapped = _inject_playwright_project(wrapped, playwright_project)
         return wrapped, parser
     # No default known for this framework and no usable detected command.
     # Fail loud: silently defaulting to `pytest` for e.g. a Java or Ruby
@@ -884,10 +911,12 @@ def run_tests(
     headless: bool = True,
     marker_filter: str | None = None,
     parallelism: int = 0,
+    playwright_project: str | None = None,
 ) -> RunResult:
     command, parser = resolve_command(
         framework, detected=detected_command, cwd=cwd, profile=profile,
         marker_filter=marker_filter, parallelism=parallelism,
+        playwright_project=playwright_project,
     )
     log.info(
         "test_runner.resolved_command",
@@ -1166,6 +1195,30 @@ _PYTEST_COLLECTION_ERRORS_RE = re.compile(
     r"(?im)^\s*(?:errors during collection|=+\s*ERRORS\s*=+)"
 )
 
+# Node/TS equivalents of the Python module-not-found signal above. Node's
+# runtime resolver (`Cannot find module 'X'`) and tsc's compile-time
+# diagnostic (`error TS2307: Cannot find module 'X'`) both name the module —
+# a relative specifier (`./foo`, `../foo`) means a broken *local* import
+# (e.g. a bad runtime-import path, our H1/H2 incident class) which is a
+# `collection_error`, not a missing dependency; a bare package name (`foo`,
+# `@scope/foo`) means an uninstalled npm package, which is `missing_module`.
+_JS_MODULE_NOT_FOUND_RE = re.compile(
+    r"(?im)Cannot find module\s+['\"](?P<module>[^'\"]+)['\"]"
+)
+_TS_MODULE_NOT_FOUND_RE = re.compile(
+    r"(?im)error\s+TS2307\s*:\s*Cannot find module\s+['\"](?P<module>[^'\"]+)['\"]"
+)
+# Generic tsc/Jest/Vitest/Cypress compile-or-collection failure with no
+# specific missing-module signal (syntax error, type error, broken fixture
+# import, etc.) — the JS/TS analogue of `_CONFTEST_IMPORT_ERROR_RE` /
+# `_PYTEST_COLLECTION_ERRORS_RE` above.
+_TS_JS_COLLECTION_ERROR_RE = re.compile(
+    r"(?im)(?:error\s+TS\d+\s*:"
+    r"|^\s*SyntaxError\s*:"
+    r"|Test suite failed to run"
+    r"|Transform failed with)"
+)
+
 _MISSING_ENV_RE = re.compile(
     r"Missing required environment variables?\s*:?\s*"
     r"(?P<body>(?:(?:\s|\\n)*-?\s*[A-Z][A-Z0-9_]+(?:\s|\\n)*)+)",
@@ -1316,6 +1369,27 @@ def classify_runner_failure(
             "summary": f"missing dependency: {module!r}",
         }
 
+    m = _TS_MODULE_NOT_FOUND_RE.search(combined) or _JS_MODULE_NOT_FOUND_RE.search(combined)
+    if m:
+        module = m.group("module")
+        if module.startswith("."):
+            return {
+                "kind": "collection_error",
+                "module": module,
+                "hint": (
+                    f"fix the broken local import path {module!r} — the "
+                    "referenced file does not exist relative to the "
+                    "importing file (check for a nested-directory path bug)"
+                ),
+                "summary": f"broken local import: {module!r} could not be resolved",
+            }
+        return {
+            "kind": "missing_module",
+            "module": module,
+            "hint": _install_hint_for(module, package_manager),
+            "summary": f"missing dependency: {module!r}",
+        }
+
     m = _MISSING_ENV_RE.search(combined)
     if m:
         body = m.group("body")
@@ -1333,7 +1407,11 @@ def classify_runner_failure(
             "summary": f"missing environment variables: {', '.join(var_names)}",
         }
 
-    if _CONFTEST_IMPORT_ERROR_RE.search(combined) or _PYTEST_COLLECTION_ERRORS_RE.search(combined):
+    if (
+        _CONFTEST_IMPORT_ERROR_RE.search(combined)
+        or _PYTEST_COLLECTION_ERRORS_RE.search(combined)
+        or _TS_JS_COLLECTION_ERROR_RE.search(combined)
+    ):
         return {
             "kind": "collection_error",
             "module": None,
@@ -1643,6 +1721,161 @@ def prepare_sut(
         stdout="\n".join(all_stdout),
         stderr="\n".join(all_stderr),
     )
+
+
+# Playwright frameworks that need browser binaries installed after the package
+# install. Kept in sync with the set Step 9 bootstrap keys off.
+_PW_FRAMEWORKS = frozenset(
+    {"playwright-py", "playwright-ts", "playwright-js", "playwright-java"}
+)
+
+# Marker file (workspace-root relative) recording the install signature of a
+# successful pre-Step-7 env prewarm. Step 9's bootstrap reads it to skip a
+# redundant re-install of an already-prepared environment on its first attempt.
+_ENV_PREP_MARKER_NAME = ".qtea-env-prep-sig"
+
+
+@dataclass
+class SutEnvResult:
+    """Outcome of :func:`prepare_sut_env` — full SUT test-env preparation."""
+
+    ok: bool
+    ran_install: bool
+    stack_profile: StackProfile | None
+    error: str | None = None
+
+
+def _sut_env_present(cwd: Path, framework: str | None) -> bool:
+    """Whether the SUT already has a usable test env despite a failed install.
+
+    Node: ``node_modules/playwright`` or ``@playwright/test`` present. Python:
+    a ``.venv`` directory present. Used to let the best-effort env prewarm
+    proceed on a committed / prior-run environment when a strict ``npm ci``
+    fails on a drifted lockfile.
+    """
+    if (framework or "") in {"playwright-ts", "playwright-js"}:
+        return (
+            (cwd / "node_modules" / "playwright").is_dir()
+            or (cwd / "node_modules" / "@playwright" / "test").is_dir()
+        )
+    # Python (playwright-py) and unknown frameworks: a venv is the usable signal.
+    return (cwd / ".venv").is_dir()
+
+
+def prepare_sut_env(
+    profile: StackProfile | None,
+    *,
+    cwd: Path,
+    framework: str | None,
+    install_log_path: Path | None = None,
+    timeout_s: int = 900,
+) -> SutEnvResult:
+    """Install SUT deps, activate the venv, and install Playwright browsers.
+
+    Single source of truth for "make the SUT test environment usable". Shared
+    by the pipeline's pre-Step-7 prewarm (so ``qtea auth-capture`` can drive
+    the SUT's own sign-in helper at Step 7) and Step 9's bootstrap. Every phase
+    is idempotent at the tool level (``poetry install`` / ``npm ci`` /
+    ``playwright install`` all no-op or restore-from-cache when satisfied), so
+    a warm second call in the same run is cheap. Never raises.
+
+    Returns a :class:`SutEnvResult` carrying the (possibly venv-swapped) profile
+    so callers that go on to run tests use the venv bin directory directly
+    instead of the slower package-manager wrapper.
+    """
+    # Phase 1: package install (poetry install / npm ci / ...).
+    prep = prepare_sut(profile, cwd=cwd, timeout_s=timeout_s)
+    if install_log_path is not None and prep.ran:
+        try:
+            install_log_path.write_text(
+                f"$ {prep.command}\n\n# STDOUT\n{prep.stdout}\n\n"
+                f"# STDERR\n{prep.stderr}\n",
+                encoding="utf-8",
+            )
+        except OSError as e:
+            log.warning("prepare_sut_env.log_write_failed", error=str(e))
+    if not prep.ok():
+        # A strict install command (`npm ci`) fails on a drifted lockfile even
+        # when a usable environment is already present (committed / prior run).
+        # For the best-effort auth-prewarm caller, proceed on the existing env
+        # rather than blocking — the install failure is non-fatal if we can
+        # still drive the SUT's own code. Otherwise report failure.
+        if _sut_env_present(cwd, framework):
+            log.warning(
+                "prepare_sut_env.install_failed_but_env_present",
+                command=prep.command, exit_code=prep.exit_code,
+                hint="using the existing SUT env; sync the lockfile to silence this",
+            )
+        else:
+            return SutEnvResult(
+                ok=False, ran_install=prep.ran, stack_profile=profile,
+                error=f"install failed: `{prep.command}` exited {prep.exit_code}",
+            )
+
+    # Phase 2: venv detection + wrapper swap. After prepare_sut created .venv,
+    # invoke subsequent commands via its bin dir directly (equivalent to
+    # activating the venv) — bypasses poetry's slower venv resolution.
+    swapped = profile
+    if profile and profile.venv_path:
+        venv_abs = cwd / profile.venv_path
+        if venv_abs.exists():
+            bin_dir = str(venv_abs / ("Scripts" if os.name == "nt" else "bin"))
+            swapped = replace(
+                profile, wrapper_prefix=bin_dir, package_manager="pip",
+            )
+
+    # Phase 3: Playwright browser binaries. Idempotent — skips if present.
+    if swapped and (framework or "") in _PW_FRAMEWORKS:
+        pw_cmd = wrap_command(swapped, "playwright install chromium")
+        rc, out, err, _dur = execute_command(
+            pw_cmd, cwd=cwd, timeout_s=400,
+            isolate_venv=(swapped.package_manager or "").lower()
+            in PYTHON_VENV_MANAGERS,
+        )
+        if install_log_path is not None:
+            try:
+                with install_log_path.open("a", encoding="utf-8") as f:
+                    f.write(
+                        f"\n$ {pw_cmd}\n# exit_code: {rc}\n"
+                        f"# STDOUT\n{out}\n\n# STDERR\n{err}\n"
+                    )
+            except OSError as e:
+                log.warning("prepare_sut_env.pw_log_write_failed", error=str(e))
+        if rc != 0:
+            # Non-fatal: browsers may already be present, or a later step can
+            # still function. Mirror Step 9's warn-and-continue.
+            log.warning(
+                "prepare_sut_env.playwright_install_failed",
+                exit_code=rc, stderr=err[:300],
+            )
+
+    return SutEnvResult(ok=True, ran_install=prep.ran, stack_profile=swapped)
+
+
+def write_env_prep_marker(workspace_root: Path, install_sig: str | None) -> None:
+    """Record a successful pre-Step-7 env prewarm's install signature.
+
+    Best-effort — a write failure just means Step 9 re-runs the (idempotent)
+    install instead of fast-pathing. Never raises.
+    """
+    if not install_sig:
+        return
+    try:
+        (Path(workspace_root) / _ENV_PREP_MARKER_NAME).write_text(
+            install_sig, encoding="utf-8",
+        )
+    except OSError as e:
+        log.warning("prepare_sut_env.marker_write_failed", error=str(e))
+
+
+def read_env_prep_marker(workspace_root: Path) -> str | None:
+    """Read the install signature written by a prior :func:`prepare_sut_env`
+    prewarm, or ``None`` when absent/unreadable."""
+    try:
+        p = Path(workspace_root) / _ENV_PREP_MARKER_NAME
+        return p.read_text(encoding="utf-8").strip() if p.is_file() else None
+    except OSError:
+        return None
 
 
 # ---------------------------------------------------------------------------

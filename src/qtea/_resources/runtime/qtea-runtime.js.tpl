@@ -1187,7 +1187,11 @@ const _qteaTest = buildQteaTest();
 installMonkeyPatch();
 
 // Playwright Test's globalSetup expects a default-exported async function.
-module.exports = async function globalSetup() {
+// The `_config` parameter is accepted-but-ignored so that any composer which
+// forwards Playwright's `config` to us (see `_compose_playwright_global_setup`)
+// matches this signature under `tsc --checkJs` — the runtime reads its inputs
+// from env, not from config.
+module.exports = async function globalSetup(_config) {
   installMonkeyPatch();
 };
 

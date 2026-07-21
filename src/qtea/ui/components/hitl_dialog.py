@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import re
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -13,6 +15,7 @@ import flet as ft
 from qtea.hitl import (
     RESOLUTION_ANSWERED,
     RESOLUTION_ANSWERED_SENSITIVE,
+    RESOLUTION_HEADED_LOGIN_SKIP,
     RESOLUTION_OVERLAY_BUG,
     RESOLUTION_OVERLAY_ONCE,
     RESOLUTION_OVERLAY_PERSIST,
@@ -266,6 +269,144 @@ def _build_overlay_dismiss_widget(
     return widget, collector
 
 
+def _build_headed_login_content(
+    q_id: str, q_text: str, metadata: dict,
+) -> tuple[ft.Control, ft.Text]:
+    """Bespoke content for the Step 7 headed-login confirm-or-skip question.
+
+    Unlike the generic clarification card, there's nothing to type — the
+    browser window itself is where the work happens. A neutral "LOGIN" chip
+    (not the orange "CLARIFICATION"/"BLOCKER" ones) signals "an external
+    action is in progress" rather than "the agent needs your knowledge".
+
+    Returns ``(content, elapsed_text)`` — the caller owns starting/stopping
+    the live ticker that updates ``elapsed_text.value``.
+    """
+    base_url = metadata.get("base_url") or ""
+    elapsed_text = ft.Text("Waiting… 00:00", size=sz(13), color=ON_SURFACE_DIM)
+    chip = ft.Container(
+        content=ft.Text(
+            "LOGIN", size=sz(10), weight=ft.FontWeight.BOLD, color="#FFFFFF",
+        ),
+        bgcolor="#2E7D9A",
+        border_radius=4,
+        padding=ft.Padding.symmetric(horizontal=6, vertical=2),
+    )
+    return ft.Column(
+        controls=[
+            ft.Row(controls=[chip, ft.Text(q_id, size=sz(11), color=ON_SURFACE_DIM)], spacing=8),
+            ft.Text(q_text, size=sz(13), color=ON_SURFACE, weight=ft.FontWeight.W_500),
+            ft.Container(
+                content=ft.Text(base_url, size=sz(12), color=ON_SURFACE_DIM, selectable=True),
+                bgcolor=BACKGROUND,
+                border_radius=4,
+                border=ft.Border.all(1, DIVIDER),
+                padding=ft.Padding.symmetric(horizontal=8, vertical=6),
+            ),
+            elapsed_text,
+            ft.Text(
+                "Skipping does NOT capture your session — Step 7 proceeds "
+                "unauthenticated.",
+                size=sz(11), color=ON_SURFACE_DIM, italic=True,
+            ),
+        ],
+        spacing=10,
+        tight=True,
+    ), elapsed_text
+
+
+def _show_headed_login_dialog(page: ft.Page, req) -> None:
+    """Bespoke 3-button dialog for the headed-login confirm/skip question.
+
+    Bypasses the generic Submit/Skip-All bar entirely (that bar resolves
+    ALL questions in the request at once and always shows a free-text
+    field — wrong model for a pure "click when done" gate). "Reopen
+    browser window" is a direct in-process call into
+    :mod:`qtea.headed_auth_capture` and deliberately does NOT resolve or
+    close the dialog.
+    """
+    from qtea import headed_auth_capture
+    from qtea.ui.components.progress_header import fmt_elapsed
+
+    q = req.questions[0]
+    q_id = q.get("id", "")
+    q_text = q.get("text", q.get("question", ""))
+    metadata = q.get("metadata") or {}
+    content, elapsed_text = _build_headed_login_content(q_id, q_text, metadata)
+
+    started_at = metadata.get("started_at")
+    t0 = started_at if isinstance(started_at, (int, float)) else time.monotonic()
+    ticking = True
+
+    async def _tick() -> None:
+        while ticking:
+            elapsed_text.value = f"Waiting… {fmt_elapsed(time.monotonic() - t0)}"
+            try:
+                elapsed_text.update()
+            except Exception:
+                with contextlib.suppress(Exception):
+                    page.update()
+            await asyncio.sleep(1)
+
+    def _resolve(resolution: str) -> None:
+        nonlocal ticking
+        ticking = False
+        req.answers[q_id] = (resolution, "")
+        try:
+            req._dialog_open = False  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        page.pop_dialog()
+        if req.completion_event:
+            req.completion_event.set()
+
+    def _on_confirm(e: ft.ControlEvent) -> None:
+        _resolve(RESOLUTION_ANSWERED)
+
+    def _on_skip(e: ft.ControlEvent) -> None:
+        _resolve(RESOLUTION_HEADED_LOGIN_SKIP)
+
+    def _on_reopen(e: ft.ControlEvent) -> None:
+        # In-process call — headed_auth_capture owns the thread-safe hop
+        # onto the pipeline's own event loop. Does not close the dialog.
+        headed_auth_capture.request_browser_reopen(q_id)
+
+    dlg = ft.AlertDialog(
+        modal=True,
+        title=ft.Text(
+            f"Step {req.step} — Waiting for you to log in",
+            size=sz(16),
+            weight=ft.FontWeight.BOLD,
+        ),
+        content=ft.Container(content=content, width=520),
+        actions=[
+            ft.TextButton(
+                "Skip authentication — continue unauthenticated",
+                style=ft.ButtonStyle(color="#FF5252"),
+                on_click=_on_skip,
+            ),
+            ft.OutlinedButton("Reopen browser window", on_click=_on_reopen),
+            ft.ElevatedButton(
+                "I've Logged In — Continue",
+                icon=ft.Icons.CHECK,
+                bgcolor=SECONDARY,
+                color="#FFFFFF",
+                on_click=_on_confirm,
+            ),
+        ],
+        actions_alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+    )
+
+    # Mark BEFORE show_dialog so any synchronous re-entry from inside
+    # page.show_dialog's update cycle hits the guard above (see show_hitl_dialog).
+    try:
+        req._dialog_open = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    page.show_dialog(dlg)
+    page.run_task(_tick)
+
+
 def show_hitl_dialog(page: ft.Page, state: AppState) -> None:
     """Show a modal dialog for pending HITL questions.
 
@@ -282,6 +423,13 @@ def show_hitl_dialog(page: ft.Page, state: AppState) -> None:
     if not req:
         return
     if getattr(req, "_dialog_open", False):
+        return
+
+    if (
+        len(req.questions) == 1
+        and (req.questions[0].get("metadata") or {}).get("type") == "headed_login"
+    ):
+        _show_headed_login_dialog(page, req)
         return
 
     answer_fields: dict[str, ft.TextField] = {}
@@ -770,8 +918,8 @@ def _make_per_row_edit_panel(
     when the user clicks Submit with non-empty input.
     """
     caption_default = (
-        f"Edit instructions for {row_id} "
-        "(sent to the editor agent, scoped to this row)"
+        f"Edit instructions for {row_id} — queued when you click "
+        "“Queue edit”, applied together when you Approve below"
     )
     edit_field = ft.TextField(
         multiline=True,
@@ -795,7 +943,8 @@ def _make_per_row_edit_panel(
         if not text:
             edit_field.border_color = "#FFB74D"
             edit_caption.value = (
-                f"Type your edit instructions for {row_id}, then click Submit."
+                f"Type your edit instructions for {row_id}, "
+                "then click Queue edit."
             )
             edit_caption.color = "#FFB74D"
             try:
@@ -805,6 +954,20 @@ def _make_per_row_edit_panel(
                 pass
             return
         on_submit(row_id, row_label, text)
+        # Queue-and-collapse: the edit is BATCHED, not sent yet. Collapse the
+        # panel and confirm so the user can queue edits on other rows before
+        # applying them all at once via the dialog's Approve/Edit button. The
+        # field value is preserved so reopening this row shows what's queued.
+        open_state["v"] = False
+        panel.visible = False
+        edit_field.border_color = DIVIDER
+        edit_caption.value = (
+            f"✓ Edit queued for {row_id}. Reopen to change it; "
+            "click Approve below to apply all queued edits."
+        )
+        edit_caption.color = SECONDARY
+        with contextlib.suppress(Exception):
+            panel.update()
 
     def _do_cancel(_e: ft.ControlEvent) -> None:
         open_state["v"] = False
@@ -825,8 +988,8 @@ def _make_per_row_edit_panel(
                     controls=[
                         ft.TextButton("Cancel", on_click=_do_cancel),
                         ft.ElevatedButton(
-                            "Submit edit",
-                            icon=ft.Icons.SEND,
+                            "Queue edit",
+                            icon=ft.Icons.ADD,
                             bgcolor=SECONDARY,
                             color="#FFFFFF",
                             on_click=_do_submit,
@@ -1227,7 +1390,14 @@ def _render_plan_fixtures(fixtures: list[dict]) -> ft.Control:
         return ft.Text(
             "fixtures: —", size=sz(11), color=ON_SURFACE_DIM, italic=True,
         )
-    rows: list[ft.Control] = [_plan_section_header("Fixtures", len(fixtures))]
+    rows: list[ft.Control] = [
+        _plan_section_header("Fixtures", len(fixtures)),
+        ft.Text(
+            "Playwright fixtures — thin DI wrappers that instantiate & inject "
+            "the Page Objects below into each test.",
+            size=sz(10), color=ON_SURFACE_DIM, italic=True, selectable=True,
+        ),
+    ]
     for f in fixtures:
         src = f.get("source", "?")
         name = f.get("name") or "?"
@@ -1339,6 +1509,98 @@ def _render_plan_page_objects(poms: list[dict]) -> ft.Control:
     return ft.Column(controls=rows, spacing=3, tight=True)
 
 
+def _deferred_locators_from_units(units: list[dict]) -> list[dict]:
+    """Exemplar (non-POM) lane: the TBD locators the SUT needs live inside each
+    reusable unit's ``deferred_targets[]`` (name + intent), not in the TC-level
+    ``locators[]``. Flatten them into ``locator_entry``-shaped dicts so the
+    shared ``_render_plan_locators`` renderer can surface them as create_tbd
+    locators (with the owning unit as ``owning_page``)."""
+    out: list[dict] = []
+    for u in units:
+        owner = u.get("name") or "?"
+        for dt in u.get("deferred_targets") or []:
+            out.append({
+                "name": dt.get("name") or "?",
+                "owning_page": dt.get("owning_unit") or owner,
+                "source": "create_tbd",
+                "intent": dt.get("intent") or "?",
+            })
+    return out
+
+
+def _render_plan_reusable_units(units: list[dict]) -> ft.Control:
+    """Exemplar-lane counterpart to ``_render_plan_page_objects``. Renders the
+    SUT's own reusable units (Screenplay Task/Question/Interaction/…) with their
+    category, reuse/create placement, and ``missing_behaviors``. Deferred
+    locators are surfaced in the shared Locators section, not here."""
+    if not units:
+        return ft.Text(
+            "reusable units: —", size=sz(11), color=ON_SURFACE_DIM, italic=True,
+        )
+    rows: list[ft.Control] = [_plan_section_header("Reusable units", len(units))]
+    for u in units:
+        src = u.get("source", "?")
+        name = u.get("name") or "?"
+        ref = u.get("from") or u.get("at") or "?"
+        arrow = "←" if src == "reuse" else "→"
+        cat = u.get("category")
+        mb = list(u.get("missing_behaviors") or [])
+        head_children: list[ft.Control] = [
+            ft.Text("•", size=sz(12), color=ON_SURFACE_DIM, width=14),
+            _source_badge(src),
+            ft.Text(
+                name, size=sz(12), color=ON_SURFACE, selectable=True,
+                font_family="Courier New",
+            ),
+            ft.Text(f"{arrow} {ref}", size=sz(11), color=ON_SURFACE_DIM,
+                    selectable=True),
+        ]
+        if cat:
+            head_children.append(_plan_inline_chip(str(cat)))
+        if mb:
+            head_children.append(_plan_inline_chip(f"+{len(mb)} behaviors"))
+        rows.append(ft.Row(
+            controls=head_children, spacing=6,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            wrap=True,
+        ))
+        for m in mb:
+            sig = _strip_trivial_return_type(
+                m.get("signature") or m.get("name") or "?",
+            )
+            rows.append(ft.Container(
+                content=ft.Row(
+                    controls=[
+                        _badge("ADD", _SOURCE_BADGE_COLORS["create"]),
+                        _plan_meta_line(sig),
+                    ],
+                    spacing=6,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    wrap=True,
+                ),
+                padding=ft.Padding.only(left=20),
+            ))
+            if m.get("purpose"):
+                rows.append(ft.Container(
+                    content=ft.Text(
+                        f"  purpose: {m['purpose']}",
+                        size=sz(11), color=ON_SURFACE_DIM, italic=True,
+                        selectable=True,
+                    ),
+                    padding=ft.Padding.only(left=20),
+                ))
+        if u.get("reuse_justification"):
+            rows.append(ft.Container(
+                content=ft.Text(
+                    f"why reuse: {u['reuse_justification']}",
+                    size=sz(11), color=ON_SURFACE_DIM, italic=True,
+                    selectable=True,
+                ),
+                padding=ft.Padding.only(left=20),
+            ))
+    return ft.Column(controls=rows, spacing=3, tight=True)
+
+
 def _render_plan_helpers(helpers: list[dict]) -> ft.Control:
     if not helpers:
         # Helpers are optional in the plan schema; collapse silently.
@@ -1431,14 +1693,20 @@ def _plan_tc_details_body(tc: dict) -> ft.Control:
     fns = list(tc.get("test_functions") or tc.get("tests") or [])
     fixtures = list(tc.get("fixtures") or [])
     poms = list(tc.get("page_objects") or [])
+    units = list(tc.get("reusable_units") or [])
     helpers = list(tc.get("helpers") or [])
     locators = list(tc.get("locators") or [])
+    # Exemplar (non-POM) lane: render reusable_units in place of page_objects and
+    # source the Locators section from each unit's deferred_targets[].
+    if units and not locators:
+        locators = _deferred_locators_from_units(units)
     children: list[ft.Control] = [
         _render_plan_test_functions(fns),
         ft.Container(height=6),
         _render_plan_fixtures(fixtures),
         ft.Container(height=6),
-        _render_plan_page_objects(poms),
+        _render_plan_reusable_units(units) if units
+        else _render_plan_page_objects(poms),
     ]
     if helpers:
         children.extend([
@@ -1457,22 +1725,37 @@ def _summarise_plan_tc(tc: dict) -> str:
     fns = list(tc.get("test_functions") or tc.get("tests") or [])
     fixtures = list(tc.get("fixtures") or [])
     poms = list(tc.get("page_objects") or [])
+    units = list(tc.get("reusable_units") or [])
     helpers = list(tc.get("helpers") or [])
     locators = list(tc.get("locators") or [])
     fix_r = sum(1 for f in fixtures if f.get("source") == "reuse")
     fix_c = sum(1 for f in fixtures if f.get("source") == "create")
-    pom_r = sum(1 for p in poms if p.get("source") == "reuse")
-    pom_c = sum(1 for p in poms if p.get("source") == "create")
-    pom_m = sum(len(p.get("missing_methods") or []) for p in poms)
-    loc_r = sum(1 for x in locators if x.get("source") == "reuse")
-    loc_t = sum(1 for x in locators if x.get("source") == "create_tbd")
     parts = [
         f"fns: {len(fns)}",
         f"fix: {fix_r}r/{fix_c}c",
-        f"pom: {pom_r}r+{pom_m}m" if pom_c == 0
-        else f"pom: {pom_r}r/{pom_c}c+{pom_m}m",
-        f"loc: {loc_r}r/{loc_t}t",
     ]
+    if units and not poms:
+        # Exemplar (non-POM) lane: units + deferred TBD locators.
+        u_r = sum(1 for u in units if u.get("source") == "reuse")
+        u_c = sum(1 for u in units if u.get("source") == "create")
+        u_b = sum(len(u.get("missing_behaviors") or []) for u in units)
+        tbd = sum(len(u.get("deferred_targets") or []) for u in units)
+        parts.append(
+            f"units: {u_r}r+{u_b}b" if u_c == 0
+            else f"units: {u_r}r/{u_c}c+{u_b}b"
+        )
+        parts.append(f"loc: {tbd}t")
+    else:
+        pom_r = sum(1 for p in poms if p.get("source") == "reuse")
+        pom_c = sum(1 for p in poms if p.get("source") == "create")
+        pom_m = sum(len(p.get("missing_methods") or []) for p in poms)
+        loc_r = sum(1 for x in locators if x.get("source") == "reuse")
+        loc_t = sum(1 for x in locators if x.get("source") == "create_tbd")
+        parts.append(
+            f"pom: {pom_r}r+{pom_m}m" if pom_c == 0
+            else f"pom: {pom_r}r/{pom_c}c+{pom_m}m"
+        )
+        parts.append(f"loc: {loc_r}r/{loc_t}t")
     if helpers:
         parts.append(f"helpers: {len(helpers)}")
     return " · ".join(parts)
@@ -1640,6 +1923,7 @@ def _render_plan_summary(
         "fns": 0,
         "fix_r": 0, "fix_c": 0,
         "pom_r": 0, "pom_c": 0, "pom_m": 0,
+        "unit_r": 0, "unit_c": 0, "unit_b": 0,
         "loc_r": 0, "loc_t": 0,
         "helpers": 0,
     }
@@ -1656,6 +1940,14 @@ def _render_plan_summary(
             elif p.get("source") == "create":
                 totals["pom_c"] += 1
             totals["pom_m"] += len(p.get("missing_methods") or [])
+        # Exemplar (non-POM) lane: reusable units + their deferred TBD locators.
+        for u in tc.get("reusable_units") or []:
+            if u.get("source") == "reuse":
+                totals["unit_r"] += 1
+            elif u.get("source") == "create":
+                totals["unit_c"] += 1
+            totals["unit_b"] += len(u.get("missing_behaviors") or [])
+            totals["loc_t"] += len(u.get("deferred_targets") or [])
         for x in tc.get("locators") or []:
             if x.get("source") == "reuse":
                 totals["loc_r"] += 1
@@ -1663,19 +1955,26 @@ def _render_plan_summary(
                 totals["loc_t"] += 1
         totals["helpers"] += len(tc.get("helpers") or [])
 
+    has_units = bool(totals["unit_r"] or totals["unit_c"])
     totals_chips: list[ft.Control] = [
         _plan_inline_chip(f"test functions · {totals['fns']}"),
         _plan_inline_chip(
             f"fixtures · {totals['fix_r']} reuse / {totals['fix_c']} create"
         ),
-        _plan_inline_chip(
+    ]
+    if has_units:
+        totals_chips.append(_plan_inline_chip(
+            f"reusable units · {totals['unit_r']} reuse / "
+            f"{totals['unit_c']} create · +{totals['unit_b']} behaviors"
+        ))
+    else:
+        totals_chips.append(_plan_inline_chip(
             f"POMs · {totals['pom_r']} reuse / {totals['pom_c']} create "
             f"· +{totals['pom_m']} methods"
-        ),
-        _plan_inline_chip(
-            f"locators · {totals['loc_r']} reuse / {totals['loc_t']} TBD"
-        ),
-    ]
+        ))
+    totals_chips.append(_plan_inline_chip(
+        f"locators · {totals['loc_r']} reuse / {totals['loc_t']} TBD"
+    ))
     if totals["helpers"]:
         totals_chips.append(_plan_inline_chip(f"helpers · {totals['helpers']}"))
 
@@ -1701,7 +2000,7 @@ def _render_plan_summary(
             ft.Row(controls=totals_chips, spacing=6, wrap=True),
             ft.Text(
                 "Click any test case to expand its test functions, "
-                "fixtures, page objects, and locators.",
+                "fixtures, page objects / reusable units, and locators.",
                 size=sz(11),
                 color=ON_SURFACE_DIM,
                 italic=True,
@@ -1943,6 +2242,40 @@ def show_review_gate_dialog(page: ft.Page, state: AppState) -> None:
         color=ON_SURFACE_DIM,
     )
 
+    # Per-row edits are BATCHED, not applied one at a time. Each row's
+    # "Queue edit" stashes a scoped instruction here (keyed by row id so
+    # re-editing a row overwrites its prior entry); they're all combined
+    # with the global field into edit_instructions when the user Approves.
+    queued_edits: dict[str, str] = {}
+
+    def _refresh_queue_caption() -> None:
+        if queued_edits:
+            ids = ", ".join(queued_edits)
+            edit_caption.value = (
+                f"Edit instructions — {len(queued_edits)} queued per-row "
+                f"edit(s): {ids}. Add more below, then click Approve to apply."
+            )
+            edit_caption.color = SECONDARY
+        else:
+            edit_caption.value = "Edit instructions (optional)"
+            edit_caption.color = ON_SURFACE_DIM
+        with contextlib.suppress(Exception):
+            edit_caption.update()
+
+    def _combined_instructions() -> str:
+        # Number each edit and separate with a blank line + rule so a
+        # multiline per-row instruction can't blur into the next entry —
+        # the agent sees discrete, individually-scoped edits.
+        parts = list(queued_edits.values())
+        extra = (edit_field.value or "").strip()
+        if extra:
+            parts.append(extra)
+        if len(parts) <= 1:
+            return parts[0] if parts else ""
+        return "\n\n".join(
+            f"{i}. {p}" for i, p in enumerate(parts, start=1)
+        )
+
     def _close_dialog() -> None:
         try:
             req._dialog_open = False  # type: ignore[attr-defined]
@@ -1960,10 +2293,10 @@ def show_review_gate_dialog(page: ft.Page, state: AppState) -> None:
             req.completion_event.set()
 
     def on_approve(e: ft.ControlEvent) -> None:
-        text = (edit_field.value or "").strip()
-        if text:
+        combined = _combined_instructions()
+        if combined:
             req.decision = "edit"
-            req.edit_instructions = text
+            req.edit_instructions = combined
         else:
             req.decision = "approve"
         _close_dialog()
@@ -1971,32 +2304,33 @@ def show_review_gate_dialog(page: ft.Page, state: AppState) -> None:
     def on_per_row_edit_submit(
         row_id: str, row_label: str, instructions: str,
     ) -> None:
-        """Scope a per-row edit to one TC / plan entry and close the dialog.
+        """Queue a per-row edit — does NOT close the dialog.
 
-        The scoped prompt nudges the ``design-editor`` / ``plan-editor``
-        agent to only modify the named row. The agents already handle
-        scoped edits well — examples like ``"remove TC-03"`` are in their
-        built-in prompt — so no agent-side change is needed.
+        The edit is scoped to one TC / plan entry and stashed in
+        ``queued_edits``; the user can queue more rows, then apply them all
+        at once via Approve/Edit. Combining works because the ``*-editor``
+        agents accept multiple scoped instructions in a single prompt — the
+        scoped prefix ("Modify only <id>") keeps each edit targeted.
         """
         scoped = (
             f"Modify only {row_id}"
             + (f" ({row_label})" if row_label and row_label != row_id else "")
             + f": {instructions}"
         )
-        req.decision = "edit"
-        req.edit_instructions = scoped
-        _close_dialog()
+        queued_edits[row_id] = scoped
+        _refresh_queue_caption()
 
     def on_edit(e: ft.ControlEvent) -> None:
-        text = (edit_field.value or "").strip()
-        if not text:
-            # No instructions yet — focus the field and make it visibly
+        combined = _combined_instructions()
+        if not combined:
+            # Nothing typed and nothing queued — make the field visibly
             # demand input so the user sees what Edit actually wants. The
             # caption above the field doubles as the prompt; tint it +
-            # the border orange and focus.
+            # the border orange.
             edit_field.border_color = "#FFB74D"
             edit_caption.value = (
-                "Type your edit instructions below, then click Edit again."
+                "Type edit instructions below (or Queue a per-row edit), "
+                "then click Edit again."
             )
             edit_caption.color = "#FFB74D"
             try:
@@ -2006,7 +2340,7 @@ def show_review_gate_dialog(page: ft.Page, state: AppState) -> None:
                 pass
             return
         req.decision = "edit"
-        req.edit_instructions = text
+        req.edit_instructions = combined
         _close_dialog()
 
     def on_reject(e: ft.ControlEvent) -> None:

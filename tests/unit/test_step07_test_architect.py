@@ -144,6 +144,171 @@ def test_validate_plan_rejects_unknown_reuse_reference():
     assert any("phantom" in v and "not found" in v for v in violations)
 
 
+def _ui_am() -> dict:
+    """Active-module inventory for a UI SUT that exposes an open + login method."""
+    return {
+        "language": "typescript",
+        "test_directory_layout": {"default_target": "tests"},
+        "auth_flow": {
+            "open_method": "src/pages/BasePage.ts:BasePage.openBaseURL",
+            "entry_method": "src/pages/BasePage.ts:BasePage.logIn",
+            "fixture_entry": None,
+        },
+    }
+
+
+def test_ui_gate_rejects_login_without_preceding_open():
+    """A UI test that logs in with no open/navigate call before it is the
+    'blank page' defect — the gate must flag it."""
+    plan = {
+        "plan_version": "1.0", "active_module": "x", "framework": "playwright-ts",
+        "test_cases": [{
+            "id": "TC-1", "test_file_target": "tests/qtea_x.spec.ts",
+            "test_functions": [{"name": "t", "markers": ["qtea_smoke"], "steps": [
+                {"order": 1, "phase": "arrange", "pom": "BasePage", "method": "logIn", "args": ["U", "P"]},
+                {"order": 2, "phase": "act", "pom": "EntityFormPage", "method": "clickOnSave"},
+            ]}],
+        }],
+    }
+    violations = _validate_plan_against_inventory(plan, _ui_am())
+    assert any("open/navigate" in v for v in violations)
+
+
+def test_ui_gate_accepts_open_then_login_in_arrange_steps():
+    plan = {
+        "plan_version": "1.0", "active_module": "x", "framework": "playwright-ts",
+        "test_cases": [{
+            "id": "TC-1", "test_file_target": "tests/qtea_x.spec.ts",
+            "test_functions": [{"name": "t", "markers": ["qtea_smoke"], "steps": [
+                {"order": 1, "phase": "arrange", "pom": "BasePage", "method": "openBaseURL"},
+                {"order": 2, "phase": "arrange", "pom": "BasePage", "method": "logIn", "args": ["U", "P"]},
+                {"order": 3, "phase": "act", "pom": "EntityFormPage", "method": "clickOnSave"},
+            ]}],
+        }],
+    }
+    violations = _validate_plan_against_inventory(plan, _ui_am())
+    assert not any("open/navigate" in v for v in violations)
+
+
+def test_ui_gate_accepts_before_each_hook_with_open_then_login():
+    plan = {
+        "plan_version": "1.0", "active_module": "x", "framework": "playwright-ts",
+        "test_cases": [{
+            "id": "TC-1", "test_file_target": "tests/qtea_x.spec.ts",
+            "hooks": [{"event": "before_each", "source": "create", "calls": [
+                {"pom": "BasePage", "method": "openBaseURL"},
+                {"pom": "BasePage", "method": "logIn", "args": ["U", "P"]},
+            ]}],
+            "test_functions": [{"name": "t", "markers": ["qtea_smoke"], "steps": [
+                {"order": 1, "phase": "act", "pom": "EntityFormPage", "method": "clickOnSave"},
+            ]}],
+        }],
+    }
+    violations = _validate_plan_against_inventory(plan, _ui_am())
+    assert not any("open/navigate" in v for v in violations)
+
+
+def test_ui_gate_trusts_reused_before_each_hook():
+    """A reused before_each replays the SUT's own open+login sequence; the gate
+    trusts it even when calls[] is not spelled out."""
+    plan = {
+        "plan_version": "1.0", "active_module": "x", "framework": "playwright-ts",
+        "test_cases": [{
+            "id": "TC-1", "test_file_target": "tests/qtea_x.spec.ts",
+            "hooks": [{"event": "before_each", "source": "reuse",
+                       "from": "tests/EntityFormSmoke.spec.ts", "calls": []}],
+            "test_functions": [{"name": "t", "markers": ["qtea_smoke"], "steps": [
+                {"order": 1, "phase": "arrange", "pom": "BasePage", "method": "logIn", "args": ["U", "P"]},
+                {"order": 2, "phase": "act", "pom": "EntityFormPage", "method": "clickOnSave"},
+            ]}],
+        }],
+    }
+    violations = _validate_plan_against_inventory(plan, _ui_am())
+    assert not any("open/navigate" in v for v in violations)
+
+
+def _nav_precondition_am() -> dict:
+    """Active-module inventory with a navigation precondition on a reused
+    grid/filter POM method, mirroring the entity-form/directory-page
+    real-SUT case that motivated this gate."""
+    am = _ui_am()
+    am["navigation_preconditions"] = [
+        {
+            "method": "DirectoryPage.selectFilteredEntity",
+            "requires_call": "BasePage.selectLoginOptionByText",
+            "requires_args_hint": "NAV_OPTIONS.DIRECTORY",
+            "evidence": "tests/EntityFormSmoke.spec.ts:104",
+        }
+    ]
+    return am
+
+
+def test_nav_precondition_gate_rejects_missing_required_call():
+    """Reusing a flagged method with no prior required call is the 'wrong
+    screen' defect — the gate must flag it."""
+    plan = {
+        "plan_version": "1.0", "active_module": "x", "framework": "playwright-ts",
+        "test_cases": [{
+            "id": "TC-1", "test_file_target": "tests/qtea_x.spec.ts",
+            "hooks": [{"event": "before_each", "source": "reuse", "calls": [
+                {"pom": "BasePage", "method": "openBaseURL"},
+                {"pom": "BasePage", "method": "logIn", "args": ["U", "P"]},
+            ]}],
+            "test_functions": [{"name": "t", "markers": ["qtea_smoke"], "steps": [
+                {"order": 1, "phase": "arrange", "pom": "DirectoryPage",
+                 "method": "selectFilteredEntity", "args": ["foo"]},
+            ]}],
+        }],
+    }
+    violations = _validate_plan_against_inventory(plan, _nav_precondition_am())
+    assert any("navigation_preconditions" in v for v in violations)
+
+
+def test_nav_precondition_gate_accepts_required_call_in_steps():
+    """The required call earlier in steps[] (same test function) satisfies
+    the precondition — no violation."""
+    plan = {
+        "plan_version": "1.0", "active_module": "x", "framework": "playwright-ts",
+        "test_cases": [{
+            "id": "TC-1", "test_file_target": "tests/qtea_x.spec.ts",
+            "hooks": [{"event": "before_each", "source": "reuse", "calls": [
+                {"pom": "BasePage", "method": "openBaseURL"},
+                {"pom": "BasePage", "method": "logIn", "args": ["U", "P"]},
+            ]}],
+            "test_functions": [{"name": "t", "markers": ["qtea_smoke"], "steps": [
+                {"order": 1, "phase": "arrange", "pom": "BasePage",
+                 "method": "selectLoginOptionByText", "args": ["NAV_OPTIONS.DIRECTORY"]},
+                {"order": 2, "phase": "arrange", "pom": "DirectoryPage",
+                 "method": "selectFilteredEntity", "args": ["foo"]},
+            ]}],
+        }],
+    }
+    violations = _validate_plan_against_inventory(plan, _nav_precondition_am())
+    assert not any("navigation_preconditions" in v for v in violations)
+
+
+def test_nav_precondition_gate_accepts_required_call_in_before_each_hook():
+    """The required call already present in the before_each hook satisfies
+    the precondition — no violation."""
+    plan = {
+        "plan_version": "1.0", "active_module": "x", "framework": "playwright-ts",
+        "test_cases": [{
+            "id": "TC-1", "test_file_target": "tests/qtea_x.spec.ts",
+            "hooks": [{"event": "before_each", "source": "reuse", "calls": [
+                {"pom": "BasePage", "method": "openBaseURL"},
+                {"pom": "BasePage", "method": "logIn", "args": ["U", "P"]},
+                {"pom": "BasePage", "method": "selectLoginOptionByText", "args": ["NAV_OPTIONS.DIRECTORY"]},
+            ]}],
+            "test_functions": [{"name": "t", "markers": ["qtea_smoke"], "steps": [
+                {"order": 1, "phase": "arrange", "pom": "DirectoryPage",
+                 "method": "selectFilteredEntity", "args": ["foo"]},
+            ]}],
+        }],
+    }
+    violations = _validate_plan_against_inventory(plan, _nav_precondition_am())
+    assert not any("navigation_preconditions" in v for v in violations)
+
+
 def test_validate_plan_rejects_bad_marker():
     am = {"test_directory_layout": {"default_target": "tests"}}
     plan = {
@@ -230,6 +395,70 @@ def test_validate_plan_passes_on_well_formed_plan():
         }],
     }
     assert _validate_plan_against_inventory(plan, am) == []
+
+
+def _screenplay_plan() -> dict:
+    """A Screenplay plan whose choreography references reusable_units (Tasks/
+    Questions), not page_objects — the shape that broke run
+    20260715-075512-f2dbad."""
+    return {
+        "plan_version": "1.0",
+        "active_module": "sut",
+        "language": "python",
+        "architecture_pattern": "screenplay",
+        "test_cases": [{
+            "id": "TC-IMPCOST-001",
+            "test_file_target": "framework/tests/qtea_import_cost_test.py",
+            "test_functions": [{
+                "name": "test_import_cost",
+                "markers": ["qtea_regression"],
+                "steps": [
+                    {"order": 1, "pom": "OpenPlansCatalog", "method": "perform_as", "phase": "act"},
+                    {"order": 2, "pom": "CountCreatedPlanItems", "method": "answered_by", "phase": "assert"},
+                ],
+            }],
+            "reusable_units": [
+                {"name": "OpenPlansCatalog", "source": "create", "category": "task",
+                 "at": "framework/tasks/open_plans_catalog.py",
+                 "missing_behaviors": [{"name": "perform_as", "signature": "perform_as(self, actor)", "kind": "action"}]},
+                {"name": "CountCreatedPlanItems", "source": "create", "category": "question",
+                 "at": "framework/questions/count_created_plan_items.py",
+                 "missing_behaviors": [{"name": "answered_by", "signature": "answered_by(self, actor)", "kind": "query"}]},
+            ],
+        }],
+    }
+
+
+def test_choreography_gate_accepts_screenplay_reusable_units():
+    """Regression: steps referencing reusable_units (task/question) must NOT be
+    rejected as `planned: none` just because page_objects is empty."""
+    am = {
+        "architecture_pattern": "screenplay",
+        "existing_page_objects": [],
+        "test_directory_layout": {"base_dir": "framework/tests"},
+        "src_directory_layout": {},
+        "pattern_exemplars": [
+            {"category": "task", "dir": "framework/tasks", "file": "framework/tasks/login.py"},
+            {"category": "question", "dir": "framework/questions", "file": "framework/questions/title.py"},
+        ],
+    }
+    assert _validate_plan_against_inventory(_screenplay_plan(), am) == []
+
+
+def test_choreography_gate_still_flags_dangling_screenplay_ref():
+    """The gate must still catch a step referencing a unit absent from
+    reusable_units — the fix broadens the planned set, it doesn't disable it."""
+    am = {
+        "architecture_pattern": "screenplay",
+        "existing_page_objects": [],
+        "test_directory_layout": {"base_dir": "framework/tests"},
+        "src_directory_layout": {},
+        "pattern_exemplars": [{"category": "task", "dir": "framework/tasks", "file": "framework/tasks/login.py"}],
+    }
+    plan = _screenplay_plan()
+    plan["test_cases"][0]["test_functions"][0]["steps"][0]["pom"] = "GhostTask"
+    violations = _validate_plan_against_inventory(plan, am)
+    assert any("GhostTask" in v and "not planned" in v for v in violations)
 
 
 def test_validate_plan_rejects_missing_reuse_justification():

@@ -13,6 +13,7 @@ Outputs (artifacts/step06/):
 from __future__ import annotations
 
 import ast
+import io
 import json
 import os
 import re
@@ -22,7 +23,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from qtea._sut_git import ensure_git_repo_and_branch
+from qtea._sut_git import ensure_git_repo_and_branch, is_git_url
 from qtea.claude_runner import run_agent
 from qtea.config import SECRET_ENV_KEYS, package_resource_root, step_timeout
 from qtea.logging_setup import get_logger
@@ -41,25 +42,50 @@ from qtea.url_resolver import detect_qa_base_url
 
 log = get_logger(__name__)
 
-
-_GIT_HOSTS = (
-    "github.com", "gitlab", "bitbucket.org",
-    "dev.azure.com", "ssh.dev.azure.com", "visualstudio.com",
-    "codeberg.org", "gitea.", "sr.ht",
-)
+_LOCATOR_SOURCE_SKIP_DIRS = frozenset({
+    ".git", "node_modules", "dist", "build", ".venv", "venv",
+    "__pycache__", ".pytest_cache", "target", "out", ".next", "coverage",
+})
 
 
-def _is_git_url(s: str) -> bool:
-    if not s.startswith(("git@", "ssh://", "http://", "https://")):
-        return False
-    if s.endswith(".git"):
-        return True
-    from urllib.parse import urlparse
+def _likely_locator_files(sut_root: Path) -> list[str]:
+    """Deterministic heuristic: SUT files that look like locator sources --
+    under a ``locators``/``selectors``/``elements``/``pages``/``pageObjects``
+    dir, or with a ``*locator*`` / ``*selector*`` / ``*element*`` /
+    ``*pages*`` filename. Excludes VCS/deps/build dirs. Best-effort advisory
+    only; returns SUT-relative paths, capped.
+
+    Used to WARN when the researcher left ``existing_locators`` empty despite
+    such files existing (Step 8 still recovers via import-follow, so this
+    doesn't hard-fail). Real projects vary widely in naming: SUTs with
+    non-standard directory/file conventions (e.g. ``constants``,
+    ``fixtures``, or domain-specific folders like ``uiKit``) will NOT be
+    detected here -- extend the recognized names below when adopting such a
+    SUT."""
+    _LOC_DIRS = frozenset({
+        "locators", "selectors", "elements",
+        "pages", "pageobjects", "page_objects",
+    })
+    _NAME_SUBSTRINGS = ("locator", "selector", "element", "pageobject")
+    hits: list[str] = []
     try:
-        netloc = urlparse(s).netloc.lower()
-    except Exception:
-        return False
-    return any(netloc == host or netloc.endswith("." + host) for host in _GIT_HOSTS)
+        for p in sut_root.rglob("*"):
+            if not p.is_file():
+                continue
+            if any(part in _LOCATOR_SOURCE_SKIP_DIRS for part in p.parts):
+                continue
+            in_loc_dir = any(seg.lower() in _LOC_DIRS for seg in p.parts)
+            name_lower = p.name.lower()
+            if in_loc_dir or any(sub in name_lower for sub in _NAME_SUBSTRINGS):
+                try:
+                    hits.append(str(p.relative_to(sut_root)).replace("\\", "/"))
+                except ValueError:
+                    hits.append(p.name)
+                if len(hits) >= 20:
+                    break
+    except OSError:
+        pass
+    return hits
 
 
 def _rmtree_safe(path: Path) -> None:
@@ -94,8 +120,29 @@ def _materialize_sut(src: str, dst: Path, *, run_id: str) -> None:
 
     The branch is the deliverable: a human reviews it via ``git diff`` or
     a PR; nothing qtea writes ever touches the upstream's ``main``.
+
+    ``<sut>/.env`` (the sole persistence target for resolved env vars —
+    see ``_persist_env_to_sut``) sits inside ``dst`` and would otherwise be
+    destroyed by the wipe-and-recreate below on any resume-time
+    re-materialization. It's stashed in memory here and restored after:
+    verbatim when the freshly materialized source ships no ``.env`` of its
+    own, or MERGED on top of the source's ``.env`` when it does — the stashed
+    (HITL/prior-run) value wins per key, source-only keys are preserved. This
+    keeps operator-typed endpoints/identity/credentials alive across
+    ``--from-step`` re-runs instead of letting a source placeholder clobber
+    them. ``.env`` is also gitignored before the baseline commit (below) so a
+    source-shipped ``.env`` is never tracked — otherwise the cleanup
+    ``git reset --hard`` would revert it before this stash could read it.
     """
-    if _is_git_url(src):
+    _stashed_env: str | None = None
+    _env_path = dst / ".env"
+    if _env_path.is_file():
+        try:
+            _stashed_env = _env_path.read_text(encoding="utf-8")
+        except OSError:
+            _stashed_env = None
+
+    if is_git_url(src):
         if dst.exists():
             _rmtree_safe(dst)
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -135,20 +182,78 @@ def _materialize_sut(src: str, dst: Path, *, run_id: str) -> None:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(p, dst)
 
+    if _stashed_env is not None and dst.is_dir():
+        try:
+            from qtea.proxy import set_owner_only_perms
+
+            if not _env_path.is_file():
+                # The freshly materialized source shipped no `.env` (typical for
+                # git-URL SUTs — upstream gitignores it). Restore the stashed
+                # file verbatim so comments/formatting survive.
+                _env_path.write_text(_stashed_env, encoding="utf-8")
+                set_owner_only_perms(_env_path)
+                log.info(
+                    "sut.env_restored_across_materialize", path=str(_env_path),
+                )
+            else:
+                # The source shipped its own `.env` (typical for local-dir SUTs
+                # copied via copytree). Merge the stashed prior-run values ON TOP
+                # so HITL-provided endpoints/identity/credentials survive: the
+                # stashed value wins per key, source-only keys are preserved, and
+                # stash-only keys are appended. Empty/None entries are dropped so
+                # a blank stash value never clobbers a real source value.
+                # `merge_dotenv_file` re-applies mode-600 perms internally.
+                from dotenv import dotenv_values
+
+                from qtea.env_resolver import merge_dotenv_file
+
+                stashed_values = {
+                    k: v
+                    for k, v in dotenv_values(
+                        stream=io.StringIO(_stashed_env)
+                    ).items()
+                    if v is not None and v != ""
+                }
+                if stashed_values:
+                    merge_dotenv_file(_env_path, stashed_values)
+                    log.info(
+                        "sut.env_merged_across_materialize",
+                        path=str(_env_path),
+                        keys=len(stashed_values),
+                    )
+        except (OSError, ImportError) as exc:
+            log.warning(
+                "sut.env_restore_failed", path=str(_env_path), error=str(exc),
+            )
+
     # Single-file SUT: nothing meaningful to branch from. Skip git setup —
     # downstream steps would fail anyway and the preflight in pipeline.py
     # surfaces the message clearly.
     if dst.is_file():
         return
-    # Gitignore the qtea artifact dir + storage-state credential in the SUT
-    # BEFORE the baseline commit (finding 2). `.qtea/storage-state.json` holds
+    # Gitignore the qtea artifact dir + storage-state credential + `.env` in the
+    # SUT BEFORE the baseline commit (finding 2). `.qtea/storage-state.json` holds
     # live session cookies (auth-capture writes it there at mode 600); nothing
     # else gitignored it, so `commit_step`'s `git add -A` would stage the
     # credential into the qtea/run-* branch — the branch a human reviews / opens
     # a PR from. Ignoring it keeps it on disk (Step 9 reads it by path) but out
     # of every commit. Belt-and-suspenders on cloned repos (no .qtea there yet).
-    _ensure_gitignore_entry(dst, ".qtea/")
-    _ensure_gitignore_entry(dst, "storage-state.json")
+    #
+    # `.env` is gitignored here too — a local-dir SUT copied via copytree brings
+    # its own `.env`, which would otherwise be committed at baseline (tracked).
+    # Once tracked, the `git reset --hard` in `_rollback_sut_to_before_step`
+    # (cleanup, on `--from-step` re-runs) reverts `.env` to the baseline
+    # placeholder BEFORE materialize's in-memory stash can read the HITL values —
+    # silently discarding them. Keeping `.env` untracked (a) lets it survive the
+    # rollback so the stash/restore below preserves HITL values, and (b) keeps the
+    # SUT's own secrets out of the reviewable qtea branch. Step 6's
+    # `_persist_env_to_sut` also adds this entry, but only AFTER this baseline —
+    # too late to stop the source `.env` from being tracked; hence here as well.
+    from qtea.env_resolver import ensure_gitignore_entry
+
+    ensure_gitignore_entry(dst, ".qtea/")
+    ensure_gitignore_entry(dst, "storage-state.json")
+    ensure_gitignore_entry(dst, ".env")
     ensure_git_repo_and_branch(dst, run_id)
 
 
@@ -564,47 +669,6 @@ def _discover_sut_env_keys(sut_path: Path) -> list[str]:
                   and not any(k.startswith(p) for p in _INTERNAL_PREFIXES))
 
 
-_ENV_QTEA_FILENAME = ".env.qtea"
-
-
-def _persist_resolved_env(workspace_root: Path, resolved: Any) -> None:
-    """Write resolved env var values to ``<workspace>/.env.qtea``.
-
-    Enables ``replay_env_from_artifacts`` to recover HITL-provided values
-    on ``--from-step`` restarts without re-prompting. The workspace already
-    contains credential-equivalent files (``storage-state.json``), so this
-    is not a new risk class.  File mode is set to 600 on non-Windows.
-    """
-    if not resolved.values:
-        return
-    dst = workspace_root / _ENV_QTEA_FILENAME
-    try:
-        lines = [f"{k}={v}\n" for k, v in sorted(resolved.values.items())]
-        dst.write_text("".join(lines), encoding="utf-8")
-        from qtea.proxy import set_owner_only_perms
-        set_owner_only_perms(dst)
-        log.info("env_resolver.persisted", count=len(lines), path=str(dst))
-    except OSError as exc:
-        log.warning("env_resolver.persist_failed", error=str(exc))
-
-
-def _ensure_gitignore_entry(directory: Path, entry: str) -> None:
-    """Append *entry* to ``<directory>/.gitignore`` if it is not already listed."""
-    gitignore = directory / ".gitignore"
-    try:
-        if gitignore.exists():
-            text = gitignore.read_text(encoding="utf-8", errors="replace")
-            if any(line.strip() == entry for line in text.splitlines()):
-                return
-            if text and not text.endswith("\n"):
-                text += "\n"
-        else:
-            text = ""
-        gitignore.write_text(text + entry + "\n", encoding="utf-8")
-    except OSError:
-        pass
-
-
 def _persist_env_to_sut(sut_path: Path, resolved: Any) -> None:
     """Merge resolved env var values into ``<sut>/.env``.
 
@@ -632,39 +696,12 @@ def _persist_env_to_sut(sut_path: Path, resolved: Any) -> None:
     if not filtered:
         return
 
-    _ensure_gitignore_entry(sut_path, ".env")
+    from qtea.env_resolver import ensure_gitignore_entry, merge_dotenv_file
 
     dst = sut_path / ".env"
-    existing_lines: list[str] = []
-    existing_keys: dict[str, int] = {}  # key → line index
-    if dst.exists():
-        try:
-            existing_lines = dst.read_text(encoding="utf-8").splitlines(keepends=True)
-            for idx, line in enumerate(existing_lines):
-                stripped = line.strip()
-                if not stripped or stripped.startswith("#"):
-                    continue
-                eq = stripped.find("=")
-                if eq > 0:
-                    existing_keys[stripped[:eq].strip()] = idx
-        except OSError:
-            existing_lines = []
-
-    # Update in-place or append.
-    for key, value in sorted(filtered.items()):
-        entry = f"{key}={value}\n"
-        if key in existing_keys:
-            existing_lines[existing_keys[key]] = entry
-        else:
-            existing_lines.append(entry)
-
-    try:
-        dst.write_text("".join(existing_lines), encoding="utf-8")
-        from qtea.proxy import set_owner_only_perms
-        set_owner_only_perms(dst)
-        log.info("env_resolver.persisted_to_sut", count=len(filtered), path=str(dst))
-    except OSError as exc:
-        log.warning("env_resolver.persist_to_sut_failed", error=str(exc))
+    ensure_gitignore_entry(sut_path, ".env")
+    merge_dotenv_file(dst, filtered)
+    log.info("env_resolver.persisted_to_sut", count=len(filtered), path=str(dst))
 
 
 _FRAMEWORK_HINTS = (
@@ -856,6 +893,8 @@ class ResearchStep(Step):
             modules=[m.name for m in sut_inventory.modules],
             active_module=sut_inventory.active_module,
             page_object_count=sum(len(m.existing_page_objects) for m in sut_inventory.modules),
+            architecture_patterns={m.name: m.architecture_pattern for m in sut_inventory.modules},
+            exemplar_count=sum(len(m.pattern_exemplars) for m in sut_inventory.modules),
         )
 
         # Fail-fast when no active module could be resolved (monorepo + no
@@ -1016,6 +1055,72 @@ class ResearchStep(Step):
                 modules=[m.name for m in sut_inventory.modules],
             )
 
+        # Invariant gate (defense-in-depth): a non-POM architecture_pattern
+        # commits Step 8 to the exemplar lane, which can ONLY generate code by
+        # imitating verbatim `pattern_exemplars[]`. If the pattern is non-POM but
+        # no exemplars were captured, the exemplar-writer has nothing to imitate
+        # and (correctly) refuses — yet Step 8's pattern-agnostic gates don't
+        # catch that refusal, so the run false-greens through to Step 9. Enforce
+        # the cross-field invariant here: schema validation only *warns* (see the
+        # is_valid call below), so it cannot be the enforcement point. Fail fast,
+        # before env resolution/HITL, so the automatic retry re-runs the agent
+        # (now under a stronger capture mandate) cheaply. Mirrors Step 8 lane
+        # selection: non-POM == pattern not in {pom, inline, none, unknown}.
+        _pom_lane_patterns = {"pom", "inline", "none", "unknown"}
+        _active_mod = sut_inventory.active()
+        if _active_mod is not None:
+            _arch = (_active_mod.architecture_pattern or "").strip().lower()
+            if _arch and _arch not in _pom_lane_patterns and not _active_mod.pattern_exemplars:
+                log.error(
+                    "step06.exemplar_invariant_violated",
+                    module=_active_mod.name,
+                    architecture_pattern=_arch,
+                )
+                return StepResult(
+                    success=False,
+                    status="failed",
+                    outputs=[],
+                    error=(
+                        f"[CLARIFICATION NEEDED] active module '{_active_mod.name}' "
+                        f"was classified architecture_pattern='{_arch}' (non-POM, so "
+                        f"Step 8 takes the exemplar lane) but zero pattern_exemplars "
+                        f"were captured. The exemplar lane imitates the SUT's own "
+                        f"reusable units verbatim and cannot generate anything "
+                        f"without at least one exemplar per category present "
+                        f"(e.g. the base class + one concrete Task/Question). "
+                        f"Re-run Step 6 to capture them, or seed pattern_exemplars[] "
+                        f"in sut_inventory.json manually."
+                    ),
+                )
+
+        # Locator-source coverage warning (defense-in-depth).
+        # Step 8 recovers a missed locator bag by following the POM's imports,
+        # but a silently-empty `existing_locators` still degrades Step 7 planning
+        # and Step 8 reuse. When the active POM-lane module has page objects but
+        # no catalogued locator sources AND the SUT tree contains locator-ish
+        # files, surface the gap — never fail (the value may legitimately be
+        # empty, and Step 8's import-follow fallback keeps codegen correct).
+        if _active_mod is not None:
+            _arch2 = (_active_mod.architecture_pattern or "").strip().lower()
+            if (
+                _arch2 in _pom_lane_patterns
+                and _active_mod.existing_page_objects
+                and not _active_mod.existing_locators
+            ):
+                _loc_files = _likely_locator_files(ctx.workspace.sut)
+                if _loc_files:
+                    log.warning(
+                        "step06.existing_locators_empty_but_sources_present",
+                        module=_active_mod.name,
+                        page_objects=len(_active_mod.existing_page_objects),
+                        sample_locator_files=_loc_files[:5],
+                        hint=(
+                            "researcher left existing_locators=[] but the SUT "
+                            "has locator-source files; Step 8 will import-follow "
+                            "to recover them (see researcher prompt §8)"
+                        ),
+                    )
+
         sut_env_keys = _discover_sut_env_keys(ctx.workspace.sut)
         if sut_env_keys:
             log.info("step06.sut_env_keys", count=len(sut_env_keys), keys=sut_env_keys)
@@ -1046,17 +1151,15 @@ class ResearchStep(Step):
         if sut_env_keys:
             from qtea.env_resolver import EnvResolverConfig, resolve_sut_env
 
-            # On Step 6 re-runs (resume, --from-step 6, retry after abort)
-            # the values a previous attempt persisted to <workspace>/.env.qtea
-            # would otherwise be invisible to the resolver, so every essential
-            # would be re-prompted. Mirror the same fallback replay uses.
-            user_env_file = getattr(ctx.options, "env_file", None)
-            ws_env_file = ctx.workspace.root / _ENV_QTEA_FILENAME
-            env_file = user_env_file or (
-                ws_env_file if ws_env_file.exists() else None
-            )
+            # On Step 6 re-runs (resume, --from-step 6, retry after abort) the
+            # resolver must not re-prompt for essentials a previous attempt
+            # already resolved. `sut_path` below already covers this: those
+            # values were persisted to <sut>/.env by `_persist_env_to_sut`
+            # on the prior attempt (the SUT dir survives retries — see
+            # `sut_ready` check above), and `DotenvFileStrategy` reads it
+            # back unconditionally whenever `sut_path` is set.
             resolver_config = EnvResolverConfig(
-                env_file=env_file,
+                env_file=getattr(ctx.options, "env_file", None),
                 sut_path=ctx.workspace.sut,
                 no_hitl=getattr(ctx.options, "no_hitl", False),
                 azdo_org=os.environ.get("AZDO_ORG"),
@@ -1068,7 +1171,6 @@ class ResearchStep(Step):
                 resolver_config, sut_env_keys, ctx.workspace.sut,
                 extra_required=pyd_required,
             )
-            _persist_resolved_env(ctx.workspace.root, resolved)
             _persist_env_to_sut(ctx.workspace.sut, resolved)
             env_resolution_audit = {
                 "resolved": list(resolved.values.keys()),
@@ -1076,6 +1178,19 @@ class ResearchStep(Step):
                 "missing_required": resolved.missing_required,
                 "missing_optional": resolved.missing_optional,
             }
+
+            # Inject all non-empty resolved values into os.environ so that
+            # downstream steps in the same process (Step 7 MCP login, Step 8
+            # JIT resolver) can access them via os.environ.get() without
+            # needing to re-read <sut>/.env. Only write keys not already set
+            # so the user's shell / --env-file values always win.
+            injected: list[str] = []
+            for _k, _v in resolved.values.items():
+                if _v and not os.environ.get(_k):
+                    os.environ[_k] = _v
+                    injected.append(_k)
+            if injected:
+                log.info("step06.env_injected_to_process", keys=injected)
 
             # Mirror the resolved canonical URL into SUT_BASE_URL so Step 8's
             # `os.environ.get("SUT_BASE_URL")` picks it up without the user
@@ -1150,16 +1265,13 @@ def replay_env_from_artifacts(workspace: Any, options: Any) -> bool:
     """Re-populate ``os.environ`` from existing Step 6 artifacts.
 
     Step 6's ``resolve_sut_env()`` call injects resolved values into
-    ``os.environ`` and persists them to ``<workspace>/.env.qtea``.  On
-    process restart (``--from-step 7+``), this helper reads the persisted
-    file (via ``DotenvFileStrategy``) together with the SUT's own ``.env``
-    and re-runs the silent resolver cascade — recovering HITL-provided
-    values without re-prompting.
+    ``os.environ`` and persists them to ``<sut>/.env``.  On process restart
+    (``--from-step 7+``), this helper re-runs the silent resolver cascade —
+    ``DotenvFileStrategy`` reads ``<sut>/.env`` back via ``sut_path``,
+    recovering HITL-provided values without re-prompting.
 
-    Fallback priority for ``env_file``:
-      1. User-supplied ``--env-file`` (highest)
-      2. ``<workspace>/.env.qtea`` (Step 6 persisted cache)
-      3. ``None`` — cascade relies on process env + SUT ``.env`` only
+    ``env_file`` is only set from the user-supplied ``--env-file``, if any;
+    otherwise the cascade relies on process env + the SUT's own ``.env``.
 
     Returns True when at least one env var was re-injected, False otherwise
     (no artifacts on disk or nothing to resolve).  Never raises; logs errors
@@ -1197,11 +1309,8 @@ def replay_env_from_artifacts(workspace: Any, options: Any) -> bool:
     if needed:
         from qtea.env_resolver import EnvResolverConfig, resolve_sut_env
 
-        user_env_file = getattr(options, "env_file", None)
-        ws_env_file = workspace.root / _ENV_QTEA_FILENAME
-        env_file = user_env_file or (ws_env_file if ws_env_file.exists() else None)
         resolver_config = EnvResolverConfig(
-            env_file=env_file,
+            env_file=getattr(options, "env_file", None),
             sut_path=workspace.sut,
             no_hitl=True,  # never prompt during replay; Step 6 already did that
             azdo_org=os.environ.get("AZDO_ORG"),

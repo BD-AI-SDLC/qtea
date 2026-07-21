@@ -16,7 +16,6 @@ from qtea.steps.s06_research import (
     _discover_sut_env_keys,
     _extract_commands,
     _materialize_sut,
-    _persist_resolved_env,
     _project_research,
 )
 from qtea.workspace import create_workspace
@@ -410,46 +409,18 @@ def test_discover_sut_env_keys_excludes_exact_os_vars(tmp_path: Path):
     assert "MY_APP_KEY" in keys
 
 
-def test_persist_resolved_env_writes_dotenv_file(tmp_path: Path):
-    """_persist_resolved_env must write KEY=value lines to .env.qtea."""
-    from dataclasses import dataclass, field
-
-    @dataclass
-    class _FakeResolved:
-        values: dict[str, str] = field(default_factory=dict)
-
-    resolved = _FakeResolved(values={"QA_URL": "https://qa.example.com", "PASSWORD": "s3cret"})
-    _persist_resolved_env(tmp_path, resolved)
-
-    env_file = tmp_path / ".env.qtea"
-    assert env_file.exists()
-    content = env_file.read_text(encoding="utf-8")
-    assert "PASSWORD=s3cret\n" in content
-    assert "QA_URL=https://qa.example.com\n" in content
-
-
-def test_persist_resolved_env_does_not_write_when_empty(tmp_path: Path):
-    """No .env.qtea file should be created when nothing was resolved."""
-    from dataclasses import dataclass, field
-
-    @dataclass
-    class _FakeResolved:
-        values: dict[str, str] = field(default_factory=dict)
-
-    _persist_resolved_env(tmp_path, _FakeResolved(values={}))
-    assert not (tmp_path / ".env.qtea").exists()
-
-
-async def test_research_step_rerun_loads_workspace_env_qtea_fallback(
+async def test_research_step_rerun_loads_sut_dotenv_fallback(
     tmp_path: Path, monkeypatch
 ):
-    """Step 6 re-runs must load `<workspace>/.env.qtea` so previously
-    HITL-provided values are not re-prompted.
+    """Step 6 re-runs must load `<sut>/.env` so previously HITL-provided
+    values are not re-prompted.
 
     Regression for the bug where every Step 6 re-run re-prompted for the
-    same essentials — because the resolver was invoked with
-    `env_file=options.env_file` only, ignoring the workspace .env.qtea
-    that a prior Step 6 attempt had persisted.
+    same essentials. Fixed by having a prior Step 6 attempt's
+    `_persist_env_to_sut` write into `<sut>/.env` — which survives retries
+    (the SUT dir isn't wiped once `sut_ready` is True) and is read back
+    unconditionally by `DotenvFileStrategy` via `sut_path`, with no separate
+    workspace-level cache file needed.
     """
     sut = tmp_path / "my-sut"
     sut.mkdir()
@@ -461,6 +432,12 @@ async def test_research_step_rerun_loads_workspace_env_qtea_fallback(
         "const p = process.env.PASSWORD_APP;\n",
         encoding="utf-8",
     )
+    # Pre-populate <sut>/.env as a prior Step 6 attempt would have — the
+    # resolver must find these on this re-run.
+    (sut / ".env").write_text(
+        "USERNAME_APP=cached_user\nPASSWORD_APP=cached_pass\n",
+        encoding="utf-8",
+    )
 
     install_fake_query(
         monkeypatch,
@@ -469,28 +446,8 @@ async def test_research_step_rerun_loads_workspace_env_qtea_fallback(
     )
 
     ctx = _ctx(tmp_path, sut)
-    # Pre-populate .env.qtea in the workspace root as a prior Step 6
-    # attempt would have — the resolver must find these on this re-run.
-    (ctx.workspace.root / ".env.qtea").write_text(
-        "USERNAME_APP=cached_user\nPASSWORD_APP=cached_pass\n",
-        encoding="utf-8",
-    )
     monkeypatch.delenv("USERNAME_APP", raising=False)
     monkeypatch.delenv("PASSWORD_APP", raising=False)
-
-    # Spy on EnvResolverConfig so we can assert Step 6 wired env_file
-    # to the workspace .env.qtea (not just None).
-    import qtea.env_resolver as env_resolver_mod
-    from qtea.env_resolver import EnvResolverConfig as _RealConfig
-
-    seen: list[_RealConfig] = []
-    orig_init = _RealConfig.__init__
-
-    def spy_init(self, *args, **kwargs):
-        orig_init(self, *args, **kwargs)
-        seen.append(self)
-
-    monkeypatch.setattr(env_resolver_mod.EnvResolverConfig, "__init__", spy_init)
 
     result = await ResearchStep().run(ctx)
     assert result.success, result.error
@@ -499,11 +456,6 @@ async def test_research_step_rerun_loads_workspace_env_qtea_fallback(
     # would see them in os.environ without any HITL prompt.
     assert os.environ.get("USERNAME_APP") == "cached_user"
     assert os.environ.get("PASSWORD_APP") == "cached_pass"
-
-    # And Step 6's config wired the workspace .env.qtea as env_file.
-    step6_configs = [c for c in seen if c.sut_path == ctx.workspace.sut]
-    assert step6_configs, "expected EnvResolverConfig built by Step 6"
-    assert step6_configs[-1].env_file == ctx.workspace.root / ".env.qtea"
 
 
 def test_materialize_sut_git_clone_uses_double_dash(tmp_path: Path, monkeypatch):
@@ -546,6 +498,56 @@ def test_materialize_sut_git_clone_uses_double_dash(tmp_path: Path, monkeypatch)
     checkout_calls = [c for c in calls if "checkout" in c and "-B" in c]
     assert checkout_calls, "ensure_git_repo_and_branch must run after clone"
     assert "qtea/run-test" in checkout_calls[0]
+
+
+def test_materialize_sut_restores_env_across_local_dir_wipe(tmp_path: Path):
+    """`<sut>/.env` (Step 6's sole persistence target) must survive a
+    resume-time re-materialization even though `_materialize_sut` wipes
+    `dst` before re-copying the source. Regression for the run
+    20260709-083909-223772 incident where `.env` vanished under
+    `--from-step` resume."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "app.py").write_text("print('hi')\n", encoding="utf-8")
+
+    dst = tmp_path / "sut"
+    dst.mkdir()
+    (dst / ".env").write_text("QA_BASE_URL=https://example.test\n", encoding="utf-8")
+
+    _materialize_sut(str(src), dst, run_id="test")
+
+    assert (dst / ".env").read_text(encoding="utf-8") == (
+        "QA_BASE_URL=https://example.test\n"
+    )
+
+
+def test_materialize_sut_merges_stash_over_source_env(tmp_path: Path):
+    """If the freshly materialized source ships its own `.env`, the stashed
+    prior-run values are merged ON TOP of it: the stashed (HITL-resolved) value
+    wins per key, while source-only keys are preserved. Without this, a
+    source-shipped placeholder `.env` would silently clobber the values the
+    operator typed via HITL on a `--from-step` re-run."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / ".env").write_text(
+        "QA_BASE_URL=https://placeholder.test\nSOURCE_ONLY=keep\n",
+        encoding="utf-8",
+    )
+
+    dst = tmp_path / "sut"
+    dst.mkdir()
+    # The prior-run <sut>/.env holding the operator's HITL value.
+    (dst / ".env").write_text(
+        "QA_BASE_URL=https://hitl-resolved.test\n", encoding="utf-8"
+    )
+
+    _materialize_sut(str(src), dst, run_id="test")
+
+    from dotenv import dotenv_values
+
+    vals = dotenv_values(dst / ".env")
+    assert vals["QA_BASE_URL"] == "https://hitl-resolved.test"  # stash wins
+    assert vals["SOURCE_ONLY"] == "keep"  # source-only key preserved
 
 
 def test_pydantic_inherited_basesettings_via_attribute_access(tmp_path: Path):

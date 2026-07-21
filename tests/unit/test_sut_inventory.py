@@ -15,10 +15,14 @@ from qtea.sut_inventory import (
     LocatorClass,
     LocatorConstant,
     ModuleInventory,
+    NavigationPrecondition,
     PageObject,
     SutInventory,
+    capture_pattern_exemplars,
+    detect_architecture_pattern,
     detect_module_inventory,
     detect_monorepo,
+    detect_src_directory_layout,
     detect_sut_inventory,
     detect_test_directory_layout,
     merge_llm_inventory,
@@ -26,16 +30,293 @@ from qtea.sut_inventory import (
     resolve_active_module,
     scan_python_auth_flow,
     scan_python_fixtures,
+    scan_python_lifecycle_hooks,
     scan_python_locators,
     scan_python_page_objects,
+    scan_ts_auth_flow,
+    scan_ts_lifecycle_hooks,
     scan_ts_locators,
     scan_ts_page_objects,
 )
 
 
+def _seed_screenplay(root: Path) -> None:
+    """Custom Screenplay SUT: framework/ package, tasks/questions dirs, no src/."""
+    _touch(root / "framework" / "actor.py",
+           "class Actor:\n    def attempts_to(self, *tasks):\n        pass\n")
+    _touch(root / "framework" / "tasks" / "login.py",
+           "from framework.actor import Actor\n\n\n"
+           "class Login(Task):\n"
+           "    def perform_as(self, actor):\n"
+           "        return actor\n")
+    _touch(root / "framework" / "questions" / "title.py",
+           "class PageTitle(Question):\n"
+           "    def answered_by(self, actor):\n"
+           "        return 'x'\n")
+
+
+def _seed_pom(root: Path) -> None:
+    _touch(root / "src" / "app" / "pages" / "login_page.py",
+           "class LoginPage:\n    def click_submit(self):\n        pass\n")
+
+
+def test_detect_architecture_pattern_screenplay(tmp_path: Path) -> None:
+    _seed_screenplay(tmp_path)
+    assert detect_architecture_pattern(
+        tmp_path, page_objects=[], locators=[], language="python",
+    ) == "screenplay"
+
+
+def test_detect_architecture_pattern_pom(tmp_path: Path) -> None:
+    _seed_pom(tmp_path)
+    pages = scan_python_page_objects(tmp_path)
+    assert detect_architecture_pattern(
+        tmp_path, page_objects=pages, locators=[], language="python",
+    ) == "pom"
+
+
+def test_detect_architecture_pattern_none(tmp_path: Path) -> None:
+    _touch(tmp_path / "README.md", "hi")
+    assert detect_architecture_pattern(
+        tmp_path, page_objects=[], locators=[], language="python",
+    ) == "none"
+
+
+def test_capture_pattern_exemplars_screenplay(tmp_path: Path) -> None:
+    _seed_screenplay(tmp_path)
+    exemplars = capture_pattern_exemplars(
+        tmp_path, pattern="screenplay", language="python",
+    )
+    cats = {e.category for e in exemplars}
+    assert "task" in cats and "question" in cats
+    login = next(e for e in exemplars if e.category == "task")
+    assert login.class_name == "Login"
+    assert login.dir == "framework/tasks"
+    assert "def perform_as" in login.excerpt
+
+
+def _seed_bespoke_screenplay(root: Path) -> None:
+    """Bespoke Screenplay SUT: base classes are named `BaseTask`/`BaseQuestion`
+    (not the upstream `screenpy` `Task`/`Question`), and a single file holds
+    several units — the real-world shape that captured zero exemplars before."""
+    _touch(root / "framework" / "tasks" / "base_task.py",
+           "from abc import ABC\n\n\nclass BaseTask(ABC):\n    pass\n")
+    _touch(root / "framework" / "questions" / "base_question.py",
+           "from abc import ABC\n\n\nclass BaseQuestion(ABC):\n    pass\n")
+    _touch(root / "framework" / "tasks" / "forms.py",
+           "from framework.tasks.base_task import BaseTask\n\n\n"
+           "class FillBudget(BaseTask):\n"
+           "    def perform_as(self, actor):\n        return actor\n\n\n"
+           "class SavePlanPosition(BaseTask):\n"
+           "    def perform_as(self, actor):\n        return actor\n")
+    _touch(root / "framework" / "questions" / "state.py",
+           "from framework.questions.base_question import BaseQuestion\n\n\n"
+           "class PlanItemCreated(BaseQuestion):\n"
+           "    def answered_by(self, actor):\n        return True\n")
+
+
+def test_capture_pattern_exemplars_bespoke_base_classes(tmp_path: Path) -> None:
+    # Regression: a SUT whose base classes are `BaseTask`/`BaseQuestion` must
+    # still yield exemplars. Empty exemplars left the writer with nothing to
+    # imitate, so it invented upstream `screenpy` imports.
+    _seed_bespoke_screenplay(tmp_path)
+    exemplars = capture_pattern_exemplars(
+        tmp_path, pattern="screenplay", language="python",
+    )
+    cats = {e.category for e in exemplars}
+    assert "task" in cats and "question" in cats
+    task = next(e for e in exemplars if e.category == "task")
+    assert task.class_name in ("FillBudget", "SavePlanPosition")
+    assert "BaseTask" in task.excerpt
+
+
+def test_capture_pattern_exemplars_generic_base_question(tmp_path: Path) -> None:
+    # Regression: Python questions typed as `BaseQuestion[str]` are subscripted
+    # generics. `_base_names` used to handle only ast.Name / ast.Attribute, so
+    # every generic-based unit was dropped — losing the entire `question`
+    # category (observed on the valuemation SUT, which false-greened Step 8).
+    _touch(tmp_path / "framework" / "questions" / "base_question.py",
+           "from abc import ABC, abstractmethod\n"
+           "from typing import Generic, TypeVar\n\n"
+           "T = TypeVar('T')\n\n\n"
+           "class BaseQuestion(ABC, Generic[T]):\n"
+           "    @abstractmethod\n"
+           "    def answered_by(self, actor): ...\n")
+    _touch(tmp_path / "framework" / "questions" / "cost_center.py",
+           "from framework.questions.base_question import BaseQuestion\n\n\n"
+           "class SelectedFieldValue(BaseQuestion[str]):\n"
+           "    def answered_by(self, actor):\n        return 'x'\n")
+    _touch(tmp_path / "framework" / "tasks" / "base_task.py",
+           "from abc import ABC\n\n\nclass BaseTask(ABC):\n    pass\n")
+    _touch(tmp_path / "framework" / "tasks" / "login.py",
+           "from framework.tasks.base_task import BaseTask\n\n\n"
+           "class Login(BaseTask):\n"
+           "    def perform_as(self, actor):\n        return actor\n")
+    exemplars = capture_pattern_exemplars(
+        tmp_path, pattern="screenplay", language="python",
+    )
+    cats = {e.category for e in exemplars}
+    assert "question" in cats, "generic-based question was dropped"
+    question = next(e for e in exemplars if e.category == "question")
+    assert question.class_name == "SelectedFieldValue"
+    assert "BaseQuestion[str]" in question.excerpt
+
+
+def _seed_bespoke_ts_screenplay(root: Path) -> None:
+    """Bespoke Playwright+TS Screenplay SUT: base classes named `BaseTask`/
+    `BaseQuestion` and inherited via `extends` (not `implements Task`)."""
+    _touch(root / "framework" / "tasks" / "fill-budget.ts",
+           "import { BaseTask } from '../base/base-task';\n\n"
+           "export class FillBudget extends BaseTask {\n"
+           "  async performAs(actor: Actor): Promise<void> {}\n"
+           "}\n")
+    _touch(root / "framework" / "questions" / "plan-item.ts",
+           "import { BaseQuestion } from '../base/base-question';\n\n"
+           "export class PlanItemCreated extends BaseQuestion<boolean> {\n"
+           "  async answeredBy(actor: Actor): Promise<boolean> { return true; }\n"
+           "}\n")
+
+
+def test_capture_pattern_exemplars_bespoke_ts(tmp_path: Path) -> None:
+    # Regression: a Playwright+TS/JS Screenplay SUT whose units use bespoke
+    # base classes via `extends BaseTask` must still yield exemplars — the old
+    # `implements \bTask\b` regex missed them, leaving the writer ungrounded.
+    _seed_bespoke_ts_screenplay(tmp_path)
+    exemplars = capture_pattern_exemplars(
+        tmp_path, pattern="screenplay", language="typescript",
+    )
+    cats = {e.category for e in exemplars}
+    assert "task" in cats and "question" in cats
+    task = next(e for e in exemplars if e.category == "task")
+    assert task.class_name == "FillBudget"
+    assert "extends BaseTask" in task.excerpt
+
+
+def test_capture_pattern_exemplars_empty_for_pom(tmp_path: Path) -> None:
+    _seed_pom(tmp_path)
+    assert capture_pattern_exemplars(
+        tmp_path, pattern="pom", language="python",
+    ) == []
+
+
+def test_src_layout_no_fabricated_pom_path_for_screenplay(tmp_path: Path) -> None:
+    """Root-cause regression: Screenplay SUTs must NOT get a synthetic
+    `src/.../pages/object` fallback (broke run 20260715-075512-f2dbad)."""
+    _seed_screenplay(tmp_path)
+    layout = detect_src_directory_layout(
+        tmp_path, page_objects=[], helpers=[], language="python",
+        architecture_pattern="screenplay",
+    )
+    assert layout.pages_object_dir is None
+    assert layout.pages_locators_dir is None
+
+
+def test_src_layout_fabricates_pom_path_for_pom_greenfield(tmp_path: Path) -> None:
+    """POM/unknown SUTs keep the greenfield fallback (unchanged behaviour)."""
+    layout = detect_src_directory_layout(
+        tmp_path, page_objects=[], helpers=[], language="python",
+        architecture_pattern="pom",
+    )
+    assert layout.pages_object_dir is not None
+    assert layout.pages_object_dir.endswith("pages/object")
+
+
+def test_pattern_fields_survive_serialize_and_merge(tmp_path: Path) -> None:
+    _seed_screenplay(tmp_path)
+    inv = detect_module_inventory(tmp_path, ".")
+    assert inv.architecture_pattern == "screenplay"
+    assert inv.pattern_exemplars
+    d = inv.as_dict()
+    assert d["architecture_pattern"] == "screenplay"
+    assert len(d["pattern_exemplars"]) >= 1
+    # merge (the clone-through path) must NOT drop the new fields
+    merged = merge_llm_inventory(inv, {"language": "python"})
+    assert merged.architecture_pattern == "screenplay"
+    assert len(merged.pattern_exemplars) == len(inv.pattern_exemplars)
+
+
 def _touch(p: Path, content: str = "") -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle-hook + open-method discovery
+# ---------------------------------------------------------------------------
+
+
+def test_ts_lifecycle_hooks_and_open_method(tmp_path: Path) -> None:
+    """TS: beforeEach/afterEach hooks capture ordered body calls; the open
+    method (openBaseURL → page.goto) is detected on the BasePage POM."""
+    _touch(
+        tmp_path / "src" / "pages" / "BasePage.ts",
+        "export class BasePage {\n"
+        "  async openBaseURL() { await this.page.goto('/'); }\n"
+        "  async logIn(u: string, p: string) { /* ... */ }\n"
+        "  async logout() { /* ... */ }\n"
+        "}\n",
+    )
+    _touch(
+        tmp_path / "tests" / "smoke.spec.ts",
+        "import { test } from './fixtures';\n"
+        "test.beforeEach(async ({ basePage }) => {\n"
+        "  await basePage.openBaseURL();\n"
+        "  await basePage.logIn('u', 'p');\n"
+        "});\n"
+        "test.afterEach(async ({ basePage }) => {\n"
+        "  await basePage.logout();\n"
+        "});\n",
+    )
+    pages = scan_ts_page_objects(tmp_path)
+    auth = scan_ts_auth_flow(tmp_path, pages)
+    assert auth.open_method == "src/pages/BasePage.ts:BasePage.openBaseURL"
+
+    hooks = scan_ts_lifecycle_hooks(tmp_path)
+    by_event = {h.event: h for h in hooks}
+    assert by_event["before_each"].calls == ["basePage.openBaseURL", "basePage.logIn"]
+    assert by_event["after_each"].calls == ["basePage.logout"]
+
+
+def test_python_lifecycle_hooks_unittest_and_autouse(tmp_path: Path) -> None:
+    _touch(
+        tmp_path / "tests" / "test_smoke.py",
+        "import pytest\n"
+        "class TestThing:\n"
+        "    def setUp(self):\n"
+        "        self.base.open_base_url()\n"
+        "        self.base.log_in('u', 'p')\n"
+        "    def tearDown(self):\n"
+        "        self.base.logout()\n"
+        "\n"
+        "@pytest.fixture(autouse=True)\n"
+        "def around(page):\n"
+        "    page.goto('/')\n"
+        "    yield\n"
+        "    page.close()\n",
+    )
+    hooks = scan_python_lifecycle_hooks(tmp_path)
+    events = {h.event for h in hooks}
+    assert {"before_each", "after_each"} <= events
+    setup = next(h for h in hooks if h.framework_construct == "setUp")
+    assert setup.event == "before_each"
+    assert setup.calls == ["self.base.open_base_url", "self.base.log_in"]
+    # autouse function fixture with yield → both a before_each and after_each
+    autouse_hooks = [h for h in hooks if "autouse" in h.framework_construct]
+    assert {h.event for h in autouse_hooks} == {"before_each", "after_each"}
+
+
+def test_python_open_method_detected_from_name(tmp_path: Path) -> None:
+    _touch(
+        tmp_path / "src" / "pages" / "base_page.py",
+        "class BasePage:\n"
+        "    def open_base_url(self):\n"
+        "        self.page.goto('/')\n"
+        "    def login(self, u, p):\n"
+        "        pass\n",
+    )
+    pages = scan_python_page_objects(tmp_path)
+    auth = scan_python_auth_flow(tmp_path, pages, [])
+    assert auth.open_method and auth.open_method.endswith("BasePage.open_base_url")
 
 
 # ---------------------------------------------------------------------------
@@ -936,12 +1217,12 @@ def test_scan_ts_locators_inline_object_property(tmp_path: Path):
     """
     from qtea.sut_inventory import scan_ts_locators
 
-    page_file = tmp_path / "src" / "pages" / "RopaEntryPage.ts"
+    page_file = tmp_path / "src" / "pages" / "EntityFormPage.ts"
     page_file.parent.mkdir(parents=True, exist_ok=True)
     page_file.write_text(
         "import { Page } from '@playwright/test';\n"
         "\n"
-        "export class RopaEntryPage {\n"
+        "export class EntityFormPage {\n"
         "    constructor(private page: Page) {}\n"
         "\n"
         "    elements: Record<string, string> = {\n"
@@ -956,9 +1237,9 @@ def test_scan_ts_locators_inline_object_property(tmp_path: Path):
     assert len(results) == 1
     lc = results[0]
     assert lc.location_pattern == "inline_object_property"
-    assert lc.owning_pom == "RopaEntryPage"
+    assert lc.owning_pom == "EntityFormPage"
     assert lc.container_name == "elements"
-    assert lc.class_name == "RopaEntryPage"
+    assert lc.class_name == "EntityFormPage"
     names = sorted(c.name for c in lc.constants)
     assert names == ["btnCreateNewRopa", "btnSubmit", "inpName"], (
         f"camelCase properties must be found; got {names!r}"
@@ -986,6 +1267,64 @@ def test_scan_ts_locators_export_const_object(tmp_path: Path):
     assert lc.class_name == "LoginLocators"
     names = sorted(c.name for c in lc.constants)
     assert names == ["EMAIL_INPUT", "PASSWORD_INPUT", "SUBMIT_BTN"]
+
+
+def test_scan_ts_locators_uppercase_snake_bag_with_owning_pom(tmp_path: Path):
+    """Regression: an UPPERCASE_SNAKE bag
+    (`export const BASE_LOCATORS = {...}`) with camelCase string keys, in a
+    `<Pom>.locators.ts` file, must be catalogued (the old PascalCase-only,
+    case-sensitive regex missed it) AND carry owning_pom inferred from the
+    filename so Step 8's locator resolver can map create_tbd(owning_page) to
+    it."""
+    from qtea.sut_inventory import scan_ts_locators
+
+    src = tmp_path / "src" / "pages" / "locators" / "BasePage.locators.ts"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text(
+        "export const BASE_LOCATORS = {\n"
+        "  inpUsername: '//input[@data-test=\"username-input\"]',\n"
+        "  btnLogin: '//input[@data-test=\"submit-button\"]',\n"
+        "};\n",
+        encoding="utf-8",
+    )
+    results = scan_ts_locators(tmp_path)
+    assert len(results) == 1
+    lc = results[0]
+    assert lc.location_pattern == "export_const_object"
+    assert lc.class_name == "BASE_LOCATORS"
+    assert lc.owning_pom == "BasePage"
+    assert sorted(c.name for c in lc.constants) == ["btnLogin", "inpUsername"]
+
+
+def test_scan_ts_locators_rejects_incidental_name_matches(tmp_path: Path):
+    """Names that CONTAIN 'locator'/'selector'/'element' but don't END with
+    the bag-suffix must NOT be picked up as locator bags. Guards against the
+    over-broad `re.I` regex that would flag `defaultLocatorStrategy` (a config
+    variable) and similar as locator sources.
+
+    Positive counter-example: a properly-named `PageSelectors` const in the
+    same file IS picked up, so the negatives above are being rejected on
+    naming shape, not because the scanner is broken."""
+    page_file = tmp_path / "src" / "pages" / "MixedNaming.ts"
+    page_file.parent.mkdir(parents=True, exist_ok=True)
+    page_file.write_text(
+        # NEGATIVES: contain the keyword but are not locator bags.
+        'export const defaultLocatorStrategy = "css";\n'
+        'export const elementCounter = 0;\n'
+        'export const selectorTests = [];\n'
+        'export const someLocatorFactory = () => ({ x: 1 });\n'
+        # POSITIVE: real bag, name ends with the suffix.
+        "export const PageSelectors = {\n"
+        '  btnGo: "#go",\n'
+        "};\n",
+        encoding="utf-8",
+    )
+    results = scan_ts_locators(tmp_path)
+    # Only the well-named bag should be picked up.
+    names = [lc.class_name for lc in results]
+    assert names == ["PageSelectors"], (
+        f"regex over-flagged non-locator names: {names}"
+    )
 
 
 def test_scan_ts_locators_readonly_locator_props(tmp_path: Path):
@@ -1072,12 +1411,12 @@ def test_scan_ts_page_objects_finds_extends_class(tmp_path: Path):
     """
     from qtea.sut_inventory import scan_ts_page_objects
 
-    src = tmp_path / "src" / "pages" / "RopaEntryPage.ts"
+    src = tmp_path / "src" / "pages" / "EntityFormPage.ts"
     src.parent.mkdir(parents=True, exist_ok=True)
     src.write_text(
         "import { BasePage } from './BasePage';\n"
         "\n"
-        "export class RopaEntryPage extends BasePage {\n"
+        "export class EntityFormPage extends BasePage {\n"
         "    constructor(page) { super(page); }\n"
         "\n"
         "    elements = { btnX: '//button' };\n"
@@ -1088,8 +1427,8 @@ def test_scan_ts_page_objects_finds_extends_class(tmp_path: Path):
     )
     poms = scan_ts_page_objects(tmp_path)
     names = sorted(p.name for p in poms)
-    assert "RopaEntryPage" in names
-    hit = next(p for p in poms if p.name == "RopaEntryPage")
+    assert "EntityFormPage" in names
+    hit = next(p for p in poms if p.name == "EntityFormPage")
     assert hit.has_inline_locators is True
 
 
@@ -1119,3 +1458,71 @@ def test_scan_ts_page_objects_structural_detection(tmp_path: Path):
         f"Structural POM detection should find `Dashboard` "
         f"despite non-`*Page` name; got {names!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# navigation_preconditions — LLM-only field, no deterministic producer
+# ---------------------------------------------------------------------------
+
+
+def test_merge_llm_inventory_appends_navigation_preconditions():
+    det = ModuleInventory(name="sut", path=".", language="typescript", source="deterministic")
+    llm = {
+        "name": "sut",
+        "navigation_preconditions": [
+            {
+                "method": "DirectoryPage.selectFilteredEntity",
+                "requires_call": "BasePage.selectLoginOptionByText",
+                "requires_args_hint": "NAV_OPTIONS.DIRECTORY",
+                "evidence": "tests/EntityFormSmoke.spec.ts:104",
+            },
+        ],
+    }
+    merged = merge_llm_inventory(det, llm)
+    assert len(merged.navigation_preconditions) == 1
+    entry = merged.navigation_preconditions[0]
+    assert entry.method == "DirectoryPage.selectFilteredEntity"
+    assert entry.requires_call == "BasePage.selectLoginOptionByText"
+    assert entry.requires_args_hint == "NAV_OPTIONS.DIRECTORY"
+    assert entry.evidence == "tests/EntityFormSmoke.spec.ts:104"
+
+
+def test_merge_llm_inventory_dedupes_navigation_preconditions():
+    det = ModuleInventory(
+        name="sut", path=".", language="typescript",
+        navigation_preconditions=[
+            NavigationPrecondition(
+                method="DirectoryPage.selectFilteredEntity",
+                requires_call="BasePage.selectLoginOptionByText",
+                requires_args_hint="NAV_OPTIONS.DIRECTORY",
+                evidence="tests/EntityFormSmoke.spec.ts:104",
+            ),
+        ],
+        source="llm_augmented",
+    )
+    llm = {
+        "name": "sut",
+        "navigation_preconditions": [
+            # Exact duplicate on (method, requires_call) — must not be added twice
+            {
+                "method": "DirectoryPage.selectFilteredEntity",
+                "requires_call": "BasePage.selectLoginOptionByText",
+                "requires_args_hint": "NAV_OPTIONS.DIRECTORY",
+                "evidence": "tests/EntityFormSmoke.spec.ts:104",
+            },
+            # Net-new pair — must be appended
+            {
+                "method": "OtherGrid.selectRow",
+                "requires_call": "BasePage.selectLoginOptionByText",
+                "requires_args_hint": "NAV_OPTIONS.OTHER",
+                "evidence": "tests/Other.spec.ts:10",
+            },
+            # Malformed — missing requires_call — must be skipped
+            {"method": "Broken.method"},
+        ],
+    }
+    merged = merge_llm_inventory(det, llm)
+    keys = [(np.method, np.requires_call) for np in merged.navigation_preconditions]
+    assert keys.count(("DirectoryPage.selectFilteredEntity", "BasePage.selectLoginOptionByText")) == 1
+    assert ("OtherGrid.selectRow", "BasePage.selectLoginOptionByText") in keys
+    assert len(merged.navigation_preconditions) == 2

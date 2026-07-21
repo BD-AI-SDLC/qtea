@@ -10,10 +10,13 @@ from __future__ import annotations
 from pathlib import Path
 
 from qtea.storage_state import (
+    ensure_gitignored,
     mask_path,
+    mcp_browser_env,
     resolve,
     summary_for_prompt,
     to_mcp_arg,
+    write_target,
 )
 
 # ---------------------------------------------------------------------------
@@ -124,6 +127,121 @@ def test_resolve_uses_os_environ_when_env_dict_is_none(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# write_target() — where a fresh capture is WRITTEN (existence-independent)
+# ---------------------------------------------------------------------------
+
+
+def test_write_target_cli_opt_wins(tmp_path):
+    sut = tmp_path / "sut"
+    sut.mkdir()
+    cli_path = tmp_path / "explicit.json"  # does NOT exist yet
+    result = write_target(
+        sut_root=sut,
+        cli_opt=cli_path,
+        env={"QTEA_STORAGE_STATE": str(tmp_path / "env.json")},
+    )
+    assert result == cli_path
+
+
+def test_write_target_env_wins_over_convention(tmp_path):
+    sut = tmp_path / "sut"
+    sut.mkdir()
+    env_path = tmp_path / "env.json"  # does NOT exist yet
+    result = write_target(
+        sut_root=sut, cli_opt=None, env={"QTEA_STORAGE_STATE": str(env_path)}
+    )
+    assert result == env_path
+
+
+def test_write_target_falls_back_to_convention(tmp_path):
+    sut = tmp_path / "sut"
+    sut.mkdir()
+    result = write_target(sut_root=sut, cli_opt=None, env={})
+    assert result == sut / ".qtea" / "storage-state.json"
+
+
+def test_write_target_is_existence_independent(tmp_path):
+    """Unlike resolve(), write_target returns the override even when nothing
+    exists on disk yet — the first capture must have somewhere to land."""
+    target = tmp_path / "nowhere" / "s.json"
+    assert not target.exists()
+    assert write_target(sut_root=tmp_path, cli_opt=target, env={}) == target
+
+
+def test_write_target_raises_without_override_or_sut():
+    import pytest
+
+    with pytest.raises(ValueError):
+        write_target(sut_root=None, cli_opt=None, env={})
+
+
+# ---------------------------------------------------------------------------
+# ensure_gitignored()
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_gitignored_adds_custom_path_inside_sut(tmp_path):
+    sut = tmp_path / "sut"
+    sut.mkdir()
+    target = sut / "auth" / "session.json"
+    ensure_gitignored(sut, target)
+    assert (sut / ".gitignore").read_text(encoding="utf-8").splitlines() == [
+        "auth/session.json"
+    ]
+
+
+def test_ensure_gitignored_is_noop_outside_sut(tmp_path):
+    sut = tmp_path / "sut"
+    sut.mkdir()
+    outside = tmp_path / "home" / "s.json"
+    ensure_gitignored(sut, outside)
+    assert not (sut / ".gitignore").exists()
+
+
+def test_ensure_gitignored_noop_when_sut_root_none(tmp_path):
+    # Must not raise.
+    ensure_gitignored(None, tmp_path / "s.json")
+
+
+def test_ensure_gitignored_is_idempotent(tmp_path):
+    sut = tmp_path / "sut"
+    sut.mkdir()
+    target = sut / "auth" / "session.json"
+    ensure_gitignored(sut, target)
+    ensure_gitignored(sut, target)
+    lines = (sut / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert lines.count("auth/session.json") == 1
+
+
+def test_ensure_gitignored_skips_when_dir_prefix_already_covers(tmp_path):
+    """The Step-6-seeded `.qtea/` directory entry already covers the default
+    convention path, so we must not append a redundant line."""
+    sut = tmp_path / "sut"
+    sut.mkdir()
+    (sut / ".gitignore").write_text(".qtea/\n", encoding="utf-8")
+    ensure_gitignored(sut, sut / ".qtea" / "storage-state.json")
+    assert (sut / ".gitignore").read_text(encoding="utf-8") == ".qtea/\n"
+
+
+def test_ensure_gitignored_skips_when_basename_pattern_already_covers(tmp_path):
+    sut = tmp_path / "sut"
+    sut.mkdir()
+    (sut / ".gitignore").write_text("storage-state.json\n", encoding="utf-8")
+    ensure_gitignored(sut, sut / ".qtea" / "storage-state.json")
+    assert (sut / ".gitignore").read_text(encoding="utf-8") == "storage-state.json\n"
+
+
+def test_ensure_gitignored_appends_with_newline_when_missing(tmp_path):
+    sut = tmp_path / "sut"
+    sut.mkdir()
+    (sut / ".gitignore").write_text("node_modules/", encoding="utf-8")  # no trailing \n
+    ensure_gitignored(sut, sut / "auth" / "session.json")
+    assert (sut / ".gitignore").read_text(encoding="utf-8") == (
+        "node_modules/\nauth/session.json\n"
+    )
+
+
+# ---------------------------------------------------------------------------
 # to_mcp_arg()
 # ---------------------------------------------------------------------------
 
@@ -138,6 +256,34 @@ def test_to_mcp_arg_set_returns_storage_state_flag(tmp_path):
 
 def test_to_mcp_arg_unset_returns_empty_string():
     assert to_mcp_arg(None) == ""
+
+
+# ---------------------------------------------------------------------------
+# mcp_browser_env()
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_browser_env_with_session_is_isolated_no_user_data_dir(tmp_path):
+    """A resolved session must run isolated + storage-state and DROP
+    --user-data-dir (a persistent profile makes @playwright/mcp ignore
+    --storage-state -- observed as auth-gated routes silently redirecting to
+    login when both flags were passed)."""
+    p = _make_file(tmp_path / "s.json")
+    env = mcp_browser_env(p, tmp_path / "profile")
+    assert env["QTEA_MCP_ISOLATED_ARG"] == "--isolated"
+    assert env["QTEA_STORAGE_STATE_ARG"].startswith("--storage-state=")
+    # user-data-dir dropped (empty → filtered out before the subprocess spawns)
+    assert env["QTEA_MCP_USER_DATA_DIR_ARG"] == ""
+
+
+def test_mcp_browser_env_without_session_uses_persistent_profile(tmp_path):
+    """No session → persistent --user-data-dir, no --isolated, no
+    --storage-state."""
+    env = mcp_browser_env(None, tmp_path / "profile")
+    assert env["QTEA_MCP_ISOLATED_ARG"] == ""
+    assert env["QTEA_STORAGE_STATE_ARG"] == ""
+    assert env["QTEA_MCP_USER_DATA_DIR_ARG"].startswith("--user-data-dir=")
+    assert str(tmp_path / "profile") in env["QTEA_MCP_USER_DATA_DIR_ARG"]
 
 
 # ---------------------------------------------------------------------------

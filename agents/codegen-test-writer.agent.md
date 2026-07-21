@@ -29,6 +29,24 @@ Each `test_function` in `plan.json` may carry an ordered `steps[]` array — the
 
 Only when a `test_function` has no `steps[]` array do you infer the action sequence from the `strategy.md` prose.
 
+## Lifecycle hooks (`hooks[]`) — emit real framework setup/teardown
+
+A test case may carry a `hooks[]` array — the SUT's setup/teardown, classified by canonical `event`. Emit each as the target framework's idiomatic lifecycle hook, calling the POM methods listed in the hook's `calls[]` (in order, with `args`, same reference/arity rules as `steps[]`):
+
+| `event` | JS/TS (Playwright/Jest/Mocha) | pytest | unittest | JUnit 5 |
+| --- | --- | --- | --- | --- |
+| `before_all` | `test.beforeAll(async () => {…})` | `@pytest.fixture(scope="module", autouse=True)` | `setUpClass` | `@BeforeAll` |
+| `after_all` | `test.afterAll(async () => {…})` | `@pytest.fixture(scope="module", autouse=True)` with `yield` | `tearDownClass` | `@AfterAll` |
+| `before_each` | `test.beforeEach(async ({ <fixtures> }) => {…})` | `@pytest.fixture(autouse=True)` (function scope) | `setUp` | `@BeforeEach` |
+| `after_each` | `test.afterEach(async ({ <fixtures> }) => {…})` | `@pytest.fixture(autouse=True)` with `yield` (teardown after the `yield`) | `tearDown` | `@AfterEach` |
+
+Rules:
+- **A `before_each` hook holds the mandatory UI setup: open the app base URL, THEN login.** A test that logs in on a fresh/blank page times out on every locator — the open-base-URL call (e.g. `basePage.openBaseURL()`) is required before login and is a separate call. Emit exactly the hook's `calls[]` in order.
+- **Do NOT duplicate hook work in the test body.** If a `before_each` opens+logs-in+navigates, the test functions start from that state — never re-emit those calls as in-body Arrange (that double-logs-in). The Arrange phase below applies only to per-test setup NOT already covered by a hook.
+- Hooks call POM methods only — never put assertions (`expect`/`assert`) in a hook body.
+- For pytest, an `autouse=True` fixture with a `yield` is one function whose pre-`yield` body is the before-half and post-`yield` body is the after-half; prefer this over separate setUp/tearDown unless the SUT uses unittest.
+- When a hook is `source: "reuse"`, the SUT already defines it — if it is a shared file-level hook the test file inherits (e.g. an autouse conftest fixture), do not re-emit it; only emit hooks this test file must declare itself.
+
 ## Arrange phase & argument binding (do NOT ship a test that skips its own setup)
 
 A test must establish its preconditions before the Act steps, and must pass every required argument. Two failure modes are explicitly forbidden:
@@ -37,7 +55,7 @@ A test must establish its preconditions before the Act steps, and must pass ever
 
 2. **Missing Arrange.** If the strategy's `Preconditions:` require an authenticated session and/or set-up state (e.g. "logged in as the editor", "a completed entry exists ready for approval") and no fixture auto-establishes it (check `existing_fixtures` — a fixture that only constructs a page object does NOT log in), you MUST emit the setup before the Act steps:
    - **Authentication:** call the login POM/method (e.g. `loginPage.logIn(USERNAME_X, PASSWORD_X)`) with the user named in the precondition/step ("As <user>, …"), before any action that assumes a session. A `switchUser(...)` mid-flow changes identity — it does not substitute for the initial login.
-   - **State setup:** create/open the entity the test acts on (e.g. capture `const entityName = await ropaEntryPage.createBasicRopaEntry()`) so later steps have something concrete to reference.
+   - **State setup:** create/open the entity the test acts on (e.g. capture `const entityName = await entityFormPage.createBasicEntity()`) so later steps have something concrete to reference.
    - Mark any setup you add that was not an explicit `steps[]` entry with `// [ASSUMPTION: precondition setup added from strategy Preconditions]`.
 
 When Step 7's `steps[]` already includes the Arrange steps (login/entity creation as ordered entries), just transpile them — do not duplicate. The goal: the emitted test authenticates, sets up its state, performs the prescribed Act sequence with correctly-bound arguments, then asserts.
@@ -60,7 +78,7 @@ existing_fixtures:
   - loginPage → src/fixtures/pageFixtures.ts
   - basePage → src/fixtures/pageFixtures.ts
 ```
-and your `test_file_target` is `tests/regression/qtea_ropa_test.spec.ts`, the correct import is:
+and your `test_file_target` is `tests/regression/qtea_entity_test.spec.ts`, the correct import is:
 ```typescript
 // GOOD — imports the extended test object with loginPage/basePage fixtures
 import { test, expect } from "../../src/fixtures/pageFixtures";

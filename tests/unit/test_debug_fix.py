@@ -336,6 +336,7 @@ async def test_run_fix_proposal_writes_files(tmp_path: Path):
         })()
         path = await _run_fix_proposal(
             42, ctx, "# Step 42 failure\n\nSomething broke",
+            result=StepResult(success=False, status="failed", outputs=[], error="Something broke"),
             debug_rca_path=seeded_rca,
         )
 
@@ -510,6 +511,46 @@ async def test_run_debug_rca_prompt_names_artifacts_dir(tmp_path: Path):
     assert "results[i].stdout" in prompt or "stdout" in prompt.lower()
 
 
+async def test_run_debug_rca_grants_pipeline_source_read(tmp_path: Path):
+    """The debug agent must get read access to the qtea package source so its
+    RCA can confirm the exact gate file/symbol instead of guessing (e.g.
+    attributing the zero-assertions gate to s08_codegen.py when it lives in
+    test_indexer.py). Granted by default; scoped to the package dir."""
+    import qtea
+
+    qtea_pkg_src = Path(qtea.__file__).resolve().parent
+
+    ctx = _ctx(tmp_path, no_fix=True)
+    with patch("qtea.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
+        mock_agent.return_value = _mock_result(success=True, final_text="rca")
+        await _run_debug_rca(8, ctx, "ctx", attempt=1)
+
+    add_dirs = mock_agent.await_args_list[0].kwargs["add_dirs"]
+    add_dirs_set = {Path(d).resolve() for d in add_dirs}
+    assert qtea_pkg_src in add_dirs_set
+    prompt = mock_agent.await_args_list[0].kwargs["user_prompt"]
+    assert "pipeline source" in prompt.lower()
+
+
+async def test_run_debug_rca_pipeline_source_opt_out(tmp_path: Path, monkeypatch):
+    """`QTEA_DEBUG_NO_PIPELINE_SRC=1` withholds the package-source grant for the
+    tightest sandbox, without collapsing the other (workspace) grants."""
+    import qtea
+
+    qtea_pkg_src = Path(qtea.__file__).resolve().parent
+    monkeypatch.setenv("QTEA_DEBUG_NO_PIPELINE_SRC", "1")
+
+    ctx = _ctx(tmp_path, no_fix=True)
+    with patch("qtea.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
+        mock_agent.return_value = _mock_result(success=True, final_text="rca")
+        await _run_debug_rca(8, ctx, "ctx", attempt=1)
+
+    add_dirs = mock_agent.await_args_list[0].kwargs["add_dirs"]
+    add_dirs_set = {Path(d).resolve() for d in add_dirs}
+    assert qtea_pkg_src not in add_dirs_set
+    assert ctx.workspace.root.resolve() in add_dirs_set
+
+
 async def test_run_debug_rca_uses_config_max_turns_and_timeout(tmp_path: Path):
     """Historical bug: hardcoded ``max_turns=10`` / ``timeout_s=300`` at the
     call site truncated the debug agent on complex failures. Config-driven
@@ -543,7 +584,11 @@ async def test_run_fix_proposal_uses_config_max_turns_and_timeout(tmp_path: Path
 
     with patch("qtea.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
         mock_agent.return_value = _mock_result(success=True, final_text="ok")
-        await _run_fix_proposal(42, ctx, "# ctx", debug_rca_path=seeded_rca)
+        await _run_fix_proposal(
+            42, ctx, "# ctx",
+            result=StepResult(success=False, status="failed", outputs=[], error="fail"),
+            debug_rca_path=seeded_rca,
+        )
 
     # Both CT and eng calls made — assert config values propagated to both.
     assert mock_agent.await_count == 2
@@ -574,7 +619,11 @@ async def test_aggregated_rca_not_overwritten_by_smaller_content(tmp_path: Path)
 
     with patch("qtea.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
         mock_agent.return_value = _mock_result(success=True, final_text="")
-        await _run_fix_proposal(42, ctx, "# ctx", debug_rca_path=tiny_rca)
+        await _run_fix_proposal(
+            42, ctx, "# ctx",
+            result=StepResult(success=False, status="failed", outputs=[], error="fail"),
+            debug_rca_path=tiny_rca,
+        )
 
     # Prior artifact preserved verbatim — the tiny content did NOT win.
     assert prior_rca.read_text(encoding="utf-8") == prior_text
@@ -595,7 +644,11 @@ async def test_aggregated_rca_overwritten_when_new_is_larger(tmp_path: Path):
 
     with patch("qtea.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
         mock_agent.return_value = _mock_result(success=True, final_text="")
-        await _run_fix_proposal(42, ctx, "# ctx", debug_rca_path=larger_rca)
+        await _run_fix_proposal(
+            42, ctx, "# ctx",
+            result=StepResult(success=False, status="failed", outputs=[], error="fail"),
+            debug_rca_path=larger_rca,
+        )
 
     assert prior_rca.read_text(encoding="utf-8") == larger_text
 
@@ -620,7 +673,9 @@ async def test_run_fix_proposal_eng_placeholder_on_turn_cap(tmp_path: Path):
             ),
         ]
         proposal_path = await _run_fix_proposal(
-            42, ctx, "# Step 42 failure", debug_rca_path=seeded_rca,
+            42, ctx, "# Step 42 failure",
+            result=StepResult(success=False, status="failed", outputs=[], error="fail"),
+            debug_rca_path=seeded_rca,
         )
 
     content = proposal_path.read_text(encoding="utf-8")
@@ -653,6 +708,7 @@ async def test_fix_proposal_uses_debug_rca_when_available(tmp_path: Path):
         })()
         await _run_fix_proposal(
             42, ctx, "# raw failure context",
+            result=StepResult(success=False, status="failed", outputs=[], error="fail"),
             debug_rca_path=seeded_rca,
         )
 
@@ -772,7 +828,9 @@ async def test_fix_proposal_writes_two_aux_records(tmp_path: Path):
             "success": True, "final_text": "text", "error": None,
         })()
         await _run_fix_proposal(
-            42, ctx, "# ctx", debug_rca_path=seeded_rca,
+            42, ctx, "# ctx",
+            result=StepResult(success=False, status="failed", outputs=[], error="fail"),
+            debug_rca_path=seeded_rca,
         )
 
     assert len(ctx.state.auxiliary_records) == 2

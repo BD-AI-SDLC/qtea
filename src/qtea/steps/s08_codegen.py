@@ -42,7 +42,9 @@ from typing import Any
 from qtea._sut_git import commit_step, files_in_commit
 from qtea.claude_runner import run_agent
 from qtea.codegen_reconcile import (
+    _js_strip,
     fixture_mismatches_to_fixture_tasks,
+    inventory_method_index,
     mismatches_to_pom_tasks,
     pom_method_signatures,
     reconcile_codegen,
@@ -141,65 +143,61 @@ def _vendor_jit_runtime(sut_root: Path) -> Path | None:
         return None
 
 
-def _ensure_conftest_registers_runtime(sut_root: Path) -> None:
-    """Make sure at least one conftest.py under `<sut>/tests/` has
-    `pytest_plugins` referencing `tests.qtea_runtime`.
+def _register_pytest_plugin(conftest: Path, module: str) -> bool:
+    """Idempotently ensure ``conftest`` registers ``module`` in ``pytest_plugins``.
 
-    Idempotent — if a conftest already registers it, no change. If no
-    conftest exists at the tests/ root, creates a minimal one. If a
-    conftest exists but doesn't register the plugin, appends the
-    registration line.
+    Creates the conftest if absent, merges into an existing
+    ``pytest_plugins = [...]`` list when one is present (never emits a second
+    assignment that would clobber the SUT's own list), else appends a fresh
+    assignment. Returns True when the file was created or modified.
     """
-    tests_dir = sut_root / "tests"
-    if not tests_dir.is_dir():
-        return
-    conftest = tests_dir / "conftest.py"
-    plugin_line = 'pytest_plugins = ["tests.qtea_runtime"]\n'
+    plugin_line = f'pytest_plugins = ["{module}"]\n'
     if not conftest.exists():
+        conftest.parent.mkdir(parents=True, exist_ok=True)
         conftest.write_text(
             "# qtea generated: registers the JIT locator runtime plugin\n"
             + plugin_line,
             encoding="utf-8",
         )
         log.info("step08.jit_conftest_created", path=str(conftest))
-        return
+        return True
     try:
         existing = conftest.read_text(encoding="utf-8")
     except OSError:
-        return
-    if "tests.qtea_runtime" in existing:
-        return
+        return False
+    if module in existing:
+        return False
     if "pytest_plugins" in existing:
-        # A pytest_plugins list already exists; append the runtime entry
-        # by replacing the first list-bracket close, best-effort. If the
-        # format is too exotic, fall through to an extra assignment line
-        # (pytest tolerates multiple assignments — last one wins, so put
-        # ours last with the merged content if we can detect a simple list).
+        # Merge into the existing list rather than emit a second assignment
+        # (a second `pytest_plugins =` would shadow the SUT's own plugins).
         import re as _re
-        m = _re.search(
-            r"pytest_plugins\s*=\s*\[(?P<items>[^\]]*)\]",
-            existing,
-        )
+        m = _re.search(r"pytest_plugins\s*=\s*\[(?P<items>[^\]]*)\]", existing)
         if m:
             items = m.group("items").strip()
-            new_items = (
-                items + ', "tests.qtea_runtime"' if items
-                else '"tests.qtea_runtime"'
-            )
+            new_items = (items + f', "{module}"') if items else f'"{module}"'
             replaced = (
                 existing[:m.start()] + f'pytest_plugins = [{new_items}]'
                 + existing[m.end():]
             )
             conftest.write_text(replaced, encoding="utf-8")
             log.info("step08.jit_conftest_extended", path=str(conftest))
-            return
-    # No pytest_plugins detected, or detection didn't match — append a line.
+            return True
     with conftest.open("a", encoding="utf-8") as f:
         if not existing.endswith("\n"):
             f.write("\n")
         f.write("\n# qtea: register the JIT locator runtime plugin\n")
         f.write(plugin_line)
     log.info("step08.jit_conftest_appended", path=str(conftest))
+    return True
+
+
+def _ensure_conftest_registers_runtime(sut_root: Path) -> None:
+    """Make sure a conftest.py under `<sut>/tests/` registers
+    `tests.qtea_runtime` as a pytest plugin. No-op when `tests/` is absent."""
+    tests_dir = sut_root / "tests"
+    if not tests_dir.is_dir():
+        return
+    _register_pytest_plugin(tests_dir / "conftest.py", "tests.qtea_runtime")
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +266,68 @@ def _detect_js_test_runner(sut_root: Path) -> str | None:
     return None
 
 
+_GLOBAL_SETUP_KEY_RE = _re.compile(
+    r"""globalSetup\s*:\s*(?P<quote>['"])(?P<path>[^'"]+)(?P=quote)"""
+)
+
+
+def _compose_playwright_global_setup(
+    sut_root: Path, cfg: Path, existing_setup_path: str, runtime_rel: str,
+) -> Path | None:
+    """Write a wrapper module that runs the SUT's own pre-existing
+    ``globalSetup`` AND the qtea JIT runtime's, in that order.
+
+    A Playwright config object literal can only have one ``globalSetup``
+    key — blindly inserting a second one is a silent last-key-wins shadow
+    (whichever key appears later in the object wins, with no error). If
+    the SUT already declares its own ``globalSetup`` (e.g. for its own
+    auth setup), qtea must compose rather than append. Returns the
+    wrapper's path, or None if it couldn't be written (best-effort).
+    """
+    tests_dir = sut_root / "tests"
+    tests_dir.mkdir(parents=True, exist_ok=True)
+    wrapper = tests_dir / "qtea-composed-global-setup.js"
+    existing_abs = (cfg.parent / existing_setup_path).resolve()
+    existing_spec = os.path.relpath(existing_abs, wrapper.parent).replace(os.sep, "/")
+    if not existing_spec.startswith("."):
+        existing_spec = "./" + existing_spec
+    runtime_spec = "./" + Path(runtime_rel).name.removesuffix(".js")
+    wrapper_content = (
+        '"use strict";\n'
+        "// Auto-generated by qtea Step 8 — composes the SUT's own\n"
+        "// Playwright globalSetup with the qtea JIT runtime's, since a\n"
+        "// config object literal can only have one `globalSetup` key\n"
+        "// (a second one would silently shadow it).\n"
+        "//\n"
+        "// Both requires are cast to `any`: the SUT setup's shape is only\n"
+        "// known at runtime (ESM `export default` vs CommonJS\n"
+        "// `module.exports = fn`) and the qtea runtime is a 0-arg CommonJS\n"
+        "// export. The cast keeps the `.default` interop probe AND the\n"
+        "// config-forwarding calls tsc-clean under the Phase B.6 `--checkJs`\n"
+        "// gate (no `.default`/arity errors) without any silencer directive.\n\n"
+        "/** @type {any} */\n"
+        f'const existing = require("{existing_spec}");\n'
+        "/** @type {any} */\n"
+        f'const qteaRuntime = require("{runtime_spec}");\n\n'
+        "module.exports = async function globalSetup(config) {\n"
+        "  const existingFn = (existing && existing.default) || existing;\n"
+        "  if (typeof existingFn === \"function\") {\n"
+        "    await existingFn(config);\n"
+        "  }\n"
+        "  const qteaFn = (qteaRuntime && qteaRuntime.default) || qteaRuntime;\n"
+        "  if (typeof qteaFn === \"function\") {\n"
+        "    await qteaFn(config);\n"
+        "  }\n"
+        "};\n"
+    )
+    try:
+        wrapper.write_text(wrapper_content, encoding="utf-8")
+    except OSError as e:
+        log.warning("step08.jit_pw_global_setup_compose_failed", error=str(e))
+        return None
+    return wrapper
+
+
 def _register_playwright_test_global_setup(sut_root: Path, runtime_rel: str) -> Path | None:
     """Set ``globalSetup`` in playwright.config.{ts,js} to the vendored runtime.
 
@@ -291,10 +351,47 @@ def _register_playwright_test_global_setup(sut_root: Path, runtime_rel: str) -> 
         text = cfg.read_text(encoding="utf-8")
     except OSError:
         return None
-    if "qtea-runtime" in text:
-        return cfg  # idempotent — already registered
+    if "qtea-runtime" in text or "qtea-composed-global-setup" in text:
+        # Idempotent — already registered, either directly (globalSetup points
+        # at the vendored runtime) or via the composed wrapper. Without the
+        # second clause a within-run retry would re-enter the compose branch
+        # below and, because the config now names the wrapper, compose the
+        # wrapper against ITSELF (require("./qtea-composed-global-setup")) —
+        # dropping the SUT's real globalSetup at runtime and adding a spurious
+        # tsc error. See run 20260709-083909-223772 Step 8 attempt 2.
+        return cfg
+
+    m_existing = _GLOBAL_SETUP_KEY_RE.search(text)
+    if m_existing is not None:
+        # SUT already declares its own globalSetup — compose, don't shadow.
+        wrapper = _compose_playwright_global_setup(
+            sut_root, cfg, m_existing.group("path"), runtime_rel,
+        )
+        if wrapper is None:
+            log.warning(
+                "step08.jit_pw_global_setup_conflict",
+                path=str(cfg), existing=m_existing.group("path"),
+                hint="pre-existing globalSetup found but compose failed; "
+                     "runtime vendored but not registered — merge manually.",
+            )
+            return None
+        wrapper_spec = os.path.relpath(
+            wrapper.resolve(), cfg.parent.resolve(),
+        ).replace(os.sep, "/").removesuffix(".js")
+        if not wrapper_spec.startswith("."):
+            wrapper_spec = "./" + wrapper_spec
+        new_text = (
+            text[:m_existing.start()]
+            + f'globalSetup: "{wrapper_spec}"'
+            + text[m_existing.end():]
+        )
+        cfg.write_text(new_text, encoding="utf-8")
+        log.info(
+            "step08.jit_pw_globalsetup_composed", path=str(cfg), wrapper=str(wrapper),
+        )
+        return cfg
+
     # Find the defineConfig({ ... }) opening brace and inject the key after it.
-    import re as _re
     m = _re.search(r"defineConfig\s*\(\s*\{", text)
     if m is None:
         log.warning(
@@ -480,23 +577,6 @@ _RUNTIME_VENDORS = {
 }
 
 
-def _ensure_gitignore_entry(directory: Path, entry: str) -> None:
-    """Append *entry* to ``<directory>/.gitignore`` if not already listed."""
-    gitignore = directory / ".gitignore"
-    try:
-        if gitignore.exists():
-            text = gitignore.read_text(encoding="utf-8", errors="replace")
-            if any(line.strip() == entry for line in text.splitlines()):
-                return
-            if text and not text.endswith("\n"):
-                text += "\n"
-        else:
-            text = ""
-        gitignore.write_text(text + entry + "\n", encoding="utf-8")
-    except OSError:
-        pass
-
-
 # SUT-relative paths of vendored runtime files that must be gitignored.
 # Checked after each vendor call; only entries whose target exists on
 # disk are added (so a Python-only run won't gitignore the JS path).
@@ -522,10 +602,12 @@ def _vendor_runtime_for_framework(framework: str | None, sut_root: Path) -> list
         return []
     created = vendor_fn(sut_root)
     if created:
+        from qtea.env_resolver import ensure_gitignore_entry
+
         for entry in _RUNTIME_GITIGNORE_ENTRIES:
             target = sut_root / entry.rstrip("/")
             if target.exists():
-                _ensure_gitignore_entry(sut_root, entry)
+                ensure_gitignore_entry(sut_root, entry)
     return created
 
 
@@ -754,9 +836,9 @@ def _b5_filter_test_files(produced: list[Path], language: str) -> list[Path]:
     * TS / JS also: Playwright's ``.spec.ts`` / ``.spec.js`` convention
       (``qtea_<feature>_test.spec.ts`` or ``qtea_<feature>.spec.ts``).
       The compound extension leaves the stem ending in ``.spec``, so this
-      branch adds an explicit check. Missing this check was why
-      run 20260701-114656-9394eb's ``qtea_ropa_approval_test.spec.ts``
-      was silently skipped by B.5 (0 files scanned).
+      branch adds an explicit check. Without it, generated ``qtea_*.spec.ts``
+      files are silently skipped by B.5 (0 files scanned) because a naive
+      ``stem.endswith("_test")`` check misses the compound extension.
     * Java: ``Qtea<Feature>Test.java`` — CamelCase. Lowercased, the stem
       ends in ``test`` with no underscore separator. Only ``.java`` files
       get this looser match; without the extension gate, a Python POM
@@ -871,7 +953,7 @@ class _LocatorTask:
     # into an object literal. For ``export_const_object`` this is the
     # const's name (e.g. ``TrialPageSelectors``). For
     # ``inline_object_property`` this is the owning POM class name
-    # (e.g. ``RopaEntryPage``) — the writer then descends into the
+    # (e.g. ``EntityFormPage``) — the writer then descends into the
     # ``container_name`` property of that class body. None for linear-
     # append patterns (``separate_class`` / ``module_const_bag``).
     container_class_name: str | None = None
@@ -900,6 +982,7 @@ def _build_pom_tasks(
 ) -> dict[str, _PomTask]:
     """Group and deduplicate page_objects with missing_methods across all TCs."""
     tasks: dict[str, _PomTask] = {}  # keyed by POM file path
+    language = plan.get("language")
     inv_entries: list[dict[str, Any]] = []
     if inventory:
         am = _active_module_dict(inventory) or {}
@@ -918,6 +1001,7 @@ def _build_pom_tasks(
             if file_path not in tasks:
                 loc_info = _resolve_locator_inventory_entry(
                     pom_name, inv_entries,
+                    pom_file=file_path, sut_root=sut_root, language=language,
                 ) or {}
                 tasks[file_path] = _PomTask(
                     pom_name=pom_name,
@@ -944,8 +1028,243 @@ def _build_pom_tasks(
     return tasks
 
 
+# ---------------------------------------------------------------------------
+# Import-following locator-bag fallback (Step-6 inventory gap recovery)
+# ---------------------------------------------------------------------------
+#
+# When Step 6's `existing_locators` misses a SUT's shared locator bag, the
+# inventory resolver below returns None → every create_tbd locator gets
+# locator_file=None → Phase A2 writes nothing → the pom-extender references
+# undefined bag keys (undefined at runtime; the A3.5b gate then hard-fails).
+# Root case: when the SUT stores locators in an
+# `export const BASE_LOCATORS = {…}` bag in a *separately imported* file --
+# a shape the researcher may leave out of `existing_locators` (shipping `[]`)
+# and that the naming-convention fallback (`{Pom}Locators`) does not match.
+# These helpers recover the bag deterministically from the POM's OWN imports
+# so Phase A2 can materialise the sentinels into the file the extender already
+# uses — no dependency on Step 6 getting the inventory right.
+
+# `import { A, B as C } from './spec'` — captures the {names} blob + specifier.
+_JS_IMPORT_FROM_RE = _re.compile(
+    r"import\s*(?:type\s*)?\{([^}]+)\}\s*from\s*['\"]([^'\"]+)['\"]"
+)
+# `from pkg.mod import A, B as C` (parens/aliases handled by the caller).
+_PY_FROM_IMPORT_RE = _re.compile(
+    r"^[ \t]*from[ \t]+([.\w]+)[ \t]+import[ \t]+(.+?)[ \t]*$", _re.MULTILINE
+)
+_TS_IMPORT_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs")
+
+
+def _split_import_name(part: str) -> tuple[str, str] | None:
+    """`"BASE_LOCATORS as BL"` -> ("BASE_LOCATORS", "BL"); plain -> (n, n)."""
+    part = part.strip()
+    if not part or part == "*":
+        return None
+    if " as " in part:
+        orig, local = (p.strip() for p in part.split(" as ", 1))
+    else:
+        orig = local = part
+    if not orig or not local:
+        return None
+    return orig, local
+
+
+def _resolve_ts_import_path(base_dir: Path, specifier: str) -> Path | None:
+    """Resolve a *relative* TS/JS import specifier to a real file on disk.
+
+    Tries the path as-is, then each TS/JS extension APPENDED (a specifier like
+    ``./locators/BasePage.locators`` has a dotted pseudo-suffix, so the real
+    extension must be appended, never substituted), then a directory
+    ``index.*`` barrel. Bare/package specifiers (no leading ``.``) are not
+    SUT-local bags → None.
+    """
+    if not specifier.startswith("."):
+        return None
+    raw = (base_dir / specifier).resolve()
+    if raw.is_file():
+        return raw
+    for ext in _TS_IMPORT_EXTS:
+        cand = Path(str(raw) + ext)
+        if cand.is_file():
+            return cand
+    for ext in _TS_IMPORT_EXTS:
+        cand = raw / f"index{ext}"
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _resolve_py_module_path(
+    pom_abs: Path, module: str, imported_name: str, sut_root: Path,
+) -> Path | None:
+    """Resolve ``from <module> import <imported_name>`` to the ``.py`` file that
+    provides ``imported_name`` as a SUBMODULE (a module-of-constants bag).
+
+    Handles relative modules (leading dots, walked up from the POM's package)
+    and dotted-absolute modules (searched from ``sut_root`` and each ancestor
+    of the POM). Conservative — returns the first existing
+    ``<module_dir>/<imported_name>.py`` or None.
+    """
+    if module.startswith("."):
+        dots = len(module) - len(module.lstrip("."))
+        base = pom_abs.parent
+        for _ in range(dots - 1):
+            base = base.parent
+        remainder = module.lstrip(".")
+        bases = [base]
+    else:
+        remainder = module
+        # Absolute dotted import: try sut_root and every ancestor of the POM
+        # up to sut_root as the package root.
+        bases = [sut_root]
+        p = pom_abs.parent
+        while True:
+            bases.append(p)
+            if p == sut_root or p.parent == p:
+                break
+            p = p.parent
+    segments = [s for s in remainder.split(".") if s]
+    for base in bases:
+        mod_dir = base
+        for seg in segments:
+            mod_dir = mod_dir / seg
+        cand = mod_dir / f"{imported_name}.py"
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _resolve_bag_import_jsts(
+    pom_src: str, pom_abs: Path, sut_root: Path,
+) -> dict[str, Any] | None:
+    """TS/JS: return an inventory-shaped entry for the ``export const <SYM> =
+    {…}`` bag the POM both imports AND member-accesses (``SYM.<key>``)."""
+    scan = _js_strip(pom_src)
+    best: tuple[str, Path] | None = None
+    best_count = 0
+    for m in _JS_IMPORT_FROM_RE.finditer(pom_src):
+        names_blob, specifier = m.group(1), m.group(2)
+        target = _resolve_ts_import_path(pom_abs.parent, specifier)
+        if target is None:
+            continue
+        try:
+            target_src = target.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for raw_name in names_blob.split(","):
+            split = _split_import_name(raw_name)
+            if split is None:
+                continue
+            orig, local = split
+            count = len(_re.findall(
+                rf"\b{_re.escape(local)}\s*\.\s*[A-Za-z_$]", scan,
+            ))
+            if count == 0:
+                continue
+            if _locate_export_const_object_body(target_src, orig) is None:
+                continue
+            if count > best_count:
+                best_count = count
+                best = (orig, target)
+    if best is None:
+        return None
+    orig, target = best
+    try:
+        rel = target.resolve().relative_to(sut_root.resolve())
+    except ValueError:
+        return None
+    return {
+        "file": str(rel).replace("\\", "/"),
+        "class_name": orig,
+        "location_pattern": "export_const_object",
+        "source": "import_follow",
+    }
+
+
+def _resolve_bag_import_py(
+    pom_src: str, pom_abs: Path, sut_root: Path,
+) -> dict[str, Any] | None:
+    """Python: return a ``module_const_bag`` entry for an imported module of
+    UPPER_CASE locator constants the POM member-accesses (``mod.NAME``).
+
+    Dict-subscript bags (``BAG["k"]``) are not mechanically injectable and are
+    intentionally not matched (member-access regex requires ``mod.NAME``) — the
+    caller then falls to the safe inline ``tbd()`` path.
+    """
+    best: Path | None = None
+    best_count = 0
+    for m in _PY_FROM_IMPORT_RE.finditer(pom_src):
+        module, names_blob = m.group(1), m.group(2)
+        for raw_name in names_blob.replace("(", " ").replace(")", " ").split(","):
+            split = _split_import_name(raw_name)
+            if split is None:
+                continue
+            orig, local = split
+            count = len(_re.findall(
+                rf"\b{_re.escape(local)}\s*\.\s*[A-Za-z_]", pom_src,
+            ))
+            if count == 0:
+                continue
+            target = _resolve_py_module_path(pom_abs, module, orig, sut_root)
+            if target is None:
+                continue
+            if count > best_count:
+                best_count = count
+                best = target
+    if best is None:
+        return None
+    try:
+        rel = best.resolve().relative_to(sut_root.resolve())
+    except ValueError:
+        return None
+    return {
+        "file": str(rel).replace("\\", "/"),
+        "class_name": None,
+        "location_pattern": "module_const_bag",
+        "source": "import_follow",
+    }
+
+
+def _resolve_locator_source_by_import(
+    pom_file: str | None,
+    sut_root: Path | None,
+    language: str | None,
+) -> dict[str, Any] | None:
+    """Fallback locator-source resolver used when Step 6's inventory has no
+    ``existing_locators`` entry for a POM. Reads the POM and recovers the shared
+    locator bag it already imports+uses. Returns an inventory-shaped dict
+    (``file``/``class_name``/``location_pattern``) or None.
+    """
+    if not pom_file or sut_root is None:
+        return None
+    pom_abs = sut_root / pom_file
+    if not pom_abs.is_file():
+        return None
+    try:
+        pom_src = pom_abs.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    lang = (language or "").lower()
+    suffix = pom_abs.suffix.lower()
+    is_jsts = lang in ("typescript", "javascript") or suffix in {
+        ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts",
+    }
+    is_py = lang in (
+        "python", "pytest", "playwright-py", "selenium-py",
+    ) or suffix == ".py"
+    if is_jsts:
+        return _resolve_bag_import_jsts(pom_src, pom_abs, sut_root)
+    if is_py:
+        return _resolve_bag_import_py(pom_src, pom_abs, sut_root)
+    return None
+
+
 def _resolve_locator_inventory_entry(
     owning: str, inv_entries: list[dict[str, Any]],
+    *,
+    pom_file: str | None = None,
+    sut_root: Path | None = None,
+    language: str | None = None,
 ) -> dict[str, Any] | None:
     """Look up the locator-source inventory entry for an owning POM.
 
@@ -962,6 +1281,11 @@ def _resolve_locator_inventory_entry(
     saw `locators.py` as a separate input and the LOCATOR CONTRACT text
     named a generic "the locator source" instead of the real file.
     Both call sites now share this single resolver.
+
+    Final fallback (Step-6 inventory gap: ``existing_locators: []``): when the
+    inventory yields nothing AND the caller supplies ``pom_file``/``sut_root``,
+    follow the POM's own imports to recover a shared locator bag it uses. This
+    keeps Step 8 correct even when Step 6 misses the locator source entirely.
     """
     if not owning:
         return None
@@ -980,12 +1304,23 @@ def _resolve_locator_inventory_entry(
         )
         if hit:
             return hit
-    return None
+    imported = _resolve_locator_source_by_import(pom_file, sut_root, language)
+    if imported is not None:
+        log.info(
+            "step08.locator_source_recovered_by_import",
+            owning_pom=owning,
+            file=imported.get("file"),
+            container=imported.get("class_name"),
+            pattern=imported.get("location_pattern"),
+        )
+    return imported
 
 
 def _build_locator_tasks(
     plan: dict[str, Any],
     inventory: dict[str, Any] | None,
+    sut_root: Path | None = None,
+    language: str | None = None,
 ) -> list[_LocatorTask]:
     """Collect create_tbd locators across all TCs.
 
@@ -998,7 +1333,11 @@ def _build_locator_tasks(
        when the POM itself owns the locators.
     2. ``class_name == f"{owning_page}Locators"`` — separate-class
        fallback for the historical Python-Selenium convention.
-    3. Nothing — task gets ``locator_file=None`` and ``_write_tbd_locators``
+    3. Import-follow — when the inventory misses the source entirely
+       (``existing_locators: []``), recover the shared bag the owning POM
+       imports+uses (needs ``sut_root``; ``language`` disambiguates the
+       import syntax). Closes the run-20260709 dangling-reference trap.
+    4. Nothing — task gets ``locator_file=None`` and ``_write_tbd_locators``
        hands it to the POM extender agent for inline ``tbd()`` placement
        (never silently dropped).
     """
@@ -1008,6 +1347,17 @@ def _build_locator_tasks(
         for lc in am.get("existing_locators") or []:
             if isinstance(lc, dict):
                 inv_entries.append(lc)
+    if language is None:
+        language = plan.get("language")
+
+    # owning_page -> POM file, so the import-follow fallback can read the POM.
+    pom_file_by_page: dict[str, str] = {}
+    for tc in plan.get("test_cases") or []:
+        for po in tc.get("page_objects") or []:
+            nm = po.get("name")
+            fp = po.get("from") or po.get("at")
+            if nm and fp and nm not in pom_file_by_page:
+                pom_file_by_page[nm] = fp
 
     tasks: list[_LocatorTask] = []
     seen: set[str] = set()
@@ -1020,7 +1370,11 @@ def _build_locator_tasks(
                 continue
             seen.add(name)
             owning = loc.get("owning_page", "")
-            entry = _resolve_locator_inventory_entry(owning, inv_entries)
+            entry = _resolve_locator_inventory_entry(
+                owning, inv_entries,
+                pom_file=pom_file_by_page.get(owning),
+                sut_root=sut_root, language=language,
+            )
             tasks.append(_LocatorTask(
                 constant_name=name,
                 intent=loc.get("intent", ""),
@@ -1277,6 +1631,46 @@ def _pom_extender_timeout_s(max_tokens: int) -> int:
     )
 
 
+def _materialized_prewritten_by_page(
+    locator_tasks: list[_LocatorTask] | None,
+    sut_root: Path,
+) -> dict[str, list[str]]:
+    """Group create_tbd constants by owning_page — but ONLY those Phase A2
+    actually materialised into a locator source on disk.
+
+    CONTRACT HONESTY: the extender's LOCATOR CONTRACT advertises these names
+    as "guaranteed PRE-WRITTEN". A prior version of this function listed EVERY
+    create_tbd task -- including ones with no writable source
+    (``locator_file=None`` → nothing written) -- so the extender was told the
+    constants existed and referenced them as ``<BAG>.<KEY>``, producing dangling
+    refs (undefined at runtime). Verifying against the on-disk file makes the
+    promise true; unmaterialised constants drop out and fall to the contract's
+    "not pre-written → [CLARIFICATION NEEDED], never invent" branch instead of a
+    silent dangling reference.
+    """
+    prewritten_by_page: dict[str, list[str]] = {}
+    loc_src_cache: dict[str, str] = {}
+    for lt in locator_tasks or []:
+        if not lt.locator_file:
+            continue
+        content = loc_src_cache.get(lt.locator_file)
+        if content is None:
+            loc_abs = sut_root / lt.locator_file
+            try:
+                content = (
+                    loc_abs.read_text(encoding="utf-8")
+                    if loc_abs.is_file() else ""
+                )
+            except OSError:
+                content = ""
+            loc_src_cache[lt.locator_file] = content
+        if content and _locator_constant_defined(content, lt.constant_name):
+            prewritten_by_page.setdefault(lt.owning_page, []).append(
+                lt.constant_name,
+            )
+    return prewritten_by_page
+
+
 async def _extend_poms(
     pom_tasks: dict[str, _PomTask],
     sut_root: Path,
@@ -1286,6 +1680,7 @@ async def _extend_poms(
     rules_content: str = "",
     ctx: StepContext | None = None,
     locator_tasks: list[_LocatorTask] | None = None,
+    live_map_hint: str = "",
 ) -> list[tuple[str, bool]]:
     """Phase A2: extend each POM with missing_methods via call_reasoning_llm.
 
@@ -1309,12 +1704,12 @@ async def _extend_poms(
     results: list[tuple[str, bool]] = []
 
     # Group pre-written locator constants by owning_page so we can tell
-    # the extender exactly which constants exist for its POM.
-    prewritten_by_page: dict[str, list[str]] = {}
-    for lt in locator_tasks or []:
-        prewritten_by_page.setdefault(lt.owning_page, []).append(
-            lt.constant_name,
-        )
+    # the extender exactly which constants exist for its POM. Only constants
+    # Phase A2 ACTUALLY materialised are advertised (contract honesty) — see
+    # `_materialized_prewritten_by_page`.
+    prewritten_by_page = _materialized_prewritten_by_page(
+        locator_tasks, sut_root,
+    )
 
     # Smart-retry override is per-_extend_poms-call. Consume once at the top:
     # all POMs in this call share the same budget multiplier (when armed),
@@ -1431,7 +1826,7 @@ async def _extend_poms(
                     f"specifications are in `missing_methods.json` — each has `name`, "
                     f"`signature`, and optionally `purpose`. Return the complete "
                     f"updated file content.\n\n"
-                    f"{locator_contract}"
+                    f"{locator_contract}{live_map_hint}"
                 ),
                 inputs=inputs,
                 step=step,
@@ -1558,6 +1953,232 @@ async def _extend_poms(
     if tasks_to_run:
         results = list(await asyncio.gather(*tasks_to_run))
     return results
+
+
+async def _create_poms(
+    create_tasks: dict[str, _PomTask],
+    sut_root: Path,
+    workdir: Path,
+    agents_root: Path,
+    step: int,
+    rules_content: str = "",
+    locator_tasks: list[_LocatorTask] | None = None,
+    live_map_hint: str = "",
+    active_module: dict[str, Any] | None = None,
+) -> list[tuple[str, bool]]:
+    """Phase A2b: create NEW page objects (plan ``source == "create"``).
+
+    The POM lane historically only *extended* existing files: a planned new POM
+    fell through ``_extend_one``'s ``pom_not_found`` guard and was never written,
+    so its methods false-flagged as ``method_not_found`` at Phase B.5 and the
+    generated spec's ``import`` dangled. This closes that gap.
+
+    Reuses the ``codegen-pom-extender`` agent in a create posture (precedent:
+    ``_create_helpers``) with an INLINE-tbd locator contract — a new page has no
+    pre-written locator source, so every ``create_tbd`` locator it owns must be
+    emitted inline as ``tbd("intent")`` in the method body (the same sentinel
+    the JIT ladder resolves at Step 9; ``_verify_tbd_compliance`` skips
+    no-locator-file constants, delegating to that inline path). Applies the same
+    truncation / syntax / symbol-presence gates as ``_extend_one``; on any
+    failure the partial file is removed so Phase B.5 reports a clean, genuine
+    ``method_not_found`` instead of parsing truncated garbage.
+    """
+    if not create_tasks:
+        return []
+
+    agent_path = agents_root / "codegen-pom-extender.agent.md"
+    sem = asyncio.Semaphore(_MAX_CONCURRENT_LLM_CALLS)
+
+    # create_tbd locators grouped by owning page — instructed inline (below).
+    intents_by_page: dict[str, list[_LocatorTask]] = {}
+    for lt in locator_tasks or []:
+        intents_by_page.setdefault(lt.owning_page, []).append(lt)
+
+    # A sibling POM for style grounding (imports / class shape / tbd usage).
+    style_ref = ""
+    style_ref_name = ""
+    for po in (active_module or {}).get("existing_page_objects") or []:
+        ref_rel = po.get("file") if isinstance(po, dict) else None
+        if not ref_rel:
+            continue
+        ref_path = sut_root / ref_rel
+        if ref_path.is_file():
+            with contextlib.suppress(OSError):
+                raw_ref = ref_path.read_text(encoding="utf-8")
+                head = raw_ref[:3500]
+                nl = head.rfind("\n")
+                style_ref = head[:nl] if nl > 0 else head
+                style_ref_name = Path(ref_rel).name
+            if style_ref:
+                break
+
+    async def _create_one(file_path: str, task: _PomTask) -> tuple[str, bool]:
+        if not task.missing_methods:
+            return file_path, True
+        abs_path = sut_root / file_path
+        # Idempotent: an existing file (e.g. created on a prior attempt) is
+        # topped up rather than clobbered.
+        existing_source = ""
+        if abs_path.is_file():
+            with contextlib.suppress(OSError):
+                existing_source = abs_path.read_text(encoding="utf-8")
+
+        inputs: dict[str, str] = {
+            "pom_specs.json": json.dumps(task.missing_methods, indent=2),
+        }
+        if existing_source:
+            inputs["existing_pom.txt"] = existing_source
+        if style_ref:
+            inputs["style_reference.txt"] = style_ref
+        if rules_content:
+            inputs["codegen-rules.md"] = rules_content
+
+        page_locators = intents_by_page.get(task.pom_name, [])
+        if page_locators:
+            loc_lines = "\n".join(
+                f"    - {lt.constant_name}: {lt.intent}" for lt in page_locators
+            )
+            locator_contract = (
+                "LOCATOR CONTRACT — this is a NEW page object with NO locator "
+                "source file. For each locator below, DO NOT invent a raw "
+                "selector string. Emit a deferred sentinel inline in the method "
+                'body: `this.page.locator(tbd("<intent>"))` (TS/JS) or the '
+                "Python/Java equivalent per §3 of `codegen-rules.md`, using the "
+                "intent text verbatim. The pipeline resolves these at Step 9:\n"
+                f"{loc_lines}\n"
+            )
+        else:
+            locator_contract = (
+                "LOCATOR RULE: emit any locator this class needs as a deferred "
+                '`tbd("intent")` sentinel per §3 of `codegen-rules.md` — NEVER a '
+                "hardcoded selector string."
+            )
+
+        method_count = len(task.missing_methods)
+        estimated = (len(existing_source) // 3) + method_count * 700 + 1200
+        dynamic_max_tokens = max(
+            8000, min(estimated, _POM_EXTENDER_MAX_TOKENS_HARD_CAP),
+        )
+        names = ", ".join(
+            m.get("name", "") for m in task.missing_methods if m.get("name")
+        )
+        style_line = (
+            f"Match the conventions (imports, class shape, locator usage) in "
+            f"`style_reference.txt` ({style_ref_name}). "
+            if style_ref else ""
+        )
+        existing_line = (
+            "A partial `existing_pom.txt` is provided — preserve its content and "
+            "add any missing method(s). "
+            if existing_source else ""
+        )
+
+        async with sem:
+            log.info(
+                "step08.pom_create.start",
+                pom=task.pom_name,
+                file=file_path,
+                methods=method_count,
+                max_tokens=dynamic_max_tokens,
+            )
+            result = await call_reasoning_llm(
+                agent_path,
+                workdir=workdir,
+                user_prompt=(
+                    f"Create a NEW Page Object class `{task.pom_name}` to be "
+                    f"written at `{file_path}`. Implement the {method_count} "
+                    f"method(s) — {names} — specified in `pom_specs.json` (each "
+                    f"has `name`, `signature`, and optionally `purpose` / "
+                    f"`acceptance_criteria`). {existing_line}{style_line}Return "
+                    f"the COMPLETE new file content, ready to write to disk.\n\n"
+                    f"{locator_contract}{live_map_hint}"
+                ),
+                inputs=inputs,
+                step=step,
+                timeout_s=_pom_extender_timeout_s(dynamic_max_tokens),
+                max_tokens=dynamic_max_tokens,
+            )
+
+        if not (result.success and result.final_text.strip()):
+            log.warning(
+                "step08.pom_create.failed",
+                pom=task.pom_name,
+                error=result.error,
+            )
+            return file_path, False
+
+        new_content = _strip_code_fences(result.final_text)
+        try:
+            abs_path.parent.mkdir(parents=True, exist_ok=True)
+            abs_path.write_text(new_content, encoding="utf-8")
+        except OSError as e:
+            log.error(
+                "step08.pom_create_write_failed",
+                pom=task.pom_name, error=str(e),
+            )
+            return file_path, False
+
+        def _discard() -> None:
+            # Remove the partial/broken create so Phase B.5 reports a clean,
+            # genuine method_not_found rather than parsing truncated garbage.
+            with contextlib.suppress(OSError):
+                if existing_source:
+                    abs_path.write_text(existing_source, encoding="utf-8")
+                else:
+                    abs_path.unlink(missing_ok=True)
+
+        # Language-agnostic truncation gate (see _extend_one): a max_tokens stop
+        # means the file was cut off mid-output.
+        if getattr(result, "stop_reason", None) == "max_tokens":
+            _discard()
+            log.error(
+                "step08.pom_create_truncated",
+                pom=task.pom_name, file=file_path,
+                chars_written=len(new_content),
+                max_tokens=dynamic_max_tokens,
+            )
+            return file_path, False
+
+        if abs_path.suffix == ".py":
+            import ast as _ast
+            import warnings as _warnings
+            try:
+                with _warnings.catch_warnings():
+                    _warnings.simplefilter("ignore", SyntaxWarning)
+                    _ast.parse(new_content)
+            except SyntaxError as e:
+                _discard()
+                log.error(
+                    "step08.pom_create_syntax_invalid",
+                    pom=task.pom_name, file=file_path, error=str(e),
+                )
+                return file_path, False
+
+        # Symbol-presence: every planned method must appear (as a definition or
+        # at least a `name(` head). Language-agnostic — the syntax gate above
+        # already covers Python structure; this catches a dropped method.
+        missing = [
+            m.get("name") for m in task.missing_methods
+            if m.get("name") and _re.search(
+                rf"\b{_re.escape(m['name'])}\s*\(", new_content,
+            ) is None
+        ]
+        if missing:
+            _discard()
+            log.error(
+                "step08.pom_create.symbols_missing",
+                pom=task.pom_name, file=file_path, missing=missing,
+            )
+            return file_path, False
+
+        log.info(
+            "step08.pom_create.done", pom=task.pom_name, file=file_path,
+        )
+        return file_path, True
+
+    return list(await asyncio.gather(
+        *[_create_one(fp, t) for fp, t in create_tasks.items()]
+    ))
 
 
 def _detect_const_indent(lines: list[str], is_java: bool) -> str:
@@ -1815,6 +2436,77 @@ def _inject_tbd_import_ts(content: str, abs_path: Path, sut_root: Path) -> str:
         return stmt + "\n" + content
     insert_at = last.end()
     return content[:insert_at] + "\n" + stmt + content[insert_at:]
+
+
+_TS_JS_SUFFIXES = (".ts", ".tsx", ".js", ".jsx")
+
+# Any TS/JS reference to the vendored runtime module by filename, regardless
+# of what literal path was written: `import { tbd } from "..."`,
+# `import tbd from "..."`, or `const { tbd } = require("...")`.
+_TS_RUNTIME_IMPORT_RE = _re.compile(
+    r"(?P<prefix>(?:import\s+(?:\{[^}]*\}|[\w$]+)\s+from\s+"
+    r"|(?:const|let|var)\s+(?:\{[^}]*\}|[\w$]+)\s*=\s*require\()\s*)"
+    r"(?P<quote>['\"])(?P<path>[^'\"]*qtea-runtime)(?P=quote)"
+    r"(?P<suffix>\)?)"
+)
+
+
+def _normalize_runtime_import_in_file(abs_path: Path, sut_root: Path) -> bool:
+    """Rewrite any TS/JS import/require of the vendored qtea runtime in
+    ``abs_path`` to the correct path relative to *this file's own
+    location*, regardless of what literal path was originally written.
+
+    The runtime lives at a single fixed location
+    (``<sut>/tests/qtea-runtime.js``, see ``_ts_runtime_import_specifier``).
+    Codegen has multiple emission paths for this import — mechanical
+    injection (``_inject_tbd_import_ts``, already correct), the
+    hardcoded-selector conversion path (already correct), and LLM-authored
+    inline ``tbd()`` usage seeded by a hardcoded ``./qtea-runtime`` example
+    in the agent prompt (NOT correct for nested POMs). A hardcoded
+    ``./qtea-runtime`` is compile-fatal for any file outside ``tests/``
+    (H2, run 20260708-121117-99f5ed) and invisible to non-compile gates.
+    Running this sweep against every codegen-touched file — rather than
+    only fixing the two mechanical call sites — normalizes all emission
+    paths at once, including whatever an LLM happened to write.
+
+    No-op (returns False) for non-TS/JS files and files with no runtime
+    import. Safe to call more than once (idempotent — re-computes and
+    rewrites the same correct path if already correct).
+    """
+    if abs_path.suffix.lower() not in _TS_JS_SUFFIXES:
+        return False
+    try:
+        text = abs_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    correct = _ts_runtime_import_specifier(abs_path, sut_root)
+
+    def _replace(m: _re.Match[str]) -> str:
+        return f"{m.group('prefix')}{m.group('quote')}{correct}{m.group('quote')}{m.group('suffix')}"
+
+    new_text, count = _TS_RUNTIME_IMPORT_RE.subn(_replace, text)
+    if count == 0 or new_text == text:
+        return False
+    try:
+        abs_path.write_text(new_text, encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def _normalize_runtime_imports(paths: list[Path], sut_root: Path) -> int:
+    """Sweep every path in *paths* through
+    ``_normalize_runtime_import_in_file``. Best-effort; files without a
+    runtime import (or non-TS/JS files) are silent no-ops. Returns the
+    number of files actually modified, for logging only — never gates.
+    """
+    fixed = 0
+    for p in paths:
+        if _normalize_runtime_import_in_file(p, sut_root):
+            fixed += 1
+    if fixed:
+        log.info("step08.runtime_import_normalized", count=fixed)
+    return fixed
 
 
 def _locator_constant_defined(content: str, constant_name: str) -> bool:
@@ -2352,7 +3044,7 @@ _HARDCODED_LOCATOR_RE = _re.compile(
 def _run_phase_b55_xpath_normalisation(
     sut_root: Path,
     candidates: set[Path],
-) -> tuple[list[RewriteReport], list[XpathSite]]:
+) -> tuple[list[RewriteReport], list[XpathSite], list[Path]]:
     """Phase B.5.5 — deterministic XPath → Playwright locator rewrite.
 
     Walks every ``.ts`` / ``.js`` / ``.mts`` / ``.mjs`` file in *candidates*
@@ -2361,12 +3053,23 @@ def _run_phase_b55_xpath_normalisation(
     idempotently adds ``testIdAttribute: 'data-test'`` to the SUT's
     playwright config.
 
-    Returns ``(reports, stragglers)`` where ``reports`` covers every file
-    the rewriter touched and ``stragglers`` aggregates the xpath sites the
-    deterministic layer refused to translate. The caller feeds stragglers
-    into the LLM violation-fixer via the existing gate path — the exempt
-    marker the rewriter stamps keeps the quality gate from failing on
-    them regardless of whether the LLM succeeds.
+    Returns ``(reports, stragglers, touched_files)`` where ``reports``
+    covers every file the rewriter touched and ``stragglers`` aggregates
+    the xpath sites the deterministic layer refused to translate. The
+    caller feeds stragglers into the LLM violation-fixer via the existing
+    gate path — the exempt marker the rewriter stamps keeps the quality
+    gate from failing on them regardless of whether the LLM succeeds.
+
+    ``touched_files`` is every file this phase itself wrote to — the
+    rewritten candidates AND the playwright config file when
+    ``testIdAttribute`` was injected. The config edit happens on a path
+    that is neither in ``candidates`` nor (at the time this phase runs)
+    yet visible to a `git diff` snapshot taken before this call, so a
+    caller building a codegen-scope set from just those two sources would
+    silently miss it (Bug 4 — a byte-identical-to-HEAD POM with a
+    violation could then bypass the quality gate; run 20260708-121117-99f5ed
+    demonstrated the sibling case of this same "scope set built too early"
+    class of bug). Callers should union this into their scope set.
     """
     # Unconditional entry log so operators can confirm this phase fired
     # even if every downstream step below is a no-op. Debugging aid: if
@@ -2416,6 +3119,8 @@ def _run_phase_b55_xpath_normalisation(
             if cfg_edit.path and cfg_edit.path.is_relative_to(sut_root)
             else None,
         )
+        if cfg_edit.changed and cfg_edit.path is not None:
+            changed_files.append(cfg_edit.path)
 
     log.info(
         "step08.b55.xpath_normalised",
@@ -2425,7 +3130,7 @@ def _run_phase_b55_xpath_normalisation(
         call_sites_migrated=sum(r.call_sites_migrated for r in reports),
         containers_migrated=sum(1 for r in reports if r.container_migrated),
     )
-    return reports, stragglers
+    return reports, stragglers, changed_files
 
 
 def _scan_and_convert_hardcoded_locators(
@@ -2795,21 +3500,118 @@ async def _create_fixtures(
 def _collect_referenced_methods(plan: dict[str, Any]) -> dict[str, set[str]]:
     """Map each POM class name → set of method names its choreography calls.
 
-    Sourced from every ``test_functions[].steps[]`` entry (``pom`` + ``method``)
-    across all test cases. Used to decide which PRE-EXISTING POM methods the
-    writer needs real signatures for.
+    Sourced from every ``test_functions[].steps[]`` entry AND every
+    ``hooks[].calls[]`` entry (``pom`` + ``method``) across all test cases.
+    Hooks matter because a UI test's open-base-URL + login calls now live in a
+    ``before_each`` hook, not in ``steps[]`` — omitting them here would leave
+    the writer without signatures for those reused methods (openBaseURL, logIn)
+    and it would emit zero-arg stubs. Used to decide which PRE-EXISTING POM
+    methods the writer needs real signatures for.
     """
     refs: dict[str, set[str]] = {}
+
+    def _add(pom: Any, method: Any) -> None:
+        if pom and method:
+            refs.setdefault(pom, set()).add(method)
+
     for tc in plan.get("test_cases") or []:
         for fn in tc.get("test_functions") or []:
             for st in fn.get("steps") or []:
-                if not isinstance(st, dict):
-                    continue
-                pom = st.get("pom")
-                method = st.get("method")
-                if pom and method:
-                    refs.setdefault(pom, set()).add(method)
+                if isinstance(st, dict):
+                    _add(st.get("pom"), st.get("method"))
+        for hook in tc.get("hooks") or []:
+            if not isinstance(hook, dict):
+                continue
+            for call in hook.get("calls") or []:
+                if isinstance(call, dict):
+                    _add(call.get("pom"), call.get("method"))
     return refs
+
+
+def _build_all_codegen_files(
+    *,
+    sut_root: Path,
+    produced_in_sut: list[Path],
+    codegen_modified: set[Path],
+    pom_tasks: dict[str, _PomTask],
+    test_results: list[tuple[str, bool]],
+    b55_touched_files: list[Path],
+    jit_resolved: set[Path],
+) -> set[Path]:
+    """Build the codegen-scope set the quality gate (Phase B.6/B.6.5) runs
+    against.
+
+    `produced_in_sut` (a `qtea_*`/`Qtea*` filename glob) and
+    `codegen_modified` (a `git diff --name-only HEAD` snapshot taken
+    before Phase B.5.5 runs) are both *inference* of what qtea touched —
+    either can structurally miss a file. A POM that is (a) not
+    `qtea_`-prefixed by naming convention AND (b) regenerated
+    byte-identical to what was already on disk is invisible to both: not
+    in the glob, and `git diff` shows no change (bug 4; sibling of the
+    incident class in run 20260708-121117-99f5ed, where a byte-identical
+    regeneration slipped past a similarly inference-based check). Union
+    in the *explicit-intent* sources that don't depend on either
+    inference: the POM paths and test-file targets qtea's own plan
+    already names, plus whatever Phase B.5.5 itself touched (which can
+    include a playwright-config edit made after the git-diff snapshot was
+    taken). Additive only — this never subtracts from the inferred sets,
+    so no currently-covered file loses coverage.
+    """
+    all_codegen_files = {
+        p for p in produced_in_sut if p.resolve() not in jit_resolved
+    }
+    all_codegen_files.update(
+        p for p in codegen_modified
+        if p.is_file() and p not in jit_resolved
+    )
+    all_codegen_files.update(
+        p for p in (
+            (sut_root / pom_task.pom_file) for pom_task in pom_tasks.values()
+        )
+        if p.is_file() and p.resolve() not in jit_resolved
+    )
+    all_codegen_files.update(
+        p for p in (
+            (sut_root / target) for target, _ok in test_results
+        )
+        if p.is_file() and p.resolve() not in jit_resolved
+    )
+    all_codegen_files.update(
+        p for p in b55_touched_files
+        if p.is_file() and p.resolve() not in jit_resolved
+    )
+    return all_codegen_files
+
+
+def _build_regen_feedback_hint(defect_feedback: str, defect_kind: str) -> str:
+    """Compose the Step 9->8 back-edge regeneration-feedback block.
+
+    The naming-convention coaching line only applies when Step 9 actually
+    diagnosed a naming defect (zero tests matched the qtea marker/prefix
+    filter). A compile/collection/missing-module failure (`defect_kind` !=
+    "naming_defect") has nothing to do with markers or filename prefixes —
+    telling the regen to "fix" a naming convention that was never broken
+    just adds noise (run 20260709-083909-223772: a TS compile-fatal import
+    error was coached as a naming fix that was never the problem).
+    """
+    naming_coaching = (
+        "Every generated test function MUST carry a "
+        "`@pytest.mark.qtea_<phase>` marker (pytest) or its file MUST "
+        "use the `qtea_` filename prefix (Playwright Test), or Step 9's "
+        "marker filter collects zero tests. Emit every import target "
+        "the tests reference.\n"
+        if defect_kind == "naming_defect"
+        else (
+            "Emit every import target the tests reference, using the "
+            "correct path for each file's own location.\n"
+        )
+    )
+    return (
+        f"\n\n--- REGENERATION FEEDBACK (Step 9 rejected the previous "
+        f"codegen output — fix THIS specifically) ---\n"
+        f"{defect_feedback}\n"
+        f"{naming_coaching}"
+    )
 
 
 def _build_imports_manifest(
@@ -2951,6 +3753,7 @@ async def _generate_test_files(
     env_hint: str,
     step: int,
     rules_content: str = "",
+    live_map_hint: str = "",
 ) -> list[tuple[str, bool]]:
     """Phase B2: generate test files via call_reasoning_llm (one per target)."""
     agent_path = agents_root / "codegen-test-writer.agent.md"
@@ -3009,7 +3812,7 @@ async def _generate_test_files(
             f"test_function has no `steps[]`. Emit exactly one assertion call per "
             f"plan-classified `kind: \"assertion\"` method, appended after the "
             f"choreographed actions — never one per Expected-Result bullet."
-            f"{env_hint}{runtime_hint}{reuse_hint}"
+            f"{env_hint}{runtime_hint}{reuse_hint}{live_map_hint}"
         )
 
         async with sem:
@@ -3468,7 +4271,7 @@ async def _run_phase_b65_parse_check(
         ),
         extra_paths=[package_resource_root() / "skills" / "webapp-testing"],
         add_dirs=[sut_root],
-        timeout_s=min(timeout_s or 1800, 300),
+        timeout_s=min(timeout_s or 1800, 500),
         step=8,
         max_turns=AUTOFIX_MAX_TURNS,
     )
@@ -3589,7 +4392,7 @@ async def _run_phase_b6(
         ),
         extra_paths=[package_resource_root() / "skills" / "webapp-testing"],
         add_dirs=[sut_root],
-        timeout_s=min(timeout_s or 1800, 300),
+        timeout_s=min(timeout_s or 1800, 500),
         step=8,
         max_turns=AUTOFIX_MAX_TURNS,
     )
@@ -3617,6 +4420,509 @@ async def _run_phase_b6(
         out_of_scope=result.out_of_scope_errors,
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Exemplar lane (non-POM SUTs): generate reusable units + tests by imitation
+# ---------------------------------------------------------------------------
+#
+# Selected when Step 6 reports a non-POM architecture_pattern (e.g. Screenplay).
+# The mature POM phases are skipped entirely; this lane instead generates new
+# reusable units + tests SHAPED LIKE the SUT's own `pattern_exemplars[]`, then
+# runs only the pattern-agnostic gates (parse-check, native type-check,
+# violation-fixer, xpath-normalisation). Deferred locators are backed by
+# `page.locator(tbd("intent"))` so they resolve through qtea's JIT tier ladder
+# at Step 9 exactly like the POM lane.
+
+
+def _exemplar_pkg_root(active_module: dict | None, plan_data: dict) -> str:
+    """First path segment shared by the SUT's exemplars (e.g. ``framework``).
+
+    This is where the JIT runtime is vendored so both the generated units and
+    the Step-9 plugin loader can import it. Falls back to the test target's
+    root segment, then ``tests``.
+    """
+    for ex in (active_module or {}).get("pattern_exemplars") or []:
+        d = (ex.get("dir") or "").replace("\\", "/").strip("/")
+        if d and d != ".":
+            return d.split("/")[0]
+    for tc in plan_data.get("test_cases") or []:
+        t = (tc.get("test_file_target") or "").replace("\\", "/").strip("/")
+        if "/" in t:
+            return t.split("/")[0]
+    return "tests"
+
+
+def _units_by_file(plan_data: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """Group every `create` reusable unit by its target file (`at`).
+
+    A SUT file can legitimately hold several units (e.g. multiple Task classes
+    in one module), so we must NOT collapse a file to a single unit — that was
+    the defect that generated only the first class per file and left the test
+    importing symbols that were never emitted. Units are deduped by (at, name)
+    because the plan repeats shared units across test cases.
+    """
+    by_at: dict[str, list[dict[str, Any]]] = {}
+    seen: dict[str, set[str]] = {}
+    for tc in plan_data.get("test_cases") or []:
+        for ru in tc.get("reusable_units") or []:
+            if not isinstance(ru, dict) or ru.get("source") != "create":
+                continue
+            at = ru.get("at")
+            name = ru.get("name")
+            if not (isinstance(at, str) and at):
+                continue
+            names = seen.setdefault(at, set())
+            if name in names:
+                continue
+            names.add(name)
+            by_at.setdefault(at, []).append(ru)
+    return by_at
+
+
+def _vendor_runtime_for_exemplar(
+    sut_root: Path, pkg_root: str,
+) -> tuple[list[Path], str | None]:
+    """Vendor the JIT runtime beside the SUT's package so exemplar code can
+    ``import tbd``. Returns ``(files_written, import_module)``.
+
+    Unlike the stock `_vendor_jit_runtime` (hardcoded `tests/`), this targets
+    the SUT's real package root (e.g. `framework/`) — the layout Screenplay
+    SUTs use — and registers the plugin via a root conftest so Step 9 loads
+    the monkey-patch regardless of where the exemplar tests live.
+    """
+    template = (
+        package_resource_root() / "_resources" / "runtime" / "qtea_runtime.py.tpl"
+    )
+    if not template.is_file():
+        alt = (
+            package_resource_root() / "src" / "qtea" / "_resources"
+            / "runtime" / "qtea_runtime.py.tpl"
+        )
+        template = alt if alt.is_file() else template
+    if not template.is_file():
+        log.warning("step08.exemplar.runtime_template_missing", tried=str(template))
+        return [], None
+
+    pkg = (pkg_root or "").strip("/") or "tests"
+    dest_dir = sut_root / pkg
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / "qtea_runtime.py"
+    written: list[Path] = []
+    try:
+        dest.write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
+        written.append(dest)
+    except OSError as e:
+        log.warning("step08.exemplar.runtime_vendor_failed", error=str(e))
+        return [], None
+
+    import_module = f"{pkg.replace('/', '.')}.qtea_runtime"
+    if _register_pytest_plugin(sut_root / "conftest.py", import_module):
+        written.append(sut_root / "conftest.py")
+    log.info(
+        "step08.exemplar.runtime_vendored", dest=str(dest), module=import_module,
+    )
+    return written, import_module
+
+
+def _module_path_from_rel(rel: str) -> str:
+    """`framework/tasks/import_cost.py` → `framework.tasks.import_cost`."""
+    p = rel.replace("\\", "/").strip("/")
+    for suf in (".py",):
+        if p.endswith(suf):
+            p = p[: -len(suf)]
+    return p.replace("/", ".")
+
+
+async def _generate_exemplar_files(
+    *,
+    plan_data: dict[str, Any],
+    strategy_text: str,
+    active_module: dict | None,
+    sut_root: Path,
+    workdir: Path,
+    agents_root: Path,
+    rules_content: str,
+    runtime_import: str | None,
+    step: int,
+) -> tuple[list[tuple[str, bool]], set[Path]]:
+    """Generate reusable-unit files then test files by imitating exemplars.
+
+    One `call_reasoning_llm` per output file. Returns
+    ``(results, written_abs_paths)``.
+    """
+    agent_path = agents_root / "codegen-exemplar-writer.agent.md"
+    exemplars = (active_module or {}).get("pattern_exemplars") or []
+    exemplars_json = json.dumps(exemplars, indent=2, ensure_ascii=False)
+    sem = asyncio.Semaphore(_MAX_CONCURRENT_LLM_CALLS)
+    results: list[tuple[str, bool]] = []
+    written: set[Path] = set()
+
+    runtime_clause = (
+        f"\n\nFor any `deferred_targets[]`, define the Target in this SUT's own "
+        f"idiom but back its selector with `page.locator(tbd(\"<intent>\"))`, "
+        f"importing `tbd` via `from {runtime_import} import tbd`. Selectors that "
+        f"are already known at codegen become plain Targets (no tbd). NEVER emit "
+        f"XPath; obey id>data-testid>role>text>label>placeholder>alt>title>"
+        f"scoped-CSS. NEVER call `get_by_*` with a tbd() argument — only "
+        f"`page.locator(tbd(...))` reaches the resolver."
+        if runtime_import else
+        "\n\nNo JIT runtime is available; emit plain Targets in the SUT's idiom."
+    )
+
+    # --- Phase E1: reusable unit files (one call per file, ALL its units) ---
+    # A single writer call emits every class for a file so the test writer's
+    # import set matches what the unit files actually define.
+    units_by_at = _units_by_file(plan_data)
+
+    unit_manifest: list[dict[str, Any]] = []
+
+    async def _gen_unit(at: str, rus: list[dict[str, Any]]) -> tuple[str, bool]:
+        inputs = {
+            "unit.json": json.dumps(rus, indent=2, ensure_ascii=False),
+            "exemplars.json": exemplars_json,
+        }
+        if rules_content:
+            inputs["codegen-rules.md"] = rules_content
+        abs_target = sut_root / at
+        names = [str(ru.get("name")) for ru in rus]
+        categories = sorted({str(ru.get("category")) for ru in rus})
+        ex_hints: list[str] = []
+        for ru in rus:
+            shaped = ru.get("shaped_like")
+            exemplar = (
+                exemplars[shaped]
+                if isinstance(shaped, int) and 0 <= shaped < len(exemplars)
+                else None
+            )
+            if exemplar:
+                ex_hints.append(
+                    f"`{ru.get('name')}` → exemplar index {shaped} "
+                    f"(`{exemplar.get('class_name')}`)"
+                )
+        ex_hint = (
+            "Shape each unit like its listed exemplar index: "
+            + "; ".join(ex_hints) + "."
+            if ex_hints else
+            "Shape each unit like the closest-category entry in `exemplars.json`."
+        )
+        prompt = (
+            f"Write ONE reusable automation file at `{abs_target}` that defines "
+            f"ALL {len(rus)} of these units ({', '.join(categories)}): "
+            f"{', '.join(names)}. `unit.json` is the list of units for this "
+            f"file. Implement EVERY one — each with its `missing_behaviors[]` "
+            f"signatures — as a separate class in this single file, imitating "
+            f"the exemplars' structure, imports, and conventions. {ex_hint} "
+            f"Output source code ONLY.{runtime_clause}"
+        )
+        async with sem:
+            res = await call_reasoning_llm(
+                agent_path, workdir=workdir, user_prompt=prompt, inputs=inputs,
+                step=step, timeout_s=180, max_tokens=32000,
+            )
+        if res.success and res.final_text.strip():
+            try:
+                abs_target.parent.mkdir(parents=True, exist_ok=True)
+                abs_target.write_text(
+                    _strip_code_fences(res.final_text), encoding="utf-8",
+                )
+                written.add(abs_target)
+                log.info("step08.exemplar.unit_done", target=at, units=len(rus))
+                return at, True
+            except OSError as e:
+                log.error("step08.exemplar.unit_write_failed", target=at, error=str(e))
+                return at, False
+        log.warning("step08.exemplar.unit_failed", target=at, error=res.error)
+        return at, False
+
+    if units_by_at:
+        unit_results = list(await asyncio.gather(
+            *[_gen_unit(at, rus) for at, rus in units_by_at.items()]
+        ))
+        results.extend(unit_results)
+        for at, rus in units_by_at.items():
+            for ru in rus:
+                unit_manifest.append({
+                    "name": ru.get("name"),
+                    "category": ru.get("category"),
+                    "at": at,
+                    "import_path": _module_path_from_rel(at),
+                })
+
+    # --- Phase E2: test files (one per target) ---
+    by_target: dict[str, list[dict[str, Any]]] = {}
+    for tc in plan_data.get("test_cases") or []:
+        target = tc.get("test_file_target")
+        if isinstance(target, str) and target:
+            by_target.setdefault(target, []).append(tc)
+
+    manifest_json = json.dumps(
+        {"reusable_units": unit_manifest}, indent=2, ensure_ascii=False,
+    )
+
+    async def _gen_test(target: str, tcs: list[dict[str, Any]]) -> tuple[str, bool]:
+        tc_ids = [tc.get("id", "") for tc in tcs]
+        sub_plan = {
+            "plan_version": plan_data.get("plan_version"),
+            "active_module": plan_data.get("active_module"),
+            "language": plan_data.get("language"),
+            "framework": plan_data.get("framework"),
+            "architecture_pattern": plan_data.get("architecture_pattern"),
+            "test_cases": tcs,
+        }
+        inputs = {
+            "plan.json": json.dumps(sub_plan, indent=2, ensure_ascii=False),
+            "strategy.md": _filter_strategy_for_tcs(strategy_text, tc_ids),
+            "units.json": manifest_json,
+            "exemplars.json": exemplars_json,
+        }
+        if rules_content:
+            inputs["codegen-rules.md"] = rules_content
+        abs_target = sut_root / target
+        prompt = (
+            f"Write ONE complete test file at `{abs_target}` covering test "
+            f"case(s): {', '.join(tc_ids)}. Use `plan.json` for structure and "
+            f"`reusable_units[]`, `units.json` for the import paths of the units "
+            f"created for this SUT, and `strategy.md` only for exact expected "
+            f"VALUES. Orchestrate the units in this SUT's own idiom (as shown in "
+            f"`exemplars.json`) — do NOT introduce Page Object Model. Output "
+            f"source code ONLY.{runtime_clause}"
+        )
+        async with sem:
+            res = await call_reasoning_llm(
+                agent_path, workdir=workdir, user_prompt=prompt, inputs=inputs,
+                step=step, timeout_s=180, max_tokens=32000,
+            )
+        if res.success and res.final_text.strip():
+            try:
+                abs_target.parent.mkdir(parents=True, exist_ok=True)
+                abs_target.write_text(
+                    _strip_code_fences(res.final_text), encoding="utf-8",
+                )
+                written.add(abs_target)
+                log.info("step08.exemplar.test_done", target=target)
+                return target, True
+            except OSError as e:
+                log.error("step08.exemplar.test_write_failed", target=target, error=str(e))
+                return target, False
+        log.warning("step08.exemplar.test_failed", target=target, error=res.error)
+        return target, False
+
+    if by_target:
+        test_results = list(await asyncio.gather(
+            *[_gen_test(t, tcs) for t, tcs in by_target.items()]
+        ))
+        results.extend(test_results)
+
+    return results, written
+
+
+_REFUSAL_SENTINELS = (
+    "[CLARIFICATION NEEDED]",  # the exemplar-writer's explicit refusal marker
+    "raise NotImplementedError",  # Python refusal idiom
+)
+
+
+def _scan_refusal_sentinels(files: set[Path]) -> list[str]:
+    """Return `<file>: <sentinel>` for any generated file that is a refusal stub.
+
+    The exemplar-writer, when it has no exemplar to imitate, correctly refuses
+    by emitting a top-level `raise ...("[CLARIFICATION NEEDED] ...")` rather than
+    guessing an import surface. Such a file *parses* and *type-checks* fine, so
+    the pattern-agnostic gates miss it and the run false-greens to Step 9. This
+    scan turns that into an honest Step 8 failure. Language-agnostic: keys on the
+    `[CLARIFICATION NEEDED]` marker (also present in a TS/JS `throw new Error(...)`)
+    plus the Python `raise NotImplementedError` idiom.
+    """
+    hits: list[str] = []
+    for p in sorted(files):
+        try:
+            text = p.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for sentinel in _REFUSAL_SENTINELS:
+            if sentinel in text:
+                hits.append(f"{p.name}: {sentinel}")
+                break
+    return hits
+
+
+async def _run_exemplar_lane(
+    *,
+    plan_data: dict[str, Any],
+    strategy_text: str,
+    active_module: dict | None,
+    arch_pattern: str,
+    sut_root: Path,
+    workdir: Path,
+    out_dir: Path,
+    agents_root: Path,
+    rules_content: str,
+    detected_stack: str | None,
+    jit_files_added: list[Path],
+    step_number: int,
+    step_name: str,
+    run_id: str,
+    timeout_s: int | None,
+) -> StepResult:
+    """Orchestrate the non-POM exemplar lane end-to-end."""
+    log.info("step08.exemplar_lane.start", pattern=arch_pattern)
+
+    pkg_root = _exemplar_pkg_root(active_module, plan_data)
+    runtime_files, runtime_import = _vendor_runtime_for_exemplar(sut_root, pkg_root)
+
+    results, written = await _generate_exemplar_files(
+        plan_data=plan_data,
+        strategy_text=strategy_text,
+        active_module=active_module,
+        sut_root=sut_root,
+        workdir=workdir,
+        agents_root=agents_root,
+        rules_content=rules_content,
+        runtime_import=runtime_import,
+        step=step_number,
+    )
+    failures = [t for t, ok in results if not ok]
+    if not results or failures:
+        (out_dir / "exemplar-gen-failures.log").write_text(
+            "\n".join(failures) or "no files generated", encoding="utf-8",
+        )
+        log.error("step08.exemplar_lane.gen_failed", failed=failures)
+        return StepResult(
+            success=False, status="failed",
+            outputs=[out_dir / "exemplar-gen-failures.log"],
+            error=(
+                f"exemplar codegen failed for {len(failures)} target(s)"
+                if failures else "exemplar codegen produced no files"
+            ),
+            notes="\n".join(failures[:5])[:500],
+        )
+
+    qtea_files = {p.resolve() for p in written if p.is_file()}
+
+    # Refusal-sentinel gate: the agent may "succeed" (write a file) while the
+    # file is actually a `[CLARIFICATION NEEDED]` / NotImplementedError stub —
+    # e.g. when pattern_exemplars is empty and it has nothing to imitate. Such
+    # stubs parse and type-check cleanly, so the gates below would pass and the
+    # run would false-green to Step 9. Fail here instead. (Step 6's exemplar
+    # invariant gate should prevent the empty-exemplars case upstream; this is
+    # the defense-in-depth backstop for any other refusal.)
+    refusals = _scan_refusal_sentinels(qtea_files)
+    if refusals:
+        (out_dir / "exemplar-refusal-stubs.log").write_text(
+            "\n".join(refusals), encoding="utf-8",
+        )
+        log.error("step08.exemplar_lane.refusal_stub", files=refusals)
+        return StepResult(
+            success=False, status="failed",
+            outputs=[out_dir / "exemplar-refusal-stubs.log"],
+            error=(
+                f"exemplar codegen produced {len(refusals)} refusal stub(s) "
+                f"([CLARIFICATION NEEDED] / NotImplementedError) instead of real "
+                f"code — the agent had nothing to imitate (likely empty "
+                f"pattern_exemplars). See exemplar-refusal-stubs.log."
+            ),
+            notes="\n".join(refusals[:5])[:500],
+        )
+
+    # Pattern-agnostic gate: deterministic XPath normalisation (TS/JS only;
+    # no-op for Python) — keeps the "never XPath" invariant.
+    try:
+        _run_phase_b55_xpath_normalisation(sut_root, set(qtea_files))
+    except Exception as e:  # never let the optional rewrite abort the lane
+        log.warning("step08.exemplar.xpath_norm_error", error=str(e))
+
+    # Pattern-agnostic gate: parse-check → violation-fixer.
+    parse_res = await _run_phase_b65_parse_check(
+        sut_root=sut_root, qtea_files=set(qtea_files),
+        agents_root=agents_root, workdir=workdir, timeout_s=timeout_s,
+    )
+    if parse_res.ran and parse_res.autofix_attempted and parse_res.post_fix_errors > 0:
+        log.error("step08.exemplar.parse_failed", errors=parse_res.post_fix_errors)
+        return StepResult(
+            success=False, status="failed", outputs=[],
+            error=f"exemplar parse-check failed: {parse_res.post_fix_errors} error(s)",
+        )
+
+    # Pattern-agnostic gate: native type-check → violation-fixer.
+    framework = resolve_framework(detected_stack, sut_root) if detected_stack else "unknown"
+    static_res = await _run_phase_b6(
+        sut_root=sut_root, framework=framework, qteaouched=set(qtea_files),
+        agents_root=agents_root, workdir=workdir, timeout_s=timeout_s,
+    )
+    if static_res.ran and static_res.autofix_attempted and static_res.post_fix_errors > 0:
+        log.error("step08.exemplar.static_failed", errors=static_res.post_fix_errors)
+        return StepResult(
+            success=False, status="failed", outputs=[],
+            error=f"exemplar type-check failed: {static_res.post_fix_errors} error(s)",
+        )
+
+    # Commit the generated units + tests + runtime onto the qtea branch.
+    produced = sorted(qtea_files | {p.resolve() for p in runtime_files} | {p.resolve() for p in jit_files_added})
+    sha = commit_step(
+        sut_root, step_number, step_name,
+        message_detail=f"exemplar lane ({arch_pattern}): {len(produced)} files",
+    )
+    manifest_path = out_dir / "generated-files.json"
+    files_list = (
+        files_in_commit(sut_root, sha) if sha else []
+    ) or [str(p.relative_to(sut_root).as_posix()) for p in produced if p.is_relative_to(sut_root)]
+    manifest_path.write_text(
+        json.dumps({
+            "sut_root": str(sut_root),
+            "branch": f"qtea/run-{run_id}",
+            "commit": sha,
+            "architecture_pattern": arch_pattern,
+            "lane": "exemplar",
+            "files": sorted(set(files_list)),
+        }, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    log.info(
+        "step08.exemplar_lane.done",
+        files=len(produced), commit=sha, pattern=arch_pattern,
+    )
+    notes = f"lane=exemplar pattern={arch_pattern} files={len(produced)}"
+    if sha:
+        notes += f" commit={sha}"
+    return StepResult(
+        success=True, status="completed",
+        outputs=[manifest_path], notes=notes,
+    )
+
+
+def _seed_observed_dev_pool(ctx: StepContext, pool: dict[str, Any]) -> None:
+    """Deposit Step-7 observed elements into the JIT resolver's tier-1b intent
+    pool (``<workspace>/locator-cache/dev-locators.json``) so Step 9 resolves
+    ``tbd(...)`` sentinels from real data before the LLM tier.
+
+    Skipped when the operator supplied their own dev-locators (CLI flag or
+    ``QTEA_DEV_LOCATORS``) — we never clobber a hand-authored pool. Merges into
+    any existing file without overwriting keys (e.g. HITL answers from a prior
+    run). Best-effort; never raises fatally to the caller.
+    """
+    locators = (pool or {}).get("locators") or {}
+    if not locators:
+        return
+    if getattr(ctx.options, "dev_locators", None) or os.environ.get("QTEA_DEV_LOCATORS"):
+        log.info("step08.observed_pool_skip", reason="dev_locators_supplied")
+        return
+    cache_dir = ctx.workspace.root / "locator-cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    dst = cache_dir / "dev-locators.json"
+    merged: dict[str, Any] = {"locators": {}}
+    if dst.is_file():
+        try:
+            existing = json.loads(dst.read_text(encoding="utf-8"))
+            if isinstance(existing, dict) and isinstance(existing.get("locators"), dict):
+                merged["locators"].update(existing["locators"])
+        except (OSError, json.JSONDecodeError):
+            pass
+    # Observed entries fill gaps only — never overwrite an existing key.
+    for k, v in locators.items():
+        merged["locators"].setdefault(k, v)
+    dst.write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8")
+    log.info("step08.observed_pool_seeded", path=str(dst), count=len(locators))
 
 
 class CodegenStep(Step):
@@ -3661,8 +4967,13 @@ class CodegenStep(Step):
             "**Do NOT search for it. Do NOT attempt to create it.** Import "
             "it directly per agent.md §3a-c:\n"
             "  - Python+pytest+PW → `from tests.qtea_runtime import tbd`\n"
-            "  - TS/JS+PW → `import { tbd } from \"./qtea-runtime\"` "
-            "(or relative path)\n"
+            "  - TS/JS+PW → `import { tbd } from \"<path>\"` where `<path>` "
+            "is the relative path FROM THIS FILE'S OWN LOCATION to "
+            "`tests/qtea-runtime` (e.g. `./qtea-runtime` if this file is "
+            "directly in `tests/`, `../../tests/qtea-runtime` if nested "
+            "under `src/pages/`) — the runtime is vendored at that ONE "
+            "fixed location regardless of where this file lives; a wrong "
+            "relative path is a compile-fatal error\n"
             "  - Java+PW → `import com.qtea.runtime.Tbd;`\n"
             "The framework's setup hook (conftest.py / playwright.config / "
             "setupFiles / @Listeners) was also updated automatically; you "
@@ -3830,6 +5141,35 @@ class CodegenStep(Step):
                 f"(or the framework equivalent such as os.environ). "
                 f"Never hardcode their values."
             )
+
+        # --- Live-exploration grounding (Step 7 site-explorer) ------------
+        # When Step 7 captured a live element map from the running SUT, ground
+        # codegen in it: prefer observed roles/names/test-ids for locators and
+        # anchor assertions in real content. Also seed the JIT resolver's
+        # tier-1b intent pool with the observed elements so Step 9 resolves
+        # `tbd(...)` sentinels from real data before paying for the LLM tier.
+        # Best-effort — absent/unreadable live-map leaves codegen unchanged.
+        live_map_hint = ""
+        live_map_path = ctx.workspace.step_dir(7) / "live-map.json"
+        if live_map_path.exists():
+            from qtea.steps.s07_live_explore import (
+                build_observed_dev_pool,
+                render_live_map_for_codegen,
+            )
+
+            try:
+                live_map = json.loads(live_map_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as e:
+                log.warning("step08.live_map_unreadable", error=str(e))
+                live_map = None
+            if isinstance(live_map, dict):
+                live_map_hint = render_live_map_for_codegen(live_map)
+                try:
+                    _seed_observed_dev_pool(
+                        ctx, build_observed_dev_pool(live_map),
+                    )
+                except Exception as e:  # never let seeding break codegen
+                    log.warning("step08.observed_pool_seed_failed", error=str(e))
 
         # --- Pre-vendor the JIT runtime BEFORE the agent runs -------------
         #
@@ -4105,9 +5445,40 @@ class CodegenStep(Step):
         # tokens of bounded context. No multi-turn growth.
         language = (active_module_dict or {}).get("language")
 
+        # --- Lane selection ------------------------------------------------
+        # Non-POM SUTs (e.g. Screenplay) take the additive exemplar lane, which
+        # imitates the SUT's own reusable units instead of forcing POM. The
+        # mature POM phases below are untouched and remain the default for
+        # pom / inline / none / unknown (and zero-existing-automation SUTs).
+        arch_pattern = (
+            plan_data.get("architecture_pattern")
+            or (active_module_dict or {}).get("architecture_pattern")
+            or "pom"
+        )
+        if arch_pattern not in ("pom", "inline", "none", "unknown"):
+            return await _run_exemplar_lane(
+                plan_data=plan_data,
+                strategy_text=strategy_text,
+                active_module=active_module_dict,
+                arch_pattern=arch_pattern,
+                sut_root=sut_root,
+                workdir=wd,
+                out_dir=out_dir,
+                agents_root=agents_root,
+                rules_content=rules_content,
+                detected_stack=detected_stack,
+                jit_files_added=jit_files_added,
+                step_number=self.number,
+                step_name=self.name,
+                run_id=ctx.workspace.run_id,
+                timeout_s=self.timeout_s,
+            )
+
         # Phase A1: deduplicate infrastructure tasks across TCs
         pom_tasks = _build_pom_tasks(plan_data, sut_root, sut_inventory_dict)
-        locator_tasks = _build_locator_tasks(plan_data, sut_inventory_dict)
+        locator_tasks = _build_locator_tasks(
+            plan_data, sut_inventory_dict, sut_root, language,
+        )
         fixture_tasks = _build_fixture_tasks(plan_data)
         helper_tasks = _build_helper_tasks(plan_data)
 
@@ -4138,13 +5509,43 @@ class CodegenStep(Step):
         if tbd_written:
             log.info("step08.tbd_locators.total", count=tbd_written)
 
-        # Phase A3: extend POMs with missing methods
-        if total_methods > 0:
+        # Phase A2b: create NEW page objects (plan source=="create"). The POM
+        # lane historically only *extended* existing files, so a planned new POM
+        # was never written — its methods then false-flagged at Phase B.5 and its
+        # spec import dangled. Runs BEFORE extend so created files exist for the
+        # downstream locator/assertion gates, the imports manifest, and test gen.
+        create_pom_tasks = {
+            fp: t for fp, t in pom_tasks.items() if t.source == "create"
+        }
+        extend_pom_tasks = {
+            fp: t for fp, t in pom_tasks.items() if t.source != "create"
+        }
+        if create_pom_tasks:
+            create_results = await _create_poms(
+                create_pom_tasks, sut_root, wd, agents_root, step=8,
+                rules_content=rules_content,
+                locator_tasks=locator_tasks,
+                live_map_hint=live_map_hint,
+                active_module=active_module_dict,
+            )
+            create_failures = [fp for fp, ok in create_results if not ok]
+            if create_failures:
+                log.warning(
+                    "step08.pom_create.partial_failure",
+                    failed=create_failures,
+                )
+
+        # Phase A3: extend existing POMs with missing methods
+        extend_methods = sum(
+            len(t.missing_methods) for t in extend_pom_tasks.values()
+        )
+        if extend_methods > 0:
             pom_results = await _extend_poms(
-                pom_tasks, sut_root, wd, agents_root, step=8,
+                extend_pom_tasks, sut_root, wd, agents_root, step=8,
                 rules_content=rules_content,
                 ctx=ctx,
                 locator_tasks=locator_tasks,
+                live_map_hint=live_map_hint,
             )
             pom_failures = [fp for fp, ok in pom_results if not ok]
             if pom_failures:
@@ -4303,6 +5704,79 @@ class CodegenStep(Step):
                     notes="\n".join(assert_violations[:5])[:500],
                 )
 
+        # Phase A3.5b: undefined create_tbd locator reference gate. A create_tbd
+        # locator whose owning page had no inventory locator-source falls to the
+        # "emit inline" deferral; if the extender instead emits a `BAG.NAME`
+        # reference without defining NAME, it is `undefined` at runtime and the
+        # syntax-only Phase B.6.5 parse check can't see it (undefined property
+        # access on a bag, e.g. `BASE_LOCATORS.SOME_KEY` referenced but never
+        # defined, is a runtime error that syntax/type checks miss). Fail here
+        # with an actionable message instead of shipping a TypeError to Step 9.
+        if (language or "").lower() in {
+            "typescript", "javascript", "java",
+            "python", "pytest", "playwright-py", "selenium-py",
+        } and locator_tasks:
+            from qtea.codegen_pom_hygiene import (
+                find_undefined_locator_ref_violations,
+            )
+            _lang_suffixes = {
+                "typescript": {".ts", ".tsx", ".js", ".jsx"},
+                "javascript": {".js", ".jsx", ".ts", ".tsx"},
+                "java": {".java"},
+            }.get((language or "").lower(), {".py"})
+            tbd_names = {
+                t.constant_name for t in locator_tasks if t.constant_name
+            }
+            undef_violations: list[str] = []
+            for pom_task in pom_tasks.values():
+                names = {
+                    _mm.get("name") for _mm in (pom_task.missing_methods or [])
+                    if isinstance(_mm, dict) and _mm.get("name")
+                }
+                if not names:
+                    continue
+                pom_abs = sut_root / pom_task.pom_file
+                if not pom_abs.is_file():
+                    continue
+                # Definition corpus: sibling source files under the POM's
+                # directory tree (locator bags live beside/under the POM, e.g.
+                # `pages/locators/BasePage.locators.ts`), plus any explicit
+                # task locator files. Scanned so a legitimately-defined key is
+                # never mistaken for a dangling reference.
+                def_files = [
+                    p for p in pom_abs.parent.rglob("*")
+                    if p.is_file() and p.suffix in _lang_suffixes
+                    and ".git" not in p.parts
+                ]
+                def_files += [
+                    sut_root / t.locator_file for t in locator_tasks
+                    if t.locator_file and (sut_root / t.locator_file).is_file()
+                ]
+                for v in find_undefined_locator_ref_violations(
+                    pom_abs, pom_task.pom_name, names, tbd_names,
+                    language=language, definition_files=def_files,
+                ):
+                    undef_violations.append(v.format())
+            if undef_violations:
+                log.error(
+                    "step08.undefined_locator_ref_failed",
+                    count=len(undef_violations),
+                )
+                (out_dir / "undefined-locator-ref-violations.log").write_text(
+                    "\n".join(undef_violations), encoding="utf-8",
+                )
+                return StepResult(
+                    success=False, status="failed",
+                    outputs=[out_dir / "undefined-locator-ref-violations.log"],
+                    error=(
+                        f"pom-extender emitted {len(undef_violations)} dangling "
+                        f"locator reference(s) — a create_tbd constant is "
+                        f"referenced as a bag member but never defined "
+                        f"(undefined at runtime; parse-check can't catch it)"
+                    ),
+                    notes="\n".join(undef_violations[:5])[:500],
+                )
+
         # Phase A3.6: purpose-fidelity judge — shadow by default
         # (QTEA_PURPOSE_JUDGE=shadow), logs verdicts on whether each
         # generated POM method's body actually implements its own
@@ -4378,20 +5852,15 @@ class CodegenStep(Step):
         # reason on ctx.extras. Prepend that reason so this regeneration fixes
         # the specific gap rather than blindly reproducing it.
         _defect_feedback = ctx.extras.pop("step8_defect_feedback", None)
+        _defect_kind = ctx.extras.pop("step8_defect_kind", "naming_defect")
         if _defect_feedback:
-            reuse_hint = (
-                f"\n\n--- REGENERATION FEEDBACK (Step 9 rejected the previous "
-                f"codegen output — fix THIS specifically) ---\n"
-                f"{_defect_feedback}\n"
-                f"Every generated test function MUST carry a "
-                f"`@pytest.mark.qtea_<phase>` marker (pytest) or its file MUST "
-                f"use the `qtea_` filename prefix (Playwright Test), or Step 9's "
-                f"marker filter collects zero tests. Emit every import target "
-                f"the tests reference.\n"
+            reuse_hint = _build_regen_feedback_hint(
+                _defect_feedback, _defect_kind,
             ) + reuse_hint
             log.info(
                 "step08.regen_with_defect_feedback",
                 feedback=str(_defect_feedback)[:200],
+                kind=_defect_kind,
             )
 
         # Phase B2: generate test files
@@ -4402,6 +5871,7 @@ class CodegenStep(Step):
             env_hint=env_hint,
             step=8,
             rules_content=rules_content,
+            live_map_hint=live_map_hint,
         )
 
         if not test_results or not any(ok for _, ok in test_results):
@@ -4509,6 +5979,15 @@ class CodegenStep(Step):
                 sut_root / pom_task.pom_file for pom_task in pom_tasks.values()
                 if (sut_root / pom_task.pom_file).is_file()
             } | set(bv_test_files)
+
+            # Normalize any TS/JS runtime import to the correct path for
+            # each file's own location BEFORE the parse-check below, so a
+            # wrong-but-otherwise-harmless hardcoded `./qtea-runtime` (H2,
+            # run 20260708-121117-99f5ed) doesn't surface as a compile-fatal
+            # parse-check failure when it's mechanically fixable. No-op for
+            # Python/Java files and files with no runtime import.
+            _normalize_runtime_imports(list(pre_verify_files), sut_root)
+
             if pre_verify_files:
                 pre_parse_result = await _run_phase_b65_parse_check(
                     sut_root=sut_root,
@@ -4629,11 +6108,17 @@ class CodegenStep(Step):
             _b5_filter_test_files(agent_produced, language)
             if b5_skipped_reason is None else []
         )
+        # Corroboration index (Step-6 sut_inventory): a method the on-disk
+        # parser misses but the inventory recorded is treated as present (with a
+        # logged `reconcile.parser_disagreement`) rather than hard-failed, so no
+        # lone method-extractor bug can block the gate on a method that exists.
+        b5_inventory_methods = inventory_method_index(sut_inventory_dict)
         recon = reconcile_codegen(
             test_files=b5_test_files,
             pom_files=manifest["pom_files"],
             sut_root=sut_root,
             language=language,
+            inventory_methods=b5_inventory_methods,
         )
         # Fixture reconciliation runs alongside POM reconciliation: it walks
         # the plan and asserts every `source==create` fixture exists on disk
@@ -4667,6 +6152,7 @@ class CodegenStep(Step):
                         patch_tasks, sut_root, wd, agents_root, step=8,
                         rules_content=rules_content,
                         ctx=ctx,
+                        live_map_hint=live_map_hint,
                     )
                 except Exception as e:
                     b5_autopatch_error = f"{type(e).__name__}: {e}"
@@ -4680,6 +6166,7 @@ class CodegenStep(Step):
                         pom_files=manifest["pom_files"],
                         sut_root=sut_root,
                         language=language,
+                        inventory_methods=b5_inventory_methods,
                     )
                     recon.fixture_files_scanned = fx_files_scanned
                     recon.fixture_mismatches = fx_mismatches
@@ -4903,9 +6390,11 @@ class CodegenStep(Step):
         # rewriter can't safely translate is kept in-place with a
         # `// qtea-xpath-exempt:` marker (test_indexer honours the marker)
         # AND collected as a straggler bundle for the LLM violation-fixer.
-        _xpath_reports, _xpath_stragglers = _run_phase_b55_xpath_normalisation(
-            sut_root=sut_root,
-            candidates=codegen_modified,
+        _xpath_reports, _xpath_stragglers, _b55_touched_files = (
+            _run_phase_b55_xpath_normalisation(
+                sut_root=sut_root,
+                candidates=codegen_modified,
+            )
         )
 
         # Index the SUT clone, then filter to ONLY qtea-prefixed entries so
@@ -4967,12 +6456,14 @@ class CodegenStep(Step):
         # excluding it here keeps Phase B.6 from feeding template errors to
         # the violation-fixer, which is forbidden from touching it
         # (`agents/codegen-violation-fixer.agent.md` §"What NOT to Do").
-        all_codegen_files = {
-            p for p in produced_in_sut if p.resolve() not in jit_resolved
-        }
-        all_codegen_files.update(
-            p for p in codegen_modified
-            if p.is_file() and p not in jit_resolved
+        all_codegen_files = _build_all_codegen_files(
+            sut_root=sut_root,
+            produced_in_sut=produced_in_sut,
+            codegen_modified=codegen_modified,
+            pom_tasks=pom_tasks,
+            test_results=test_results,
+            b55_touched_files=_b55_touched_files,
+            jit_resolved=jit_resolved,
         )
         generated_manifest = {
             "sut_root": str(sut_root),
@@ -5154,7 +6645,7 @@ class CodegenStep(Step):
                 ),
                 extra_paths=[package_resource_root() / "skills" / "webapp-testing"],
                 add_dirs=[sut_root],
-                timeout_s=min(self.timeout_s or 1800, 300),
+                timeout_s=min(self.timeout_s or 1800, 500),
                 step=8,
                 max_turns=AUTOFIX_MAX_TURNS,
             )

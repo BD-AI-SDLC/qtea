@@ -19,6 +19,7 @@ import logging
 import re
 import sys
 import warnings
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -343,8 +344,47 @@ _SECRET_VALUE_RE = re.compile(
 )
 
 
+# Runtime registry of exact secret VALUES (e.g. resolved SUT credentials) to
+# redact everywhere — structured logs (via _mask_secrets_processor) and agent
+# prompt/transcript files (via mask_secret_values). Populated by callers BEFORE
+# any secret flows to an agent. Complements the token-SHAPE regex above, which
+# can't know an arbitrary username/password.
+_REGISTERED_SECRET_VALUES: set[str] = set()
+# Don't register trivially short strings — masking a 1-2 char value would shred
+# unrelated log text. Real credentials comfortably exceed this.
+_MIN_SECRET_LEN = 4
+
+
+def register_secret_values(values: Iterable[str]) -> None:
+    """Register exact secret values to be redacted as ``***REDACTED***`` in all
+    log output and in any text passed through :func:`mask_secret_values`.
+
+    Idempotent; values shorter than ``_MIN_SECRET_LEN`` are ignored to avoid
+    over-masking. Safe to call repeatedly (e.g. per run).
+    """
+    for v in values:
+        if isinstance(v, str) and len(v.strip()) >= _MIN_SECRET_LEN:
+            _REGISTERED_SECRET_VALUES.add(v)
+
+
+def mask_secret_values(text: str) -> str:
+    """Redact registered secret values + known token shapes from free text.
+
+    For sinks that bypass the structlog pipeline — the agent user-prompt file
+    and transcript JSONL written directly in ``claude_runner``.
+    """
+    return _mask_str(text)
+
+
 def _mask_str(val: str) -> str:
-    return _SECRET_VALUE_RE.sub("***REDACTED***", val)
+    out = val
+    # Registered exact values first (longest first so overlapping secrets mask
+    # fully before a shorter substring match fires).
+    if _REGISTERED_SECRET_VALUES:
+        for secret in sorted(_REGISTERED_SECRET_VALUES, key=len, reverse=True):
+            if secret in out:
+                out = out.replace(secret, "***REDACTED***")
+    return _SECRET_VALUE_RE.sub("***REDACTED***", out)
 
 
 def _mask_secrets_processor(

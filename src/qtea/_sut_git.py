@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from urllib.parse import urlparse
 
 from qtea.logging_setup import get_logger
 
@@ -34,6 +35,31 @@ log = get_logger(__name__)
 
 _AUTHOR_NAME = "qtea"
 _AUTHOR_EMAIL = "qtea@local"
+
+_GIT_HOSTS = (
+    "github.com", "gitlab", "bitbucket.org",
+    "dev.azure.com", "ssh.dev.azure.com", "visualstudio.com",
+    "codeberg.org", "gitea.", "sr.ht",
+)
+
+
+def is_git_url(s: str) -> bool:
+    """True when ``s`` looks like a git remote URL rather than a local path.
+
+    Shared by ``steps.s06_research`` (SUT materialization) and
+    ``incident_memory`` (per-SUT fingerprint derivation) so both agree on
+    what counts as "the same SUT source".
+    """
+    if not s.startswith(("git@", "ssh://", "http://", "https://")):
+        return False
+    if s.endswith(".git"):
+        return True
+    try:
+        # .hostname strips userinfo (e.g. "user@host" → "host") and lowercases
+        hostname = urlparse(s).hostname or ""
+    except Exception:
+        return False
+    return any(hostname == host or hostname.endswith("." + host) for host in _GIT_HOSTS)
 
 
 def branch_name(run_id: str) -> str:
@@ -177,4 +203,5 @@ __all__ = [
     "commit_step",
     "current_branch",
     "ensure_git_repo_and_branch",
+    "is_git_url",
 ]

@@ -26,6 +26,7 @@ from qtea.codegen_pom_hygiene import (
     _non_void_agent_methods,
     find_pom_assertion_violations,
     find_return_consumption_violations,
+    find_undefined_locator_ref_violations,
 )
 from qtea.codegen_reconcile import _js_strip
 
@@ -587,3 +588,111 @@ def test_return_consumption_flags_multiple_call_sites(tmp_path: Path):
     )
     assert len(vs) == 2
     assert {v.line for v in vs} == {5, 6}
+
+
+# ---------------------------------------------------------------------------
+# find_undefined_locator_ref_violations
+# ---------------------------------------------------------------------------
+
+
+def test_undefined_locator_ref_flags_dangling_bag_reference(tmp_path: Path):
+    """Regression: the extender references
+    `BASE_LOCATORS.NOTIFICATION_INBOX_ITEMS` from an agent-authored method but
+    the key is defined in neither the POM nor the locator bag -> must flag."""
+    pom = tmp_path / "src" / "pages" / "BasePage.ts"
+    _write(pom,
+        "import { BASE_LOCATORS } from './locators/BasePage.locators';\n"
+        "export class BasePage {\n"
+        "  getNotificationInboxItemsLocator(): Locator {\n"
+        "    return this.page.locator(BASE_LOCATORS.NOTIFICATION_INBOX_ITEMS);\n"
+        "  }\n"
+        "}\n",
+    )
+    locators = tmp_path / "src" / "pages" / "locators" / "BasePage.locators.ts"
+    _write(locators,
+        "export const BASE_LOCATORS = {\n"
+        "  btnLogin: '//input[@id=\"login\"]',\n"
+        "};\n",
+    )
+    vs = find_undefined_locator_ref_violations(
+        pom, "BasePage", {"getNotificationInboxItemsLocator"},
+        {"NOTIFICATION_INBOX_ITEMS"},
+        language="typescript", definition_files=[locators],
+    )
+    assert len(vs) == 1
+    assert vs[0].rule == "undefined-locator-ref"
+    assert "NOTIFICATION_INBOX_ITEMS" in vs[0].message
+    assert vs[0].method == "getNotificationInboxItemsLocator"
+
+
+def test_undefined_locator_ref_passes_when_defined_in_bag(tmp_path: Path):
+    """When the key IS defined in the locator bag, no violation."""
+    pom = tmp_path / "src" / "pages" / "BasePage.ts"
+    _write(pom,
+        "export class BasePage {\n"
+        "  getItems(): Locator {\n"
+        "    return this.page.locator(BASE_LOCATORS.NOTIFICATION_INBOX_ITEMS);\n"
+        "  }\n"
+        "}\n",
+    )
+    locators = tmp_path / "src" / "pages" / "locators" / "BasePage.locators.ts"
+    _write(locators,
+        "export const BASE_LOCATORS = {\n"
+        "  NOTIFICATION_INBOX_ITEMS: '[data-test=\"inbox-item\"]',\n"
+        "};\n",
+    )
+    assert find_undefined_locator_ref_violations(
+        pom, "BasePage", {"getItems"}, {"NOTIFICATION_INBOX_ITEMS"},
+        language="typescript", definition_files=[locators],
+    ) == []
+
+
+def test_undefined_locator_ref_passes_when_inlined(tmp_path: Path):
+    """A create_tbd locator the extender legitimately INLINED (constant name
+    absent, selector literal in the body) is never referenced as `.NAME` and
+    must not be flagged."""
+    pom = tmp_path / "src" / "pages" / "BasePage.ts"
+    _write(pom,
+        "export class BasePage {\n"
+        "  openInbox(): Locator {\n"
+        "    return this.page.getByRole('button', { name: 'Inbox' });\n"
+        "  }\n"
+        "}\n",
+    )
+    assert find_undefined_locator_ref_violations(
+        pom, "BasePage", {"openInbox"}, {"NOTIFICATION_INBOX_ICON"},
+        language="typescript", definition_files=[],
+    ) == []
+
+
+def test_undefined_locator_ref_ignores_non_agent_methods(tmp_path: Path):
+    """A dangling reference in a PRE-EXISTING (non-agent-authored) method is
+    out of scope — only methods qtea just wrote are checked."""
+    pom = tmp_path / "src" / "pages" / "BasePage.ts"
+    _write(pom,
+        "export class BasePage {\n"
+        "  preExisting(): Locator {\n"
+        "    return this.page.locator(BASE_LOCATORS.LEGACY_KEY);\n"
+        "  }\n"
+        "}\n",
+    )
+    assert find_undefined_locator_ref_violations(
+        pom, "BasePage", {"someOtherMethod"}, {"LEGACY_KEY"},
+        language="typescript", definition_files=[],
+    ) == []
+
+
+def test_undefined_locator_ref_python_dangling(tmp_path: Path):
+    """Python analogue: `Locators.INBOX_ITEMS` referenced, never defined."""
+    pom = tmp_path / "pages" / "base_page.py"
+    _write(pom,
+        "class BasePage:\n"
+        "    def notification_items(self):\n"
+        "        return self.page.locator(Locators.INBOX_ITEMS)\n",
+    )
+    vs = find_undefined_locator_ref_violations(
+        pom, "BasePage", {"notification_items"}, {"INBOX_ITEMS"},
+        language="python", definition_files=[],
+    )
+    assert len(vs) == 1
+    assert "INBOX_ITEMS" in vs[0].message

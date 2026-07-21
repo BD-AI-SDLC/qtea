@@ -2,7 +2,7 @@
   "mcpServers": {
     "playwright": {
       "command": "npx",
-      "args": ["-y", "@playwright/mcp@latest", "--headless", "${QTEA_MCP_USER_DATA_DIR_ARG}", "${QTEA_STORAGE_STATE_ARG}"]
+      "args": ["-y", "@playwright/mcp@0.0.78", "--headless", "${QTEA_MCP_ISOLATED_ARG}", "${QTEA_MCP_USER_DATA_DIR_ARG}", "${QTEA_STORAGE_STATE_ARG}"]
     }
   }
 }

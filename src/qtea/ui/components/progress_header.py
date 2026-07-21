@@ -107,6 +107,18 @@ def build_progress_header(
         state.run_status = "failed"
         state.exit_code = 130
 
+        # Cut the /run view's state listeners FIRST — before any notify() below
+        # (this handler's, the pop_dialog calls', or the still-cancelling
+        # pipeline worker's trailing events). Otherwise pipeline_view's
+        # on_state_change runs one more time: it rebuilds the doomed /run
+        # controls (visible flicker) AND calls scroll_to_end() on the log
+        # Column just as it is detached, which fires a scroll_to invoke_method
+        # against a control whose Flutter ScrollController is now null — the
+        # "null check operator used on a null value" client crash. We snap to
+        # /results below, which registers a fresh listener, so nothing here
+        # needs the /run listener anymore.
+        state._listeners.clear()
+
         # Cancel the asyncio task driving run_pipeline. This unwinds
         # awaited steps cleanly; sync work (subprocesses) is killed below.
         loop = state.pipeline_loop
@@ -159,7 +171,9 @@ def build_progress_header(
                 with contextlib.suppress(Exception):
                     page.pop_dialog()
 
-        state.notify()
+        # (No state.notify() here — listeners were cleared at the top of this
+        # handler precisely to prevent a final /run rebuild + detached-control
+        # scroll_to. The snap-navigate below builds the results view directly.)
 
         # Snap to the results view NOW — don't wait for the still-cancelling
         # pipeline task to hit its finally block. Otherwise every trailing

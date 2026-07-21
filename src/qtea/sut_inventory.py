@@ -182,6 +182,91 @@ class AuthFlow:
     entry_method: str | None = None  # "<file>:<Class>.<method>" or "<file>:<func>"
     credentials_env_vars: list[str] = field(default_factory=list)
     fixture_entry: str | None = None  # "<file>:<func>"
+    # The method that navigates to the app base URL (e.g. `page.goto('/')`) —
+    # the mandatory FIRST step of any UI test, before login. Same
+    # "<file>:<Class>.<method>" shape as `entry_method`. None when no such
+    # method is found in the SUT's page objects.
+    open_method: str | None = None
+
+
+@dataclass
+class LifecycleHook:
+    """A SUT test setup/teardown hook, classified by canonical trigger event.
+
+    Framework keywords are normalized to one of four canonical events so
+    Step 7 (planning) and Step 8 (codegen) stay framework-agnostic:
+
+    | event        | JS/TS              | pytest                          | unittest       | JUnit5       |
+    | ------------ | ------------------ | ------------------------------- | -------------- | ------------ |
+    | before_all   | beforeAll/before   | @fixture(scope="module")        | setUpClass     | @BeforeAll   |
+    | after_all    | afterAll/after     | @fixture(scope="module")+yield  | tearDownClass  | @AfterAll    |
+    | before_each  | beforeEach         | @fixture(scope="function")/auto | setUp          | @BeforeEach  |
+    | after_each   | afterEach          | @fixture+yield                  | tearDown       | @AfterEach   |
+
+    `calls` is the ordered list of call expressions in the hook body (e.g.
+    ``["basePage.openBaseURL", "basePage.logIn", "basePage.goToEntityModule"]``)
+    so Step 7 can replay the SUT's canonical sequence and Step 8 can
+    regenerate it. `framework_construct` records the raw keyword/decorator for
+    traceability. A single yielding pytest fixture can produce TWO hooks (a
+    before_* from its pre-yield body and an after_* from its post-yield body).
+    """
+
+    event: str  # before_all | after_all | before_each | after_each
+    file: str
+    framework_construct: str = ""  # e.g. "beforeEach", "@pytest.fixture(scope=module)", "setUp", "@BeforeEach"
+    scope: str | None = None
+    calls: list[str] = field(default_factory=list)
+
+
+@dataclass
+class NavigationPrecondition:
+    """A POM method with no in-code guard that is only valid after another
+    call has already run — a pure calling convention, visible only across
+    real test-body call sites, not in the method's own source.
+
+    Unlike `LifecycleHook`, there is no deterministic scanner for this field:
+    hook bodies are a narrow, structurally predictable region to scan, but
+    detecting "every real call site of X is preceded by Y" requires judgment
+    across arbitrarily-shaped test bodies. Populated by the LLM researcher
+    only, with the same anti-fabrication discipline as `auth_flow` —
+    only recorded when call sites agree and at least one is evidenced.
+
+    `method` / `requires_call` are plain `ClassName.methodName` strings (same
+    convention as `LifecycleHook.calls` entries), so Step 7 (planning) can
+    match them against its own `pom`/`method` choreography fields without any
+    language-specific parsing.
+    """
+
+    method: str  # e.g. "DirectoryPage.selectFilteredEntity"
+    requires_call: str  # e.g. "BasePage.selectLoginOptionByText"
+    requires_args_hint: str | None = None  # e.g. "NAV_OPTIONS.DIRECTORY"
+    evidence: str = ""  # e.g. "tests/EntityFormSmoke.spec.ts:104"
+
+
+@dataclass
+class PatternExemplar:
+    """A verbatim source slice of one of the SUT's own reusable automation
+    units, captured so Step 8's exemplar lane can generate new code by
+    *imitation* rather than by imposing Page Object Model on every SUT.
+
+    Only populated for non-POM patterns (e.g. Screenplay Task/Question/
+    Interaction). For POM / inline / none the list stays empty and the mature
+    POM codegen path is used unchanged.
+
+    ``excerpt`` is the raw class (or Target-module) body sliced via the same
+    ``lineno``/``end_lineno`` approach ``_extract_locator_constants`` uses,
+    hard-capped at ``_EXEMPLAR_CHAR_CAP`` so the s07/s08 prompt stays bounded.
+    ``dir`` (the excerpt file's parent dir) is what Step 7's ``_approved_dirs``
+    adds to the create-target allowlist so new units land beside the SUT's own.
+    """
+
+    file: str
+    category: str  # task | question | interaction | ability | target | page_object | other
+    class_name: str | None
+    excerpt: str
+    line_start: int = 0
+    line_end: int = 0
+    dir: str | None = None
 
 
 @dataclass
@@ -196,8 +281,21 @@ class ModuleInventory:
     existing_helpers: list[Helper] = field(default_factory=list)
     existing_fixtures: list[Fixture] = field(default_factory=list)
     existing_locators: list[LocatorClass] = field(default_factory=list)
+    # Test setup/teardown hooks discovered in the SUT's own tests, classified
+    # by canonical trigger event. Step 7 reuses these; Step 8 regenerates them.
+    lifecycle_hooks: list[LifecycleHook] = field(default_factory=list)
+    # POM methods with an undeclared navigation precondition, mined from real
+    # call sites across the SUT's own tests. LLM-only (no deterministic
+    # producer) — Step 7's phase gate cross-checks planned steps against this.
+    navigation_preconditions: list[NavigationPrecondition] = field(default_factory=list)
     auth_flow: AuthFlow = field(default_factory=AuthFlow)
     custom_test_id_attribute: str | None = None
+    # Detected test-automation design pattern. Drives Step 8 lane selection:
+    # "pom" | "inline" | "none" | "unknown" → mature POM codegen lane;
+    # anything else (e.g. "screenplay") → exemplar-imitation lane.
+    architecture_pattern: str = "unknown"
+    # Verbatim reusable-unit snippets for the exemplar lane (non-POM only).
+    pattern_exemplars: list[PatternExemplar] = field(default_factory=list)
     source: str = "deterministic"  # "deterministic" | "llm_augmented" | "llm_only"
 
     def as_dict(self) -> dict[str, Any]:
@@ -883,10 +981,10 @@ def _extract_locator_constants(class_def: ast.ClassDef) -> Iterator[LocatorConst
 #
 # The scanner runs SEVERAL detectors per file and unions the results, so
 # a SUT is not forced into one convention. Real projects vary widely:
-#   1. `class RopaLocators { EMAIL = "..." }`         → separate_class
-#   2. `export const RopaLocators = { EMAIL: "..." }` → export_const_object
-#   3. `class RopaPage { elements = { btnX: "..." } }` → inline_object_property
-#   4. `class RopaPage { readonly submitBtn = page.getByRole(...) }` → readonly_locator_props
+#   1. `class EntityLocators { EMAIL = "..." }`         → separate_class
+#   2. `export const EntityLocators = { EMAIL: "..." }` → export_const_object
+#   3. `class EntityPage { elements = { btnX: "..." } }` → inline_object_property
+#   4. `class EntityPage { readonly submitBtn = page.getByRole(...) }` → readonly_locator_props
 #   5. `export const EMAIL_INPUT = "..."` at module scope  → module_const_bag
 #
 # All accept both UPPERCASE (`BTN_SEND`) and camelCase (`btnSend`) names,
@@ -908,15 +1006,49 @@ _TS_LOCATOR_FIELD_ANY_CASE_RE = re.compile(
     r"""(?P<quote>["'`])(?P<value>(?:(?!(?P=quote))[^\\]|\\.)*)(?P=quote)""",
     re.M,
 )
+# Class/const declarations whose IDENTIFIER ends with the Locators/Selectors/
+# Elements suffix (PascalCase and UPPER_SNAKE both allowed via re.I). Anchored
+# to the end of the name so decorative words BEFORE the suffix count but the
+# suffix itself must be present (e.g. `BasePageLocators`, `LOGIN_SELECTORS`,
+# `PageElements` all match; `defaultLocatorStrategy` -- suffix followed by
+# `Strategy` -- does NOT).
 _TS_LOCATOR_CLASS_RE = re.compile(
-    r"""(?:export\s+)?(?:class|const)\s+(?P<name>\w*Locators?\w*)\b""",
+    r"""(?:export\s+)?(?:class|const)\s+(?P<name>\w*(?:Locators?|Selectors?|Elements?|LOCATORS?|SELECTORS?|ELEMENTS?))\b""",
 )
-# Any exported const with an object literal named *Locators / *Selectors /
-# *Elements — the object-literal locator convention common in Playwright TS.
+# Exported const whose IDENTIFIER ends with the same suffix family, e.g.
+# `BASE_LOCATORS`, `PageLocators`, `App_Selectors`. Case-insensitive but
+# ANCHORED to the tail of the name via `$` inside `\b` -- excludes names
+# where the suffix is a prefix or middle substring
+# (`defaultLocatorStrategy`, `elementCounter`, `selectorTests` do NOT match).
+# Non-locator objects that still pass the tail-suffix filter are filtered
+# downstream by `_looks_like_selector` on their values.
 _TS_EXPORT_CONST_LOCATOR_RE = re.compile(
-    r"""export\s+const\s+(?P<name>\w*(?:Locators?|Selectors?|Elements?))\s*"""
+    r"""export\s+const\s+(?P<name>[A-Za-z_$][\w$]*?(?:locators?|selectors?|elements?))\s*"""
     r"""(?::\s*[\w<>\[\],\s.]+?)?\s*=\s*\{""",
+    re.I,
 )
+# `<Pom>.locators.ts` / `<Pom>.selectors.tsx` / ... filename convention: the
+# stem before the `.locators`/`.selectors`/`.elements` infix names the POM that
+# owns the bag (e.g. `BasePage.locators.ts` -> `BasePage`). Lets the export-
+# const scanner set `owning_pom` so Step 8's locator resolver can match a
+# create_tbd locator (owning_page) to the bag even when the bag identifier
+# (`BASE_LOCATORS`) doesn't follow the `{Pom}Locators` naming fallback.
+_TS_LOCATOR_FILE_POM_RE = re.compile(
+    r"""^(?P<pom>\w+?)\.(?:locators?|selectors?|elements?)\.\w+$""",
+    re.I,
+)
+
+
+def _infer_owning_pom_from_filename(src: Path) -> str | None:
+    """Derive the owning POM from a ``<Pom>.locators.ts``-style filename.
+
+    Returns None unless the file follows the
+    ``<Pom>.<locators|selectors|elements>.<ext>`` dot-infix convention, so
+    bare ``locators.ts`` or PascalCase ``EntityLocators.ts`` (no dot infix)
+    keep ``owning_pom=None`` and fall back to the ``{Pom}Locators`` class-name
+    resolution — no behavioural change for those shapes."""
+    m = _TS_LOCATOR_FILE_POM_RE.match(src.name)
+    return m.group("pom") if m else None
 # `class Foo { elements: ... = { ... }` — inline object property inside a
 # POM class body. `container` captures the property name (elements,
 # selectors, locators, etc.) — used as owning_pom + container_name to
@@ -1004,6 +1136,7 @@ def _scan_ts_export_const_object(
             name=name, file=rel, class_name=name,
             constants=kept, import_path=None, truncated_count=dropped,
             location_pattern="export_const_object",
+            owning_pom=_infer_owning_pom_from_filename(src),
         ))
     return out
 
@@ -1379,12 +1512,224 @@ def scan_python_auth_flow(
                 if cand in text:
                     found_env.append(cand)
 
+    prefer = entry_method.split(":")[0] if entry_method else None
     return AuthFlow(
         type=entry_type if entry_method else "unknown",
         entry_method=entry_method,
         credentials_env_vars=found_env,
         fixture_entry=fixture_entry,
+        open_method=_detect_open_method(page_objects, prefer_file=prefer),
     )
+
+
+# ---------------------------------------------------------------------------
+# Open-base-URL method detection (language-agnostic; operates on PageObject)
+# ---------------------------------------------------------------------------
+
+# Normalized (lowercased, separators stripped) method-name signals for the
+# "navigate to the app base URL" step — the mandatory FIRST action of any UI
+# test, before login. Kept language-agnostic so it works on Python snake_case
+# and TS camelCase alike after normalization.
+_OPEN_METHOD_NAMES: frozenset[str] = frozenset({
+    "open", "openbaseurl", "openurl", "openpage", "openapp", "openhome",
+    "openbasepage", "opensite", "openhomepage", "openloginpage",
+    "goto", "gotobaseurl", "gotohome", "navigate", "navigateto",
+    "navigatetobaseurl", "visit", "load", "loadapp", "gohome",
+})
+
+
+def _norm_method_name(name: str) -> str:
+    return name.replace("_", "").replace("-", "").lower()
+
+
+def _is_open_method_name(name: str) -> bool:
+    n = _norm_method_name(name)
+    if n in _OPEN_METHOD_NAMES:
+        return True
+    # Strong prefix signal: openBaseURL, openHomePage, openLoginPage, ...
+    if n.startswith("open") and any(
+        t in n for t in ("url", "base", "app", "home", "page", "site")
+    ):
+        return True
+    return False
+
+
+def _detect_open_method(
+    pages: list[PageObject], prefer_file: str | None = None
+) -> str | None:
+    """Find a page-object method that navigates to the app base URL.
+
+    Returns ``"<file>:<Class>.<method>"`` or ``None``. When several methods
+    match, prefers one on ``prefer_file`` (usually the auth entry's file /
+    BasePage), else the first found. Searches ALL page objects — the open/
+    navigate method commonly lives on a BasePage, not the auth page.
+    """
+    matches: list[tuple[PageObject, str]] = []
+    for po in pages:
+        for m in po.methods:
+            if _is_open_method_name(m):
+                matches.append((po, f"{po.file}:{po.class_name}.{m}"))
+    if not matches:
+        return None
+    if prefer_file:
+        for po, ref in matches:
+            if po.file == prefer_file:
+                return ref
+    return matches[0][1]
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle-hook discovery (setup / teardown), classified by trigger event
+# ---------------------------------------------------------------------------
+
+_HOOK_CALLS_CAP = 30
+
+_UNITTEST_HOOK_EVENTS: dict[str, str] = {
+    "setUpClass": "before_all",
+    "tearDownClass": "after_all",
+    "setUp": "before_each",
+    "tearDown": "after_each",
+}
+_PYTEST_MODULE_HOOK_EVENTS: dict[str, str] = {
+    "pytest_runtest_setup": "before_each",
+    "pytest_runtest_teardown": "after_each",
+}
+
+
+def _stmt_outermost_call(stmt: ast.stmt) -> str | None:
+    """The primary call expression of a statement, as dotted source text.
+
+    Unwraps ``Expr`` / ``Await`` / ``Assign`` / ``Return`` so that a body of
+    ``await base.openBaseURL()`` / ``x = await make()`` yields the readable
+    high-level callee (``base.openBaseURL``), not the inner sub-calls.
+    """
+    node: ast.AST = stmt
+    if isinstance(node, ast.Expr):
+        node = node.value
+    elif isinstance(node, ast.Assign):
+        node = node.value
+    elif isinstance(node, ast.AnnAssign) and node.value is not None:
+        node = node.value
+    elif isinstance(node, ast.Return) and node.value is not None:
+        node = node.value
+    if isinstance(node, ast.Await):
+        node = node.value
+    if isinstance(node, ast.Call):
+        try:
+            return ast.unparse(node.func)
+        except Exception:  # pragma: no cover - defensive
+            return None
+    return None
+
+
+def _ordered_calls_from_body(body: list[ast.stmt]) -> list[str]:
+    out: list[str] = []
+    for stmt in body:
+        c = _stmt_outermost_call(stmt)
+        if c:
+            out.append(c)
+        if len(out) >= _HOOK_CALLS_CAP:
+            break
+    return out
+
+
+def _fixture_autouse(dec: ast.expr) -> bool:
+    if isinstance(dec, ast.Call):
+        for kw in dec.keywords:
+            if kw.arg == "autouse" and isinstance(kw.value, ast.Constant):
+                return bool(kw.value.value)
+    return False
+
+
+def _split_body_at_yield(
+    body: list[ast.stmt],
+) -> tuple[list[ast.stmt], list[ast.stmt]]:
+    """Split a fixture body into pre-yield (setup) and post-yield (teardown)."""
+    pre: list[ast.stmt] = []
+    post: list[ast.stmt] = []
+    seen = False
+    for stmt in body:
+        is_yield = isinstance(stmt, ast.Expr) and isinstance(
+            stmt.value, ast.Yield | ast.YieldFrom
+        )
+        if is_yield:
+            seen = True
+            continue
+        (post if seen else pre).append(stmt)
+    return pre, post
+
+
+def scan_python_lifecycle_hooks(module_root: Path) -> list[LifecycleHook]:
+    """Discover pytest/unittest setup-teardown hooks under ``tests/``.
+
+    - unittest ``setUpClass``/``tearDownClass``/``setUp``/``tearDown``
+    - pytest module functions ``pytest_runtest_setup``/``_teardown``
+    - autouse ``@pytest.fixture`` (scope maps to before_all vs before_each; a
+      yielding fixture also yields a matching after_* hook)
+    """
+    out: list[LifecycleHook] = []
+    tests_root = module_root / "tests"
+    if not tests_root.is_dir():
+        return out
+    for src in iter_python_files(tests_root):
+        tree = parse_file(src)
+        if tree is None:
+            continue
+        rel = relative_posix(src, module_root)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            if node.name in _UNITTEST_HOOK_EVENTS:
+                out.append(LifecycleHook(
+                    event=_UNITTEST_HOOK_EVENTS[node.name],
+                    file=rel,
+                    framework_construct=node.name,
+                    scope="class" if "Class" in node.name else "function",
+                    calls=_ordered_calls_from_body(node.body),
+                ))
+                continue
+            if node.name in _PYTEST_MODULE_HOOK_EVENTS:
+                out.append(LifecycleHook(
+                    event=_PYTEST_MODULE_HOOK_EVENTS[node.name],
+                    file=rel,
+                    framework_construct=node.name,
+                    calls=_ordered_calls_from_body(node.body),
+                ))
+                continue
+            fixture_dec = next(
+                (d for d in node.decorator_list if _is_pytest_fixture_decorator(d)),
+                None,
+            )
+            # Only autouse fixtures act as implicit setup hooks; explicit
+            # (non-autouse) fixtures are already captured in existing_fixtures.
+            if fixture_dec is None or not _fixture_autouse(fixture_dec):
+                continue
+            scope = _fixture_scope(fixture_dec)
+            before_event = (
+                "before_all"
+                if scope in ("module", "session", "package")
+                else "before_each"
+            )
+            after_event = (
+                "after_all"
+                if scope in ("module", "session", "package")
+                else "after_each"
+            )
+            pre, post = _split_body_at_yield(node.body)
+            construct = f"@pytest.fixture(scope={scope}, autouse=True)"
+            if pre:
+                out.append(LifecycleHook(
+                    event=before_event, file=rel,
+                    framework_construct=construct, scope=scope,
+                    calls=_ordered_calls_from_body(pre),
+                ))
+            if post:
+                out.append(LifecycleHook(
+                    event=after_event, file=rel,
+                    framework_construct=construct, scope=scope,
+                    calls=_ordered_calls_from_body(post),
+                ))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1607,6 +1952,7 @@ def scan_ts_fixtures(module_root: Path) -> list[Fixture]:
 
 
 def scan_ts_auth_flow(module_root: Path, pages: list[PageObject]) -> AuthFlow:
+    open_method = _detect_open_method(pages)
     auth_pages = [p for p in pages if p.scope == "auth"]
     if auth_pages:
         page = auth_pages[0]
@@ -1616,7 +1962,8 @@ def scan_ts_auth_flow(module_root: Path, pages: list[PageObject]) -> AuthFlow:
             else f"{page.file}:{page.class_name}"
         )
         return AuthFlow(type="sso", entry_method=entry,
-                        credentials_env_vars=[], fixture_entry=None)
+                        credentials_env_vars=[], fixture_entry=None,
+                        open_method=open_method)
     # Fallback: grep export login/signIn functions in *auth*.ts files.
     for src in _iter_ts_files(module_root):
         if not _AUTH_FILE_RE.search(src.name):
@@ -1631,8 +1978,81 @@ def scan_ts_auth_flow(module_root: Path, pages: list[PageObject]) -> AuthFlow:
             return AuthFlow(
                 type="sso", entry_method=f"{rel}:{m.group(1)}",
                 credentials_env_vars=[], fixture_entry=None,
+                open_method=open_method,
             )
-    return AuthFlow()
+    return AuthFlow(open_method=open_method)
+
+
+_TS_HOOK_EVENT: dict[str, str] = {
+    "beforeAll": "before_all",
+    "afterAll": "after_all",
+    "beforeEach": "before_each",
+    "afterEach": "after_each",
+    "before": "before_all",   # Mocha
+    "after": "after_all",     # Mocha
+}
+# `test.beforeEach(` / bare `beforeEach(` / `before(` (Mocha). We only scan
+# files under tests/, so bare before/after false positives are unlikely.
+_TS_HOOK_RE = re.compile(
+    r"(?:\btest\s*\.\s*)?\b(beforeAll|afterAll|beforeEach|afterEach|before|after)\s*\(",
+)
+_TS_CALL_CHAIN_RE = re.compile(
+    r"\b([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+)\s*\(",
+)
+
+
+def _ts_balanced_parens_after(text: str, after_open: int) -> str | None:
+    """Return the text between a hook's ``(`` and its matching ``)``.
+
+    ``after_open`` is the index just past the opening paren (``m.end()`` of the
+    hook regex, which ends in ``\\(``). Balancing parens over the ENTIRE
+    callback — signature + body — sidesteps the arrow-param-vs-body brace
+    ambiguity (``async ({ basePage }) => { ... }``): the call-chain regex only
+    matches ``x.y(`` patterns, which never appear in a destructured signature.
+    """
+    depth = 1
+    for j in range(after_open, len(text)):
+        ch = text[j]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return text[after_open:j]
+    return None
+
+
+def _ts_call_chains(block: str) -> list[str]:
+    out: list[str] = []
+    for m in _TS_CALL_CHAIN_RE.finditer(block):
+        out.append(m.group(1))
+        if len(out) >= _HOOK_CALLS_CAP:
+            break
+    return out
+
+
+def scan_ts_lifecycle_hooks(module_root: Path) -> list[LifecycleHook]:
+    """Discover JS/TS ``beforeAll``/``afterAll``/``beforeEach``/``afterEach``
+    (and Mocha ``before``/``after``) hooks under ``tests/``, capturing the
+    ordered method-call chains in each hook body."""
+    out: list[LifecycleHook] = []
+    tests_root = module_root / "tests"
+    if not tests_root.exists():
+        return out
+    for src in _iter_ts_files(tests_root):
+        text = _read_text(src)
+        rel = relative_posix(src, module_root)
+        for m in _TS_HOOK_RE.finditer(text):
+            kw = m.group(1)
+            event = _TS_HOOK_EVENT.get(kw)
+            if not event:
+                continue
+            block = _ts_balanced_parens_after(text, m.end())
+            calls = _ts_call_chains(block) if block else []
+            out.append(LifecycleHook(
+                event=event, file=rel, framework_construct=kw, calls=calls,
+            ))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1780,12 +2200,322 @@ def _find_dirs_named(module_root: Path, names: set[str]) -> list[Path]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Architecture pattern detection + exemplar capture (drives Step 8 lane select)
+# ---------------------------------------------------------------------------
+
+# Directory names that structurally signal the Screenplay pattern (from the
+# researcher agent's §6 globs). A very strong, language-agnostic signal.
+_SCREENPLAY_DIR_NAMES = {"tasks", "questions", "interactions", "abilities", "actors"}
+
+# Base class → exemplar category. A ClassDef whose base resolves to one of
+# these is a reusable Screenplay unit worth capturing verbatim.
+_SCREENPLAY_BASE_CATEGORY = {
+    "Task": "task",
+    "Performable": "task",
+    "Question": "question",
+    "Interaction": "interaction",
+    "Ability": "ability",
+}
+
+# Bespoke frameworks name their base classes with a category keyword rather than
+# the upstream screenpy identifiers (e.g. ``BaseTask``, ``BaseQuestion``,
+# ``SearchPanelInteractions``). Match the keyword as a suffix of the base name.
+# Checked only after the exact-name map; ordered so plurals/longer keywords win.
+_SCREENPLAY_BASE_SUFFIX = (
+    ("Performable", "task"),
+    ("Task", "task"),
+    ("Question", "question"),
+    ("Interactions", "interaction"),
+    ("Interaction", "interaction"),
+    ("Ability", "ability"),
+)
+
+
+def _screenplay_category(base_names: list[str]) -> str | None:
+    """Map a class's base names to a Screenplay exemplar category.
+
+    Recognises both the upstream screenpy identifiers (``Task``, ``Question`` …)
+    and bespoke framework conventions (``BaseTask``, ``BaseQuestion`` …) so the
+    exemplar lane grounds writers in the SUT's real base classes instead of the
+    generic upstream library.
+    """
+    for b in base_names:
+        if b in _SCREENPLAY_BASE_CATEGORY:
+            return _SCREENPLAY_BASE_CATEGORY[b]
+    for b in base_names:
+        for keyword, category in _SCREENPLAY_BASE_SUFFIX:
+            if b.endswith(keyword):
+                return category
+    return None
+
+# Code-level fallback signals when a SUT keeps Screenplay units in one file
+# rather than per-category dirs.
+_SCREENPLAY_PY_CODE_RE = re.compile(
+    rb"attempts_to\b|perform_as\b|answered_by\b|from\s+screenpy\b"
+    rb"|class\s+\w+\s*\(\s*(?:Task|Question|Ability|Interaction|Performable)\b"
+)
+_SCREENPLAY_TS_CODE_RE = re.compile(
+    rb"@serenity-js/core|actorCalled|\.attemptsTo\(|Task\.where|Question\.about"
+    rb"|\bperformAs\b|\bansweredBy\b|\battemptsTo\b"
+)
+
+# Per-exemplar hard cap and the max number of exemplars captured per module.
+_EXEMPLAR_CHAR_CAP = 4000
+_EXEMPLAR_MAX = 3
+# Category ordering when trimming to _EXEMPLAR_MAX — a Task + a Question convey
+# the pattern's shape best; targets show the locator convention.
+_EXEMPLAR_CATEGORY_ORDER = ["task", "question", "interaction", "target", "ability", "other"]
+
+# Files under {ts,tsx,js,mjs,cjs,mts,cts} — bounded glob for the TS code signal.
+_TS_SOURCE_GLOBS = ("**/*.ts", "**/*.tsx", "**/*.js", "**/*.mjs")
+# Bound the file scan for the code-level signal / TS exemplar capture.
+_ARCH_SCAN_FILE_CAP = 600
+
+
+def _base_names(class_def: ast.ClassDef) -> list[str]:
+    """Return the trailing identifier of each base.
+
+    Handles plain names (``BaseTask``), dotted attributes (``screenpy.Task``),
+    and subscripted generics (``BaseQuestion[str]`` → ``BaseQuestion``). The
+    generic case is common for typed Question/Task bases and was previously
+    dropped — silently losing every generic-based unit (e.g. an entire
+    ``question`` category) from exemplar capture.
+    """
+    names: list[str] = []
+    for base in class_def.bases:
+        node = base.value if isinstance(base, ast.Subscript) else base
+        if isinstance(node, ast.Name):
+            names.append(node.id)
+        elif isinstance(node, ast.Attribute):
+            names.append(node.attr)
+    return names
+
+
+def _has_screenplay_code_signal(module_root: Path, language: str) -> bool:
+    """Cheap content scan for Screenplay idioms when the dir signal is absent."""
+    if language == "python":
+        for n, src in enumerate(iter_python_files(module_root)):
+            if n >= _ARCH_SCAN_FILE_CAP:
+                break
+            try:
+                if _SCREENPLAY_PY_CODE_RE.search(src.read_bytes()):
+                    return True
+            except OSError:
+                continue
+        return False
+    if language in ("typescript", "javascript"):
+        n = 0
+        for pat in _TS_SOURCE_GLOBS:
+            for src in module_root.glob(pat):
+                if n >= _ARCH_SCAN_FILE_CAP:
+                    return False
+                if not src.is_file() or _skip_path_part(src.parts):
+                    continue
+                n += 1
+                try:
+                    if _SCREENPLAY_TS_CODE_RE.search(src.read_bytes()):
+                        return True
+                except OSError:
+                    continue
+        return False
+    return False
+
+
+def detect_architecture_pattern(
+    module_root: Path,
+    *,
+    page_objects: list[PageObject] | None = None,
+    locators: list[LocatorClass] | None = None,
+    language: str = "unknown",
+) -> str:
+    """Classify the SUT's test-automation design pattern.
+
+    Returns one of ``pom | screenplay | inline | none | unknown``.
+
+    Signal precedence:
+      1. Screenplay-named dirs (``tasks/``, ``questions/`` …) are authoritative —
+         a very strong structural signal, honoured even if a stray page object
+         exists.
+      2. Otherwise POM wins ties: any detected page object → ``pom`` (or
+         ``inline`` when POMs carry inline locators and no separate locator
+         classes exist).
+      3. A code-only Screenplay signal (single-file units) → ``screenplay``.
+      4. Locator classes but no page objects → ``pom``.
+      5. Nothing detected → ``none``.
+    """
+    page_objects = page_objects or []
+    locators = locators or []
+
+    if _find_dirs_named(module_root, _SCREENPLAY_DIR_NAMES):
+        return "screenplay"
+
+    if page_objects:
+        inline_only = not locators and any(
+            getattr(p, "has_inline_locators", False) for p in page_objects
+        )
+        return "inline" if inline_only else "pom"
+
+    if _has_screenplay_code_signal(module_root, language):
+        return "screenplay"
+
+    if locators:
+        return "pom"
+
+    return "none"
+
+
+def _slice_source(text: str, line_start: int, line_end: int) -> str:
+    """Slice 1-based inclusive [line_start, line_end] and hard-cap the result."""
+    lines = text.splitlines()
+    snippet = "\n".join(lines[max(0, line_start - 1):line_end])
+    if len(snippet) > _EXEMPLAR_CHAR_CAP:
+        snippet = snippet[:_EXEMPLAR_CHAR_CAP] + "\n# ... [truncated by qtea] ..."
+    return snippet
+
+
+def _capture_python_exemplars(module_root: Path) -> list[PatternExemplar]:
+    # (category, PatternExemplar, size) candidates — keep the smallest per category.
+    best: dict[str, tuple[int, PatternExemplar]] = {}
+    for n, src in enumerate(iter_python_files(module_root)):
+        if n >= _ARCH_SCAN_FILE_CAP:
+            break
+        tree = parse_file(src)
+        if tree is None:
+            continue
+        try:
+            text = src.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        rel = relative_posix(src, module_root)
+        rel_dir = rel.rsplit("/", 1)[0] if "/" in rel else "."
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            category = _screenplay_category(_base_names(node))
+            if category is None:
+                continue
+            end = getattr(node, "end_lineno", node.lineno) or node.lineno
+            excerpt = _slice_source(text, node.lineno, end)
+            size = len(excerpt)
+            if category not in best or size < best[category][0]:
+                best[category] = (size, PatternExemplar(
+                    file=rel, category=category, class_name=node.name,
+                    excerpt=excerpt, line_start=node.lineno, line_end=end,
+                    dir=rel_dir,
+                ))
+    return _trim_exemplars([e for _, e in best.values()])
+
+
+def _capture_ts_exemplars(module_root: Path) -> list[PatternExemplar]:
+    """Brace-matched slice of the first class in each Screenplay-signal TS file.
+
+    TS has no AST here (regex-only tier), so this uses a small local brace
+    matcher rather than importing Step 8 utilities (wrong dependency direction).
+    Recognises both upstream Serenity/JS bases (``implements Task``) and bespoke
+    frameworks (``extends BaseTask``) by matching the shared Screenplay category
+    keywords against every heritage identifier — never a single hard-coded base
+    name — so it stays framework- and stack-agnostic.
+    """
+    best: dict[str, tuple[int, PatternExemplar]] = {}
+    # Capture a class declaration and its heritage clause (everything up to the
+    # opening brace of the body): `class Foo extends BaseTask implements X {`.
+    class_re = re.compile(
+        r"(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+(?P<name>\w+)"
+        r"(?P<heritage>[^{;]*)\{",
+    )
+    ident_re = re.compile(r"[A-Za-z_]\w*")
+    n = 0
+    seen: set[Path] = set()
+    for pat in _TS_SOURCE_GLOBS:
+        for src in module_root.glob(pat):
+            if n >= _ARCH_SCAN_FILE_CAP:
+                break
+            if src in seen or not src.is_file() or _skip_path_part(src.parts):
+                continue
+            seen.add(src)
+            n += 1
+            try:
+                text = src.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            rel = relative_posix(src, module_root)
+            rel_dir = rel.rsplit("/", 1)[0] if "/" in rel else "."
+            for m in class_re.finditer(text):
+                heritage = m.group("heritage")
+                if "extends" not in heritage and "implements" not in heritage:
+                    continue
+                category = _screenplay_category(ident_re.findall(heritage))
+                if category is None:
+                    continue
+                excerpt = _brace_matched_slice(text, m.start())
+                size = len(excerpt)
+                if category not in best or size < best[category][0]:
+                    best[category] = (size, PatternExemplar(
+                        file=rel, category=category, class_name=m.group("name"),
+                        excerpt=excerpt, dir=rel_dir,
+                    ))
+    return _trim_exemplars([e for _, e in best.values()])
+
+
+def _brace_matched_slice(text: str, start: int) -> str:
+    """Slice from *start* to the matching close brace, hard-capped."""
+    depth = 0
+    started = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+            started = True
+        elif ch == "}":
+            depth -= 1
+            if started and depth == 0:
+                snippet = text[start:i + 1]
+                break
+    else:
+        snippet = text[start:start + _EXEMPLAR_CHAR_CAP]
+    if len(snippet) > _EXEMPLAR_CHAR_CAP:
+        snippet = snippet[:_EXEMPLAR_CHAR_CAP] + "\n// ... [truncated by qtea] ..."
+    return snippet
+
+
+def _trim_exemplars(exemplars: list[PatternExemplar]) -> list[PatternExemplar]:
+    """Order by category priority and cap the count."""
+    def _rank(e: PatternExemplar) -> int:
+        try:
+            return _EXEMPLAR_CATEGORY_ORDER.index(e.category)
+        except ValueError:
+            return len(_EXEMPLAR_CATEGORY_ORDER)
+    return sorted(exemplars, key=_rank)[:_EXEMPLAR_MAX]
+
+
+def capture_pattern_exemplars(
+    module_root: Path,
+    *,
+    pattern: str,
+    language: str = "unknown",
+) -> list[PatternExemplar]:
+    """Capture 1-2 verbatim reusable-unit snippets for the non-POM exemplar lane.
+
+    Returns ``[]`` for pom / inline / none / unknown so the mature POM path is
+    byte-identical.
+    """
+    if pattern != "screenplay":
+        return []
+    if language == "python":
+        return _capture_python_exemplars(module_root)
+    if language in ("typescript", "javascript"):
+        return _capture_ts_exemplars(module_root)
+    return []
+
+
 def detect_src_directory_layout(
     module_root: Path,
     *,
     page_objects: list[PageObject] | None = None,
     helpers: list[Helper] | None = None,
     language: str = "unknown",
+    architecture_pattern: str = "unknown",
 ) -> SrcDirectoryLayout:
     """Derive where the SUT puts production (non-test) code.
 
@@ -1887,9 +2617,13 @@ def detect_src_directory_layout(
     )
 
     if convention_source == "unknown":
-        # Greenfield fallback (Python only — TS/JS conventions vary too
-        # widely for a useful default; leave fields None).
-        if language == "python":
+        # Greenfield fallback. ONLY synthesise the POM-shaped `pages/object`
+        # + `pages/locators` layout for POM-family patterns. For non-POM
+        # patterns (e.g. Screenplay) a `<pkg>/pages/object` path is a fiction
+        # that poisons Step 7/8 placement (root cause of run
+        # 20260715-075512-f2dbad) — leave the POM dir fields None; the
+        # exemplar lane derives placement from `pattern_exemplars[].dir`.
+        if language == "python" and architecture_pattern in ("pom", "inline", "unknown"):
             pkg = package_root or f"src/{module_root.name.lower().replace('-', '_')}"
             package_root = package_root or pkg
             pages_object_dir = f"{pkg}/pages/object"
@@ -1897,7 +2631,9 @@ def detect_src_directory_layout(
             helpers_dir = f"{pkg}/helpers"
             convention_source = "fallback"
         else:
-            convention_source = "fallback"  # fields stay None for non-Python
+            # Non-POM, or non-Python: keep any detected package_root, leave
+            # POM dir fields None.
+            convention_source = "fallback"
 
     return SrcDirectoryLayout(
         package_root=package_root,
@@ -1957,6 +2693,7 @@ def detect_module_inventory(sut_root: Path, module_rel: str) -> ModuleInventory:
     helpers: list[Helper] = []
     fixtures: list[Fixture] = []
     locators: list[LocatorClass] = []
+    lifecycle_hooks: list[LifecycleHook] = []
     auth = AuthFlow()
 
     if language == "python":
@@ -1964,17 +2701,28 @@ def detect_module_inventory(sut_root: Path, module_rel: str) -> ModuleInventory:
         helpers = scan_python_helpers(module_root)
         fixtures = scan_python_fixtures(module_root)
         locators = scan_python_locators(module_root)
+        lifecycle_hooks = scan_python_lifecycle_hooks(module_root)
         auth = scan_python_auth_flow(module_root, pages, fixtures)
     elif language in ("typescript", "javascript"):
         pages = scan_ts_page_objects(module_root)
         helpers = scan_ts_helpers(module_root)
         fixtures = scan_ts_fixtures(module_root)
         locators = scan_ts_locators(module_root)
+        lifecycle_hooks = scan_ts_lifecycle_hooks(module_root)
         auth = scan_ts_auth_flow(module_root, pages)
     # Other languages: leave empty for Tier 3 (LLM) to fill in.
 
+    # Detect the design pattern BEFORE the src layout so the POM-shaped
+    # fallback is suppressed for non-POM SUTs (Screenplay etc.).
+    architecture_pattern = detect_architecture_pattern(
+        module_root, page_objects=pages, locators=locators, language=language,
+    )
     src_layout = detect_src_directory_layout(
         module_root, page_objects=pages, helpers=helpers, language=language,
+        architecture_pattern=architecture_pattern,
+    )
+    pattern_exemplars = capture_pattern_exemplars(
+        module_root, pattern=architecture_pattern, language=language,
     )
     custom_test_id = detect_custom_test_id_attribute(module_root)
 
@@ -1996,8 +2744,11 @@ def detect_module_inventory(sut_root: Path, module_rel: str) -> ModuleInventory:
         existing_helpers=helpers,
         existing_fixtures=fixtures,
         existing_locators=locators,
+        lifecycle_hooks=lifecycle_hooks,
         auth_flow=auth,
         custom_test_id_attribute=custom_test_id,
+        architecture_pattern=architecture_pattern,
+        pattern_exemplars=pattern_exemplars,
         source=source,
     )
 
@@ -2229,12 +2980,31 @@ def _clone_module_inventory(src: ModuleInventory) -> ModuleInventory:
             )
             for lc in src.existing_locators
         ],
+        lifecycle_hooks=[
+            LifecycleHook(
+                event=hk.event, file=hk.file,
+                framework_construct=hk.framework_construct,
+                scope=hk.scope, calls=list(hk.calls),
+            )
+            for hk in src.lifecycle_hooks
+        ],
         auth_flow=AuthFlow(
             type=src.auth_flow.type,
             entry_method=src.auth_flow.entry_method,
             credentials_env_vars=list(src.auth_flow.credentials_env_vars),
             fixture_entry=src.auth_flow.fixture_entry,
+            open_method=src.auth_flow.open_method,
         ),
+        custom_test_id_attribute=src.custom_test_id_attribute,
+        architecture_pattern=src.architecture_pattern,
+        pattern_exemplars=[
+            PatternExemplar(
+                file=e.file, category=e.category, class_name=e.class_name,
+                excerpt=e.excerpt, line_start=e.line_start, line_end=e.line_end,
+                dir=e.dir,
+            )
+            for e in src.pattern_exemplars
+        ],
         source=src.source,
     )
 
@@ -2399,6 +3169,58 @@ def merge_llm_inventory(
             out.auth_flow.credentials_env_vars = [str(x) for x in envs if isinstance(x, (str, int))]
         if not out.auth_flow.fixture_entry and auth_llm.get("fixture_entry"):
             out.auth_flow.fixture_entry = str(auth_llm["fixture_entry"])
+        if not out.auth_flow.open_method and auth_llm.get("open_method"):
+            out.auth_flow.open_method = str(auth_llm["open_method"])
+
+    # Lifecycle hooks: append LLM-supplied hooks that don't collide on
+    # (event, file). Deterministic Tier-1/2 covers Python + TS/JS; Java and
+    # other stacks arrive only via the LLM (Tier 3).
+    existing_hook_keys = {
+        (hk.event, hk.file) for hk in out.lifecycle_hooks
+    }
+    _VALID_HOOK_EVENTS = {"before_all", "after_all", "before_each", "after_each"}
+    for hk in llm.get("lifecycle_hooks") or []:
+        if not isinstance(hk, dict):
+            continue
+        event = str(hk.get("event") or "")
+        if event not in _VALID_HOOK_EVENTS or not hk.get("file"):
+            continue
+        key = (event, str(hk["file"]))
+        if key in existing_hook_keys:
+            continue
+        existing_hook_keys.add(key)
+        calls = hk.get("calls") or []
+        out.lifecycle_hooks.append(LifecycleHook(
+            event=event, file=str(hk["file"]),
+            framework_construct=str(hk.get("framework_construct", "")),
+            scope=hk.get("scope"),
+            calls=[str(c) for c in calls if isinstance(c, (str, int))],
+        ))
+
+    # Navigation preconditions: LLM-only field, no deterministic producer
+    # (unlike hooks, there's no narrow structural region to scan — this is
+    # mined from judgment across arbitrarily-shaped test bodies). Append,
+    # deduped on (method, requires_call).
+    existing_nav_keys = {
+        (np_.method, np_.requires_call) for np_ in out.navigation_preconditions
+    }
+    for np_entry in llm.get("navigation_preconditions") or []:
+        if not isinstance(np_entry, dict):
+            continue
+        method = str(np_entry.get("method") or "")
+        requires_call = str(np_entry.get("requires_call") or "")
+        if not method or not requires_call:
+            continue
+        key = (method, requires_call)
+        if key in existing_nav_keys:
+            continue
+        existing_nav_keys.add(key)
+        out.navigation_preconditions.append(NavigationPrecondition(
+            method=method,
+            requires_call=requires_call,
+            requires_args_hint=np_entry.get("requires_args_hint"),
+            evidence=str(np_entry.get("evidence") or ""),
+        ))
 
     # Update source tag.
     if deterministic.source == "llm_only":
@@ -2516,6 +3338,8 @@ __all__ = [
     "AuthFlow",
     "Fixture",
     "Helper",
+    "LifecycleHook",
+    "NavigationPrecondition",
     "LocatorClass",
     "LocatorConstant",
     "ModuleInventory",
@@ -2533,8 +3357,11 @@ __all__ = [
     "scan_python_auth_flow",
     "scan_python_fixtures",
     "scan_python_helpers",
+    "scan_python_lifecycle_hooks",
     "scan_python_locators",
     "scan_python_page_objects",
+    "scan_ts_auth_flow",
+    "scan_ts_lifecycle_hooks",
     "scan_ts_locators",
     "scan_ts_page_objects",
 ]

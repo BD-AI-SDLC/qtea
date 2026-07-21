@@ -21,6 +21,47 @@ from pathlib import Path
 from qtea.steps.base import StepContext
 
 
+def _derive_scan_roots(ctx: StepContext, sut_root: Path) -> list[Path]:
+    """Directories to scan for ``tbd()`` sentinels.
+
+    Starts from the conventional POM roots (``src``/``tests``/``pages``) and
+    adds inventory-derived roots so non-POM layouts (e.g. Screenplay under
+    ``framework/``) are covered — the active module's ``package_root``, the
+    first path segment of each captured ``pattern_exemplars[].dir``, and the
+    test ``base_dir``. Without this, a Screenplay SUT's deferred-Target
+    ``tbd()`` calls under ``framework/`` are silently never prewarmed.
+    Falls back to the whole SUT when nothing resolves.
+    """
+    rel_dirs: set[str] = {"src", "tests", "pages"}
+    try:
+        research_path = ctx.workspace.step_dir(6) / "research.json"
+        if research_path.is_file():
+            research = json.loads(research_path.read_text(encoding="utf-8"))
+            inv = research.get("sut_inventory") or {}
+            active = inv.get("active_module")
+            for mod in inv.get("modules") or []:
+                if not isinstance(mod, dict) or mod.get("name") != active:
+                    continue
+                src_layout = mod.get("src_directory_layout") or {}
+                pkg = src_layout.get("package_root")
+                if isinstance(pkg, str) and pkg:
+                    rel_dirs.add(pkg.replace("\\", "/").strip("/").split("/")[0])
+                for ex in mod.get("pattern_exemplars") or []:
+                    d = (ex.get("dir") or "").replace("\\", "/").strip("/")
+                    if d and d != ".":
+                        rel_dirs.add(d.split("/")[0])
+                test_layout = mod.get("test_directory_layout") or {}
+                base = test_layout.get("base_dir")
+                if isinstance(base, str) and base:
+                    rel_dirs.add(base.replace("\\", "/").strip("/").split("/")[0])
+                break
+    except (OSError, json.JSONDecodeError, KeyError):
+        pass
+
+    roots = [sut_root / d for d in sorted(rel_dirs) if (sut_root / d).is_dir()]
+    return roots or [sut_root]
+
+
 def _prewarm_jit_cache_dev_pool(
     *,
     ctx: StepContext,
@@ -42,9 +83,7 @@ def _prewarm_jit_cache_dev_pool(
     from qtea.tbd_scanner import scan_tbd_intents
 
     sut_root = ctx.workspace.sut
-    scan_roots = [p for p in (sut_root / d for d in ("src", "tests", "pages")) if p.is_dir()]
-    if not scan_roots:
-        scan_roots = [sut_root]
+    scan_roots = _derive_scan_roots(ctx, sut_root)
     hits = scan_tbd_intents(scan_roots, sut_root=sut_root)
     if not hits:
         return 0

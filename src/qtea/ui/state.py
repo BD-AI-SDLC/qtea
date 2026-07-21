@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from collections.abc import Callable
@@ -152,6 +153,11 @@ class AppState:
     storage_state: str = ""
     dev_locators: str = ""
     text_scale: float = 1.0
+    # Optional operator context captured on the pre-run screen. Per-run and
+    # spec-specific, so it is NOT persisted in prefs and NOT cleared by
+    # reset_run() (the context screen sets it fresh — or empty on Skip —
+    # immediately before each launch).
+    operator_context: str = ""
 
     # ── Resume from a prior workspace (UI mirror of CLI --run-id / --from-step) ──
     # Empty string + None ⇒ fresh run. When ``resume_run_id`` is set, ``from_step``
@@ -323,8 +329,13 @@ class AppState:
         self._listeners.append(listener)
 
     def notify(self) -> None:
+        # Guard each listener independently: a stale subscriber (e.g. a torn-down
+        # view whose controls are already detached from the page) must not let
+        # its exception escape and crash the whole session / blank the page.
+        # One bad listener no-ops; the rest still run.
         for cb in self._listeners:
-            cb()
+            with contextlib.suppress(Exception):
+                cb()
 
     def save_prefs(self) -> None:
         _save_prefs(

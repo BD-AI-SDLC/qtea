@@ -1,6 +1,6 @@
 """Step 9 runner-failure diagnostics — stderr AND stdout must both surface.
 
-Regression guard for run 20260701-114656-9394eb where Playwright's real
+Regression guard for a class of failure where Playwright's real
 SyntaxError lived in the JSON reporter's stdout but the failure-context
 handed to the debug agent only carried a 27-byte stderr snippet (the
 benign `qtea {"event":"installed"}` marker). The prior `elif` collapsed
@@ -19,7 +19,7 @@ from qtea.steps.s09_execute import _compose_runner_stream_diagnostics
 def test_both_streams_appear_when_both_non_empty():
     stderr = "qtea {\"event\":\"installed\"}"
     stdout = (
-        "SyntaxError: qtea_ropa_approval_test.spec.ts: Unexpected token (1:0)\n"
+        "SyntaxError: qtea_entity_approval_test.spec.ts: Unexpected token (1:0)\n"
         "> 1 | # Stack: typescript+playwright\n"
     )
     out = _compose_runner_stream_diagnostics(stderr, stdout)

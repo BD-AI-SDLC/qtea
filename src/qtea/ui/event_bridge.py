@@ -195,6 +195,16 @@ class _UILogHandler(logging.Handler):
         self._loop.call_soon_threadsafe(self._do_notify)
 
     def _do_notify(self) -> None:
+        # Once Stop is requested, the UI has already snap-navigated to
+        # /results and cleared state listeners. The cancelled task still
+        # unwinds through a burst of step.end/log events, each scheduled
+        # here; a page.update() from that burst landing while
+        # navigate_to("/results") is mid clear-and-rebuild corrupts the
+        # Flutter tree (SESSION_CRASHED -> reconnect flicker). Go silent the
+        # instant Stop fires — reset_run() clears cancel_requested for the
+        # next run.
+        if self.state.cancel_requested:
+            return
         self.state.notify()
         with contextlib.suppress(Exception):
             self.page.update()

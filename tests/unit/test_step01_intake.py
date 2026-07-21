@@ -119,6 +119,93 @@ async def test_intake_url_passthrough(tmp_path: Path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Docupedia (Confluence DC) — authenticated fetch; passthrough, no agent
+# ---------------------------------------------------------------------------
+
+_DOCU_URL = (
+    "https://inside-docupedia.bosch.com/confluence/spaces/AIENG/"
+    "pages/4486682440/Architecture+-+Test+bed"
+)
+
+
+async def test_intake_docupedia_direct_passthrough(tmp_path: Path, monkeypatch):
+    """Direct Docupedia URL: fetch authenticated, write markdown, no LLM call."""
+    ctx = _ctx(tmp_path, _DOCU_URL)
+    monkeypatch.setattr(
+        "qtea.steps.s01_intake.fetch_page_markdown",
+        lambda _url: ("Architecture - Test bed", "# Arch\n\nDISTINCTIVE_DOCU_MARKER\n"),
+    )
+    # Tripwire: agent must NOT be called for Docupedia sources.
+    install_fake_anthropic(monkeypatch, text="should not appear")
+
+    result = await IntakeStep().run(ctx)
+
+    assert result.success is True
+    spec_text = (ctx.workspace.step_dir(1) / "spec.md").read_text(encoding="utf-8")
+    assert "DISTINCTIVE_DOCU_MARKER" in spec_text
+    assert "should not appear" not in spec_text
+    jira_stub = (ctx.workspace.step_dir(1) / "jira-spec.md").read_text(encoding="utf-8")
+    assert "Docupedia source" in jira_stub
+
+
+async def test_intake_docupedia_direct_hard_fail(tmp_path: Path, monkeypatch):
+    """Direct Docupedia URL with a fetch error → Step 1 hard-fails."""
+    from qtea.confluence_client import ConfluenceFetchError
+
+    ctx = _ctx(tmp_path, _DOCU_URL)
+
+    def _boom(_url):
+        raise ConfluenceFetchError("no DOCUPEDIA_PAT")
+
+    monkeypatch.setattr("qtea.steps.s01_intake.fetch_page_markdown", _boom)
+
+    result = await IntakeStep().run(ctx)
+
+    assert result.success is False
+    assert result.status == "failed"
+
+
+async def test_intake_docupedia_embedded_link_appended(tmp_path: Path, monkeypatch):
+    """A Docupedia link inside a local spec is fetched and appended as context."""
+    src = tmp_path / "input.md"
+    src.write_text(f"# Spec\n\nSee {_DOCU_URL} for architecture.\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "qtea.steps.s01_intake.fetch_page_markdown",
+        lambda _url: ("Architecture - Test bed", "Fetched Docupedia body."),
+    )
+    install_fake_anthropic(monkeypatch, text="should not appear")
+
+    ctx = _ctx(tmp_path, str(src))
+    result = await IntakeStep().run(ctx)
+
+    assert result.success is True
+    spec_text = (ctx.workspace.step_dir(1) / "spec.md").read_text(encoding="utf-8")
+    assert "Linked Docupedia Context" in spec_text
+    assert "Fetched Docupedia body." in spec_text
+
+
+async def test_intake_docupedia_embedded_best_effort(tmp_path: Path, monkeypatch):
+    """An embedded Docupedia link that fails to fetch never aborts intake."""
+    from qtea.confluence_client import ConfluenceFetchError
+
+    src = tmp_path / "input.md"
+    src.write_text(f"# Spec\n\nSee {_DOCU_URL}.\n", encoding="utf-8")
+
+    def _boom(_url):
+        raise ConfluenceFetchError("access denied")
+
+    monkeypatch.setattr("qtea.steps.s01_intake.fetch_page_markdown", _boom)
+
+    ctx = _ctx(tmp_path, str(src))
+    result = await IntakeStep().run(ctx)
+
+    assert result.success is True
+    spec_text = (ctx.workspace.step_dir(1) / "spec.md").read_text(encoding="utf-8")
+    assert "Linked Docupedia Context" not in spec_text
+
+
+# ---------------------------------------------------------------------------
 # JIRA path: jira:KEY shorthand → REST + ticket-to-ai-spec agent
 # ---------------------------------------------------------------------------
 
@@ -220,6 +307,77 @@ async def test_intake_jira_inlines_payload_with_shape_a_header(
     assert "jira-issue.json" in user_content
     # Shape-B header must NOT appear (this is a JIRA call).
     assert "spec-source.md" not in user_content
+
+
+# ---------------------------------------------------------------------------
+# Operator context injection (ticket sources only)
+# ---------------------------------------------------------------------------
+
+
+async def test_intake_jira_injects_operator_context(tmp_path: Path, monkeypatch):
+    """Operator context reaches the enrichment LLM under `user-context.md`."""
+    monkeypatch.setenv("JIRA_BASE_URL", "https://x.atlassian.net")
+    monkeypatch.setenv("JIRA_EMAIL", "u@b.com")
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+    monkeypatch.setattr(
+        "qtea.steps.s01_intake.fetch_issue",
+        lambda base_url, ticket_id: _fake_jira_payload(),
+    )
+
+    captured: dict = {}
+    install_fake_anthropic(monkeypatch, text=_AGENT_SPEC_MD, on_call=captured.update)
+
+    ctx = _ctx(tmp_path, "jira:PROJ-1")
+    ctx.operator_context = "OP_CTX_MARKER_JIRA"
+    result = await IntakeStep().run(ctx)
+    assert result.success, result.error
+
+    user_content = captured["messages"][-1]["content"]
+    assert "user-context.md" in user_content
+    assert "OP_CTX_MARKER_JIRA" in user_content
+
+
+async def test_intake_jira_no_operator_context_omits_input(tmp_path: Path, monkeypatch):
+    """No operator context ⇒ no user-context.md input (unchanged behavior)."""
+    monkeypatch.setenv("JIRA_BASE_URL", "https://x.atlassian.net")
+    monkeypatch.setenv("JIRA_EMAIL", "u@b.com")
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+    monkeypatch.setattr(
+        "qtea.steps.s01_intake.fetch_issue",
+        lambda base_url, ticket_id: _fake_jira_payload(),
+    )
+
+    captured: dict = {}
+    install_fake_anthropic(monkeypatch, text=_AGENT_SPEC_MD, on_call=captured.update)
+
+    ctx = _ctx(tmp_path, "jira:PROJ-1")  # operator_context defaults to None
+    result = await IntakeStep().run(ctx)
+    assert result.success, result.error
+
+    assert "user-context.md" not in captured["messages"][-1]["content"]
+
+
+async def test_intake_ado_injects_operator_context(tmp_path: Path, monkeypatch):
+    """Operator context reaches the ADO enrichment LLM under `user-context.md`."""
+    monkeypatch.setenv("AZDO_ORG", "Org")
+    monkeypatch.setenv("AZDO_PROJECT", "Proj")
+    monkeypatch.setenv("AZDO_PAT", "fake-pat")
+    monkeypatch.setattr(
+        "qtea.steps.s01_intake.fetch_work_item",
+        lambda org, project, item_id: _fake_ado_payload(),
+    )
+
+    captured: dict = {}
+    install_fake_anthropic(monkeypatch, text=_AGENT_SPEC_MD, on_call=captured.update)
+
+    ctx = _ctx(tmp_path, "ado:9370")
+    ctx.operator_context = "OP_CTX_MARKER_ADO"
+    result = await IntakeStep().run(ctx)
+    assert result.success, result.error
+
+    user_content = captured["messages"][-1]["content"]
+    assert "user-context.md" in user_content
+    assert "OP_CTX_MARKER_ADO" in user_content
 
 
 # ---------------------------------------------------------------------------

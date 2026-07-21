@@ -427,7 +427,7 @@ def _url_role_rank(url: str) -> int:
     """Rank a URL by its host's environment role. QA wins, prod/live lose.
 
     Mirrors ``_role_for_key`` but classifies the hostname (config baseURLs
-    carry the role in the host, e.g. ``grchub-qa.example.com``), not a key.
+    carry the role in the host, e.g. ``app-qa.example.com``), not a key.
 
     Non-production roles require a WHOLE-TOKEN match (host split on ``. - _``)
     so ``latest``/``product``/``backstage`` are not mis-read as test/prod/stage.

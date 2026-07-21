@@ -63,6 +63,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -138,6 +139,232 @@ def _filter_empty_args(args: list[Any]) -> list[str]:
     return [str(a) for a in args if a not in ("", None)]
 
 
+# ---------------------------------------------------------------------------
+# Playwright MCP launch optimisation: bypass npx via a pinned local install
+# ---------------------------------------------------------------------------
+#
+# ``npx @playwright/mcp@<v>`` re-resolves the package tree and re-spawns node on
+# EVERY invocation. On corporate Windows hosts (real-time AV scanning the npm
+# cache) that overhead can be enormous -- on corporate networks with AV
+# scanning of the npm cache, spawn times of ~2-3 MINUTES have been observed
+# vs ~4-6 s for a direct ``node cli.js``. The Agent SDK freezes an agent's
+# tool list once ``MCP_TIMEOUT`` (60 s) elapses, so a slow npx spawn leaves
+# the Playwright server ``pending`` for the whole run (surfaced as
+# ``step07.live_explore_mcp_unavailable`` -- 0 routes captured).
+#
+# Fix: install the pinned version ONCE into a qtea-managed dir and invoke its
+# ``cli.js`` directly with node. The committed ``.mcp.json`` keeps the npx form
+# as a zero-setup fallback; ``_rewrite_npx_playwright_to_node`` only swaps it
+# for the node form when a pinned install is actually present. Still stdio,
+# still per-call isolation — this only changes HOW the same server is launched.
+
+PLAYWRIGHT_SERVER_NAME = "playwright"
+_PLAYWRIGHT_PKG = "@playwright/mcp"
+# Fallback only — the authoritative version is the ``@playwright/mcp@<v>`` pin
+# in ``.mcp.json`` (parsed by ``pinned_playwright_version``). Keep in sync.
+_DEFAULT_PLAYWRIGHT_MCP_VERSION = "0.0.78"
+
+
+def playwright_mcp_install_dir() -> Path:
+    """Stable, qtea-managed dir holding the pinned ``@playwright/mcp`` install.
+
+    Override with ``QTEA_MCP_INSTALL_DIR``; defaults to ``~/.qtea/mcp``. This is
+    pipeline-managed state (like ``~/.qtea/incident-memory``), never written by
+    agents — it holds the ``node_modules`` for the direct-node launch.
+    """
+    override = os.environ.get("QTEA_MCP_INSTALL_DIR")
+    if override:
+        return Path(override)
+    return Path.home() / ".qtea" / "mcp"
+
+
+def resolve_playwright_cli() -> Path | None:
+    """Path to a pinned ``@playwright/mcp`` ``cli.js``, or ``None``.
+
+    Order: ``QTEA_PLAYWRIGHT_MCP_CLI`` env override, then the qtea-managed
+    install dir. ``None`` means no pinned install → callers keep the npx form.
+    """
+    override = os.environ.get("QTEA_PLAYWRIGHT_MCP_CLI")
+    if override and Path(override).is_file():
+        return Path(override)
+    cli = (
+        playwright_mcp_install_dir()
+        / "node_modules" / "@playwright" / "mcp" / "cli.js"
+    )
+    return cli if cli.is_file() else None
+
+
+def pinned_playwright_version(source: Path | None = None) -> str:
+    """Return the ``@playwright/mcp`` version pinned in ``.mcp.json``.
+
+    Single source of truth: parses ``@playwright/mcp@<v>`` from the playwright
+    server's args so the managed install and the config never drift. Falls back
+    to :data:`_DEFAULT_PLAYWRIGHT_MCP_VERSION` when unreadable / unpinned.
+    """
+    try:
+        cfg = source or find_mcp_config()
+        raw = json.loads(cfg.read_text(encoding="utf-8"))
+        spec = (raw.get("mcpServers") or {}).get(PLAYWRIGHT_SERVER_NAME) or {}
+        for arg in spec.get("args") or []:
+            if isinstance(arg, str) and arg.startswith(_PLAYWRIGHT_PKG + "@"):
+                return arg.split("@", 2)[-1]
+    except (OSError, ValueError, KeyError):
+        pass
+    return _DEFAULT_PLAYWRIGHT_MCP_VERSION
+
+
+def _rewrite_npx_playwright_to_node(
+    name: str, spec: dict[str, Any],
+) -> dict[str, Any]:
+    """Swap an npx-based playwright spec for a direct ``node cli.js`` launch.
+
+    No-op unless (a) this is the playwright server, (b) it's the npx form, and
+    (c) a pinned install exists. Keeps every arg AFTER the package spec
+    (``--headless``, storage-state, …) so the launch is behaviourally identical
+    — only the launcher changes. Returns a NEW dict; never mutates ``spec``.
+    """
+    if name != PLAYWRIGHT_SERVER_NAME or not isinstance(spec, dict):
+        return spec
+    if "npx" not in str(spec.get("command", "")).lower():
+        return spec  # already node/other — leave untouched
+    args = list(spec.get("args") or [])
+    pkg_idx = next(
+        (i for i, a in enumerate(args)
+         if isinstance(a, str) and a.startswith(_PLAYWRIGHT_PKG)),
+        None,
+    )
+    if pkg_idx is None:
+        return spec
+    cli = resolve_playwright_cli()
+    if cli is None:
+        return spec  # no pinned install → keep the npx fallback
+    return {**spec, "command": "node", "args": [str(cli), *args[pkg_idx + 1:]]}
+
+
+def ensure_playwright_mcp_installed(
+    version: str | None = None, timeout_s: float = 900.0,
+) -> tuple[bool, str]:
+    """Ensure a pinned ``@playwright/mcp`` is installed in the managed dir.
+
+    Idempotent: a fast no-op when :func:`resolve_playwright_cli` already finds
+    the ``cli.js``. Otherwise runs ``npm install --prefix <dir>
+    @playwright/mcp@<v>`` ONCE — the setup step that unlocks the direct-node
+    launch. Best-effort: returns ``(False, reason)`` on any failure so callers
+    can transparently fall back to npx.
+    """
+    existing = resolve_playwright_cli()
+    if existing is not None:
+        return True, f"present: {existing}"
+    if os.environ.get("QTEA_MCP_NO_AUTO_INSTALL"):
+        # Managed/air-gapped hosts provision the install out-of-band; callers
+        # then fall back to npx. Also the switch tests use to stay hermetic.
+        return False, "auto-install disabled (QTEA_MCP_NO_AUTO_INSTALL)"
+    npm = shutil.which("npm")
+    if not npm:
+        return False, "npm not on PATH"
+    version = version or pinned_playwright_version()
+    install_dir = playwright_mcp_install_dir()
+    try:
+        install_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return False, f"cannot create install dir: {e}"
+    cmd = [
+        npm, "install", "--prefix", str(install_dir),
+        f"{_PLAYWRIGHT_PKG}@{version}",
+        "--no-audit", "--no-fund", "--prefer-offline", "--loglevel=error",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True,
+            env=safe_subprocess_env(), timeout=timeout_s, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"npm install timed out after {timeout_s:.0f}s"
+    except OSError as e:
+        return False, f"npm install spawn error: {e}"
+    cli = resolve_playwright_cli()
+    if cli is not None:
+        return True, f"installed {version}: {cli}"
+    return False, (
+        f"npm install rc={proc.returncode}: "
+        f"{(proc.stderr or proc.stdout or '').strip()[:200]}"
+    )
+
+
+def _playwright_browsers_path() -> Path:
+    """Default Playwright browser cache dir (honours ``PLAYWRIGHT_BROWSERS_PATH``)."""
+    override = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if override:
+        return Path(override)
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "ms-playwright"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "ms-playwright"
+    return Path.home() / ".cache" / "ms-playwright"
+
+
+def _has_chromium_build() -> bool:
+    """Cheap heuristic: any ``chromium*`` build present in the browser cache.
+
+    A heuristic, not a guarantee — the exact revision @playwright/mcp needs may
+    still be absent (the server then downloads it on first navigate). Used to
+    skip the (slower) install on the hot path; ``doctor`` runs the authoritative
+    ``install chromium`` regardless.
+    """
+    try:
+        return any(
+            c.is_dir() and c.name.startswith("chromium")
+            for c in _playwright_browsers_path().iterdir()
+        )
+    except OSError:
+        return False
+
+
+def ensure_playwright_mcp_browser(
+    timeout_s: float = 600.0, *, force: bool = False,
+) -> tuple[bool, str]:
+    """Ensure the Chromium build @playwright/mcp uses is installed.
+
+    Uses the *version-matched* Playwright bundled inside the managed install
+    (``node <dir>/node_modules/playwright/cli.js install chromium``) so the
+    revision matches what the pinned server expects — ``npx playwright install
+    chromium`` would fetch an unrelated standard build. Idempotent (Playwright's
+    own install no-ops when the revision is present).
+
+    On the hot path pass ``force=False`` (default): a cheap ``chromium*``
+    presence check short-circuits so warm runs pay nothing. ``doctor`` passes
+    ``force=True`` for an authoritative, revision-exact install.
+    """
+    if not force and _has_chromium_build():
+        return True, "chromium present (fs check)"
+    if os.environ.get("QTEA_MCP_NO_AUTO_INSTALL"):
+        return False, "auto-install disabled (QTEA_MCP_NO_AUTO_INSTALL)"
+    node = shutil.which("node")
+    pw_cli = (
+        playwright_mcp_install_dir()
+        / "node_modules" / "playwright" / "cli.js"
+    )
+    if not node or not pw_cli.is_file():
+        return False, "managed playwright not installed (run ensure_playwright_mcp_installed first)"
+    try:
+        proc = subprocess.run(
+            [node, str(pw_cli), "install", "chromium"],
+            capture_output=True, text=True,
+            env=safe_subprocess_env(), timeout=timeout_s, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"browser install timed out after {timeout_s:.0f}s"
+    except OSError as e:
+        return False, f"browser install spawn error: {e}"
+    if proc.returncode == 0:
+        return True, "chromium installed (version-matched)"
+    return False, (
+        f"browser install rc={proc.returncode}: "
+        f"{(proc.stderr or proc.stdout or '').strip()[:200]}"
+    )
+
+
 def load_mcp_config(
     path: Path | None = None,
     env: dict[str, str] | None = None,
@@ -155,6 +382,7 @@ def load_mcp_config(
     out: dict[str, McpServer] = {}
     for name, spec in servers_raw.items():
         resolved = _substitute_env(spec, env)
+        resolved = _rewrite_npx_playwright_to_node(name, resolved)
         out[name] = McpServer(
             name=name,
             command=resolved.get("command", ""),
@@ -195,9 +423,17 @@ def stage_mcp_config(
     # MCP subprocess will choke on.
     if isinstance(rendered, dict):
         servers = rendered.get("mcpServers") or {}
-        for spec in servers.values():
-            if isinstance(spec, dict) and "args" in spec:
-                spec["args"] = _filter_empty_args(list(spec["args"] or []))
+        for name, spec in list(servers.items()):
+            if not isinstance(spec, dict):
+                continue
+            # Rewrite BEFORE filtering: the npx→node swap drops `-y` + the
+            # package spec, and the empty-arg filter then removes any unset
+            # optional tokens (e.g. storage-state) in the surviving tail.
+            spec = _rewrite_npx_playwright_to_node(name, spec)
+            if "args" in spec:
+                spec["args"] = _filter_empty_args(list(spec.get("args") or []))
+            servers[name] = spec
+        rendered["mcpServers"] = servers
     target_dir.mkdir(parents=True, exist_ok=True)
     dst = target_dir / ".mcp.json"
     dst.write_text(json.dumps(rendered, indent=2), encoding="utf-8")
@@ -337,3 +573,119 @@ def _terminate(proc: subprocess.Popen) -> None:
                 proc.kill()
     except Exception:
         pass
+
+
+def _mcp_initialize_handshake(
+    proc: subprocess.Popen, timeout_s: float,
+) -> tuple[bool, str]:
+    """Drive one MCP ``initialize`` request over stdio and await the response.
+
+    Unlike ``probe_server``'s "did it crash?" smoke test, a completed handshake
+    proves the server can actually speak MCP — the strongest readiness signal we
+    can get without a full client. Version-tolerant: any well-formed JSON-RPC
+    response to our ``id`` counts (the server echoes its own protocolVersion),
+    so a protocol mismatch still reads as "up". Non-JSON stdout lines (log
+    banners) are skipped. A background thread drains stderr so a chatty server
+    can't deadlock on a full pipe.
+    """
+    import queue
+    import threading
+    import time as _time
+
+    out_q: queue.Queue[str | None] = queue.Queue()
+    err_lines: list[str] = []
+
+    def _drain(stream, sink, is_stdout: bool) -> None:
+        try:
+            for line in stream:
+                sink(line)
+        except Exception:
+            pass
+        finally:
+            if is_stdout:
+                out_q.put(None)  # stdout EOF sentinel — unblocks the reader
+
+    threading.Thread(
+        target=_drain, args=(proc.stdout, out_q.put, True), daemon=True,
+    ).start()
+    threading.Thread(
+        target=_drain, args=(proc.stderr, err_lines.append, False), daemon=True,
+    ).start()
+
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "qtea-warmup", "version": "1.0"},
+        },
+    }
+    try:
+        proc.stdin.write(json.dumps(request) + "\n")
+        proc.stdin.flush()
+    except OSError as e:
+        return False, f"stdin write failed: {e}"
+
+    deadline = _time.monotonic() + timeout_s
+    while True:
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            return False, f"no initialize response within {timeout_s:.0f}s"
+        try:
+            line = out_q.get(timeout=remaining)
+        except queue.Empty:
+            return False, f"no initialize response within {timeout_s:.0f}s"
+        if line is None:  # stdout closed before responding
+            detail = "".join(err_lines).strip()[:200]
+            return False, f"server closed before responding: {detail}"
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue  # skip non-JSON log output
+        if isinstance(msg, dict) and msg.get("id") == 1:
+            if "result" in msg:
+                return True, "mcp initialize ok"
+            return False, f"initialize error: {msg.get('error')}"
+
+
+def warm_mcp_server(server: McpServer, timeout_s: float = 60.0) -> tuple[bool, str]:
+    """Warm + readiness-probe a stdio MCP server via a real MCP handshake.
+
+    Supersedes ``probe_server`` on the warm paths (Step 7 live-explore, Step 9
+    heal): it returns as soon as the server answers ``initialize`` — typically a
+    few seconds with the direct-node launch — instead of always burning the full
+    ``timeout_s`` like the smoke probe. A ``True`` here means the copy the Agent
+    SDK spawns moments later will reach ``connected`` before the tool list
+    freezes. HTTP servers still route through the lightweight HTTP probe.
+    """
+    if server.type == "http":
+        return _probe_http(server.url, timeout_s=min(timeout_s, 10.0))
+    if not server.command:
+        return False, "no command"
+    resolved = shutil.which(server.command)
+    if not resolved:
+        return False, f"`{server.command}` not on PATH"
+    env = safe_subprocess_env(server.env)
+    try:
+        proc = subprocess.Popen(
+            [resolved, *server.args],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+    except OSError as e:
+        return False, f"spawn error: {e}"
+    try:
+        return _mcp_initialize_handshake(proc, timeout_s)
+    finally:
+        _terminate(proc)

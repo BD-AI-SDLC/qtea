@@ -69,6 +69,15 @@ Document for each bug:
 - Same inputs produce same outputs every time
 - Use fixed, stable test data; document external dependencies
 
+### Shared / Append-Only Counters
+
+Some counted entities are NOT reset per test — a notification inbox, audit log, activity feed, or comment thread accumulates across users, background jobs, and prior runs. Treat any Expected Result targeting one of these as a **delta from a captured baseline**, never an absolute value:
+
+- Bad: `Expected Result: Business Responsible inbox shows exactly 1 notification for the entity`
+- Good: `Steps: ... capture the current notification count for the entity as the baseline ...` / `Expected Result: notification count for the entity equals baseline + 1`
+
+This is a corollary of "avoid shared state" above, but for state the test cannot clean up because it belongs to another actor or persists across runs — the fix is a relative assertion, not a cleanup step.
+
 ### Test Data Sourcing — No Fabrication
 
 Never invent concrete-looking test data identifiers not present in the input spec.

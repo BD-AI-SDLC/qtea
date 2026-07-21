@@ -64,6 +64,7 @@ class PipelineOptions:
     headless: bool = True
     debug: bool = False
     no_fix: bool = False
+    no_incident_memory: bool = False
     strict_xray: bool = False
     skip_steps: set[int] = field(default_factory=set)
     report: str = "auto"
@@ -77,6 +78,19 @@ class PipelineOptions:
     isolated_tests: bool = False
     yes: bool = False
     no_auto_deps: bool = False
+    # Disable the pre-Step-7 headless auth prewarm (driving the SUT's sign-in
+    # helper so site-exploration authenticates). Default off = prewarm enabled.
+    no_auth_capture: bool = False
+    # Run the auth prewarm HEADED (visible browser) so a human can complete an
+    # interactive MFA / captcha challenge. Only effective in an interactive
+    # session (TTY or UI). SSO with a dedicated service user stays headless.
+    auth_headed: bool = False
+    # Auth-prewarm strategy: "headed" (human logs in via a visible browser,
+    # default) | "mcp" (site-explorer logs in via Playwright MCP) | "script"
+    # (run the SUT's sign-in helper in a subprocess) | "off".
+    # None → resolved from QTEA_AUTH_PREWARM_MODE, else "headed". See
+    # s07_auth_prewarm.auth_prewarm_mode.
+    auth_prewarm_mode: str | None = None
     dev_locators: Path | None = None
     # Playwright `storageState.json` for Step 9 heal-agent reuse. CLI
     # override; lower-priority sources (env var, SUT convention path,
@@ -94,6 +108,11 @@ class PipelineOptions:
     no_cleanup: bool = False
     # Desktop UI mode — stdin is not a TTY but HITL should still be active.
     ui_mode: bool = False
+    # Optional operator-supplied free-text context about the spec, captured at
+    # run start (CLI --context/--context-file or the UI pre-run screen). Flows
+    # to Step 1 ticket enrichment and Step 2 refinement as trusted guidance.
+    # None/empty = no context; behavior is unchanged.
+    operator_context: str | None = None
 
 
 def _build_registry() -> dict[int, Step]:
@@ -168,6 +187,20 @@ def _validate_resume_prerequisites(
         )
 
 
+def _purge_step_aux(state: RunState, step: int) -> None:
+    """Drop auxiliary (debug/critical-thinking/PSE) records for one ``step``.
+
+    Aux rows are created only during a step's own ``execute()`` on failure, so
+    removing them by step number before that step re-executes only ever drops
+    records from a prior, superseded run — never the current one. Without this,
+    each resume of a still-failing step stacks another fix-chain trio, inflating
+    the pipeline summary (regression seen on run 20260709-083909-223772).
+    """
+    state.auxiliary_records = [
+        a for a in state.auxiliary_records if a.step != step
+    ]
+
+
 def _reset_steps_from(state: RunState, from_step: int) -> None:
     """Drop checkpoint records for steps >= ``from_step`` so they re-execute.
 
@@ -177,6 +210,12 @@ def _reset_steps_from(state: RunState, from_step: int) -> None:
     for k in list(state.steps.keys()):
         if k >= from_step:
             del state.steps[k]
+    # Aux records are keyed by step; drop them for the re-run range too so a
+    # --from-step resume doesn't stack a fresh fix-chain trio on the prior
+    # run's (the loop-level purge handles the plain-resume path).
+    state.auxiliary_records = [
+        a for a in state.auxiliary_records if a.step < from_step
+    ]
     # Re-open the run so pipeline.end can stamp a new finished_at.
     state.finished_at = None
     state.end_reason = None
@@ -463,6 +502,91 @@ def _select_steps(opts: PipelineOptions) -> list[int]:
     return [i for i in range(start, TOTAL_STEPS + 1) if i not in opts.skip_steps]
 
 
+async def _prewarm_sut_env_for_auth(ctx: StepContext, console: Console) -> None:
+    """After Step 6, install the SUT test env early IF an auth prewarm will use
+    it, so Step 7's site-explorer can authenticate.
+
+    The SUT's Playwright env isn't installed until Step 9 bootstrap, but
+    ``qtea auth-capture`` (which the Step 7 auth prewarm drives) needs it to run
+    the SUT's own sign-in helper. This hoists the install so a storage-state can
+    be produced before exploration. Gated on an auth prewarm actually being
+    applicable (enabled, no existing session, Playwright stack with an
+    ``auth_flow.entry_method``) so runs that won't authenticate pay no early
+    install cost. Best-effort: any failure logs a warning and the pipeline
+    proceeds — Step 9 installs as usual.
+    """
+    try:
+        from qtea.steps.s07_auth_prewarm import (
+            auth_prewarm_mode,
+            headed_mode_requested,
+            is_applicable,
+            is_interactive_session,
+            load_active_module,
+        )
+
+        # Only the `script` strategy runs the SUT's own code and thus needs its
+        # test env early. `headed` drives qtea's OWN Playwright (human-driven
+        # login), `mcp` drives the bundled Playwright MCP, and `off` does nothing
+        # — none need the SUT env, so all skip the early install entirely.
+        if auth_prewarm_mode(ctx.options) != "script":
+            _log.info("pipeline.env_prewarm_skip", reason="mode_not_script")
+            return
+
+        active_module = load_active_module(ctx.workspace.step_dir(6))
+        applicable, reason = is_applicable(
+            sut_root=ctx.workspace.sut.resolve(),
+            workspace_root=ctx.workspace.root,
+            active_module=active_module,
+            cli_storage_state=getattr(ctx.options, "storage_state", None),
+            no_auth_capture=getattr(ctx.options, "no_auth_capture", False),
+            headed_requested=headed_mode_requested(ctx.options),
+            interactive=is_interactive_session(ctx.options),
+        )
+        if not applicable:
+            _log.info("pipeline.env_prewarm_skip", reason=reason)
+            return
+
+        from qtea.steps.s09.attempt_state import _compute_install_sig
+        from qtea.steps.s09.context_loaders import (
+            _framework,
+            _load_stack_profile,
+            _research_payload,
+        )
+        from qtea.test_runner import prepare_sut_env, write_env_prep_marker
+
+        profile = _load_stack_profile(ctx)
+        if profile is None or not profile.install_command:
+            _log.info("pipeline.env_prewarm_skip", reason="no_stack_profile")
+            return
+        framework = _framework(_research_payload(ctx), {})
+        console.print(
+            "[dim]preparing SUT environment early so site-exploration can "
+            "authenticate…[/]"
+        )
+        result = await asyncio.to_thread(
+            prepare_sut_env,
+            profile,
+            cwd=ctx.workspace.sut,
+            framework=framework,
+            install_log_path=ctx.workspace.root / "env-prep.log",
+        )
+        if not result.ok:
+            _log.warning("pipeline.env_prewarm_install_failed", error=result.error)
+            console.print(
+                "[yellow]early SUT env prep failed — continuing; Step 9 will "
+                "install as usual (site-exploration may be unauthenticated)[/]"
+            )
+            return
+        # Record the install signature so Step 9's first attempt skips a
+        # redundant re-install of the now-prepared environment.
+        write_env_prep_marker(
+            ctx.workspace.root, _compute_install_sig(ctx.workspace.sut, profile),
+        )
+        _log.info("pipeline.env_prewarm_done", ran_install=result.ran_install)
+    except Exception as e:  # never let env prewarm break the pipeline
+        _log.warning("pipeline.env_prewarm_unexpected_error", error=str(e))
+
+
 def _mcp_preflight_for_step(
     step: Step,
     *,
@@ -613,6 +737,8 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
             opts.spec = prior_state.spec_source
         if opts.sut is None:
             opts.sut = prior_state.sut_source
+        if opts.operator_context is None:
+            opts.operator_context = prior_state.operator_context
 
     missing = [n for n, v in (("--spec", opts.spec), ("--sut", opts.sut)) if not v]
     if missing:
@@ -668,10 +794,12 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
         workspace=str(ws.root),
         spec_source=opts.spec,
         sut_source=opts.sut,
+        operator_context=opts.operator_context,
     )
     # Refresh source pointers if user changed them.
     state.spec_source = opts.spec
     state.sut_source = opts.sut
+    state.operator_context = opts.operator_context
 
     # Claim this run for the current process. On resume this overwrites the
     # prior (now-dead) pid — correct, since we are the live owner now. Lets
@@ -900,6 +1028,7 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
         state=state,
         spec_source=opts.spec,
         sut_source=opts.sut,
+        operator_context=opts.operator_context,
         options=opts,
     )
 
@@ -947,6 +1076,13 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
                 log.error("step.mcp_preflight_abort", step=step_num)
                 exit_code = 2
                 break
+            # Purge any aux (debug/critical-thinking/PSE) records from a PRIOR
+            # execution of this step so the summary reflects only THIS run's
+            # fix-chain spend. Aux rows are created solely during a step's own
+            # execute() on failure, so filtering by step number is safe — it
+            # only drops superseded records. Covers plain --run-id resume,
+            # --from-step, and the Step 9->8 back-edge (all re-enter this loop).
+            _purge_step_aux(state, step_num)
             result = await step.execute(ctx)
             record = state.steps.get(step_num)
 
@@ -972,10 +1108,13 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
                     ):
                         ctx.extras["_rerun8_used"] = True
                         _reason = ctx.extras.get("rerun_reason", "codegen defect")
+                        _rerun_kind = ctx.extras.pop("rerun_kind", "naming_defect")
                         ctx.extras["step8_defect_feedback"] = _reason
+                        ctx.extras["step8_defect_kind"] = _rerun_kind
                         log.info(
                             "pipeline.step_rerun_requested",
                             from_step=9, target_step=8, reason=_reason,
+                            kind=_rerun_kind,
                         )
                         console.print(
                             f"[yellow]step 09 requested Step 8 regeneration "
@@ -1036,6 +1175,12 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
             console.print()
             console.print(line)
             _after_step_status = True
+
+            # After Step 6 (repo discovery), optionally install the SUT test
+            # env early so the Step 7 site-explorer can authenticate. Gated +
+            # best-effort — see _prewarm_sut_env_for_auth.
+            if step_num == 6:
+                await _prewarm_sut_env_for_auth(ctx, console)
 
         return exit_code
 

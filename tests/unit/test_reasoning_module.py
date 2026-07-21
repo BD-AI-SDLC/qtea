@@ -496,6 +496,19 @@ async def test_model_fallback_on_unavailable_error(tmp_path, monkeypatch):
         def __init__(self):
             self.create = handler
 
+        def stream(self, **kwargs):
+            class _S:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *_a):
+                    return None
+
+                async def get_final_message(self):
+                    return await handler(**kwargs)
+
+            return _S()
+
     class FakeClient:
         def __init__(self, **_kwargs):
             self.messages = FakeMessages()

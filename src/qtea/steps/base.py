@@ -38,6 +38,13 @@ from qtea.hitl import (
     resolve_against_ledger,
     write_answers_file,
 )
+from qtea.incident_memory import (
+    incident_memory_enabled,
+    query_similar,
+    record_incident,
+    render_prior_incidents_md,
+    sut_fingerprint,
+)
 from qtea.logging_setup import get_logger
 from qtea.metrics import CURRENT_STEP_METRICS, StepMetricsAccumulator
 from qtea.workspace import Workspace
@@ -120,6 +127,9 @@ class StepContext:
     spec_source: str
     sut_source: str
     options: Any  # PipelineOptions (avoid circular import in typing)
+    # Optional operator-supplied free-text context about the spec (trusted
+    # guidance). None/empty when not provided; consumed by Steps 1 and 2.
+    operator_context: str | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -283,16 +293,62 @@ async def _run_debug_rca(
     # instruction actually possible to execute.
     step_workdir = ctx.workspace.step_workdir(step_num)
     step_artifacts = ctx.workspace.step_dir_path(step_num)
+    # (d) the qtea pipeline package source (read-only). Many failures are
+    # pipeline defects — a shallow gate matcher, an over-broad regex, a broken
+    # contract — not SUT/test bugs. Without source access the agent guesses the
+    # file/symbol (e.g. attributing the zero-assertions gate to s08_codegen.py
+    # when it lives in test_indexer.py) and downstream fix-proposals inherit the
+    # wrong location. Granting read of the package dir lets the RCA confirm the
+    # exact gate logic. Read-only by the agent's diagnosis-only contract — same
+    # add_dirs-as-read-only pattern Step 6 already uses. Scoped to the package
+    # dir (not the repo root) so the add_dirs quarantine never touches qtea's
+    # own CLAUDE.md/.claude. `QTEA_DEBUG_NO_PIPELINE_SRC=1` opts out.
+    qtea_pkg_src = Path(__file__).resolve().parent.parent
     _dir_candidates = [step_workdir, step_artifacts, ctx.workspace.root]
+    if os.environ.get("QTEA_DEBUG_NO_PIPELINE_SRC", "").strip() not in ("1", "true", "yes"):
+        _dir_candidates.append(qtea_pkg_src)
     add_dirs = [d for d in _dir_candidates if d.exists()] or None
 
     out_path = ctx.workspace.debug / f"step-{step_num:02d}-attempt{attempt}-debug-rca.md"
+
+    # Cross-run incident memory: stage a shortlist of similar past incidents
+    # on THIS SUT so the agent can reuse a known root cause rather than
+    # re-diagnosing from scratch. Retrieval never raises — a missing/corrupt
+    # store degrades to "no prior incidents", never blocks the investigation.
+    inputs = {"failure-context.md": context_file}
+    prior_note = ""
+    if incident_memory_enabled(ctx):
+        similar = query_similar(
+            fingerprint=sut_fingerprint(ctx.sut_source or ""),
+            step_num=step_num,
+            failure_signature=(
+                failure_context.splitlines()[0] if failure_context.strip() else ""
+            ),
+            limit=5,
+        )
+        if similar:
+            prior_incidents = rca_workdir / "prior-incidents.md"
+            prior_incidents.write_text(
+                render_prior_incidents_md(similar), encoding="utf-8"
+            )
+            inputs["prior-incidents.md"] = prior_incidents
+            prior_note = (
+                " Before investigating from scratch, read `./prior-incidents.md` "
+                "— it lists past incidents on THIS SUT that may share the same "
+                "root cause; use it as a lead to confirm or rule out, not as "
+                "ground truth (your own investigation is authoritative)."
+            )
+            log.info(
+                "incident_memory.prior_found",
+                step=step_num,
+                count=len(similar),
+            )
 
     try:
         result = await run_agent(
             agent,
             workdir=rca_workdir,
-            inputs={"failure-context.md": context_file},
+            inputs=inputs,
             user_prompt=(
                 f"Step {step_num} attempt {attempt} failed. Read "
                 f"`./failure-context.md` first, then the step's artefacts "
@@ -301,10 +357,17 @@ async def _run_debug_rca(
                 f"`install.log`, `bug-candidates.json`; for Playwright "
                 f"failures inspect `results[i].stdout` — the JSON reporter "
                 f"emits its structured errors there, NOT to stderr) and any "
-                f"transcripts under `{step_workdir / 'logs'}/`. Produce a "
+                f"transcripts under `{step_workdir / 'logs'}/`. If the failure "
+                f"looks like a qtea pipeline defect (a quality-gate false "
+                f"positive, an over-broad matcher, a broken contract) rather "
+                f"than a SUT/test bug, read the qtea pipeline source under "
+                f"`{qtea_pkg_src}/` (read-only) to confirm the EXACT file, "
+                f"symbol, and logic before naming it — do not guess the "
+                f"location. Produce a "
                 f"structured root-cause analysis at `./debug-rca.md` "
                 f"following the Phase 1-3 protocol in your agent.md. "
                 f"Diagnosis only — do NOT edit source, fixtures, or env."
+                f"{prior_note}"
             ),
             add_dirs=add_dirs,
             timeout_s=DEBUG_AGENT_TIMEOUT_S,
@@ -361,6 +424,7 @@ async def _run_fix_proposal(
     step_num: int,
     ctx: StepContext,
     failure_context: str,
+    result: StepResult,
     debug_rca_path: Path | None = None,
 ) -> Path | None:
     """Auto-fires on retry exhaustion (unless ``--no-fix``).
@@ -368,6 +432,10 @@ async def _run_fix_proposal(
     Chain: consumes the debug agent's RCA (already written on final-failure
     via ``_run_debug_rca``) → critical-thinking agent reasons about fix
     approach → principal-software-engineer produces concrete fix proposal.
+
+    ``result`` is the final (retry-exhausting) ``StepResult`` — used to
+    classify the incident against the failure that actually triggered this
+    chain (not attempt 1's) when recording to cross-run incident memory.
 
     ``debug_rca_path`` should point at ``<ws>/debug/step-NN-attemptM-debug-rca.md``
     (path stashed on ``ctx.extras[f"step{n}_rca_path"]``). If ``None`` /
@@ -576,6 +644,28 @@ async def _run_fix_proposal(
         )
 
     log.info("fix.proposal_written", step=step_num, path=str(proposal_path))
+
+    # Persist to cross-run incident memory so a future run against this SUT
+    # can retrieve this diagnosis instead of re-investigating. Never raises.
+    if incident_memory_enabled(ctx):
+        from qtea.failure_classifiers import FailureCategory, classify_failure
+        try:
+            category = classify_failure(result, ctx).category
+        except Exception:  # noqa: BLE001 — classification must not block record
+            category = FailureCategory.UNKNOWN
+        step_record = ctx.state.steps.get(step_num)
+        record_incident(
+            ctx=ctx,
+            step_num=step_num,
+            step_name=step_record.name if step_record else f"step-{step_num:02d}",
+            attempt=step_record.attempts if step_record else 0,
+            category=category,
+            failure_context=failure_context,
+            debug_rca_text=debug_rca_text,
+            strategy_text=strategy_text,
+            fix_proposal_path=proposal_path,
+        )
+
     return proposal_path
 
 
@@ -1122,7 +1212,8 @@ class Step(ABC):
             rca_path_str = ctx.extras.get(f"step{self.number}_rca_path")
             debug_rca_path = Path(rca_path_str) if rca_path_str else None
             await _run_fix_proposal(
-                self.number, ctx, failure_context, debug_rca_path=debug_rca_path
+                self.number, ctx, failure_context, result,
+                debug_rca_path=debug_rca_path,
             )
 
         return result

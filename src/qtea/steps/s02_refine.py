@@ -540,12 +540,32 @@ class RefineStep(Step):
                 f"{prior_violations}\n\n---\n\n" + base_user_prompt
             )
 
+        # Optional operator context: a trusted, free-text note the operator
+        # supplied at run start (CLI --context / UI screen). Inline it as a
+        # distinct input so the agent treats it as guidance, not as the spec
+        # itself. It AUGMENTS the spec — it must not silently override the
+        # acceptance criteria; genuine conflicts get a [CLARIFICATION NEEDED].
+        inputs = {"spec.md": spec_text}
+        if ctx.operator_context:
+            inputs["user-context.md"] = ctx.operator_context
+            base_user_prompt += (
+                "\n\nAn operator has supplied additional context in "
+                "`./user-context.md`. Treat it as TRUSTED guidance to "
+                "disambiguate and sharpen the spec — apply environmental "
+                "facts, scope emphasis, and domain clarifications it "
+                "provides. It AUGMENTS the requirement; it does NOT replace "
+                "the acceptance criteria in `spec.md`. If it genuinely "
+                "conflicts with a stated requirement, do NOT silently "
+                "override — raise a `[CLARIFICATION NEEDED]` describing the "
+                "conflict."
+            )
+
         result = await call_reasoning_llm_with_hitl(
             agent,
             ctx=ctx,
             workdir=wd,
             user_prompt=base_user_prompt,
-            inputs={"spec.md": spec_text},
+            inputs=inputs,
             output_filename="refined-spec.md",
             output_schema=None,  # markdown output; schema validates projection only
             timeout_s=self.timeout_s,

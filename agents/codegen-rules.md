@@ -154,7 +154,7 @@ Credentials and API keys come from environment variables only (`process.env`, `o
 
 ## 6. F.I.R.S.T. Tests
 
-Fast, Independent, Repeatable, Self-validating, Timely. Each test creates and tears down its own data; no shared state.
+Fast, Independent, Repeatable, Self-validating, Timely. Each test creates and tears down its own data; no shared state. Per-test setup/teardown hooks (`beforeEach`/`afterEach`, autouse function-scoped fixtures, `setUp`/`tearDown`, `@BeforeEach`/`@AfterEach`) are fully compatible with Independence — they run fresh for every test — and are the correct home for the mandatory UI open-base-URL + login sequence. `beforeAll`/`afterAll` (module/class scope) are for expensive one-time setup only; never use them to share mutable per-test state.
 
 ## 7. Reuse Is the Default
 
@@ -454,6 +454,26 @@ For every test case, walk the strategy's `Steps:` and `Expected Result:` section
 **Substring / truthy / range assertions are ONLY acceptable when the strategy explicitly uses non-exact language** (e.g. "label is non-empty", "count is at least 1", "contains the word Gemini").
 
 When the strategy's expected value is a long literal (URL, multi-line string, JSON), declare it as a module-level constant at the top of the test file with a clear name (e.g. `GEMINI_ENTERPRISE_HREF = "https://..."`) and reference it in the assertion.
+
+### Baseline-then-delta for shared/append-only counters
+
+The `count equals N` row above assumes the counted entity is fully owned or reset by the test (a form's own validation-error list, a freshly created record's own child rows). It does NOT apply to a **shared or append-only counter** — a notification inbox, audit log, activity feed, comment thread, or any list other users/background processes can add to independently of this test. Asserting an absolute value there tests today's incidental app state, not the behavior under test: false-red the moment the environment isn't pristine, false-green everywhere else it happens to match.
+
+Recognize a shared/append-only counter from the domain noun, not the literal wording of the strategy: notification/inbox, audit/log, activity/feed, history, comment/thread, message queue.
+
+For these, always emit the capture-baseline → act → assert-delta shape, even if the strategy's `Expected Result` states an absolute value (treat "exactly 1 notification" as shorthand for "+1 from baseline"):
+
+```python
+baseline_count = notification_inbox_page.get_notification_count_for_entity(ENTITY_NAME)
+
+# ... perform the action under test ...
+
+expect(
+    notification_inbox_page.get_notifications_for_entity(ENTITY_NAME)
+).to_have_count(baseline_count + 1)
+```
+
+If capturing the baseline requires visiting a page/actor not already in `Steps:` (e.g. checking the recipient's inbox before the change), add that as an earlier step rather than skip the baseline.
 
 ---
 

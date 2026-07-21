@@ -257,6 +257,22 @@ async def call_reasoning_llm(
     agent_config = model_for_agent(_agent_key(agent_path))
     requested_model = model or (agent_config.model if agent_config else None)
     resolved_thinking = agent_config.thinking if agent_config else None
+    # `effort` is an Agent-SDK (run_agent) control only — it is forwarded to the
+    # `claude` CLI as `--effort`. The direct-SDK path here has no equivalent
+    # Messages-API param wired in, so an `effort` set on a direct-SDK agent is
+    # silently dropped. Warn so the misconfiguration surfaces instead of
+    # no-op'ing (both transports read the same agent_models.yaml). Use
+    # `thinking` to control reasoning depth on this path.
+    if agent_config and agent_config.effort:
+        log.warning(
+            "reasoning.effort_ignored",
+            agent=agent_path.name,
+            effort=agent_config.effort,
+            hint=(
+                "`effort` is honored only on the Agent SDK (run_agent) path; "
+                "call_reasoning_llm ignores it — use `thinking` here instead."
+            ),
+        )
     if not requested_model:
         raise ValueError(
             f"No model resolved for agent {agent_path.name}. Pass "
@@ -380,6 +396,25 @@ async def call_reasoning_llm(
             used_model = candidate_model
 
             try:
+                # Non-streaming single-shot request (Vertex `:rawPredict`).
+                #
+                # We deliberately do NOT use client.messages.stream()
+                # (`:streamRawPredict`) here. Streaming was tried to keep the
+                # connection warm against a corporate proxy idle timeout (BCNC
+                # `px` default `idle=300`) that severed long non-streaming calls
+                # as APIConnectionError (the 5.4M-token/max_tokens=32000 opus
+                # incident). But on the Bosch model-farm Vertex gateway,
+                # `:streamRawPredict` does NOT stream through incrementally: the
+                # gateway buffers, then returns an HTTP 500 status line at
+                # ~285-290s (proven by run 20260701-114656 — the 500 arrives as
+                # the response STATUS, i.e. no bytes ever flowed). So streaming
+                # gained nothing AND turned a survivable-under-300s call into a
+                # hard 500. Non-streaming `:rawPredict` works fine for the same
+                # durations (169-235s observed, incl. sonnet-5). The residual
+                # px-idle risk only bites pathologically long (>300s-to-first-
+                # byte) generations — the correct mitigation for those is
+                # shrinking the prompt / max_tokens (keep the call under ~300s),
+                # NOT re-introducing the streaming endpoint that 500s on BMF.
                 response = await client.messages.create(**create_kwargs)
                 transcript.append({
                     "type": "request",

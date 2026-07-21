@@ -1046,7 +1046,7 @@ async def test_step09_dep_recovery_refreshes_install_sig(
     def fake_run_tests(
         framework, *, cwd, detected_command=None, timeout_s,
         env_extra=None, profile=None, headless=True, marker_filter=None,
-        parallelism=0,
+        parallelism=0, playwright_project=None,
     ):
         call_seq["n"] += 1
         from datetime import UTC as _UTC
@@ -1144,7 +1144,7 @@ async def test_step09_dep_recovery_uses_unnarrowed_cmd_on_retry(
     def fake_run_tests(
         framework, *, cwd, detected_command=None, timeout_s,
         env_extra=None, profile=None, headless=True, marker_filter=None,
-        parallelism=0,
+        parallelism=0, playwright_project=None,
     ):
         call_seq["n"] += 1
         captured_cmds.append(detected_command or "(default)")
@@ -1389,34 +1389,34 @@ def test_lazy_probe_returns_failure_when_server_not_declared(monkeypatch):
 
 
 def test_lazy_probe_returns_success_when_server_probes_ok(monkeypatch):
-    """Happy path: server is declared + probes OK."""
+    """Happy path: server is declared + the MCP handshake succeeds."""
     fake_server = object()
     monkeypatch.setattr(
         "qtea.mcp_manager.load_mcp_config",
         lambda path=None, env=None: {"playwright": fake_server},
     )
     monkeypatch.setattr(
-        "qtea.mcp_manager.probe_server",
-        lambda srv, timeout_s=30.0: (True, "ok"),
+        "qtea.mcp_manager.warm_mcp_server",
+        lambda srv, timeout_s=60.0: (True, "mcp initialize ok"),
     )
     ok, _detail, _warmup_s = _lazy_probe_heal_mcp("playwright")
     assert ok is True
 
 
 def test_lazy_probe_returns_failure_when_probe_fails(monkeypatch):
-    """Probe failure (e.g. npx missing, server crash) surfaces the detail."""
+    """Handshake failure (e.g. node missing, server crash) surfaces the detail."""
     fake_server = object()
     monkeypatch.setattr(
         "qtea.mcp_manager.load_mcp_config",
         lambda path=None, env=None: {"playwright": fake_server},
     )
     monkeypatch.setattr(
-        "qtea.mcp_manager.probe_server",
-        lambda srv, timeout_s=30.0: (False, "npx not on PATH"),
+        "qtea.mcp_manager.warm_mcp_server",
+        lambda srv, timeout_s=60.0: (False, "`node` not on PATH"),
     )
     ok, detail, _warmup_s = _lazy_probe_heal_mcp("playwright")
     assert ok is False
-    assert "npx" in detail
+    assert "node" in detail
 
 
 async def test_step09_skips_heal_when_mcp_probe_fails(tmp_path: Path, monkeypatch):
@@ -2093,7 +2093,7 @@ def test_refine_element_not_in_dom_token_found_reclassifies(tmp_path):
         "  - link \"Home\"\n"
         "- main\n"
         "  - button \"Actions\"\n"   # "action" token matches "action-menu-button"
-        "  - heading \"ROPA Entry\"\n"
+        "  - heading \"Entity\"\n"
     )
     (tmp_path / "T-foo.txt").write_text(aom_text, encoding="utf-8")
     entry = _mk_entry(
@@ -2113,7 +2113,7 @@ def test_refine_element_not_in_dom_token_absent_stays_not_in_dom(tmp_path):
         "- navigation\n"
         "  - link \"Home\"\n"
         "- main\n"
-        "  - heading \"ROPA Entry\"\n"
+        "  - heading \"Entity\"\n"
         "  - textbox \"Search\"\n"
     )
     (tmp_path / "T-foo.txt").write_text(aom_text, encoding="utf-8")
@@ -2234,7 +2234,7 @@ def test_refine_locator_absence_locator_timeout_token_absent_downgrades(tmp_path
         "- navigation\n"
         "  - link \"Home\"\n"
         "- main\n"
-        "  - heading \"ROPA Entry\"\n"
+        "  - heading \"Entity\"\n"
         "  - textbox \"Search\"\n"
     )
     (tmp_path / "T-ghost.txt").write_text(aom_text, encoding="utf-8")
@@ -2307,7 +2307,7 @@ def test_partition_layer2_downgrades_locator_timeout_to_real_bug(tmp_path):
         "- navigation\n"
         "  - link \"Home\"\n"
         "- main\n"
-        "  - heading \"ROPA Entry\"\n"
+        "  - heading \"Entity\"\n"
     )
     (tmp_path / "T-devbug.txt").write_text(aom_text, encoding="utf-8")
     # Message shape matches Playwright TypeScript locator.click timeout,
@@ -2363,3 +2363,93 @@ def test_refine_element_not_in_dom_alias_exists():
     import _refine_element_not_in_dom. It must resolve to the same
     function object as _refine_locator_absence."""
     assert _refine_element_not_in_dom is _refine_locator_absence
+
+
+# ---------------------------------------------------------------------------
+# Bug 3 regression: empty-collection diagnosis must trust an already-
+# classified runner_failure instead of always assuming a naming defect
+# (run 20260709-083909-223772 — a TS compile error was misreported as
+# "add the qtea_ prefix").
+# ---------------------------------------------------------------------------
+
+
+def _mk_empty_pw_run_result(framework: str, *, entries: list) -> "RunResult":
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    from qtea.test_runner import RunResult
+
+    now = _dt.now(_UTC).isoformat()
+    return RunResult(
+        framework=framework, command="npx playwright test",
+        cwd=".", started_at=now, finished_at=now,
+        duration_s=0.1, exit_code=1, results=entries,
+        stdout="", stderr="",
+    )
+
+
+async def test_step09_empty_collection_defaults_to_naming_defect_when_unclassified(
+    tmp_path: Path, monkeypatch
+):
+    """Genuine zero-matches (no runner_failure attached to any result entry)
+    still falls back to the naming-defect diagnosis — this is the correct
+    behavior when nothing else classified the failure."""
+    ctx = _ctx(tmp_path)
+    _seed_with_stack_profile(
+        ctx, command="npx playwright test", framework="playwright-ts",
+    )
+
+    monkeypatch.setattr(
+        "qtea.steps.s09_execute.run_tests",
+        lambda *a, **kw: _mk_empty_pw_run_result("playwright-ts", entries=[]),
+    )
+    monkeypatch.setattr(
+        "qtea.steps.s09_execute.commit_step", lambda *a, **kw: "fake-sha",
+    )
+
+    result = await ExecuteStep().run(ctx)
+
+    assert not result.success
+    assert "qtea_" in (result.error or "")
+    assert ctx.extras.get("rerun_step") == 8
+    assert ctx.extras.get("rerun_kind") == "naming_defect"
+
+
+async def test_step09_empty_collection_trusts_classified_collection_error(
+    tmp_path: Path, monkeypatch
+):
+    """When run_tests already classified the zero-results cause as a
+    collection_error (e.g. a TS compile-fatal import), Step 9 must report
+    THAT cause and set rerun_kind accordingly — not coach toward a naming
+    fix that was never the problem."""
+    ctx = _ctx(tmp_path)
+    _seed_with_stack_profile(
+        ctx, command="npx playwright test", framework="playwright-ts",
+    )
+
+    entry = TestRunEntry(
+        id="T-runner-failure", name="runner_failure",
+        file="tests/pages/login.page.ts", status="failed",
+        message="Cannot find module './qtea-runtime'",
+        runner_failure={
+            "kind": "collection_error",
+            "module": "./qtea-runtime",
+            "summary": "broken local import: './qtea-runtime' could not be resolved",
+            "hint": "fix the broken local import path",
+        },
+    )
+    monkeypatch.setattr(
+        "qtea.steps.s09_execute.run_tests",
+        lambda *a, **kw: _mk_empty_pw_run_result("playwright-ts", entries=[entry]),
+    )
+    monkeypatch.setattr(
+        "qtea.steps.s09_execute.commit_step", lambda *a, **kw: "fake-sha",
+    )
+
+    result = await ExecuteStep().run(ctx)
+
+    assert not result.success
+    assert "qtea_" not in (result.error or "")
+    assert "broken local import" in (result.error or "")
+    assert ctx.extras.get("rerun_step") == 8
+    assert ctx.extras.get("rerun_kind") == "collection_error"

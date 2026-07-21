@@ -16,20 +16,20 @@ polyglot-test-planner:      # direct-SDK (call_reasoning_llm_with_hitl)
   thinking: adaptive
 
 test-designer:               # direct-SDK (call_reasoning_llm)
-  model: claude-opus-4-8
+  model: claude-opus-4-7
   thinking: adaptive
 
 # -- Phase B: Research & Implementation --
-polyglot-test-researcher:
+polyglot-test-researcher:    # Agent SDK (run_agent) — effort honored
   model: claude-sonnet-5
   effort: high
   thinking: adaptive
 
 test-automation-architect:  # direct-SDK (call_reasoning_llm)
-  model: claude-opus-4-8
+  model: claude-sonnet-5
   thinking: adaptive
 
-codegen-violation-fixer:
+codegen-violation-fixer:    # Agent SDK (run_agent) — effort honored
   model: claude-sonnet-5
   effort: high
   thinking: adaptive
@@ -39,12 +39,16 @@ codegen-pom-extender:       # direct-SDK (call_reasoning_llm)
   thinking: adaptive
 
 codegen-test-writer:        # direct-SDK (call_reasoning_llm)
-  model: claude-opus-4-8
+  model: claude-sonnet-5
+  thinking: adaptive
+
+codegen-exemplar-writer:    # direct-SDK (call_reasoning_llm) — non-POM exemplar lane
+  model: claude-opus-4-7
   thinking: adaptive
 
 # -- Phase C: Execution & Reporting --
-polyglot-test-fixer:
-  model: claude-opus-4-8
+polyglot-test-fixer:        # Agent SDK (run_agent) — Step 9 heal; effort honored
+  model: claude-opus-4-7
   effort: high
   thinking: adaptive
 
@@ -53,10 +57,22 @@ bug-report-classifier:      # direct-SDK (call_reasoning_llm)
   thinking: adaptive
 
 # -- Step 7 live exploration (browser, run_agent) --
-site-explorer:
+site-explorer:               # Agent SDK (run_agent) — effort honored
   model: claude-sonnet-5
   effort: medium
   thinking: adaptive
+
+live-explore-target-extractor:  # direct-SDK (call_reasoning_llm) — Step 7 pre-pass
+  model: claude-sonnet-5         # semantic prose->target mapping; adaptive, not haiku
+  thinking: adaptive
+
+live-explore-reveal-judge:   # direct-SDK (call_reasoning_llm) — Step 7 driver reveal decisions
+  model: claude-haiku-4-5@20251001
+  thinking: disabled
+
+live-explore-ambiguity-judge:  # direct-SDK (call_reasoning_llm) — Step 7 driver locator disambiguation
+  model: claude-haiku-4-5@20251001
+  thinking: disabled
 
 # -- Review-gate editors (Steps 3/4/8; direct-SDK call_reasoning_llm) --
 plan-editor:
@@ -74,7 +90,7 @@ tbd-intent-editor:
 # -- Step 8 Phase D (TBD intent quality gate; direct-SDK) --
 tbd-intent-scorer:
   model: claude-haiku-4-5@20251001
-  thinking: adaptive
+  thinking: disabled
 
 # -- Step 8 Stage-3 assertion-intent judge (shadow; direct-SDK) --
 assertion-intent-judge:
@@ -86,17 +102,18 @@ purpose-fidelity-judge:
   model: claude-sonnet-5
   thinking: adaptive
 
-debug:
-  model: claude-opus-4-8
+# -- Debug + fix-proposal chain (Agent SDK, run_agent — effort honored) --
+debug:                       # Agent SDK (run_agent)
+  model: claude-opus-4-7
   effort: xhigh
   thinking: adaptive
 
-critical-thinking:
-  model: claude-opus-4-8
+critical-thinking:           # Agent SDK (run_agent)
+  model: claude-opus-4-7
   effort: high
   thinking: adaptive
 
-principal-software-engineer:
-  model: claude-opus-4-8
+principal-software-engineer:  # Agent SDK (run_agent)
+  model: claude-opus-4-7
   effort: high
   thinking: adaptive

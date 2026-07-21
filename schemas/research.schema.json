@@ -66,6 +66,24 @@
               "language": { "type": ["string", "null"] },
               "package_manager": { "type": ["string", "null"] },
               "custom_test_id_attribute": { "type": ["string", "null"], "description": "Non-default test-id attribute (e.g. data-test, data-cy). null means default data-testid." },
+              "architecture_pattern": { "type": ["string", "null"], "enum": ["pom", "screenplay", "inline", "none", "unknown", null], "description": "Detected test-automation design pattern. Drives Step 8 lane selection: pom|inline|none|unknown → mature POM codegen lane; screenplay (and any other non-POM value) → exemplar-imitation lane." },
+              "pattern_exemplars": {
+                "type": "array",
+                "description": "Verbatim source slices of the SUT's own reusable units (Screenplay Task/Question/Interaction etc.), captured for non-POM patterns so Step 8's exemplar lane generates new code by imitation. Empty for pom/inline/none.",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "file": { "type": "string" },
+                    "category": { "type": ["string", "null"], "enum": ["task", "question", "interaction", "ability", "target", "page_object", "other", null] },
+                    "class_name": { "type": ["string", "null"] },
+                    "excerpt": { "type": "string" },
+                    "line_start": { "type": ["integer", "null"] },
+                    "line_end": { "type": ["integer", "null"] },
+                    "dir": { "type": ["string", "null"] }
+                  },
+                  "additionalProperties": true
+                }
+              },
               "source": { "type": ["string", "null"], "enum": ["deterministic", "llm_augmented", "llm_only", null] },
               "test_directory_layout": {
                 "type": ["object", "null"],
@@ -92,10 +110,56 @@
               "existing_page_objects": { "type": "array" },
               "existing_helpers": { "type": "array" },
               "existing_fixtures": { "type": "array" },
+              "lifecycle_hooks": {
+                "type": "array",
+                "description": "Test setup/teardown hooks discovered in the SUT's own tests, classified by canonical trigger event so Step 7 can reuse them and Step 8 can regenerate them in the target framework's idiom. Populate for non-Python/TS stacks (Java @BeforeEach/@AfterEach, etc.) that Tier 1/2 can't scan. `calls` is the ordered list of method-call expressions in the hook body (e.g. ['basePage.openBaseURL','basePage.logIn']).",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "event": { "type": "string", "enum": ["before_all", "after_all", "before_each", "after_each"], "description": "Canonical trigger event. Map framework keywords: beforeAll/before/@BeforeAll/setUpClass/@fixture(scope=module) → before_all; afterAll/after/@AfterAll/tearDownClass → after_all; beforeEach/@BeforeEach/setUp/@fixture(scope=function,autouse) → before_each; afterEach/@AfterEach/tearDown/@fixture+yield → after_each." },
+                    "framework_construct": { "type": ["string", "null"], "description": "Raw framework keyword/decorator, e.g. 'beforeEach', '@BeforeEach', 'setUp', '@pytest.fixture(scope=module, autouse=True)'." },
+                    "file": { "type": "string", "description": "SUT-relative path to the file defining the hook." },
+                    "scope": { "type": ["string", "null"] },
+                    "calls": { "type": "array", "items": { "type": "string" }, "description": "Ordered method-call expressions in the hook body." }
+                  },
+                  "required": ["event", "file"],
+                  "additionalProperties": true
+                }
+              },
+              "navigation_preconditions": {
+                "type": "array",
+                "description": "POM methods that act on a specific already-active view (grid/table/tab/filtered list) with no in-code guard, discovered to be consistently preceded by another call across the SUT's own real usages. Step 7 must plan `requires_call` before any reuse of `method`; Step 8 never sees this field directly. LLM-only (no deterministic scanner) — only emit when every real call site agrees and at least one is evidenced; never fabricate.",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "method": { "type": "string", "description": "The dependent method, as `ClassName.methodName` (e.g. 'DirectoryPage.selectFilteredEntity')." },
+                    "requires_call": { "type": "string", "description": "The call that must happen first, as `ClassName.methodName` (e.g. 'BasePage.selectLoginOptionByText')." },
+                    "requires_args_hint": { "type": ["string", "null"], "description": "Optional hint for the argument the required call needs at real call sites (e.g. 'NAV_OPTIONS.DIRECTORY')." },
+                    "evidence": { "type": "string", "description": "SUT-relative file[:line] of a real call site demonstrating the ordering, e.g. 'tests/EntityFormSmoke.spec.ts:104'." }
+                  },
+                  "required": ["method", "requires_call"],
+                  "additionalProperties": true
+                }
+              },
               "existing_locators": {
                 "type": "array",
-                "description": "Locator constant classes discovered in the SUT (e.g. ChatPageLocators). Surfaced so the codegen step's agent can import existing constants instead of inventing byte-identical duplicates.",
-                "items": { "type": "object", "additionalProperties": true }
+                "description": "Locator collections discovered in the SUT: constant classes (e.g. ChatPageLocators), object-literal bags (e.g. `export const BASE_LOCATORS = {...}`, including UPPERCASE_SNAKE names), inline class-property maps, readonly Locator properties, and modules of constants. MUST include bags that live in a SEPARATELY IMPORTED file (e.g. `<Pom>.locators.ts` imported into the POM) even when the POM has no inline locators — trace each POM's imports. Do NOT leave this `[]` when the SUT keeps locators in files/classes/constants: codegen relies on it to import/extend existing constants instead of inventing duplicates or dangling references. See prompt §8.",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "file": { "type": "string", "description": "SUT-relative path to the file that DEFINES the bag/class/constants." },
+                    "class_name": { "type": ["string", "null"], "description": "The bag/const/class identifier, e.g. `BASE_LOCATORS`, `ChatPageLocators`." },
+                    "owning_pom": { "type": ["string", "null"], "description": "The POM this source belongs to (from a `<Pom>.locators.ts` filename or the POM that imports+uses it)." },
+                    "location_pattern": {
+                      "type": ["string", "null"],
+                      "enum": ["export_const_object", "inline_object_property", "readonly_locator_props", "separate_class", "module_const_bag", null],
+                      "description": "How codegen must write new constants into this source."
+                    },
+                    "names": { "type": "array", "items": { "type": "string" }, "description": "Optional: the constant/key names in the bag." }
+                  },
+                  "required": ["file"],
+                  "additionalProperties": true
+                }
               },
               "auth_flow": {
                 "type": ["object", "null"],
@@ -103,12 +167,26 @@
                   "type": { "type": ["string", "null"], "enum": ["sso", "oauth", "basic", "none", "unknown", null] },
                   "entry_method": { "type": ["string", "null"] },
                   "credentials_env_vars": { "type": "array", "items": { "type": "string" } },
-                  "fixture_entry": { "type": ["string", "null"] }
+                  "fixture_entry": { "type": ["string", "null"] },
+                  "open_method": { "type": ["string", "null"], "description": "The page-object method that navigates to the app base URL (e.g. `page.goto('/')`), '<file>:<Class>.<method>'. This is the mandatory FIRST step of any UI test, before login. null when no such method exists in the SUT." }
                 },
                 "additionalProperties": true
               }
             },
-            "additionalProperties": true
+            "additionalProperties": true,
+            "allOf": [
+              {
+                "$comment": "Non-POM patterns commit Step 8 to the exemplar lane, which imitates pattern_exemplars[] verbatim. A non-POM classification with zero exemplars has nothing to imitate — reject it.",
+                "if": {
+                  "required": ["architecture_pattern"],
+                  "properties": { "architecture_pattern": { "const": "screenplay" } }
+                },
+                "then": {
+                  "required": ["pattern_exemplars"],
+                  "properties": { "pattern_exemplars": { "type": "array", "minItems": 1 } }
+                }
+              }
+            ]
           }
         }
       },

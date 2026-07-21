@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qtea/schemas/incident-record.schema.json",
+  "title": "IncidentRecord",
+  "description": "A single cross-run incident-memory record: the diagnosed root cause and proposed fix for one step's retry-exhaustion failure, scoped to one SUT (sut_fingerprint) and persisted at ~/.qtea/incident-memory/<sut_fingerprint>/<incident_id>.json so future runs against the same SUT can reuse the diagnosis instead of re-investigating from scratch. Written once by qtea.incident_memory.record_incident() at the end of the debug/fix-proposal chain (steps/base.py::_run_fix_proposal); never mutated in place (one file per incident, no read-modify-write).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "incident_id",
+    "schema_version",
+    "sut_fingerprint",
+    "recorded_at",
+    "run_id",
+    "step_num",
+    "step_name",
+    "attempt",
+    "category",
+    "symptom_tags",
+    "failure_signature",
+    "failure_context_excerpt",
+    "rca_excerpt",
+    "fix_strategy_excerpt",
+    "fix_proposal_path",
+    "resolved"
+  ],
+  "properties": {
+    "incident_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "uuid4 hex; also the filename stem of this record."
+    },
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Record schema version. Bump when fields change in a non-backward-compatible way."
+    },
+    "sut_fingerprint": {
+      "type": "string",
+      "minLength": 1,
+      "description": "sha256[:16] of the normalized git remote URL or resolved local path of the SUT (see qtea.incident_memory.sut_fingerprint). Directory name under incident-memory/."
+    },
+    "recorded_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC ISO-8601 timestamp when the incident was recorded."
+    },
+    "run_id": {
+      "type": "string",
+      "description": "The qtea run that diagnosed this incident (provenance/audit only — not dereferenced by retrieval)."
+    },
+    "step_num": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 11,
+      "description": "Pipeline step number (1-11) that failed."
+    },
+    "step_name": {
+      "type": "string",
+      "description": "Human-readable step name at the time of failure."
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Attempt count at final failure (typically MAX_ATTEMPTS)."
+    },
+    "category": {
+      "type": "string",
+      "enum": [
+        "truncation_recoverable",
+        "schema_type_mismatch",
+        "schema_missing_required_field",
+        "json_unparseable",
+        "plan_gate_violation",
+        "api_fatal",
+        "api_retry_storm",
+        "agent_no_output",
+        "locator_resolution_timeout",
+        "sut_git_failure",
+        "test_runner_error",
+        "unknown"
+      ],
+      "description": "qtea.failure_classifiers.FailureCategory value — reused taxonomy, not a new one."
+    },
+    "symptom_tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1,
+      "description": "Lowercase keyword tokens derived from the failure signature, category, and step name. Used by query_similar() for Jaccard-overlap scoring."
+    },
+    "failure_signature": {
+      "type": "string",
+      "maxLength": 500,
+      "description": "Short, redacted summary of the failure (first line(s) of the error). Used for difflib.SequenceMatcher scoring against future failures."
+    },
+    "failure_context_excerpt": {
+      "type": "string",
+      "maxLength": 4000,
+      "description": "Redacted excerpt of the failure_context markdown passed into the debug/fix chain."
+    },
+    "rca_excerpt": {
+      "type": "string",
+      "maxLength": 4000,
+      "description": "Redacted excerpt of the debug agent's root-cause analysis (debug_rca_text)."
+    },
+    "fix_strategy_excerpt": {
+      "type": "string",
+      "maxLength": 4000,
+      "description": "Redacted excerpt of the critical-thinking agent's fix-strategy.md content."
+    },
+    "fix_proposal_path": {
+      "type": ["string", "null"],
+      "description": "Best-effort, workspace-relative path to step-NN-fix-proposal.md at write time. Provenance only — not guaranteed to still exist; not dereferenced by retrieval (the excerpts above are self-sufficient)."
+    },
+    "resolved": {
+      "type": "boolean",
+      "description": "Always false in v1 (no consumer flips this yet). Reserved for a v2 self-heal / operator-confirmation loop that marks an incident's fix as verified."
+    },
+    "outcome_notes": {
+      "type": ["string", "null"],
+      "maxLength": 1000,
+      "description": "Reserved for v2. Null in v1."
+    }
+  }
+}

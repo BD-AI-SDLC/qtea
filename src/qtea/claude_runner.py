@@ -34,7 +34,7 @@ from qtea.config import (
     model_for_agent,
     step_timeout,
 )
-from qtea.logging_setup import get_logger
+from qtea.logging_setup import get_logger, mask_secret_values
 from qtea.mcp_manager import stage_empty_mcp_config, stage_mcp_config
 from qtea.metrics import CURRENT_STEP_METRICS, AgentMetrics, extract_agent_metrics
 from qtea.proxy import with_proxy_env
@@ -118,6 +118,14 @@ class AgentResult:
     # populates it; callers checking for truncation should test both this AND
     # any post-hoc parse-failure signal (e.g. ast.parse).
     stop_reason: str | None = None
+    # True when the agent terminated by exhausting its `max_turns` budget
+    # (SDK error "Reached maximum number of turns (N)"). This is a KNOWN,
+    # EXPECTED terminal condition for best-effort passes (e.g. Step 7 live
+    # exploration, which recovers a partial map from disk) — not a crash. It is
+    # surfaced as a distinct flag so callers can degrade gracefully and the
+    # runner can log it at WARN (no scary traceback) rather than as an
+    # `agent.sdk_error` exception. `success` is still False.
+    hit_max_turns: bool = False
 
 
 # MCP tool allowlist. The SDK's `permission_mode="acceptEdits"` does NOT
@@ -460,7 +468,12 @@ async def _drive_query(
     with transcript_path.open("w", encoding="utf-8") as transcript_fp:
         async for message in query(prompt=user_prompt, options=options):
             evt = _message_to_dict(message)
-            transcript_fp.write(json.dumps(evt, ensure_ascii=False) + "\n")
+            # Redact registered secret values (e.g. resolved SUT credentials the
+            # agent typed via browser_type) from the on-disk transcript. The
+            # in-memory event kept for token accounting is unaffected.
+            transcript_fp.write(
+                mask_secret_values(json.dumps(evt, ensure_ascii=False)) + "\n"
+            )
             transcript_fp.flush()
             state.events.append(evt)
 
@@ -684,6 +697,7 @@ async def run_agent(
     resume: str | None = None,
     enable_mcp: bool = False,
     mcp_env: dict[str, str] | None = None,
+    hooks: dict[Any, Any] | None = None,
 ) -> AgentResult:
     """Run a single agent via the Claude Agent SDK in an isolated workdir.
 
@@ -730,6 +744,13 @@ async def run_agent(
         9's polyglot-test-fixer heal flow needs Playwright MCP). Inverting
         the historic default reflects the audit: 5+ caller sites never
         used the MCPs they were paying to spawn.
+    hooks: optional SDK hook map (``dict[HookEvent, list[HookMatcher]]``) passed
+        verbatim to ``ClaudeAgentOptions.hooks``. Lets a caller enforce hard,
+        mechanical limits on agent tool use that prompt prose cannot reliably
+        hold — e.g. Step 7 live-explore's per-page snapshot/evaluate budget
+        enforcer, which DENIES a snapshot once a page's cap is spent so the
+        explorer physically cannot rat-hole on one data-grid page and exhaust
+        its whole turn budget. ``None`` = no hooks (unchanged behavior).
     """
     del debug_live  # accepted for API compat
     workdir.mkdir(parents=True, exist_ok=True)
@@ -754,7 +775,9 @@ async def run_agent(
     # match the transcript for the same call.
     prompt_path = logs_dir / f"user-prompt{suffix}.md"
     try:
-        prompt_path.write_text(user_prompt, encoding="utf-8")
+        # Redact registered secret values (e.g. credentials embedded for an
+        # MCP-driven login) before persisting the prompt to disk.
+        prompt_path.write_text(mask_secret_values(user_prompt), encoding="utf-8")
     except OSError as e:
         # Best-effort: a failure to dump the prompt should never block
         # the actual agent call. Log + continue.
@@ -863,6 +886,24 @@ async def run_agent(
         if k in full_env:
             forwarded_env[k] = full_env[k]
 
+    # Give slow stdio MCP servers time to connect BEFORE the tool list freezes.
+    # The SDK does not block for MCP at init: it starts servers async and emits
+    # the init message with whatever status they've reached. Any server still
+    # `pending` at that instant is invisible for the WHOLE run — its tools stay
+    # "No such tool available" even after it connects, because the tool list is
+    # frozen at init (WaitForMcpServers does NOT retro-register them). MCP_TIMEOUT
+    # (milliseconds; CLI default 30000) governs how long init waits for a server
+    # to come up. On Windows a cold `npx @playwright/mcp` spawn routinely exceeds
+    # the default, so when this call actually uses MCP we raise the ceiling —
+    # respecting an operator-set value — so the freeze happens AFTER playwright is
+    # `connected`. Without this, run 20260701-114656 step 7 saw playwright still
+    # `pending` ~4s post-spawn (even with a warm npx cache) → empty live-map.
+    if enable_mcp:
+        forwarded_env["MCP_TIMEOUT"] = full_env.get("MCP_TIMEOUT") or "60000"
+        forwarded_env["MCP_TOOL_TIMEOUT"] = (
+            full_env.get("MCP_TOOL_TIMEOUT") or "120000"
+        )
+
     sdk_options_kwargs: dict[str, Any] = {
         "cwd": str(workdir),
         # Append our agent .md to the Claude Code preset system prompt — same
@@ -881,6 +922,11 @@ async def run_agent(
     }
     if max_turns is not None:
         sdk_options_kwargs["max_turns"] = max_turns
+    if hooks:
+        # Mechanical tool-use enforcement (PreToolUse/PostToolUse callbacks).
+        # Passed straight to the SDK; the callbacks run in-process in this event
+        # loop. Used by Step 7 live-explore to hard-cap per-page snapshots.
+        sdk_options_kwargs["hooks"] = hooks
     if resume:
         sdk_options_kwargs["resume"] = resume
     if add_dirs:
@@ -900,6 +946,7 @@ async def run_agent(
     timed_out = False
     error: str | None = None
     exit_code = -1
+    hit_max_turns = False
 
     # Capture stderr from the `claude` CLI subprocess into stderr_path. The
     # CLI always runs with `--verbose` (see
@@ -996,6 +1043,7 @@ async def run_agent(
         timed_out = False
         error = None
         exit_code = -1
+        hit_max_turns = False
         state = _DriveState(pre_existing_children=_current_child_pids())
 
         drive_task = asyncio.create_task(_drive_query(
@@ -1040,6 +1088,28 @@ async def run_agent(
             # body). Surface both so users don't have to grep transcripts.
             api_detail = (state.final_text or "").strip()
             error = f"sdk error: {e} | api: {api_detail[:500]}" if api_detail else f"sdk error: {e}"
+            if "maximum number of turns" in str(e).lower():
+                # KNOWN, EXPECTED terminal condition — not a crash. The agent
+                # simply spent its `max_turns` budget. Best-effort passes (e.g.
+                # Step 7 live-explore) recover a partial result from disk, so
+                # this must NOT masquerade as an `agent.sdk_error` with a scary
+                # traceback that alarms operators (a known, benign condition
+                # -- agent resource-limited termination is not an error).
+                # Log at WARN, no stack, and flag it so callers can
+                # branch on the condition explicitly.
+                hit_max_turns = True
+                exit_code = -12
+                log.warning(
+                    "agent.max_turns_reached",
+                    agent=agent_path.name,
+                    max_turns=max_turns,
+                    num_turns=state.metrics.num_turns,
+                    api_detail=api_detail[:200] if api_detail else None,
+                )
+                await _force_cleanup(
+                    drive_task, state.pre_existing_children, grace_s=2.0,
+                )
+                break
             log.exception(
                 "agent.sdk_error",
                 agent=agent_path.name,
@@ -1166,4 +1236,5 @@ async def run_agent(
         mcp_servers_failed=mcp_servers_failed,
         mcp_servers_pending=mcp_servers_pending,
         stop_reason=state.stop_reason,
+        hit_max_turns=hit_max_turns,
     )

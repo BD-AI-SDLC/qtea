@@ -11,6 +11,11 @@
     "active_module": { "type": "string", "minLength": 1 },
     "language": { "type": ["string", "null"] },
     "framework": { "type": ["string", "null"] },
+    "architecture_pattern": {
+      "type": ["string", "null"],
+      "enum": ["pom", "screenplay", "inline", "none", "unknown", null],
+      "description": "Stamped from Step 6's sut_inventory (authoritative). Drives Step 8 lane selection: pom|inline|none|unknown → POM codegen lane (page_objects[]); anything else (e.g. screenplay) → exemplar lane (reusable_units[])."
+    },
     "test_cases": {
       "type": "array",
       "minItems": 1,
@@ -39,9 +44,19 @@
           "type": "array",
           "items": { "$ref": "#/$defs/fixture_entry" }
         },
+        "hooks": {
+          "type": "array",
+          "description": "Test setup/teardown hooks Step 8 must generate as real framework lifecycle hooks (JS/TS beforeAll/afterAll/beforeEach/afterEach; pytest fixtures; unittest setUp/tearDown; JUnit5 @BeforeEach/@AfterEach). Reuse the SUT's discovered hooks (sut_inventory.lifecycle_hooks) by replaying their calls, or create new ones. For any UI test the before_each hook MUST open the app base URL (auth_flow.open_method) THEN login (auth_flow.entry_method) — mirroring the SUT's own beforeEach — unless a reused auto-authenticating fixture guarantees it. Per-test steps[] should NOT repeat what a hook already does.",
+          "items": { "$ref": "#/$defs/hook_entry" }
+        },
         "page_objects": {
           "type": "array",
           "items": { "$ref": "#/$defs/page_object_entry" }
+        },
+        "reusable_units": {
+          "type": "array",
+          "description": "Non-POM only (exemplar lane). New/reused reusable units (Screenplay Task/Question/Interaction etc.) shaped like sut_inventory.pattern_exemplars[]. Used INSTEAD OF page_objects[] when architecture_pattern is non-POM.",
+          "items": { "$ref": "#/$defs/reusable_unit" }
         },
         "helpers": {
           "type": "array",
@@ -50,6 +65,101 @@
         "locators": {
           "type": "array",
           "items": { "$ref": "#/$defs/locator_entry" }
+        }
+      }
+    },
+    "hook_entry": {
+      "type": "object",
+      "description": "One test setup/teardown hook the writer materializes into a framework-idiomatic lifecycle hook. `calls` is the ordered POM method-call choreography the hook body runs (same shape as a subset of choreography_step: pom + method + args).",
+      "required": ["event", "calls"],
+      "additionalProperties": true,
+      "properties": {
+        "event": {
+          "type": "string",
+          "enum": ["before_all", "after_all", "before_each", "after_each"],
+          "description": "Canonical trigger event. Step 8 emits the framework equivalent: JS/TS beforeAll/afterAll/beforeEach/afterEach; pytest @fixture(scope=module) / (scope=function,autouse=True) with yield for the after-half; unittest setUpClass/tearDownClass/setUp/tearDown; JUnit5 @BeforeAll/@AfterAll/@BeforeEach/@AfterEach."
+        },
+        "source": {
+          "enum": ["reuse", "create"],
+          "description": "reuse = replay a hook that already exists in sut_inventory.lifecycle_hooks; create = a new hook the writer must author."
+        },
+        "from": {
+          "type": ["string", "null"],
+          "description": "When source=reuse: '<file>' or '<file>:<symbol>' pointer to the discovered hook in sut_inventory.lifecycle_hooks."
+        },
+        "calls": {
+          "type": "array",
+          "description": "Ordered method calls the hook body performs. Each item names a POM method (same rules as choreography_step: pom must match a page_objects[].name; method must be reused or a missing_methods[].name).",
+          "items": {
+            "type": "object",
+            "required": ["pom", "method"],
+            "additionalProperties": true,
+            "properties": {
+              "pom": { "type": "string", "minLength": 1 },
+              "method": { "type": "string", "minLength": 1 },
+              "args": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        }
+      }
+    },
+    "reusable_unit": {
+      "type": "object",
+      "description": "A reusable automation unit for the non-POM exemplar lane, shaped like a captured pattern_exemplar (Task/Question/Interaction/etc.).",
+      "required": ["name", "source"],
+      "additionalProperties": true,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "source": { "enum": ["reuse", "create"] },
+        "category": {
+          "type": ["string", "null"],
+          "description": "task | question | interaction | ability | target | other — matches a pattern_exemplar category."
+        },
+        "shaped_like": {
+          "type": ["integer", "null"],
+          "description": "Index into sut_inventory active module's pattern_exemplars[] whose shape this unit imitates."
+        },
+        "from": {
+          "type": "string",
+          "description": "Required when source=reuse. SUT-relative file path of the existing unit."
+        },
+        "at": {
+          "type": "string",
+          "description": "Required when source=create. SUT-relative path where the new unit lands — place it in the matching exemplar's dir."
+        },
+        "missing_behaviors": {
+          "type": "array",
+          "description": "Behaviours the test needs on this unit. Kept pattern-agnostic (no POM assertion-oracle mandate) — the exemplar lane imitates the SUT's own idiom.",
+          "items": {
+            "type": "object",
+            "required": ["name", "signature", "kind"],
+            "additionalProperties": true,
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "signature": { "type": "string", "minLength": 1 },
+              "kind": { "enum": ["action", "assertion", "query"] },
+              "purpose": { "type": ["string", "null"] },
+              "acceptance_criteria": { "type": "array" }
+            }
+          }
+        },
+        "deferred_targets": {
+          "type": "array",
+          "description": "Element locators the unit needs whose selector is unknown at codegen. Step 8 backs each with a JIT resolver hook (page.locator(tbd(intent))) that resolves via the tier ladder at Step 9. Do NOT hardcode selectors.",
+          "items": {
+            "type": "object",
+            "required": ["name", "intent"],
+            "additionalProperties": true,
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "intent": { "type": "string", "minLength": 1, "maxLength": 120 },
+              "owning_unit": { "type": ["string", "null"] }
+            }
+          }
+        },
+        "reuse_justification": {
+          "type": "string",
+          "description": "Required when source=reuse — one sentence naming the concrete matching dimension observed in the exemplar/source."
         }
       }
     },
@@ -104,7 +214,7 @@
         "phase": {
           "type": ["string", "null"],
           "enum": ["arrange", "act", "assert", null],
-          "description": "Which phase of the test this step belongs to. 'arrange' = precondition setup the strategy's Preconditions require (authentication / entity creation / navigation to the entity under test); 'act' = the manual-step actions; 'assert' = verification. Default 'act' when omitted. The architect MUST translate the strategy's Preconditions into explicit ordered 'arrange' steps (e.g. logIn, createBasicRopaEntry) — the writer will not invent them."
+          "description": "Which phase of the test this step belongs to. 'arrange' = precondition setup the strategy's Preconditions require (authentication / entity creation / navigation to the entity under test); 'act' = the manual-step actions; 'assert' = verification. Default 'act' when omitted. The architect MUST translate the strategy's Preconditions into explicit ordered 'arrange' steps (e.g. logIn, createBasicEntity) — the writer will not invent them."
         },
         "args": {
           "type": "array",
