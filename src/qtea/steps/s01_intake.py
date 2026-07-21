@@ -48,6 +48,12 @@ from qtea.ado_client import (
     normalize_description as ado_normalize_description,
 )
 from qtea.config import package_resource_root, step_timeout
+from qtea.confluence_client import (
+    ConfluenceFetchError,
+    fetch_page_markdown,
+    find_docupedia_urls,
+    is_docupedia_url,
+)
 from qtea.jira_client import (
     JiraFetchError,
     fetch_issue,
@@ -79,6 +85,18 @@ _PROMPT_INJECTION_RE = re.compile(
 
 def _sanitize_for_prompt(text: str) -> str:
     return _PROMPT_INJECTION_RE.sub("<sanitized>", text)
+
+
+# Appended to the enrichment prompt when the operator supplied run-start
+# context. The context is TRUSTED (operator-authored, not external ticket
+# text) so it is inlined verbatim without prompt-injection sanitization.
+_OPERATOR_CONTEXT_CLAUSE = (
+    " An operator has supplied additional context in `./user-context.md`. "
+    "Treat it as TRUSTED guidance to disambiguate and sharpen the spec — "
+    "apply environmental facts, scope emphasis, and domain clarifications it "
+    "provides. It AUGMENTS the ticket; it does NOT replace or contradict the "
+    "ticket's requirements."
+)
 
 
 def _is_jira(src: str) -> bool:
@@ -145,6 +163,7 @@ async def _enrich_jira_via_agent(
     out_dir: Path,
     source_label: str,
     payload_json: str,
+    operator_context: str | None = None,
 ) -> Path:
     """Invoke the ``ticket-to-ai-spec`` agent on an inlined JIRA payload.
 
@@ -172,12 +191,16 @@ async def _enrich_jira_via_agent(
         f"around the spec body, no preamble. Return only the spec.md "
         f"markdown content."
     )
+    inputs = {"jira-issue.json": payload_json}
+    if operator_context:
+        inputs["user-context.md"] = operator_context
+        user_prompt += _OPERATOR_CONTEXT_CLAUSE
 
     result = await call_reasoning_llm(
         agent,
         workdir=workdir,
         user_prompt=user_prompt,
-        inputs={"jira-issue.json": payload_json},
+        inputs=inputs,
         output_schema=None,
         timeout_s=step_timeout(1),
         step=1,
@@ -201,7 +224,7 @@ async def _jira_via_rest(
     workdir: Path,
 ) -> Path:
     """Fetch a Jira ticket via direct REST + enrich via the ticket-to-ai-spec agent."""
-    del ctx  # accepted for signature parity with other intake helpers
+    operator_context = ctx.operator_context
     try:
         payload = fetch_issue(base_url, ticket_id)
     except JiraFetchError as e:
@@ -224,6 +247,7 @@ async def _jira_via_rest(
         out_dir=out_dir,
         source_label=f"{base_url}/browse/{ticket_id}",
         payload_json=payload_text,
+        operator_context=operator_context,
     )
 
     if linked_items:
@@ -241,6 +265,7 @@ async def _enrich_ado_via_agent(
     out_dir: Path,
     source_label: str,
     payload_json: str,
+    operator_context: str | None = None,
 ) -> Path:
     """Invoke the ``ticket-to-ai-spec`` agent on an inlined Azure DevOps payload.
 
@@ -258,12 +283,16 @@ async def _enrich_ado_via_agent(
         f"around the spec body, no preamble. Return only the spec.md "
         f"markdown content."
     )
+    inputs = {"ado-workitem.json": payload_json}
+    if operator_context:
+        inputs["user-context.md"] = operator_context
+        user_prompt += _OPERATOR_CONTEXT_CLAUSE
 
     result = await call_reasoning_llm(
         agent,
         workdir=workdir,
         user_prompt=user_prompt,
-        inputs={"ado-workitem.json": payload_json},
+        inputs=inputs,
         output_schema=None,
         timeout_s=step_timeout(1),
         step=1,
@@ -288,7 +317,7 @@ async def _ado_via_rest(
     workdir: Path,
 ) -> Path:
     """Fetch an Azure DevOps work item via REST + enrich via the agent."""
-    del ctx
+    operator_context = ctx.operator_context
     try:
         payload = fetch_work_item(org, project, item_id)
     except AdoFetchError as e:
@@ -309,6 +338,7 @@ async def _ado_via_rest(
         out_dir=out_dir,
         source_label=source_label,
         payload_json=payload_text,
+        operator_context=operator_context,
     )
 
     if linked_items:
@@ -332,6 +362,20 @@ def _url_passthrough(url: str, out_dir: Path) -> Path:
     return dst
 
 
+def _docupedia_passthrough(url: str, out_dir: Path) -> Path:
+    """Fetch a Docupedia page (authenticated) and write markdown to spec.md.
+
+    Raises :class:`ConfluenceFetchError` (missing PAT, auth, HTTP, unrecognized
+    URL) — the caller lets it propagate so Step 1 hard-fails with a clear
+    message, rather than silently writing an SSO login page.
+    """
+    _title, md = fetch_page_markdown(url)
+    md = _sanitize_for_prompt(md)
+    dst = out_dir / "spec.md"
+    dst.write_text(md, encoding="utf-8")
+    return dst
+
+
 def _file_passthrough(src: str, out_dir: Path) -> Path:
     """Copy a local file's content verbatim to spec.md."""
     raw_md = _read_local_text(src)  # raises FileNotFoundError if missing
@@ -348,13 +392,14 @@ def _format_linked_context_md(linked_items: list[dict]) -> str:
         "",
         "---",
         "",
-        "## Linked Context (text only — external URLs not followed)",
+        "## Linked Context (text only — non-Docupedia external URLs not followed)",
         "",
         "> The following tickets are linked to this requirement and were fetched "
         "automatically to provide broader context for refinement. "
-        "Only text fields from the issue tracker are included; Figma designs, "
-        "Confluence pages, and other external URLs are not accessible and have "
-        "not been fetched.",
+        "Only text fields from the issue tracker are included. Docupedia pages "
+        "referenced anywhere in this spec are fetched separately (see the "
+        "Docupedia context section, when a DOCUPEDIA_PAT is configured); other "
+        "external URLs (e.g. Figma designs) are not followed.",
         "",
     ]
     for item in linked_items:
@@ -382,6 +427,76 @@ def _format_linked_context_md(linked_items: list[dict]) -> str:
             lines.append(ac)
             lines.append("")
     return "\n".join(lines) + "\n"
+
+
+def _format_docupedia_context_md(items: list[dict]) -> str:
+    """Render fetched Docupedia pages as a markdown section for spec.md."""
+    if not items:
+        return ""
+    lines = [
+        "",
+        "---",
+        "",
+        "## Linked Docupedia Context (fetched via REST)",
+        "",
+        "> The following Docupedia pages were referenced in the spec and fetched "
+        "automatically to provide broader context for refinement. Page bodies are "
+        "included as markdown; attachments, images, and child pages are not fetched.",
+        "",
+    ]
+    for item in items:
+        title = item.get("title") or item.get("url") or "?"
+        url = item.get("url") or ""
+        body = (item.get("body") or "").strip()
+        lines.append(f"### {title}")
+        lines.append("")
+        if url:
+            lines.append(f"**Source:** {url}")
+            lines.append("")
+        if body:
+            lines.append(body)
+            lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _append_docupedia_context(spec_path: Path, *, skip_url: str | None = None) -> int:
+    """Scan spec.md for Docupedia URLs, fetch each, and append a context section.
+
+    Best-effort: any fetch error is logged and skipped so a missing PAT or an
+    inaccessible page never aborts Step 1 (contrast the direct-source branch,
+    which hard-fails). Returns the number of pages appended.
+    """
+    if not spec_path.exists():
+        return 0
+    text = spec_path.read_text(encoding="utf-8")
+    urls = find_docupedia_urls(text)
+    if skip_url:
+        urls = [u for u in urls if u != skip_url]
+    if not urls:
+        return 0
+
+    items: list[dict] = []
+    for url in urls:
+        try:
+            title, body = fetch_page_markdown(url)
+            items.append({
+                "url": url,
+                "title": title,
+                "body": _sanitize_for_prompt(body),
+            })
+            log.info("step01.docupedia_fetch_ok", url=url)
+        except ConfluenceFetchError as e:
+            log.warning("step01.docupedia_fetch_failed", url=url, error=str(e))
+        except Exception as e:  # noqa: BLE001 - never abort intake
+            log.warning("step01.docupedia_fetch_error", url=url, error=str(e))
+
+    if not items:
+        return 0
+    context_md = _format_docupedia_context_md(items)
+    with spec_path.open("a", encoding="utf-8") as fh:
+        fh.write(context_md)
+    log.info("step01.docupedia_context_appended", count=len(items))
+    return len(items)
 
 
 def _fetch_linked_jira_safe(base_url: str, payload: dict) -> list[dict]:
@@ -479,6 +594,15 @@ class IntakeStep(Step):
                     f"normalized content.\n",
                     encoding="utf-8",
                 )
+            elif is_docupedia_url(src):
+                _docupedia_passthrough(src, out_dir)
+                jira_dst.write_text(
+                    f"# Docupedia source\n\nFetched from: {src}\n\n"
+                    f"Page body fetched via Confluence REST (PAT auth) and "
+                    f"written as markdown to `spec.md` — no agent enrichment "
+                    f"was performed at step 1.\n",
+                    encoding="utf-8",
+                )
             elif _is_url(src):
                 _url_passthrough(src, out_dir)
                 jira_dst.write_text(
@@ -498,6 +622,12 @@ class IntakeStep(Step):
         except Exception as e:
             log.error("step01.failed", error=str(e), source=src)
             return StepResult(success=False, status="failed", outputs=[], error=str(e))
+
+        # Best-effort: fetch any Docupedia links referenced in the spec (or in
+        # appended linked-issue context) and append them as context. A Docupedia
+        # URL passed as the direct source was already fetched above — skip it.
+        skip = src if is_docupedia_url(src) else None
+        _append_docupedia_context(spec_dst, skip_url=skip)
 
         if not spec_dst.exists() or spec_dst.stat().st_size == 0:
             return StepResult(
@@ -519,12 +649,15 @@ class IntakeStep(Step):
 __all__ = [
     "IntakeStep",
     "_ado_via_rest",
+    "_append_docupedia_context",
+    "_docupedia_passthrough",
     "_download_text",
     "_enrich_ado_via_agent",
     "_enrich_jira_via_agent",
     "_fetch_linked_ado_safe",
     "_fetch_linked_jira_safe",
     "_file_passthrough",
+    "_format_docupedia_context_md",
     "_format_linked_context_md",
     "_is_ado",
     "_is_jira",

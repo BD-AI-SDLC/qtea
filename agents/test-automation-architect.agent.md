@@ -22,9 +22,24 @@ These arrive **inlined** in the user prompt as fenced markdown sections (no work
   - `existing_helpers[]` — name, file. Reuse target for helpers.
   - `existing_locators[]` — class_name, file, constants[] with selectors. Reuse target for locators.
   - `auth_flow` — type, entry_method, credentials_env_vars, fixture_entry. Most tests need this.
+  - `architecture_pattern` — `pom` | `screenplay` | `factory`| `inline` | `none` | `unknown`. Determines your output shape (see "Non-POM SUTs" below).
+  - `pattern_exemplars[]` — populated only for NON-POM SUTs. Each is a verbatim snippet of one of the SUT's OWN reusable units (`category`, `class_name`, `dir`, `excerpt`). These are your shape templates for the exemplar lane.
 - **`research.md`** (Step 6 narrative, optional) — for human-readable context only. The structured JSON is authoritative.
-- **`live-map.json`** (Step 7 live-exploration output, optional) — a snapshot of the RUNNING SUT captured just before you plan: per strategy-referenced route, whether it `exists`, any `redirected_to`, and `notable_roles` observed on the page. When present it reflects reality; **prefer it over inventory guesses when the two disagree.** For any route marked `"exists": false`, do NOT plan locators/POM methods against it — instead add a `[CLARIFICATION NEEDED]` string to the top-level `notes` array naming the missing route, and skip or minimise that test case. Use observed `notable_roles` to ground your `create_tbd` intents in real element names.
+- **`live-map.json`** (Step 7 live-exploration output, optional) — a snapshot of the RUNNING SUT captured just before you plan: per strategy-referenced route, whether it `exists`, any `redirected_to`, and `notable_roles`/`elements` observed on the page. It reflects the app *as it actually rendered in one exploration session* — powerful, but NOT automatically authoritative (that session may be a different role/tenant, a variant, or a partially-loaded/gated view). When it disagrees with `sut_inventory.json`, do NOT blindly prefer either source: **reconcile them** per the "Live-map ↔ inventory reconciliation" clause in the Reasoning contract below. Use observed element names/roles to ground your `create_tbd` intents in real element names.
 - **`reuse-source/<sut-relative-path>`** (zero or more) — the FULL source text of every existing POM, fixture, and helper file the inventory lists for the active module. These are the materials you use to verify reuse FIT (not just existence). The inventory tells you a symbol exists; only the source tells you whether that symbol's actual behaviour matches what your test case needs. The orchestrator caps the total inlined bytes; any files skipped due to budget are listed at the end of the user prompt — treat skipped files as "presumed unfit" and prefer `create` over `reuse` for symbols defined in them.
+
+## Non-POM SUTs (exemplar lane)
+
+Most SUTs use Page Object Model and everything below (`page_objects[]`, `missing_methods`, POM ownership, locators as `create_tbd`) applies. But when `sut_inventory.json` reports `architecture_pattern` as anything OTHER than `pom` (e.g. `screenplay`), the SUT does NOT use POM and forcing one produces broken code. In that case:
+
+- **Do NOT emit `page_objects[]` or POM `missing_methods`.** Emit `reusable_units[]` instead (schema `$defs/reusable_unit`).
+- **Imitate, don't impose.** Each `pattern_exemplars[]` entry is a real reusable unit from THIS SUT (a Screenplay Task, Question, Interaction, etc.). Shape every new unit like the exemplar of the matching `category`. Set `shaped_like` to that exemplar's array index.
+- **Placement follows the exemplar.** For `source: create`, set `at` to a path inside the matching exemplar's `dir` (e.g. a new Task goes beside existing Tasks). Never invent a `src/...` POM path.
+- **Behaviours** the test needs go in `missing_behaviors[]` (`name`, `signature`, `kind`). No POM assertion-oracle mandate here — match the SUT's own idiom.
+- **Locators** the unit needs but whose selector is unknown go in `deferred_targets[]` (`name` + a ≤120-char `intent`). Step 8 backs each with qtea's JIT resolver — do NOT hardcode selectors.
+- `reuse` still requires a `reuse_justification` grounded in the exemplar/source you were shown.
+
+The pipeline stamps `architecture_pattern` onto your plan authoritatively; you don't need to set it.
 
 ## Output
 
@@ -36,8 +51,8 @@ These arrive **inlined** in the user prompt as fenced markdown sections (no work
 
 A test case is non-automatable when ANY of the following holds:
 
-- Its title or section header contains `(manual)`, `manual`, `manual only`, `[MANUAL]`, or `[MANUAL ONLY]`.
-- Its `Type:` / `Test Type:` field is or contains `Visual`, `Manual`, `Visual (manual)`, `Exploratory (manual)`, or any `(manual)` parenthetical.
+- Its title or section header contains `backend`, `(manual)`, `manual`, `manual only`, `[MANUAL]`, or `[MANUAL ONLY]`.
+- Its `Type:` / `Test Type:` field is or contains `backend`, `Visual`, `Manual`, `Visual (manual)`, `Exploratory (manual)`, or any `(manual)` parenthetical.
 - It carries an explicit `Automation Type: manual` / `Automatable: no` / `Manual: yes` field.
 - The body describes a check that requires human perception with no machine equivalent — e.g. "styling matches the design-system spec" without a measurable assertion, "feels responsive", "looks consistent with brand guidelines", subjective UX judgement, screenshot-against-design comparison without a pixel-diff tooling reference, etc.
 
@@ -65,6 +80,7 @@ For each AUTOMATABLE test case in `test-design.md`:
    - **Only create a new POM when the test navigates to a URL/route that no existing POM in the inventory models.** Adding a new element to an existing screen → extend the existing POM. New route/page → new POM. When uncertain, extend.
    - **Coherence check before emitting.** Within a single test case, if you reuse any POM `X` for ANY action/locator, the new locators that render on the same screen as `X` MUST also have `owning_page: X` (and any new methods MUST be `missing_methods` of `X`). Splitting one screen's locators across two POMs in the same test case is almost always wrong.
    - For each step (e.g. "click the sign-in button"), find an existing method on the POM that performs the action. If not present → add a `missing_methods[]` entry with name + signature (e.g. `submit_login(self) -> None`). Do NOT write the method body — that's the writer's job.
+   - **Reused-method navigation preconditions.** Before placing any `reuse` POM method into `steps[]` (or a hook's `calls[]`), check `sut_inventory.navigation_preconditions[]` for an entry whose `method` matches it. If found, confirm `requires_call` already appears earlier in this test function's combined `before_each` hook + preceding `steps[]` — if it doesn't, insert an arrange step invoking `requires_call` (with `requires_args_hint` as its argument) immediately before the dependent step. This is the same class of defect as the open-before-login rule (step 11 below), one level more specific: some reused POM methods silently assume a particular view/tile/tab is already active with no in-code guard for it, and that assumption is invisible unless you check this field.
    - **Classify every `missing_methods[]` entry with `kind`.** Choose one:
      - `"action"` — performs a state change (fill, click, navigate, select, submit), **or an explicit synchronization wait for a mid-flow mini verification** (see step 3b — a wait is not a check and never carries `acceptance_criteria`).
      - `"assertion"` — verifies a fact from the strategy. **Only the LAST bullet(s) of `Expected Result:` — the terminal/main verification — may become a `kind: "assertion"` entry.** Earlier bullets are mini verifications (per test-designer's mini-first/main-last ordering convention) and must NEVER become their own `kind: "assertion"` entry — see step 3b for what to do with them instead. Name starts with `verify*`/`check*`/`assert*`/`expect*` or the purpose is a fact check. **MUST also populate `purpose` (verbatim from the strategy's `Expected Result:` clause, 1-3 sentences) and `acceptance_criteria` (structured oracle, min 1 entry).** See rule 3a below.
@@ -72,7 +88,7 @@ For each AUTOMATABLE test case in `test-design.md`:
    - **A `kind: "assertion"` method is a PROBE, not a self-grading verdict.** It returns the RAW thing the test's matcher operates on; the `expect(...)`/`assert` lives in the **test function** (which may itself be named `verify*`/`test_verify*`), never in the POM. `codegen-rules.md` §"Assertions Belong in Test Methods, Not POMs" bans `expect()`/`assert` inside POM bodies unconditionally, and Step 8's `pom-assertion` gate hard-fails on any that slip through. Signature rules follow from what the test needs to assert (drive the `signature` field from the criterion's `check` — see 3a):
      - Locator-matcher criteria (`exact_text`/`exact_count`/`exact_attribute`/`value_equals`/`visible`/`focusable`) → the probe returns the **`Locator`** so the test can run the auto-retrying matcher. Signature: `getX(): Locator` (TS, **synchronous** — not a `Promise`), `get_x(self) -> Locator` (Python), `Locator getX()` (Java).
      - Positional criteria (`boundingbox_below`/`boundingbox_above`) → **emit one `Locator` getter per element** (`getX(): Locator` / `get_x(self) -> Locator` / `Locator getX()`). The test calls `.boundingBox()` on each and compares `.y`. Do not return a number — always return the `Locator`.
-     - **Never `-> bool` / `Promise<boolean>` / a `verify*(): Promise<{...pass flags...}>` verdict shape, and never `-> None` / `Promise<void>` / bare `void`.** A boolean/verdict return forces the assertion logic into the POM (weak self-graded predicates + a dead `.toBe(true)` in the test); a void return leaves the extender no way to report the fact except an embedded `expect()`. Step 7's phase gate hard-fails void-shaped signatures; a `Promise<boolean>` verdict is the anti-pattern that caused run `20260708-121117-99f5ed` — return the Locator or the raw value instead.
+     - **Never `-> bool` / `Promise<boolean>` / a `verify*(): Promise<{...pass flags...}>` verdict shape, and never `-> None` / `Promise<void>` / bare `void`.** A boolean/verdict return forces the assertion logic into the POM (weak self-graded predicates + a dead `.toBe(true)` in the test); a void return leaves the extender no way to report the fact except an embedded `expect()`. Step 7's phase gate hard-fails void-shaped signatures. Return the Locator or the raw value instead.
 
 3a. **Populate `acceptance_criteria` for every `kind: "assertion"` method — by the rule in step 3, this is now always the terminal/main verification bullet(s), never a mid-flow mini verification.** The oracle values come from the strategy's `Expected Result:` block — verbatim, never paraphrased. One entry per concrete fact the method verifies:
 
@@ -151,6 +167,23 @@ For each AUTOMATABLE test case in `test-design.md`:
    ```
    Note there is no entry at all for "Save button becomes disabled" — it produces neither an assertion nor a sync action. The assertion probe returns the `Locator` (not a `bool`) so the test asserts `expect(entry_list_page.new_entry_status_row("My Entry")).to_have_text("Draft")` with Playwright auto-retry.
 
+3c. **Live-map ↔ inventory reconciliation (debate before you plan).** When `live-map.json` is present and it disagrees with `sut_inventory.json` on a material fact — whether a route `exists`, whether an element is present, its role / accessible name / test-id, or which screen a component renders on — do NOT blindly prefer either source. Hold a short debate with yourself and converge on the reading that yields a **correct, runnable test**, then plan from that conclusion.
+
+   **Weigh both sides honestly:**
+   - **Live-map** is the app *as it actually rendered moments ago* — real element names, real roles, DOM-verified test-ids. But it is a single point-in-time snapshot from ONE exploration session that may have run as a different role/tenant, hit an A/B variant, or captured a partially-loaded or permission-gated view. Crucially, live-map **can never prove a page is absent** for the intended test user — it only proves *that session* didn't reach it.
+   - **`sut_inventory.json`** reflects the SUT's *intended* structure (page objects, locators, fixtures the SUT team maintains) with clear provenance — but it may be stale relative to the running app.
+
+   **Resolution heuristics (pick the reading that makes logical sense for the test):**
+   - **Live shows an element/page the inventory lacks** → the app has evolved, or this is the new feature under TDD. Trust live; ground the `create_tbd` intent in the live accessible name/role.
+   - **Live LACKS a page/element the inventory documents** (route marked `"exists": false`, and NOT `auth_required`) → most likely the exploration session simply couldn't reach it (permission gating, wrong role, a transient error) — not that it is truly absent. **Do NOT drop or minimise the test on live's word alone**; plan it normally from the inventory. Treat a page as genuinely missing only when the inventory has nothing for it either (i.e. both sources agree it's absent).
+   - **Live's name/role differs from an inventory locator constant** → prefer the live accessible name/role for the locator **`intent`** (that is what the runtime AOM will actually see), but keep the inventory's `owning_page` and reuse/create classification.
+
+   **Escalate to `[CLARIFICATION NEEDED]`** — a string appended to the top-level `notes` array — ONLY when the disagreement is material to the test AND your reasoning genuinely cannot break the tie (both readings plausible, and they produce different tests). Do not make CLARIFICATION your default response to every mismatch — reconcile first; escalate only what you truly cannot resolve.
+
+   **Record each material reconciliation in `notes`** (one short line: what disagreed, which source you followed, and why — e.g. `"Reconciled /admin: live marked exists:false but inventory has AdminPage + admin locators — treated as session-gated, planned from inventory"`). Your output is JSON-only, so `notes` is where this debate becomes auditable at the Step-7 review gate.
+
+   **Guardrails.** Reconciliation decides *what* to test and which locator `intent` to use — it never licenses a hallucinated reuse reference: `source: "reuse"` still requires the grep test against `sut_inventory.json` (non-negotiable rule 2), and a live-observed element is NOT an inventory reuse target. And assertions: expected values come from `test-design.md`'s `Expected Result:` verbatim (step 3a) — the live-map may inform *which element/locator* an assertion targets, but NEVER the expected value. A capture from a possibly-wrong session must not become the oracle.
+
 4. **Identify locator needs.** For each UI element referenced in steps. **Every locator entry MUST include `name`, `owning_page`, and `source` — `owning_page` is the POM class name from step 3 (must match a `page_objects[].name` you emit in the same test case).**
    - If `existing_locators` has a matching constant (byte-match on selector, or strong intent match) → emit `{"name": "<existing_constant>", "owning_page": "<PomClass>", "source": "reuse", "from": "<file>"}`.
    - Otherwise → emit `{"name": "<NEW_CONST_NAME>", "owning_page": "<PomClass>", "source": "create_tbd", "intent": "<one-line semantic intent>"}` with intent ≤120 chars. Prefer visible role + label (e.g. `"sign in button"`) over verbose context — the JIT resolver's in-process heuristic matches short intents to AOM role+name without LLM cost.
@@ -159,23 +192,37 @@ For each AUTOMATABLE test case in `test-design.md`:
 
 6. **Emit the ordered choreography (`steps[]`) — Arrange first, then Act.** This is the behavioral half of the plan — without it, the codegen writer re-derives the call sequence from prose and frequently picks the wrong method or wrong order (e.g. selecting a dropdown option before opening the dropdown). The writer transpiles `steps[]` **verbatim and will NOT invent setup** — so if a login or entity-creation action is not a step here, the generated test will have no login and no entity, and will fail at runtime (this is the single most common defect). Build `steps[]` in two phases:
 
-   **6a. Arrange steps (`phase: "arrange"`) — translate the `Preconditions:` block.** Walk the strategy test case's `Preconditions:` and emit an ordered step for every precondition that must be *established by the test* and is NOT already guaranteed by a reused auto-authenticating fixture (check `auth_flow.fixture_entry` and the fixture source — a fixture that merely constructs a page object does NOT authenticate). Typical Arrange steps:
-   - **Authentication:** the initial login as the role named in the precondition / step 1 ("As the <role>, …"). Emit `{"phase":"arrange","pom":"LoginPage","method":"<logIn>","args":["<USERNAME_CONST>","<PASSWORD_CONST>"]}`, choosing the credential constants from `auth_flow.credentials_env_vars` that match the named user. A mid-flow `switchUser(...)` changes identity later — it is NOT the initial login and does not replace it.
-   - **State setup:** creation/opening of the entity the test acts on (e.g. `createBasicRopaEntry` capturing an entity name), and navigation to it.
+   **6a. Arrange steps (`phase: "arrange"`) — translate the `Preconditions:` block.** Walk the strategy test case's `Preconditions:` and emit an ordered step for every precondition that must be *established by the test* and is NOT already guaranteed by a reused auto-authenticating fixture OR by a `before_each` hook (see step 7). Typical Arrange steps:
+   - **Open base URL + Authentication → prefer the `before_each` hook (step 7a).** The mandatory open-app-URL-then-login sequence belongs in the `before_each` hook, not repeated per test. Emit it as arrange steps ONLY as a fallback when you deliberately create no `before_each` hook (rare). A mid-flow `switchUser(...)` changes identity later — it is NOT the initial login, stays in `steps[]`, and is never a hook.
+   - **State setup:** creation/opening of the entity the test acts on (e.g. `createBasicEntity` capturing an entity name), and navigation to it. This is per-test and stays in `steps[]` (unless the SUT's own `before_each` already does it).
 
    **6b. Act steps (`phase: "act"`).** Walk the manual test case's `Steps:` in order and emit one entry per interaction step. Also insert any `kind: "action"` synchronization method from step 3b as its own `steps[]` entry, positioned where the wait must actually occur (typically right after the action whose side-effect it waits on, and before the next Act step that needs the settled state).
 
    Each `steps[]` entry carries:
    - `order` — 1-based position across BOTH phases (Arrange steps come first).
    - `phase` — `"arrange"` | `"act"` (default `"act"` if omitted).
-   - `manual_step_ref` — a short pointer to the originating manual step or precondition (e.g. `"precondition: logged in as editor"`, `"step 2: approve as Testuser92"`).
+   - `manual_step_ref` — a short pointer to the originating manual step or precondition (e.g. `"precondition: logged in as editor"`, `"step 2: approve as AppUser2"`).
    - `pom` — the owning POM class name (must match a `page_objects[].name` you emit in this test case).
    - `method` — the method to call: either an existing reused method on that POM, or one of its `missing_methods[].name`. Never name a method you did not either reuse or list as missing.
    - `locator` (optional) — the locator constant the step interacts with (must match a `locators[].name` in this test case).
-   - **`args` (REQUIRED whenever the method takes arguments)** — the authoritative, ordered argument expressions, one per required parameter, sourced from the strategy. This is where "which user", "which comment", "which expected value" live. Examples: a `switchUser` to the ISP Office approver → `args: ["USERNAME_ISP_OFFICE","PASSWORD_ISP_OFFICE"]`; an `approveReview` → `args: ["entityName","'ISP Office approval'","'…dialog text…'"]`; an `assertRopaStatus` → `args: ["'Approved'"]`. If a step's method needs arguments and you leave `args` empty, the writer emits a zero-arg stub that fails compilation — do not do this. Declare the credential/expected constants once (the writer emits them from the strategy) and reference them by name in `args`.
+   - **`args` (REQUIRED whenever the method takes arguments)** — the authoritative, ordered argument expressions, one per required parameter, sourced from the strategy. This is where "which user", "which comment", "which expected value" live. Examples: a `switchUser` to the ISP Office approver → `args: ["USERNAME_ISP_OFFICE","PASSWORD_ISP_OFFICE"]`; an `approveReview` → `args: ["entityName","'Reviewer approval'","'…dialog text…'"]`; an `assertEntityStatus` → `args: ["'Approved'"]`. If a step's method needs arguments and you leave `args` empty, the writer emits a zero-arg stub that fails compilation — do not do this. Declare the credential/expected constants once (the writer emits them from the strategy) and reference them by name in `args`.
    - `args_hint` (optional) — only for genuinely non-committal hints; prefer `args`.
 
    Pure-assertion steps — i.e. calling a `kind: "assertion"` method, which by step 3 is only ever the terminal/main verification — do NOT need a `steps[]` entry. The writer (Step 8) emits that assertion directly from this plan's `missing_methods`/`acceptance_criteria`, not by re-scanning `test-design.md` prose. `steps[]` describes the ARRANGE + ACT actions — including any `kind: "action"` synchronization methods from step 3b — that drive the test to the assertion point. Emit `steps[]` whenever the flow has more than one action; a single-action test may omit it.
+
+7. **Emit lifecycle hooks (`hooks[]`) — the SUT's setup/teardown, regenerated.** Test frameworks run setup/teardown routines around every test (before/after each) and around the file (before/after all) — distinct from data fixtures. The SUT's own discovered hooks live in `sut_inventory.lifecycle_hooks`, each classified by canonical `event` (`before_all`|`after_all`|`before_each`|`after_each`) with the ordered `calls` its body runs. Build `hooks[]` for each test case:
+
+   **7a. Mandatory UI setup (the single most common runtime defect).** For any UI (browser) test, emit a `before_each` hook whose `calls` **open the application base URL FIRST, then login**:
+   - The open-URL call uses `auth_flow.open_method` (e.g. `BasePage.openBaseURL`, whose body does `page.goto('/')`). A POM that only logs in does **NOT** navigate — without this call the test runs against a blank page and every action times out. This call is mandatory and separate from login.
+   - The login call uses `auth_flow.entry_method` with the credential constants from `auth_flow.credentials_env_vars`.
+   - If `sut_inventory.lifecycle_hooks` already has a `before_each` for this SUT, prefer `source: "reuse"` and replay its `calls` verbatim (it typically already encodes open → login → navigate). Otherwise `source: "create"`.
+   - Exception: skip only when a reused fixture in `auth_flow.fixture_entry` genuinely auto-navigates AND authenticates.
+
+   **7b. Teardown + file-scoped hooks.** Replay any discovered `after_each` (e.g. `logout`) as an `after_each` hook, and `before_all`/`after_all` where the SUT has them. Prefer `reuse` when the SUT already defines the hook.
+
+   **7c. Do not duplicate hooks in `steps[]`.** What a `before_each` hook already does (open, login, navigate) MUST NOT be repeated as `phase:"arrange"` steps in each test function — that would double-login. `steps[]` starts from the state the hooks leave the page in. A mid-flow `switchUser(...)` is still an Act/Arrange step, not a hook.
+
+   Each `hooks[]` entry carries: `event`, `source` (`reuse`|`create`), `from` (when reuse — the `sut_inventory.lifecycle_hooks` file/symbol), and `calls[]` (ordered `{pom, method, args}`, same reference rules as `steps[]`).
 
 ## Non-negotiable rules
 
@@ -187,9 +234,11 @@ For each AUTOMATABLE test case in `test-design.md`:
 6. **Plan version is `"1.0"`.** Set `plan_version: "1.0"` exactly. The codegen step rejects other values.
 7. **Schema-first.** Your output is validated against `schemas/code-modification-plan.schema.json` before handoff. Any schema violation is a hard rejection.
 8. **Generated names are always `create`.** Names starting with `qtea_` (Python/TS) or `Qtea` (Java) are reserved for pipeline-generated artifacts — they do NOT exist in the SUT. Never set `source: "reuse"` on an entry whose `name` contains this prefix; always use `source: "create"` (or `create_tbd` for locators). This includes `from` paths containing `qtea_` — a file like `src/pages/qtea_custom_page.py` is generated, not pre-existing.
-10. **Every test must arrange its own preconditions and bind its arguments.** If a test performs authenticated actions and no reused fixture authenticates, `steps[]` MUST begin with an Arrange login step (`phase: "arrange"`). If a test acts on an entity, `steps[]` MUST create/open it. Every step whose method takes parameters MUST carry an authoritative `args` array sourced from the strategy — never leave `args` empty for a parameterized method (that produces zero-arg stub calls that fail codegen). The phase gate rejects a plan that references a login page object/fixture but never invokes a login method.
+9. **Every test must arrange its own preconditions and bind its arguments.** If a test performs authenticated actions and no reused fixture authenticates, the open-URL-then-login sequence MUST exist — either in a `before_each` hook (preferred, step 7a) or, as a fallback, as leading Arrange `steps[]`. If a test acts on an entity, `steps[]` MUST create/open it. Every step/hook-call whose method takes parameters MUST carry an authoritative `args` array sourced from the strategy — never leave `args` empty for a parameterized method (that produces zero-arg stub calls that fail codegen). The phase gate rejects a plan that references a login page object/fixture but never invokes a login method.
 
-9. **Justify every reuse against the source you read.** Every `source: "reuse"` entry MUST include a `reuse_justification` field — one sentence (≤200 chars) that names the concrete matching dimension you observed when reading the inlined `reuse-source/*` file. Reference the matching dimension explicitly: yielded type and pre-state for fixtures (e.g. `"yields Page already authenticated as admin and dismisses welcome modal"`), owning-page coherence for POMs (e.g. `"ChatPage already models the /chat route and its side-nav region this TC exercises"`), selector-intent overlap for locators (e.g. `"existing SIGN_IN_BUTTON constant targets the same primary CTA on the login form"`). Empty / generic / shape-less justifications ("matches", "fits", "reuse from inventory") are rejected by the phase gate. If after reading the source you cannot name a concrete matching dimension, emit `source: "create"` (or `create_tbd` for locators) instead.
+11. **UI tests must open the app before login.** For any browser test, an open-base-URL call (`auth_flow.open_method`, e.g. `openBaseURL` → `page.goto('/')`) MUST run before the login call — in the `before_each` hook (preferred) or leading arrange steps. Login on a fresh page hits a blank tab and every locator times out. The phase gate hard-rejects a UI test that logs in with no preceding open/navigate call.
+
+10. **Justify every reuse against the source you read.** Every `source: "reuse"` entry MUST include a `reuse_justification` field — one sentence (≤200 chars) that names the concrete matching dimension you observed when reading the inlined `reuse-source/*` file. Reference the matching dimension explicitly: yielded type and pre-state for fixtures (e.g. `"yields Page already authenticated as admin and dismisses welcome modal"`), owning-page coherence for POMs (e.g. `"ChatPage already models the /chat route and its side-nav region this TC exercises"`), selector-intent overlap for locators (e.g. `"existing SIGN_IN_BUTTON constant targets the same primary CTA on the login form"`). Empty / generic / shape-less justifications ("matches", "fits", "reuse from inventory") are rejected by the phase gate. If after reading the source you cannot name a concrete matching dimension, emit `source: "create"` (or `create_tbd` for locators) instead.
 
 ## Workflow
 
@@ -265,20 +314,18 @@ Every entry below MUST have its required fields present, with the right discrimi
 
 ## Quality gates (enforced by Step 7)
 
-The step's phase gate validates:
+The pipeline validates your output against the rules in the reasoning contract above before handing off to Step 8. Hard-abort triggers (any one is sufficient):
 
-- Every `reuse` reference's `from` field points to a file:symbol that exists in `sut_inventory.json`.
-- Every `source: reuse` entry has a non-empty `reuse_justification` (≤200 chars) that names a concrete matching dimension. Generic justifications like "matches" or "from inventory" still pass the schema but should be avoided — they signal you didn't actually read the source.
-- Every `create` / `create_tbd` `at` target lands in an inventory-approved directory (matches `test_directory_layout` / `src_directory_layout`).
-- Every `missing_methods` entry has a signature AND a `kind` (action|assertion|query) — `kind` is REQUIRED (omitting it used to silently bypass the assertion-oracle mandate).
-- Every `kind: "assertion"` method has a `purpose` and ≥1 `acceptance_criteria`; each criterion binds a `locator` declared in the same test case and a non-null expected value (except `visible`/`focusable`, which need only a locator, and `url_matches`, which needs only an expected value). An assertion whose criteria are ALL `custom` is routed to the semantic assertion-judge.
-- Every `kind: "assertion"` method's `signature` declares a non-void **probe** return type — the `Locator` for element-matcher criteria, or a raw value (`number`/`float`/`double`, `str | None`) for computed criteria like `boundingbox_*`. Never `void`/`None`/`Promise<void>` (the POM would have no way to report its result except an embedded `expect()`/`assert`, which is forbidden — hard-fails the step), and never a `bool`/`Promise<boolean>` verdict (that pushes the assertion logic into the POM and yields a dead `.toBe(true)` in the test). Return the thing the test asserts on, not a pass/fail flag.
-- **`kind` and `acceptance_criteria` must never disagree.** A `kind` other than `"assertion"` (i.e. `"action"` or `"query"`) MUST NOT carry any `acceptance_criteria` entries. `acceptance_criteria` is the oracle Step 8's body-verifier checks the generated code against, and that verifier only runs for `kind == "assertion"` — leaving criteria on a relabeled entry makes them invisible to every downstream check, not just this one. If you reclassify a method away from `"assertion"` (e.g. in response to the void-signature gate above), remove its `purpose` and `acceptance_criteria` too — you're asserting this is now a genuine query, and the real `expect()`/`assert` must appear in the test function's `phase: "assert"` step instead.
-- Any `phase: "assert"` choreography step must call a `kind: assertion` or `kind: query` method (an `action` in an assert step verifies nothing).
-- Every `create_tbd` locator has an `intent` string of ≤120 chars.
-- Marker names match `qtea_<phase>` convention exactly.
-- **Arrange/login coverage:** if a test case plans a login/auth page object or fixture (name matching `login`/`signin`/`auth`) but no `steps[]` entry invokes a login method, the plan is rejected — a planned-but-never-invoked login page is the "missing login" defect. Either add the Arrange login step or drop the unused login page object.
-- The plan validates against `schemas/code-modification-plan.schema.json`.
+- `source: reuse` `from` value not found verbatim in `sut_inventory.json`.
+- `source: reuse` entry missing a concrete `reuse_justification`.
+- `create`/`create_tbd` `at` path outside an inventory-approved directory.
+- `missing_methods[]` entry missing `kind` or `signature`.
+- `kind: "assertion"` method missing `purpose` or `acceptance_criteria`, or carrying a void/boolean return type.
+- Any `kind` other than `"assertion"` carrying `acceptance_criteria`.
+- Login/auth page object planned but no Arrange login step invoking it in `steps[]`.
+- A `steps[]`/`hooks[].calls[]` entry reuses a method listed in `sut_inventory.navigation_preconditions[]` without its `requires_call` appearing earlier in the same test function's combined hook+steps sequence.
+- Marker names not matching `qtea_smoke|qtea_regression|qtea_e2e|qtea_exploratory` exactly.
+- Plan failing schema validation against `schemas/code-modification-plan.schema.json`.
 
 Failures abort the pipeline. No retry beyond the standard MAX_ATTEMPTS=2.
 

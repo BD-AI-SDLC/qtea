@@ -67,8 +67,25 @@ class _ScriptedAnthropic:
                 usage=FakeUsage(),
             )
 
+        class _Stream:
+            def __init__(self, kwargs):
+                self._kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_a):
+                return None
+
+            async def get_final_message(self):
+                return await _create(**self._kwargs)
+
         class FakeMessages:
             create = staticmethod(_create)
+
+            @staticmethod
+            def stream(**kwargs):
+                return _Stream(kwargs)
 
         class FakeClient:
             def __init__(self, **_kw):

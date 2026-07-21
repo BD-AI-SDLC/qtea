@@ -1138,10 +1138,21 @@ def _scan_zero_assertion_tests(
 # with a `qtea-setup` opt-out mirroring @pytest.mark.qtea_setup. Deliberately
 # does NOT strip comments/strings: that biases toward UNDER-detection
 # (a commented-out expect is ignored) rather than false-reds on real tests.
-_JSTS_TEST_DECL_RE = re.compile(r"\b(?:test|it)\s*(?:\.\s*\w+\s*)?\(")
+_JSTS_TEST_DECL_RE = re.compile(r"\b(?:test|it)\s*(?:\.\s*(?P<method>\w+)\s*)?\(")
 _JSTS_ASSERT_RE = re.compile(r"\bexpect\s*\(|\.\s*should\s*[\.\(]|\bassert(?:\.\w+)?\s*\(")
 _JSTS_SETUP_OPT_OUT = re.compile(r"qtea[-:]setup", re.IGNORECASE)
 _JSTS_SKIP_DECL_RE = re.compile(r"\b(?:test|it)\s*\.\s*(?:skip|fixme|todo)\s*\(")
+# `test.<method>(` forms that are NOT executable test blocks and therefore
+# legitimately carry no assertion: lifecycle hooks (Playwright/Jest/Mocha use
+# `test.beforeEach` etc.), grouping (`describe`), in-test step grouping
+# (`step`), and config (`use`, `slow`). Excluding these keeps the gate from
+# being structurally unpassable on any hook-bearing spec. Real test blocks
+# (`test(`, `it(`) and `test.only(` deliberately stay IN scope — an
+# assertion-less `test.only()` is a genuine bug.
+_JSTS_NON_TEST_METHODS = frozenset({
+    "beforeEach", "afterEach", "beforeAll", "afterAll", "before", "after",
+    "describe", "step", "use", "slow",
+})
 
 
 def _find_balanced_paren(s: str, open_idx: int) -> int:
@@ -1172,6 +1183,11 @@ def _scan_zero_assertion_tests_jsts(
         return []
     out: list[Violation] = []
     for m in _JSTS_TEST_DECL_RE.finditer(text):
+        # Lifecycle hooks / grouping / config (`test.beforeEach(`, `describe(`,
+        # `test.step(`, ...) are not executable test blocks — never require an
+        # assertion. Excluding them is why hook-bearing specs stay passable.
+        if (m.group("method") or "") in _JSTS_NON_TEST_METHODS:
+            continue
         open_idx = m.end() - 1
         close = _find_balanced_paren(text, open_idx)
         if close == -1:

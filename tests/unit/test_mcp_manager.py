@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from qtea.mcp_manager import (
     _substitute_env,
     load_mcp_config,
@@ -347,3 +349,193 @@ def test_stage_mcp_config_threads_env_overlay_and_filters_empty(
     out = stage_mcp_config(tmp_path / "wd", source=src, env={"SET": "--present"})
     data = json.loads(out.read_text(encoding="utf-8"))
     assert data["mcpServers"]["x"]["args"] == ["--keep", "--present"]
+
+
+# ---------------------------------------------------------------------------
+# npx → direct-node Playwright launch (bypass npx's per-spawn overhead)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.use_ambient_playwright_mcp
+def test_playwright_npx_rewritten_to_node_when_pinned_install_present(
+    tmp_path: Path, monkeypatch,
+):
+    """With a pinned cli.js resolvable, the npx spec is rewritten to a direct
+    ``node cli.js`` launch — dropping ``-y`` + the package spec and keeping the
+    tail (``--headless`` + any resolved storage-state arg)."""
+    fake_cli = tmp_path / "cli.js"
+    fake_cli.write_text("// fake", encoding="utf-8")
+    monkeypatch.setenv("QTEA_PLAYWRIGHT_MCP_CLI", str(fake_cli))
+    cfg = tmp_path / ".mcp.json"
+    cfg.write_text(json.dumps({"mcpServers": {"playwright": {
+        "command": "npx",
+        "args": ["-y", "@playwright/mcp@0.0.78", "--headless",
+                 "${QTEA_STORAGE_STATE_ARG}"],
+    }}}), encoding="utf-8")
+    servers = load_mcp_config(
+        cfg, env={"QTEA_STORAGE_STATE_ARG": "--storage-state=/abs/s.json"},
+    )
+    pw = servers["playwright"]
+    assert pw.command == "node"
+    assert pw.args == [str(fake_cli), "--headless", "--storage-state=/abs/s.json"]
+
+
+def test_playwright_stays_npx_when_no_pinned_install(tmp_path: Path):
+    """Default (no pinned install, via the isolation fixture): the committed npx
+    form is preserved — the direct-node rewrite is opt-in on the install."""
+    cfg = tmp_path / ".mcp.json"
+    cfg.write_text(json.dumps({"mcpServers": {"playwright": {
+        "command": "npx",
+        "args": ["-y", "@playwright/mcp@0.0.78", "--headless"],
+    }}}), encoding="utf-8")
+    pw = load_mcp_config(cfg)["playwright"]
+    assert pw.command == "npx"
+    assert pw.args == ["-y", "@playwright/mcp@0.0.78", "--headless"]
+
+
+@pytest.mark.use_ambient_playwright_mcp
+def test_stage_mcp_config_rewrites_playwright_to_node(tmp_path: Path, monkeypatch):
+    """The staged file (what the spawned claude CLI reads) is the node form,
+    with empty optional tokens filtered out of the surviving tail."""
+    fake_cli = tmp_path / "cli.js"
+    fake_cli.write_text("//", encoding="utf-8")
+    monkeypatch.setenv("QTEA_PLAYWRIGHT_MCP_CLI", str(fake_cli))
+    monkeypatch.setenv("QTEA_MCP_INSTALL_DIR", str(tmp_path / "empty"))
+    src = tmp_path / ".mcp.json"
+    src.write_text(json.dumps({"mcpServers": {"playwright": {
+        "command": "npx",
+        "args": ["-y", "@playwright/mcp@0.0.78", "--headless", "${MISSING}"],
+    }}}), encoding="utf-8")
+    out = stage_mcp_config(tmp_path / "wd", source=src)
+    data = json.loads(out.read_text(encoding="utf-8"))["mcpServers"]["playwright"]
+    assert data["command"] == "node"
+    assert data["args"] == [str(fake_cli), "--headless"]
+
+
+def test_non_playwright_npx_server_never_rewritten(tmp_path: Path, monkeypatch):
+    """The rewrite is Playwright-specific — an unrelated npx MCP server is
+    left untouched even when a pinned Playwright cli.js exists."""
+    fake_cli = tmp_path / "cli.js"
+    fake_cli.write_text("//", encoding="utf-8")
+    monkeypatch.setenv("QTEA_PLAYWRIGHT_MCP_CLI", str(fake_cli))
+    cfg = tmp_path / ".mcp.json"
+    cfg.write_text(json.dumps({"mcpServers": {"other": {
+        "command": "npx", "args": ["-y", "some-other-mcp", "--flag"],
+    }}}), encoding="utf-8")
+    other = load_mcp_config(cfg)["other"]
+    assert other.command == "npx"
+    assert other.args == ["-y", "some-other-mcp", "--flag"]
+
+
+def test_pinned_playwright_version_parses_config(tmp_path: Path):
+    from qtea.mcp_manager import pinned_playwright_version
+    cfg = tmp_path / ".mcp.json"
+    cfg.write_text(json.dumps({"mcpServers": {"playwright": {
+        "command": "npx", "args": ["-y", "@playwright/mcp@1.2.3", "--headless"],
+    }}}), encoding="utf-8")
+    assert pinned_playwright_version(cfg) == "1.2.3"
+
+
+def test_pinned_playwright_version_fallback_when_absent(tmp_path: Path):
+    from qtea.mcp_manager import (
+        _DEFAULT_PLAYWRIGHT_MCP_VERSION,
+        pinned_playwright_version,
+    )
+    cfg = tmp_path / ".mcp.json"
+    cfg.write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
+    assert pinned_playwright_version(cfg) == _DEFAULT_PLAYWRIGHT_MCP_VERSION
+
+
+@pytest.mark.use_ambient_playwright_mcp
+def test_resolve_playwright_cli_env_override_then_none(tmp_path: Path, monkeypatch):
+    from qtea.mcp_manager import resolve_playwright_cli
+    real = tmp_path / "cli.js"
+    real.write_text("//", encoding="utf-8")
+    monkeypatch.setenv("QTEA_PLAYWRIGHT_MCP_CLI", str(real))
+    assert resolve_playwright_cli() == real
+    # Override points at a missing file → fall through to the (empty) managed dir.
+    monkeypatch.setenv("QTEA_PLAYWRIGHT_MCP_CLI", str(tmp_path / "missing.js"))
+    monkeypatch.setenv("QTEA_MCP_INSTALL_DIR", str(tmp_path / "empty"))
+    assert resolve_playwright_cli() is None
+
+
+def test_ensure_playwright_mcp_installed_respects_no_auto_install():
+    """With auto-install disabled (set by the isolation fixture) and no pinned
+    install present, ensure returns False WITHOUT spawning npm."""
+    from qtea.mcp_manager import ensure_playwright_mcp_installed
+    ok, detail = ensure_playwright_mcp_installed()
+    assert ok is False
+    assert "auto-install disabled" in detail
+
+
+# ---------------------------------------------------------------------------
+# MCP initialize handshake readiness probe
+# ---------------------------------------------------------------------------
+
+
+def _fake_proc(stdout_lines, stderr_lines=()):
+    class _Stream:
+        def __init__(self, lines):
+            self._lines = list(lines)
+
+        def __iter__(self):
+            return iter(self._lines)
+
+    class _Stdin:
+        def __init__(self):
+            self.written: list[str] = []
+
+        def write(self, s):
+            self.written.append(s)
+
+        def flush(self):
+            pass
+
+    class _Proc:
+        def __init__(self):
+            self.stdin = _Stdin()
+            self.stdout = _Stream(stdout_lines)
+            self.stderr = _Stream(stderr_lines)
+
+        def poll(self):
+            return None
+
+    return _Proc()
+
+
+def test_mcp_handshake_success():
+    from qtea.mcp_manager import _mcp_initialize_handshake
+    resp = json.dumps(
+        {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2024-11-05"}}
+    ) + "\n"
+    ok, detail = _mcp_initialize_handshake(_fake_proc([resp]), timeout_s=5)
+    assert ok is True
+    assert detail == "mcp initialize ok"
+
+
+def test_mcp_handshake_skips_non_json_banner():
+    from qtea.mcp_manager import _mcp_initialize_handshake
+    resp = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}) + "\n"
+    ok, _ = _mcp_initialize_handshake(
+        _fake_proc(["Listening on stdio\n", resp]), timeout_s=5,
+    )
+    assert ok is True
+
+
+def test_mcp_handshake_error_response():
+    from qtea.mcp_manager import _mcp_initialize_handshake
+    resp = json.dumps(
+        {"jsonrpc": "2.0", "id": 1, "error": {"code": -32600, "message": "bad"}}
+    ) + "\n"
+    ok, detail = _mcp_initialize_handshake(_fake_proc([resp]), timeout_s=5)
+    assert ok is False
+    assert "initialize error" in detail
+
+
+def test_mcp_handshake_eof_before_response():
+    from qtea.mcp_manager import _mcp_initialize_handshake
+    ok, detail = _mcp_initialize_handshake(
+        _fake_proc([], stderr_lines=["boom\n"]), timeout_s=5,
+    )
+    assert ok is False
+    assert "closed before responding" in detail

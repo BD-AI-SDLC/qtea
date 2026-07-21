@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qtea/schemas/live-map.schema.json",
+  "title": "LiveMap",
+  "description": "Output of Step 7's site-explorer pre-pass: a per-route map of what actually exists on the running SUT, captured via Playwright MCP. Consumed by Step 7 planning (render_live_map_for_prompt) and Step 8 codegen (render_live_map_for_codegen, build_observed_dev_pool) as a non-authoritative grounding/locator-seed source — codegen still emits tbd(\"intent\") sentinels resolved at Step 9 runtime.",
+  "type": "object",
+  "required": ["routes"],
+  "additionalProperties": true,
+  "$defs": {
+    "element": {
+      "type": "object",
+      "required": ["role", "name"],
+      "additionalProperties": true,
+      "properties": {
+        "role": {
+          "type": "string",
+          "description": "Accessible role, as read from the AOM (e.g. button, link, textbox). May be 'generic' or similar for a roleless clickable captured via the text/CSS fallback."
+        },
+        "name": {
+          "type": "string",
+          "description": "Accessible name, captured verbatim from the AOM. For a roleless clickable this is the visible text used to anchor the locator."
+        },
+        "locator": {
+          "type": ["object", "null"],
+          "description": "Verified locator object: the HIGHEST-priority candidate (per the CLAUDE.md ladder id>test_id>role>label>placeholder>text>alt>title>css) that the DOM probe confirmed resolves to EXACTLY ONE element on the page. Null (or omitted) only when NO candidate is verified-unique — in which case locator_ambiguous must be set. This is the authoritative locator field going forward; test_id is retained for backward compatibility with the dev-pool path.",
+          "required": ["strategy", "value", "verified_unique"],
+          "additionalProperties": true,
+          "properties": {
+            "strategy": {
+              "type": "string",
+              "enum": ["id", "test_id", "role", "label", "placeholder", "text", "alt", "title", "css"],
+              "description": "Locator strategy, following the CLAUDE.md priority ladder in that exact order. Maps to a Playwright getter: id/test_id -> get_by_test_id or #id; role -> get_by_role(role, name=); label/placeholder/text/alt/title -> the matching get_by_* getter; css -> a scoped CSS selector (NEVER XPath). 'text' also serves the roleless-clickable fallback (e.g. a launcher tile that is a <p> inside a clickable <div> with no ARIA role) — verified unique among the page's clickables."
+            },
+            "value": {
+              "type": "string",
+              "description": "The locator value: the attribute value for id/test_id, the accessible name for role, the label/placeholder/text/alt/title string for those, or the CSS selector for css."
+            },
+            "name": {
+              "type": "string",
+              "description": "Accessible name, present for strategy=role so the runtime can call get_by_role(role, name=...). Usually equal to the element's name field."
+            },
+            "verified_unique": {
+              "type": "boolean",
+              "description": "True when the DOM probe confirmed this candidate matches exactly one element on the page (the 'one result in the devtools search box' check). A locator object is only emitted when this is true."
+            }
+          }
+        },
+        "test_id": {
+          "type": ["string", "null"],
+          "description": "DOM attribute value (id/data-testid/data-test/data-cy/data-qa/name), populated ONLY when a browser_evaluate probe confirmed it uniquely identifies this element on the page. Never a value inferred/guessed from the accessible name or context. Null when no such attribute was found or verified unique. Retained for backward compatibility with the JIT dev-pool path; the authoritative field going forward is `locator`."
+        },
+        "locator_ambiguous": {
+          "type": "boolean",
+          "description": "Present and true only when NEITHER a unique DOM attribute NOR a unique role+name pair could be established for this element — a genuine SUT testability/accessibility gap, not a fabricated locator. Absent (not false) when not applicable."
+        },
+        "ambiguity_reason": {
+          "type": "string",
+          "description": "Short human-readable explanation of why the element is ambiguous (e.g. a data-test value shared across sibling elements, or an icon-only control with no accessible name). Only meaningful when locator_ambiguous is true."
+        }
+      }
+    }
+  },
+  "properties": {
+    "base_url": {
+      "type": ["string", "null"],
+      "description": "SUT origin the crawl was run against."
+    },
+    "_telemetry": {
+      "type": "object",
+      "description": "Per-run counters emitted by the deterministic driver (steps/s07/live_driver.py). Absent when the map came from the site-explorer LLM agent path. Diagnostic only — never used for planning decisions.",
+      "additionalProperties": true,
+      "properties": {
+        "routes_requested_by_plan": {"type": "integer", "minimum": 0},
+        "routes_explored": {"type": "integer", "minimum": 0},
+        "routes_truncated_by_cap": {"type": "integer", "minimum": 0, "description": "Number of plan entries dropped because the plan exceeded QTEA_LIVE_EXPLORE_MAX_ROUTES. Nonzero = silent coverage loss; Step 7 architect logs a warning when this is > 0."},
+        "routes_skipped_auth_required": {"type": "integer", "minimum": 0},
+        "reveal_callouts": {"type": "integer", "minimum": 0, "description": "Number of LLM callouts to the live-explore-reveal-judge (progressive-disclosure decisions)."},
+        "reveal_callouts_failed": {"type": "integer", "minimum": 0},
+        "ambiguity_callouts": {"type": "integer", "minimum": 0, "description": "Number of LLM callouts to the live-explore-ambiguity-judge (locator disambiguation)."},
+        "ambiguity_callouts_failed": {"type": "integer", "minimum": 0},
+        "llm_tokens_total": {"type": "integer", "minimum": 0},
+        "elapsed_ms": {"type": "integer", "minimum": 0}
+      }
+    },
+    "routes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "exists", "auth_required"],
+        "additionalProperties": true,
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Route path relative to base_url."
+          },
+          "url": {
+            "type": ["string", "null"],
+            "description": "Final resolved URL, when it differs from path."
+          },
+          "exists": {
+            "type": "boolean",
+            "description": "True only if the page rendered expected app content. A route gated behind login is still exists:false + auth_required:true (it is NOT reported as truly missing)."
+          },
+          "auth_required": {
+            "type": "boolean",
+            "description": "True if the route bounced to a login/SSO/identity-provider screen (no/stale session). The route almost certainly exists behind the gate."
+          },
+          "redirected_to": {
+            "type": ["string", "null"],
+            "description": "Final URL when it differs from the requested path, else null."
+          },
+          "discovered_from": {
+            "type": ["string", "null"],
+            "description": "The path this route was reached from. Null for seeds/root."
+          },
+          "entry_element": {
+            "type": ["object", "null"],
+            "description": "The element ON THE PARENT (discovered_from) route that the explorer clicked to reach THIS route. Same shape as an elements[] entry. Absent/null on root routes (discovered_from == null) or when the transition wasn't a click (direct URL nav, redirect). Guarantees the reach-path navigation is captured with a verified locator so codegen's beforeEach / setup has an authoritative locator for the launcher tile / nav item that led here — even when it is a roleless clickable that AOM alone would miss. Recorded in ADDITION to (not instead of) inclusion in the parent route's elements[]; the entry_element form makes the parent->child edge explicit.",
+            "$ref": "#/$defs/element"
+          },
+          "snapshot_source": {
+            "type": "string",
+            "enum": ["aom", "iframe_full", "raw_dom_fallback"],
+            "description": "How this route's elements were captured. 'aom' (default, omitted) = the accessibility tree, always preferred. 'iframe_full' = a frame-scoped/full snapshot taken because a tested element lives inside an <iframe> the AOM does not reach (Hard Rule exception 1). 'raw_dom_fallback' = the full-DOM last-resort tier, used ONLY when AOM + the scoped attribute probe could not yield a verified-unique locator for a needed element (Hard Rule exception 2). Both non-aom values are gated by the $10 cost ceiling and must carry a fallback_reason."
+          },
+          "fallback_reason": {
+            "type": "string",
+            "description": "Short human-readable reason the route needed a non-AOM snapshot_source (e.g. 'target Save button lives inside a payment <iframe>' or 'no unique attribute or role+name for the grid row-action menu; full DOM read to recover a scoped CSS locator')."
+          },
+          "elements": {
+            "type": "array",
+            "description": "Comprehensive list of interactive/salient elements captured on this route, including elements revealed inside a non-destructively opened dialog/form.",
+            "items": {"$ref": "#/$defs/element"}
+          }
+        }
+      }
+    }
+  }
+}

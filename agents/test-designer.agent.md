@@ -138,6 +138,8 @@ Write `test-design.md` to the output directory with these sections:
 
 **Why this is non-negotiable:** Step 7 (Test Automation Architect) maps `Steps` 1:1 onto POM action methods (`kind: "action"`). `Expected Result` bullets feed Step 7's assertion oracles, but NOT 1:1 — only the terminal/main verification (the last bullet) becomes its own `kind: "assertion"` entry; earlier mini-verification bullets are consumed as implicit facts (already guaranteed by the next action's auto-wait) or as non-asserting `kind: "action"` synchronization methods, never their own assertion. A verification phrased as a step still has no correct home in that mapping — it either gets silently dropped or forces an assertion (`expect()`/`assert`) into a page-object method, which `codegen-rules.md` bans unconditionally. Keeping the two concerns cleanly separated here is what lets Step 7 produce a correct plan without having to re-derive which words were actions and which were checks.
 
+**Shared/append-only counters: phrase Expected Result as a delta, never an absolute value.** A notification inbox, audit log, activity feed, or comment thread accumulates entries independently of this test — other users, background processes, or prior runs may already have items in it. `Expected Result: exactly 1 notification exists for the entity` tests today's incidental app state, not the change under test, and fails the moment the environment isn't pristine. Instead: add a step that captures the current count as a precondition/baseline, then phrase the Expected Result relative to it (e.g. "notification count for the entity is exactly one more than the baseline captured before the change"). Reserve an absolute-value assertion for entities that are fully test-owned and known-empty by construction (e.g. a form's own validation-error list on a fresh page load).
+
 **Required per-TC fields (machine-extracted by Step 4 parser).** In addition to `Type / Priority / Preconditions / Steps / Expected`, every `#### TC-<slug>:` body MUST include:
 
 - `**Req ID:** REQ-<slug>` — the refined-spec requirement id this TC traces back to.
@@ -194,3 +196,4 @@ Before finalizing output, verify:
 - [ ] No duplicate or near-duplicate test cases
 - [ ] No step is phrased as a verification (`Verify/Confirm/Observe/Inspect/Monitor/Ensure/Assert/Validate …`) — every such fact is a bullet in Expected Result instead
 - [ ] No fact is stated in both Steps and Expected Result
+- [ ] Any count assertion on a shared/append-only entity (notifications, logs, feeds, threads) is phrased as a baseline-delta, not an absolute value

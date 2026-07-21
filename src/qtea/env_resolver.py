@@ -10,9 +10,9 @@ resolves their *values* via a cascade of strategies:
 
 Resolved values are injected into ``os.environ`` so downstream steps
 (8, 9) pick them up transparently.  Values are never logged but ARE
-persisted to ``<workspace>/.env.qtea`` (mode 600) so that
-``--from-step`` restarts can recover HITL-provided values without
-re-prompting.
+persisted to ``<sut>/.env`` (mode 600, gitignored) by the calling step so
+that ``--from-step`` restarts can recover HITL-provided values without
+re-prompting — ``DotenvFileStrategy`` reads it back via ``sut_path``.
 """
 
 from __future__ import annotations
@@ -177,7 +177,7 @@ class ProcessEnvStrategy(EnvStrategy):
             if k in already_resolved:
                 continue
             v = os.environ.get(k)
-            if v is not None:
+            if v:  # skip empty strings — they are unset for resolution purposes
                 out[k] = v
         return out
 
@@ -187,21 +187,24 @@ class DotenvFileStrategy(EnvStrategy):
 
     def __init__(self, env_file: Path | None, sut_path: Path | None) -> None:
         self._paths: list[Path] = []
-        if env_file and env_file.exists():
-            self._paths.append(env_file)
         if sut_path:
             # Order matters: dotenv_values entries later in the list override
             # earlier ones. Templates / examples (placeholders) go first;
-            # real `.env` / `.env.local` files (actual values) go last so they
-            # win. Reading `.env` is what lets `qtea run --from-step 7+`
-            # find QA_URL across process restarts — without it, the in-process
-            # `os.environ` write from a prior Step 6 run is gone and Step 8
-            # aborts with BASE_URL_UNRESOLVED.
+            # real `.env` / `.env.local` files (actual values) go next so they
+            # win over placeholders. Reading `.env` is what lets
+            # `qtea run --from-step 7+` find QA_URL across process restarts —
+            # without it, the in-process `os.environ` write from a prior
+            # Step 6 run is gone and Step 8 aborts with BASE_URL_UNRESOLVED.
             for name in (".env.example", ".env.template", ".env.sample",
                          ".env", ".env.local"):
                 p = sut_path / name
                 if p.exists():
                     self._paths.append(p)
+        # An explicit user-supplied --env-file is added last so it overrides
+        # the SUT's own cached `.env` — the user's explicit input always
+        # wins over a previously persisted/HITL-recovered value.
+        if env_file and env_file.exists():
+            self._paths.append(env_file)
 
     def resolve(
         self,
@@ -422,22 +425,96 @@ class InteractivePromptStrategy(EnvStrategy):
         out = {}
         for k in keys:
             current = self._defaults.get(k, "")
+            is_secret = any(
+                p in k.upper()
+                for p in ("PASSWORD", "PASS", "PASSWD", "PWD", "SECRET", "TOKEN", "AUTH")
+            )
             suffix = (
-                "[dim](found — Enter to keep, or type new)[/]"
+                "[dim](found — Enter to keep, or type/paste new)[/]"
                 if current
-                else "[dim](not found — type to supply)[/]"
+                else "[dim](not found — type or paste value)[/]"
             )
             console.print()
+            # Do NOT use password=True: it breaks clipboard paste on Windows
+            # terminals (raw-mode stdin drops Ctrl+V sequences) and gives no
+            # benefit since the value is written to <sut>/.env on disk anyway.
+            # Secret keys show a masked confirmation line after entry instead.
             val = Prompt.ask(
                 f"  [green]{k}[/green] {suffix}",
                 default=current,
-                password=True,
-                show_default=False,
+                show_default=bool(current and not is_secret),
             )
             val = (val or "").strip()
             if val:
+                if is_secret:
+                    console.print(f"    [dim]✓ {k} set ({len(val)} chars)[/]")
                 out[k] = val
         return out
+
+
+# ---------------------------------------------------------------------------
+# Shared SUT-file persistence helpers
+#
+# Used by Step 6 (initial resolution), Step 8 (JIT runtime vendoring), and
+# Step 9 (HITL env-var recovery mid-run) — anywhere qtea writes a file into
+# the SUT clone that must never be committed.
+# ---------------------------------------------------------------------------
+
+def ensure_gitignore_entry(directory: Path, entry: str) -> None:
+    """Append *entry* to ``<directory>/.gitignore`` if not already listed."""
+    gitignore = directory / ".gitignore"
+    try:
+        if gitignore.exists():
+            text = gitignore.read_text(encoding="utf-8", errors="replace")
+            if any(line.strip() == entry for line in text.splitlines()):
+                return
+            if text and not text.endswith("\n"):
+                text += "\n"
+        else:
+            text = ""
+        gitignore.write_text(text + entry + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def merge_dotenv_file(dst: Path, values: dict[str, str]) -> None:
+    """Merge ``KEY=value`` pairs into *dst*, creating it if it doesn't exist.
+
+    Preserves existing comments/blank lines and unrelated keys; updates keys
+    already present in place, appends new ones. Sets owner-only permissions
+    (mode 600 on POSIX) since dotenv files may hold credentials.
+    """
+    if not values:
+        return
+
+    existing_lines: list[str] = []
+    existing_keys: dict[str, int] = {}
+    if dst.exists():
+        try:
+            existing_lines = dst.read_text(encoding="utf-8").splitlines(keepends=True)
+            for idx, line in enumerate(existing_lines):
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                eq = stripped.find("=")
+                if eq > 0:
+                    existing_keys[stripped[:eq].strip()] = idx
+        except OSError:
+            existing_lines = []
+
+    for key, value in sorted(values.items()):
+        entry = f"{key}={value}\n"
+        if key in existing_keys:
+            existing_lines[existing_keys[key]] = entry
+        else:
+            existing_lines.append(entry)
+
+    try:
+        dst.write_text("".join(existing_lines), encoding="utf-8")
+        from qtea.proxy import set_owner_only_perms
+        set_owner_only_perms(dst)
+    except OSError as exc:
+        log.warning("env_resolver.merge_dotenv_failed", path=str(dst), error=str(exc))
 
 
 # ---------------------------------------------------------------------------

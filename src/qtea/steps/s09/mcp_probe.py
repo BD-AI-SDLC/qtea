@@ -45,9 +45,25 @@ def _lazy_probe_heal_mcp(
     """
     import time as _time
 
-    from qtea.mcp_manager import load_mcp_config, probe_server
+    from qtea.mcp_manager import (
+        PLAYWRIGHT_SERVER_NAME,
+        ensure_playwright_mcp_browser,
+        ensure_playwright_mcp_installed,
+        load_mcp_config,
+        warm_mcp_server,
+    )
 
     started = _time.monotonic()
+
+    # Bypass npx via a pinned local install (direct `node cli.js`): npx spawns
+    # cost ~186 s on AV-scanned Windows hosts vs ~4-6 s for node, which
+    # otherwise leaves Playwright `pending` past the SDK's MCP_TIMEOUT. Both
+    # calls are idempotent no-ops once the managed install / browser exist;
+    # `load_mcp_config` then rewrites the npx spec to the node form.
+    if server_name == PLAYWRIGHT_SERVER_NAME:
+        ensure_playwright_mcp_installed()
+        ensure_playwright_mcp_browser()
+
     try:
         all_servers = load_mcp_config(env=env)
     except (FileNotFoundError, OSError, ValueError) as e:
@@ -57,7 +73,9 @@ def _lazy_probe_heal_mcp(
     if server is None:
         return False, f"{server_name!r} not declared in .mcp.json", 0.0
 
-    ok, detail = probe_server(server)
+    # A real MCP `initialize` handshake — returns as soon as the server answers
+    # (a few seconds) instead of always burning the full smoke-probe window.
+    ok, detail = warm_mcp_server(server)
     elapsed = round(_time.monotonic() - started, 2)
     return ok, detail or "", elapsed
 

@@ -122,9 +122,33 @@ def install_fake_anthropic(
             return response
         create_mock.side_effect = _capture_and_return
 
+    class _FakeStream:
+        """Async-context-manager stand-in for ``client.messages.stream(...)``.
+
+        Routes through the same ``create_mock`` so call-count / ``on_call`` /
+        ``raises`` / sequence assertions behave identically whether the code
+        under test uses ``create()`` or ``stream().get_final_message()``.
+        """
+
+        def __init__(self, kwargs: dict[str, Any]):
+            self._kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return None
+
+        async def get_final_message(self):
+            return await create_mock(**self._kwargs)
+
     class FakeMessages:
         def __init__(self):
             self.create = create_mock
+
+        def stream(self, **kwargs):
+            # Sync method returning an async CM, mirroring the real SDK.
+            return _FakeStream(kwargs)
 
     class FakeClient:
         """Stand-in for ``anthropic.AsyncAnthropic`` / ``AsyncAnthropicVertex``.

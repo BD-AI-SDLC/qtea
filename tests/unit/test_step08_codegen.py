@@ -22,14 +22,22 @@ from qtea.steps.base import StepContext
 from qtea.steps.s08_codegen import (
     CodegenStep,
     _b5_filter_test_files,
+    _build_all_codegen_files,
+    _build_regen_feedback_hint,
+    _compose_playwright_global_setup,
     _detect_init_placement,
     _filter_index_to_qtea,
     _framework_mismatch_message,
     _LocatorTask,
     _match_dev_locator,
+    _PomTask,
+    _normalize_runtime_import_in_file,
+    _normalize_runtime_imports,
     _parse_test_command_head,
+    _register_playwright_test_global_setup,
     _run_phase_b55_xpath_normalisation,
     _strip_code_fences,
+    _units_by_file,
     _write_tbd_locators,
 )
 from qtea.workspace import create_workspace
@@ -427,13 +435,13 @@ def test_strip_code_fences_bare():
 
 def test_b5_filter_recognises_playwright_spec_ts_convention(tmp_path: Path):
     """Regression guard for run 20260701-114656-9394eb: the emitted test
-    file was ``qtea_ropa_approval_test.spec.ts`` (Playwright's ``.spec.ts``
+    file was ``qtea_entity_approval_test.spec.ts`` (Playwright's ``.spec.ts``
     convention). The prior filter required ``stem.endswith("_test")``, and
-    the stem here is ``qtea_ropa_approval_test.spec`` — so the file was
+    the stem here is ``qtea_entity_approval_test.spec`` — so the file was
     silently skipped by B.5 (0 test files scanned).
     """
     files = [
-        tmp_path / "qtea_ropa_approval_test.spec.ts",       # Playwright .spec.ts
+        tmp_path / "qtea_entity_approval_test.spec.ts",       # Playwright .spec.ts
         tmp_path / "qtea_login.spec.ts",                    # Playwright bare .spec.ts
         tmp_path / "qtea_dashboard.spec.js",                # Playwright .spec.js
         tmp_path / "qtea_setup_page.ts",                    # POM — must NOT be picked
@@ -443,7 +451,7 @@ def test_b5_filter_recognises_playwright_spec_ts_convention(tmp_path: Path):
         p.write_text("", encoding="utf-8")
     picked = _b5_filter_test_files(files, language="typescript")
     picked_names = {p.name for p in picked}
-    assert "qtea_ropa_approval_test.spec.ts" in picked_names
+    assert "qtea_entity_approval_test.spec.ts" in picked_names
     assert "qtea_login.spec.ts" in picked_names
     assert "qtea_dashboard.spec.js" in picked_names
     assert "qtea_setup_page.ts" not in picked_names, "POM leaked into test set"
@@ -555,7 +563,7 @@ def test_phase_b55_normalises_legacy_xpath_in_pom(tmp_path: Path):
         "});\n",
         encoding="utf-8",
     )
-    reports, stragglers = _run_phase_b55_xpath_normalisation(
+    reports, stragglers, touched_files = _run_phase_b55_xpath_normalisation(
         sut_root=sut,
         candidates={pom.resolve()},
     )
@@ -572,6 +580,12 @@ def test_phase_b55_normalises_legacy_xpath_in_pom(tmp_path: Path):
     # config touched
     cfg = (sut / "playwright.config.ts").read_text(encoding="utf-8")
     assert "testIdAttribute: 'data-test'" in cfg
+    # touched_files reports both the rewritten POM AND the config edit, so
+    # callers building a codegen-scope set can union it in (bug 4).
+    assert pom.resolve() in {p.resolve() for p in touched_files}
+    assert (sut / "playwright.config.ts").resolve() in {
+        p.resolve() for p in touched_files
+    }
 
 
 def test_phase_b55_collects_stragglers_for_llm(tmp_path: Path):
@@ -590,7 +604,7 @@ def test_phase_b55_collects_stragglers_for_llm(tmp_path: Path):
         "}\n",
         encoding="utf-8",
     )
-    _reports, stragglers = _run_phase_b55_xpath_normalisation(
+    _reports, stragglers, _touched = _run_phase_b55_xpath_normalisation(
         sut_root=sut,
         candidates={pom.resolve()},
     )
@@ -610,12 +624,13 @@ def test_phase_b55_skips_non_ts_js_files(tmp_path: Path):
     py.write_text("assert True\n", encoding="utf-8")
     java = sut / "Base.java"
     java.write_text("class Base {}\n", encoding="utf-8")
-    reports, stragglers = _run_phase_b55_xpath_normalisation(
+    reports, stragglers, touched_files = _run_phase_b55_xpath_normalisation(
         sut_root=sut,
         candidates={py.resolve(), java.resolve()},
     )
     assert reports == []
     assert stragglers == []
+    assert touched_files == []
 
 
 def test_phase_b55_gate_gets_zero_violations_after_rewrite(tmp_path: Path):
@@ -1208,10 +1223,10 @@ def test_write_tbd_locators_writes_inline_object_property(
     """
     import logging
 
-    pom_file = tmp_path / "src" / "pages" / "RopaEntryPage.ts"
+    pom_file = tmp_path / "src" / "pages" / "EntityFormPage.ts"
     pom_file.parent.mkdir(parents=True, exist_ok=True)
     pom_file.write_text(
-        "export class RopaEntryPage {\n"
+        "export class EntityFormPage {\n"
         "    elements = { btnCreate: '//button' };\n"
         "}\n",
         encoding="utf-8",
@@ -1219,11 +1234,11 @@ def test_write_tbd_locators_writes_inline_object_property(
     tasks = [_LocatorTask(
         constant_name="btnSendForApproval",
         intent="send for approval button",
-        owning_page="RopaEntryPage",
-        locator_file="src/pages/RopaEntryPage.ts",
+        owning_page="EntityFormPage",
+        locator_file="src/pages/EntityFormPage.ts",
         location_pattern="inline_object_property",
         container_name="elements",
-        container_class_name="RopaEntryPage",
+        container_class_name="EntityFormPage",
     )]
     caplog.set_level(logging.INFO)
     count = _write_tbd_locators(tasks, tmp_path, "typescript")
@@ -1494,7 +1509,7 @@ def test_build_locator_tasks_matches_inline_by_owning_pom(tmp_path: Path):
                 "source": "create_tbd",
                 "name": "btnSendForApproval",
                 "intent": "send for approval button",
-                "owning_page": "RopaEntryPage",
+                "owning_page": "EntityFormPage",
             }],
         }],
     }
@@ -1502,10 +1517,10 @@ def test_build_locator_tasks_matches_inline_by_owning_pom(tmp_path: Path):
         "modules": [{
             "name": "sut", "path": ".", "language": "typescript",
             "existing_locators": [{
-                "class_name": "RopaEntryPage",
-                "file": "src/pages/RopaEntryPage.ts",
+                "class_name": "EntityFormPage",
+                "file": "src/pages/EntityFormPage.ts",
                 "location_pattern": "inline_object_property",
-                "owning_pom": "RopaEntryPage",
+                "owning_pom": "EntityFormPage",
                 "container_name": "elements",
             }],
         }],
@@ -1515,7 +1530,7 @@ def test_build_locator_tasks_matches_inline_by_owning_pom(tmp_path: Path):
     assert len(tasks) == 1
     t = tasks[0]
     assert t.location_pattern == "inline_object_property"
-    assert t.locator_file == "src/pages/RopaEntryPage.ts"
+    assert t.locator_file == "src/pages/EntityFormPage.ts"
     assert t.container_name == "elements"
 
 
@@ -1813,3 +1828,365 @@ async def test_step08_fails_fast_on_framework_mismatch(tmp_path: Path):
     err = result.error or ""
     assert "detected_stack" in err
     assert "playwright test" in err or "playwright-ts" in err
+
+
+def test_units_by_file_groups_all_classes_per_file() -> None:
+    """Regression: multiple reusable units targeting one file must all be kept.
+
+    The old dedup-by-`at` collapsed a file to its first unit, so a file that
+    should define 5 Task classes emitted only 1 — and the test imported symbols
+    that were never generated. Grouping must retain every distinct class and
+    dedup only exact (file, name) repeats across test cases.
+    """
+    plan = {
+        "test_cases": [
+            {
+                "id": "TC-1",
+                "reusable_units": [
+                    {"name": "QteaOpenPlansCatalog", "at": "framework/tasks/x.py",
+                     "category": "task", "source": "create"},
+                    {"name": "QteaSelectSkill", "at": "framework/tasks/x.py",
+                     "category": "task", "source": "create"},
+                    {"name": "QteaUploadImportFile", "at": "framework/tasks/x.py",
+                     "category": "task", "source": "create"},
+                    {"name": "QteaImportFunctionAvailable",
+                     "at": "framework/questions/x.py",
+                     "category": "question", "source": "create"},
+                ],
+            },
+            {
+                "id": "TC-2",
+                "reusable_units": [
+                    # Repeat of a TC-1 unit (must dedup) + a new one.
+                    {"name": "QteaOpenPlansCatalog", "at": "framework/tasks/x.py",
+                     "category": "task", "source": "create"},
+                    {"name": "QteaPlanItemCreated",
+                     "at": "framework/questions/x.py",
+                     "category": "question", "source": "create"},
+                    # `use` units are not generated, only `create`.
+                    {"name": "Login", "at": "framework/tasks/login.py",
+                     "category": "task", "source": "use"},
+                ],
+            },
+        ],
+    }
+
+    by_at = _units_by_file(plan)
+
+    assert set(by_at) == {"framework/tasks/x.py", "framework/questions/x.py"}
+    task_names = [u["name"] for u in by_at["framework/tasks/x.py"]]
+    assert task_names == [
+        "QteaOpenPlansCatalog", "QteaSelectSkill", "QteaUploadImportFile",
+    ]
+    question_names = {u["name"] for u in by_at["framework/questions/x.py"]}
+    assert question_names == {"QteaImportFunctionAvailable", "QteaPlanItemCreated"}
+
+
+# ---------------------------------------------------------------------------
+# TS/JS runtime-import path normalization (Bug 1+2, run 20260709-083909-223772)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_runtime_import_fixes_nested_pom_hardcoded_path(tmp_path: Path):
+    """A POM two directories deep from `tests/` with a hardcoded (wrong)
+    `./qtea-runtime` import must be rewritten to the correct relative path.
+    This is the exact H2 defect class from run 20260708-121117-99f5ed /
+    20260709-083909-223772: a hardcoded example in the agent prompt leaks
+    into LLM-authored inline `tbd()` usage regardless of file nesting."""
+    sut_root = tmp_path
+    (sut_root / "tests").mkdir()
+    (sut_root / "tests" / "qtea-runtime.js").write_text("", encoding="utf-8")
+    pom_dir = sut_root / "src" / "pages"
+    pom_dir.mkdir(parents=True)
+    pom_path = pom_dir / "LoginPage.ts"
+    pom_path.write_text(
+        'import { tbd } from "./qtea-runtime";\n\n'
+        "export class LoginPage {\n"
+        '  readonly submit = tbd("submit button");\n'
+        "}\n",
+        encoding="utf-8",
+    )
+
+    changed = _normalize_runtime_import_in_file(pom_path, sut_root)
+
+    assert changed
+    new_text = pom_path.read_text(encoding="utf-8")
+    assert 'from "../../tests/qtea-runtime"' in new_text
+    assert './qtea-runtime"' not in new_text
+
+
+def test_normalize_runtime_import_noop_when_already_correct(tmp_path: Path):
+    sut_root = tmp_path
+    (sut_root / "tests").mkdir()
+    pom_path = sut_root / "tests" / "LoginPage.ts"
+    pom_path.write_text(
+        'import { tbd } from "./qtea-runtime";\n', encoding="utf-8",
+    )
+
+    changed = _normalize_runtime_import_in_file(pom_path, sut_root)
+
+    assert not changed
+
+
+def test_normalize_runtime_import_noop_for_non_ts_js_files(tmp_path: Path):
+    sut_root = tmp_path
+    py_path = sut_root / "pom.py"
+    py_path.write_text(
+        'from tests.qtea_runtime import tbd\n', encoding="utf-8",
+    )
+
+    assert not _normalize_runtime_import_in_file(py_path, sut_root)
+
+
+def test_normalize_runtime_imports_sweeps_multiple_files(tmp_path: Path):
+    sut_root = tmp_path
+    (sut_root / "tests").mkdir()
+    nested = sut_root / "src" / "pages"
+    nested.mkdir(parents=True)
+    a = nested / "A.ts"
+    a.write_text('import { tbd } from "./qtea-runtime";\n', encoding="utf-8")
+    b = nested / "B.ts"
+    b.write_text('const { tbd } = require("./qtea-runtime");\n', encoding="utf-8")
+
+    fixed = _normalize_runtime_imports([a, b], sut_root)
+
+    assert fixed == 2
+    assert '"../../tests/qtea-runtime"' in a.read_text(encoding="utf-8")
+    assert '"../../tests/qtea-runtime"' in b.read_text(encoding="utf-8")
+
+
+def test_register_global_setup_composes_with_existing_setup(tmp_path: Path):
+    """If the SUT's own playwright.config.ts already declares a
+    `globalSetup`, qtea must compose (wrap both) rather than inject a
+    second `globalSetup` key — a duplicate key in a JS object literal
+    silently shadows the first (last-key-wins), which would make the
+    qtea JIT runtime never load with no error."""
+    sut_root = tmp_path
+    (sut_root / "tests").mkdir()
+    auth_setup = sut_root / "auth-setup.ts"
+    auth_setup.write_text(
+        "export default async function globalSetup() {}\n", encoding="utf-8",
+    )
+    cfg = sut_root / "playwright.config.ts"
+    cfg.write_text(
+        "import { defineConfig } from '@playwright/test';\n"
+        "export default defineConfig({\n"
+        '  globalSetup: "./auth-setup",\n'
+        "  testDir: './tests',\n"
+        "});\n",
+        encoding="utf-8",
+    )
+
+    result = _register_playwright_test_global_setup(sut_root, "tests/qtea-runtime.js")
+
+    assert result == cfg
+    new_text = cfg.read_text(encoding="utf-8")
+    # Exactly one globalSetup key remains — pointing at the composed wrapper.
+    assert new_text.count("globalSetup:") == 1
+    assert "qtea-composed-global-setup" in new_text
+    wrapper = sut_root / "tests" / "qtea-composed-global-setup.js"
+    assert wrapper.is_file()
+    wrapper_text = wrapper.read_text(encoding="utf-8")
+    assert "require(\"../auth-setup\")" in wrapper_text
+    assert "require(\"./qtea-runtime\")" in wrapper_text
+    # Both requires MUST be cast to `any`, with the JSDoc on the line directly
+    # above the declaration whose initializer is the require call — otherwise
+    # `tsc --checkJs` re-flags `.default` (TS2339) / arity (TS2554) and the
+    # Phase B.6 gate deterministically fails (run 20260709-083909-223772).
+    assert wrapper_text.count("/** @type {any} */") == 2
+    assert '/** @type {any} */\nconst existing = require("../auth-setup");' in wrapper_text
+    assert '/** @type {any} */\nconst qteaRuntime = require("./qtea-runtime");' in wrapper_text
+    # config is still forwarded to both callables (the `any` cast makes the
+    # extra arg tsc-clean; at runtime the 0-arg qtea runtime ignores it).
+    assert "await existingFn(config)" in wrapper_text
+    assert "await qteaFn(config)" in wrapper_text
+
+
+def test_register_global_setup_injects_when_no_existing_key(tmp_path: Path):
+    sut_root = tmp_path
+    (sut_root / "tests").mkdir()
+    cfg = sut_root / "playwright.config.ts"
+    cfg.write_text(
+        "import { defineConfig } from '@playwright/test';\n"
+        "export default defineConfig({\n"
+        "  testDir: './tests',\n"
+        "});\n",
+        encoding="utf-8",
+    )
+
+    result = _register_playwright_test_global_setup(sut_root, "tests/qtea-runtime.js")
+
+    assert result == cfg
+    new_text = cfg.read_text(encoding="utf-8")
+    assert new_text.count("globalSetup:") == 1
+    assert 'globalSetup: "./tests/qtea-runtime"' in new_text
+
+
+def test_register_global_setup_idempotent_when_already_registered(tmp_path: Path):
+    sut_root = tmp_path
+    (sut_root / "tests").mkdir()
+    cfg = sut_root / "playwright.config.ts"
+    original = (
+        "import { defineConfig } from '@playwright/test';\n"
+        "export default defineConfig({\n"
+        '  globalSetup: "./tests/qtea-runtime",\n'
+        "  testDir: './tests',\n"
+        "});\n"
+    )
+    cfg.write_text(original, encoding="utf-8")
+
+    result = _register_playwright_test_global_setup(sut_root, "tests/qtea-runtime.js")
+
+    assert result == cfg
+    assert cfg.read_text(encoding="utf-8") == original
+
+
+def test_register_global_setup_idempotent_when_composed_wrapper_registered(tmp_path: Path):
+    """Regression (run 20260709-083909-223772 Step 8 attempt 2): on a within-run
+    retry the config already points at the composed wrapper (the SUT working
+    tree is not reset between attempts). The guard must treat that as
+    already-registered and NOT re-enter the compose branch — otherwise the
+    wrapper is composed against ITSELF (`require("./qtea-composed-global-setup")`),
+    which drops the SUT's real globalSetup at runtime and adds a spurious tsc
+    error. The old guard keyed only on `"qtea-runtime"`, which the composed path
+    does not contain."""
+    sut_root = tmp_path
+    (sut_root / "tests").mkdir()
+    cfg = sut_root / "playwright.config.ts"
+    original = (
+        "import { defineConfig } from '@playwright/test';\n"
+        "export default defineConfig({\n"
+        '  globalSetup: "./tests/qtea-composed-global-setup",\n'
+        "  testDir: './tests',\n"
+        "});\n"
+    )
+    cfg.write_text(original, encoding="utf-8")
+    # Post-first-run wrapper on disk, correctly requiring the SUT's real setup.
+    wrapper = sut_root / "tests" / "qtea-composed-global-setup.js"
+    wrapper.write_text(
+        '/** @type {any} */\nconst existing = require("../auth-setup");\n',
+        encoding="utf-8",
+    )
+
+    result = _register_playwright_test_global_setup(sut_root, "tests/qtea-runtime.js")
+
+    assert result == cfg
+    # Config untouched — still one key, still the wrapper.
+    assert cfg.read_text(encoding="utf-8") == original
+    # Wrapper NOT recomposed against itself; the real setup require survives.
+    wrapper_text = wrapper.read_text(encoding="utf-8")
+    assert 'require("./qtea-composed-global-setup")' not in wrapper_text
+    assert 'require("../auth-setup")' in wrapper_text
+
+
+# ---------------------------------------------------------------------------
+# Bug 3 regression: Step 9->8 regen feedback must not coach a naming fix
+# when the real defect was a compile/collection error.
+# ---------------------------------------------------------------------------
+
+
+def test_build_regen_feedback_hint_includes_naming_coaching_for_naming_defect():
+    hint = _build_regen_feedback_hint("zero tests matched the filter", "naming_defect")
+    assert "qtea_" in hint
+    assert "zero tests matched the filter" in hint
+
+
+def test_build_regen_feedback_hint_omits_naming_coaching_for_collection_error():
+    hint = _build_regen_feedback_hint(
+        "broken local import: './qtea-runtime' could not be resolved",
+        "collection_error",
+    )
+    assert "qtea_" not in hint
+    assert "@pytest.mark" not in hint
+    assert "broken local import" in hint
+
+
+# ---------------------------------------------------------------------------
+# Bug 4 regression: a POM regenerated byte-identical to HEAD (so `git diff`
+# shows no change) AND not `qtea_`-prefixed (so the filename glob misses it
+# too) must still land in the codegen-scope set, or a violation in it never
+# reaches the quality gate (sibling of the incident class in run
+# 20260708-121117-99f5ed).
+# ---------------------------------------------------------------------------
+
+
+def test_build_all_codegen_files_includes_byte_identical_pom_via_pom_tasks(
+    tmp_path: Path,
+):
+    sut_root = tmp_path
+    (sut_root / "src" / "pages").mkdir(parents=True)
+    pom_path = sut_root / "src" / "pages" / "LoginPage.ts"
+    pom_path.write_text(
+        "export class LoginPage {\n"
+        "  loc = { user: '//input[@id=\"user\"]' };\n"  # in-scope xpath violation
+        "}\n",
+        encoding="utf-8",
+    )
+    pom_tasks = {
+        "LoginPage": _PomTask(
+            pom_name="LoginPage",
+            pom_file="src/pages/LoginPage.ts",
+            source="reuse",
+        ),
+    }
+
+    all_files = _build_all_codegen_files(
+        sut_root=sut_root,
+        produced_in_sut=[],  # not qtea_-prefixed — glob misses it
+        codegen_modified=set(),  # byte-identical to HEAD — git diff misses it
+        pom_tasks=pom_tasks,
+        test_results=[],
+        b55_touched_files=[],
+        jit_resolved=set(),
+    )
+
+    assert pom_path.resolve() in {p.resolve() for p in all_files}
+
+
+def test_build_all_codegen_files_includes_test_result_targets_and_b55_touched(
+    tmp_path: Path,
+):
+    sut_root = tmp_path
+    (sut_root / "tests").mkdir()
+    test_path = sut_root / "tests" / "qtea_login_test.spec.ts"
+    test_path.write_text("test('x', async () => {});\n", encoding="utf-8")
+    cfg_path = sut_root / "playwright.config.ts"
+    cfg_path.write_text("export default {};\n", encoding="utf-8")
+
+    all_files = _build_all_codegen_files(
+        sut_root=sut_root,
+        produced_in_sut=[],
+        codegen_modified=set(),
+        pom_tasks={},
+        test_results=[("tests/qtea_login_test.spec.ts", True)],
+        b55_touched_files=[cfg_path],
+        jit_resolved=set(),
+    )
+
+    resolved = {p.resolve() for p in all_files}
+    assert test_path.resolve() in resolved
+    assert cfg_path.resolve() in resolved
+
+
+def test_build_all_codegen_files_excludes_jit_resolved_paths(tmp_path: Path):
+    sut_root = tmp_path
+    (sut_root / "src" / "pages").mkdir(parents=True)
+    pom_path = sut_root / "src" / "pages" / "Runtime.ts"
+    pom_path.write_text("export const x = 1;\n", encoding="utf-8")
+    pom_tasks = {
+        "Runtime": _PomTask(
+            pom_name="Runtime", pom_file="src/pages/Runtime.ts", source="reuse",
+        ),
+    }
+
+    all_files = _build_all_codegen_files(
+        sut_root=sut_root,
+        produced_in_sut=[],
+        codegen_modified=set(),
+        pom_tasks=pom_tasks,
+        test_results=[],
+        b55_touched_files=[],
+        jit_resolved={pom_path.resolve()},
+    )
+
+    assert pom_path.resolve() not in {p.resolve() for p in all_files}

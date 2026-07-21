@@ -6,6 +6,7 @@ from pathlib import Path
 
 from qtea.hitl import (
     RESOLUTION_ANSWERED,
+    RESOLUTION_HEADED_LOGIN_SKIP,
     RESOLUTION_SCOPE_EXCLUSION,
     RESOLUTION_SKIPPED_DROP,
     RESOLUTION_SKIPPED_LEGACY,
@@ -21,6 +22,7 @@ from qtea.hitl import (
     load_ledger,
     looks_like_negative_drop_intent,
     looks_like_skip_intent,
+    prompt_user,
     question_key,
     render_prior_decisions_md,
     resolve_against_ledger,
@@ -680,6 +682,48 @@ def test_resolution_constants_have_expected_string_values():
     assert RESOLUTION_SKIPPED_DROP == "skipped_drop"
     assert RESOLUTION_SCOPE_EXCLUSION == "scope_exclusion"
     assert RESOLUTION_SKIPPED_LEGACY == "skipped"
+    assert RESOLUTION_HEADED_LOGIN_SKIP == "headed_login_skip"
+
+
+# ---------------------------------------------------------------------------
+# prompt_user — headed_login metadata branch
+# ---------------------------------------------------------------------------
+
+
+def _headed_login_question() -> Question:
+    return Question(
+        id="AUTH-HEADED-LOGIN",
+        kind="clarification",
+        prompt_text="A browser window has opened. Press Enter when done.",
+        context="Waiting for you to finish logging in at https://sut.example",
+        metadata={"type": "headed_login", "base_url": "https://sut.example"},
+    )
+
+
+def test_prompt_user_headed_login_confirm_on_blank_enter(monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("qtea.hitl.Prompt.ask", lambda *a, **kw: "")
+    q = _headed_login_question()
+    result = prompt_user([q], agent_label="Step 7 Headed Login")
+    assert result == {q.id: (RESOLUTION_ANSWERED, "")}
+
+
+def test_prompt_user_headed_login_skip_on_skip_intent_text(monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("qtea.hitl.Prompt.ask", lambda *a, **kw: "skip")
+    q = _headed_login_question()
+    result = prompt_user([q], agent_label="Step 7 Headed Login")
+    assert result == {q.id: (RESOLUTION_HEADED_LOGIN_SKIP, "")}
+
+
+def test_prompt_user_headed_login_confirm_on_arbitrary_text(monkeypatch):
+    """Any non-skip-intent text (not just blank Enter) still confirms — the
+    answer content itself is never meaningful for this question."""
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("qtea.hitl.Prompt.ask", lambda *a, **kw: "done")
+    q = _headed_login_question()
+    result = prompt_user([q], agent_label="Step 7 Headed Login")
+    assert result == {q.id: (RESOLUTION_ANSWERED, "")}
 
 
 def test_ledger_legacy_skipped_jsonl_maps_to_legacy_resolution(tmp_path: Path):

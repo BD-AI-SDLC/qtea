@@ -22,8 +22,8 @@ _state = AppState()
 # fresh local scope. Previously this could only be confirmed after the fact
 # via a manual `grep -c "App session started"` on the run log.
 _session_starts: list[float] = []
-_SESSION_STORM_WINDOW_S = 10.0
-_SESSION_STORM_THRESHOLD = 5
+_SESSION_STORM_WINDOW_S = 6.0
+_SESSION_STORM_THRESHOLD = 3
 
 
 def main(page: ft.Page):
@@ -48,6 +48,92 @@ def main(page: ft.Page):
                 "'Unhandled error in main() handler' to find the cause. "
                 "Rendering the minimal crash-safe view to break the loop.",
             )
+
+    if _state.run_status == "running":
+        initial_route = "/run"
+    elif _state.exit_code is not None:
+        initial_route = "/results"
+    else:
+        initial_route = "/"
+
+    # Crash-loop breaker: bail out HERE, before touching page.title, window
+    # geometry, theme, or registering services/route handlers. A prior
+    # version of this guard rendered the minimal view only after that setup
+    # had already run unconditionally on every main() call (reconnect or
+    # not) — but a real crash-storm run log showed zero Python-side
+    # exceptions anywhere (no ui.handler_exception, no ui.view_build_failed,
+    # no "Unhandled error in main() handler" from Flet's own app.py). Every
+    # path in Flet that sends SESSION_CRASHED is preceded by one of those
+    # log calls, except a hooks/effects path this app doesn't use — so a
+    # storm with none of them logged means the fault is a Dart/Flutter
+    # render crash triggered by something applied unconditionally before the
+    # view is even built (most likely the native window resize from
+    # `page.window.width/height`), not by anything in the view tree. This
+    # branch touches nothing but page.views + page.update() to eliminate
+    # every one of those suspects on the recovery path.
+    if crash_looping:
+        with contextlib.suppress(Exception):
+            page.views.clear()
+            _rid = getattr(_state, "run_id", None) or "N/A"
+            _ws = getattr(_state, "workspace_path", None)
+
+            def _minimal_new_run(_: ft.ControlEvent) -> None:
+                _state.reset_run()
+                with contextlib.suppress(Exception):
+                    page.views.clear()
+                    page.update()
+
+            page.views.append(
+                ft.View(
+                    route=initial_route,
+                    controls=[
+                        ft.Container(
+                            content=ft.Column(
+                                controls=[
+                                    ft.Container(height=24),
+                                    ft.Text(
+                                        "Display error — simplified view",
+                                        size=sz(22),
+                                        weight=ft.FontWeight.BOLD,
+                                        color="#FFB74D",
+                                    ),
+                                    ft.Text(
+                                        "The full screen kept crashing the "
+                                        "renderer, so it was replaced with "
+                                        "this safe view to stop a reconnect "
+                                        "loop. Your run's artifacts are intact "
+                                        "on disk.",
+                                        size=sz(13),
+                                        color="#E0E0E0",
+                                    ),
+                                    ft.Container(height=8),
+                                    ft.Text(f"Run: {_rid}", size=sz(12)),
+                                    ft.Text(
+                                        f"Workspace: {_ws}" if _ws else "",
+                                        size=sz(12),
+                                    ),
+                                    ft.Container(height=16),
+                                    ft.ElevatedButton(
+                                        "Start New Run",
+                                        icon=ft.Icons.REPLAY,
+                                        on_click=_minimal_new_run,
+                                    ),
+                                ],
+                                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                                spacing=4,
+                            ),
+                            expand=True,
+                            alignment=ft.Alignment.center,
+                            bgcolor=BACKGROUND,
+                            padding=40,
+                        )
+                    ],
+                    padding=0,
+                    bgcolor=BACKGROUND,
+                )
+            )
+            page.update()
+        return
 
     page.title = "QTea"
     page.window.width = 1480
@@ -76,6 +162,7 @@ def main(page: ft.Page):
 
     # Lazy imports to avoid circular refs
     from qtea.ui.views.config_view import build_config_view
+    from qtea.ui.views.context_capture_view import build_context_capture_view
     from qtea.ui.views.pipeline_view import build_pipeline_view
     from qtea.ui.views.results_view import build_results_view
 
@@ -90,13 +177,23 @@ def main(page: ft.Page):
     async def _tick_elapsed() -> None:
         """Advance the elapsed-time clock once per second.
 
-        We update only the live elapsed widget (published on ``page.data``)
+        We update only the live elapsed widgets (the header's persistent
+        widget, plus a fresh tree-walk for the in-progress step's widget)
         rather than calling ``state.notify()``, which would rebuild every
         step card, the metrics panel, and the entire log list once per
         second. The clock is pause-aware via ``state.update_elapsed()`` —
         HITL waits don't accumulate.
+
+        The step widget is re-located every tick (not cached) because a
+        step that makes one long blocking call (e.g. a single LLM
+        reasoning turn) emits no log lines between ``step.start`` and
+        ``step.end`` — nothing would trigger a rebuild to refresh a cached
+        reference, leaving the step's clock frozen for its entire duration.
+        The tree-walk itself is cheap: it searches already-built controls,
+        it doesn't rebuild them.
         """
         from qtea.ui.components.progress_header import fmt_elapsed
+        from qtea.ui.views.pipeline_view import find_live_step_widget
 
         while _state.run_status == "running":
             _state.update_elapsed()
@@ -104,7 +201,9 @@ def main(page: ft.Page):
             step_widget = None
             if isinstance(page.data, dict):
                 widget = page.data.get("live_elapsed")
-                step_widget = page.data.get("live_step_elapsed")
+                phase_groups = page.data.get("phase_groups_ref")
+                if phase_groups is not None:
+                    step_widget = find_live_step_widget(phase_groups.controls)
             if widget is not None:
                 widget.value = fmt_elapsed(_state.elapsed_s)
                 try:
@@ -158,6 +257,7 @@ def main(page: ft.Page):
             run_id=_state.resume_run_id or None,
             from_step=_state.from_step,
             ui_mode=True,
+            operator_context=_state.operator_context or None,
         )
 
         # Capture the Flet event loop so bridges running work on the worker
@@ -195,6 +295,12 @@ def main(page: ft.Page):
             task = loop.create_task(run_pipeline(opts, console=silent_console))
             _state.pipeline_loop = loop
             _state.pipeline_task = task
+            # Stop may have fired before this worker thread published the
+            # loop/task — the Stop handler's `if loop and task` guard would
+            # then no-op, leaving the pipeline running (and billing) after
+            # the UI already moved to /results. Honor a Stop that raced ahead.
+            if _state.cancel_requested:
+                task.cancel()
             try:
                 return loop.run_until_complete(task)
             except asyncio.CancelledError:
@@ -263,6 +369,16 @@ def main(page: ft.Page):
             # repeats. Observed in the wild as the results screen "blinking"
             # in an infinite reconnect loop instead of showing the summary.
             try:
+                # Cut the old /run view's on_state_change subscription before
+                # we navigate. The fix-proposal chain (debug -> critical-thinking
+                # -> PSE) emits extra `aux_agent.recorded` notify()s between
+                # step.end and here; any trailing notify — including the
+                # explicit one below — would otherwise drive the stale
+                # pipeline_view listener to mutate now-detached controls, whose
+                # reconcile blanks the whole page (the flicker bug in a new
+                # form). The Stop path already clears listeners for the same
+                # reason (progress_header.py); the normal finish path must too.
+                _state._listeners.clear()
                 # Skip the rebuild if the Stop button already snap-navigated
                 # to /results. Two full page.views.clear()+rebuild sequences
                 # in rapid succession orphan the Flet client's widget-id
@@ -379,9 +495,52 @@ def main(page: ft.Page):
     @_safe_handler
     def on_new_run() -> None:
         _state.reset_run()
+        _state.operator_context = ""
         page.route = "/"
         _build_views_for_route("/")
         page.update()
+
+    @_safe_handler
+    def on_config_continue() -> None:
+        """Config 'Start' handler (config already validated).
+
+        Operator context is only consumed by Step 1 (ticket enrich) and Step 2
+        (refine). Show the pre-run context screen only when it can still take
+        effect — a fresh run, or a resume that re-enters at Step 1 or 2. A
+        resume at Step 3+ skips those steps, so the screen would be a no-op:
+        launch straight through (the prior run's stored context still carries
+        forward via pipeline's resume fallback)."""
+        _state.save_prefs()
+        is_resume = bool(_state.resume_run_id)
+        reenters_early = _state.from_step is not None and _state.from_step <= 2
+        if is_resume and not reenters_early:
+            on_start_pipeline()
+            return
+        if is_resume and reenters_early:
+            # Pre-populate the box with the prior run's stored context so the
+            # operator sees/edits what was used before. Best-effort: a missing
+            # or unreadable state file just leaves the box empty.
+            with contextlib.suppress(Exception):
+                from qtea.checkpoints import load_state
+                from qtea.config import get_settings
+
+                base = get_settings().default_workspace
+                prior = load_state(base / _state.resume_run_id / "state.json")
+                if prior is not None and prior.operator_context:
+                    _state.operator_context = prior.operator_context
+        page.route = "/context"
+        _build_views_for_route("/context")
+        page.update()
+
+    @_safe_handler
+    def on_context_skip() -> None:
+        _state.operator_context = ""
+        on_start_pipeline()
+
+    @_safe_handler
+    def on_context_continue(text: str) -> None:
+        _state.operator_context = (text or "").strip()
+        on_start_pipeline()
 
     # ── Routing ──────────────────────────────────────────────────────────
 
@@ -475,7 +634,7 @@ def main(page: ft.Page):
                             lambda: build_config_view(
                                 page,
                                 _state,
-                                on_start_pipeline,
+                                on_config_continue,
                                 spec_picker=spec_picker,
                                 sut_picker=sut_picker,
                             ),
@@ -486,7 +645,26 @@ def main(page: ft.Page):
                     bgcolor=BACKGROUND,
                 )
             )
-            if route == "/run":
+            if route == "/context":
+                page.views.append(
+                    ft.View(
+                        route="/context",
+                        controls=[
+                            _safe_build(
+                                lambda: build_context_capture_view(
+                                    page,
+                                    _state,
+                                    on_context_skip,
+                                    on_context_continue,
+                                ),
+                                "/context",
+                            )
+                        ],
+                        padding=0,
+                        bgcolor=BACKGROUND,
+                    )
+                )
+            elif route == "/run":
                 page.views.append(
                     ft.View(
                         route="/run",
@@ -663,83 +841,10 @@ def main(page: ft.Page):
     # run is already in flight or already finished, not always reset to the
     # empty config screen. Landing back on "/" after a run has already
     # completed/failed is exactly the "session ended but the main screen
-    # shows instead of the summary" bug.
-    if _state.run_status == "running":
-        initial_route = "/run"
-    elif _state.exit_code is not None:
-        initial_route = "/results"
-    else:
-        initial_route = "/"
-    # Crash-loop breaker: if main() is being re-entered in a tight burst, the
-    # normal view for `initial_route` is what's crashing the Flutter client
-    # (a Dart-side error such as "Null check operator used on a null value"
-    # that no Python `_safe_handler` can catch, because it fires in the
-    # renderer after the controls ship to the client). Rebuilding the same
-    # view just crashes again — an endless reconnect flicker (observed in the
-    # wild looping for hours until the window was force-closed). Instead,
-    # render a minimal view built from ONLY primitive controls (Text /
-    # Container / ElevatedButton — no DataTable, Dropdown, dialog, or
-    # scrollable), which cannot trip the same class of render bug. This
-    # renders successfully, the client stops reconnecting, and the user keeps
-    # a usable escape hatch (New Run) plus their run identity. Artifacts are
-    # always intact on disk regardless of this screen.
-    if crash_looping:
-        with contextlib.suppress(Exception):
-            page.views.clear()
-            _rid = getattr(_state, "run_id", None) or "N/A"
-            _ws = getattr(_state, "workspace_path", None)
-            page.views.append(
-                ft.View(
-                    route=initial_route,
-                    controls=[
-                        ft.Container(
-                            content=ft.Column(
-                                controls=[
-                                    ft.Container(height=24),
-                                    ft.Text(
-                                        "Display error — simplified view",
-                                        size=sz(22),
-                                        weight=ft.FontWeight.BOLD,
-                                        color="#FFB74D",
-                                    ),
-                                    ft.Text(
-                                        "The full screen kept crashing the "
-                                        "renderer, so it was replaced with "
-                                        "this safe view to stop a reconnect "
-                                        "loop. Your run's artifacts are intact "
-                                        "on disk.",
-                                        size=sz(13),
-                                        color="#E0E0E0",
-                                    ),
-                                    ft.Container(height=8),
-                                    ft.Text(f"Run: {_rid}", size=sz(12)),
-                                    ft.Text(
-                                        f"Workspace: {_ws}" if _ws else "",
-                                        size=sz(12),
-                                    ),
-                                    ft.Container(height=16),
-                                    ft.ElevatedButton(
-                                        "Start New Run",
-                                        icon=ft.Icons.REPLAY,
-                                        on_click=lambda _: on_new_run(),
-                                    ),
-                                ],
-                                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                                spacing=4,
-                            ),
-                            expand=True,
-                            alignment=ft.Alignment.center,
-                            bgcolor=BACKGROUND,
-                            padding=40,
-                        )
-                    ],
-                    padding=0,
-                    bgcolor=BACKGROUND,
-                )
-            )
-            page.update()
-        return
-
+    # shows instead of the summary" bug. `initial_route` was already computed
+    # at the top of this function (the crash-loop bailout up there needs it
+    # too, before any of this setup runs).
+    #
     # _build_views_for_route is internally exception-proof (see _safe_build /
     # the backstop try/except above), but page.route/page.update() themselves
     # touch the session and this runs outside any _safe_handler wrapper —

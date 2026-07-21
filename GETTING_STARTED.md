@@ -67,6 +67,14 @@ JIRA_API_TOKEN=your-jira-api-token   # Cloud only
 JIRA_PAT=your-personal-access-token  # Server / Data Center only
 ```
 
+**Docupedia** (Bosch Confluence — needed when `--spec` is a Docupedia URL, or when the spec/ticket text contains Docupedia links to fetch):
+
+```env
+DOCUPEDIA_PAT=your-personal-access-token  # Bearer auth (Confluence DC)
+```
+
+Create a PAT at `<docupedia-base>/plugins/personalaccesstokens/usertokens.action`. When set, Step 1 fetches Docupedia pages via REST and inlines them as markdown; without it, a direct Docupedia `--spec` fails fast and embedded links are skipped.
+
 **Azure DevOps** (needed when `--spec` is `ado:ID` shorthand; not needed for full URLs or `ado:ORG/PROJECT/ID`):
 
 ```env
@@ -92,7 +100,7 @@ qtea run --spec ./spec.md --sut ./app --env-file /path/to/.env.prod
 
 ### Remote SUT (git URL)
 
-`--sut` accepts git URLs from any major hosting provider (shallow-cloned `--depth=1` into the workspace). Example when using CLI version:
+`--sut` accepts a git URL from any recognized host — GitHub, GitLab, Bitbucket, Azure DevOps, Codeberg, Gitea, sr.ht, or any `.git` URL — shallow-cloned (`--depth=1`) into the workspace using your ambient git credentials (credential manager, SSH keys, or a token embedded in the URL). Example when using CLI version:
 
 ```bash
 qtea run --spec ./spec.md --sut https://github.com/org/app.git                     # GitHub / GitLab / Bitbucket
@@ -156,6 +164,14 @@ steps:
 
 qtea auto-detects the scheme from the hostname: `*.atlassian.net` → Cloud (Basic); any other host → Server/DC (Bearer). Override with `JIRA_AUTH_TYPE=cloud` or `JIRA_AUTH_TYPE=datacenter` if auto-detection is wrong.
 
+### Docupedia integration
+
+| Env Var | Required when | Auth scheme | Purpose |
+| --- | --- | --- | --- |
+| `DOCUPEDIA_PAT` | `--spec` is a Docupedia URL, or the spec text contains Docupedia links | Bearer | Personal Access Token for Bosch Docupedia (Confluence DC). Masked in logs. |
+
+Step 1 fetches Docupedia pages via the Confluence REST API and inlines them as markdown — both when a Docupedia URL is passed directly as `--spec` (fails fast if `DOCUPEDIA_PAT` is unset) and when Docupedia links appear inside the spec or a linked ticket (best-effort; skipped on error). The base URL is taken from the link itself. Attachments, images, and child pages are not fetched.
+
 ## 2. Install qtea
 
 ```bash
@@ -167,6 +183,8 @@ qtea ui          # opens the desktop configuration window
 ```
 
 This installs both the CLI (`qtea run`, `qtea doctor`, …) and the Flet-based desktop UI (`qtea ui`).
+
+> **First `qtea ui` launch downloads the Flet desktop client** (a one-time, per-version operation — you'll see `Preparing Flet v… for the first use`). On Windows this can occasionally fail with `PermissionError: [WinError 5] Access is denied` if antivirus (Defender) briefly locks the freshly-extracted files during unpack. Just run `qtea ui` again — it succeeds on the next try. If it keeps failing, add a Defender exclusion for the cache folder from an elevated terminal: `Add-MpPreference -ExclusionPath "$env:USERPROFILE\.flet"`.
 
 **CLI only** (headless / CI environments):
 
@@ -361,6 +379,26 @@ During test execution the pipeline may pause for:
 qtea run --spec ./spec.md --sut ./app                # default: step 5 auto-skips when JIRA_XRAY creds are unset
 qtea run --spec ./spec.md --sut ./app --strict-xray  # enforce: fail the pipeline if Xray upload doesn't succeed
 ```
+
+### Step-7 authenticated exploration (auth modes)
+
+Before writing tests, Step 7's `site-explorer` opens the running app to map the real pages/components the tests will drive. On a login-gated SUT it must authenticate first. How it does so is **mode-switchable** with `--auth-prewarm-mode` (or `QTEA_AUTH_PREWARM_MODE`):
+
+| Mode | How it logs in | Credentials sent to the model? | Needs SUT test env installed? |
+| --- | --- | --- | --- |
+| `headed` (default) | Opens the SUT's base URL in a **visible browser** and waits for a human to log in by any means (MFA / SSO / captcha), then captures the session and explores. | No — typed straight into the browser. | No. |
+| `mcp` | The explorer drives the login UI via Playwright MCP — types the credentials and submits, then explores in the same session. Pattern-agnostic (POM, Screenplay, …). | Yes, to type them — but **masked** (`***REDACTED***`) in the on-disk user-prompt, transcript, and logs. | No (uses qtea's bundled MCP browser). |
+| `script` | Runs the SUT's own sign-in helper in a subprocess to produce a `storage-state.json`. | No — they stay in the subprocess. | Yes. |
+| `off` | Explore unauthenticated (login-gated pages are recorded as "exists, gated"). | — | — |
+
+**`headed` is the default — you don't need to set anything to use it.** A human logs in once in the visible browser, so no credentials ever reach the model. Because it needs an interactive session (a person at the machine), **headless / CI runs must choose `mcp`, `script`, or `off` explicitly**. `--auth-headed` (or `QTEA_AUTH_CAPTURE_HEADED=1`) also forces `headed` regardless of the mode flag, and auth prewarm is skipped entirely (forced `off`) by `--no-auth-capture`, `QTEA_AUTH_CAPTURE=0`, or zero-LLM CI mode (`QTEA_NO_LLM_RESOLVE=1`).
+
+The `mcp` and `script` modes authenticate from stored credentials instead of a human. They read the SUT's login credentials from `auth_flow.credentials_env_vars` (populated by Step 6), resolved from your environment (user vars) or via `--env-file`. If the credentials are absent, automated login is skipped and exploration falls back to unauthenticated. Controls:
+
+- `QTEA_AUTH_USERNAME_VAR` / `QTEA_AUTH_PASSWORD_VAR` — pick exactly which env vars are the username/password (default: first name containing `USER` / `PASS`).
+- `QTEA_AUTH_IDENTITY_PROVIDER` — hint which provider/business-unit option to select on a login chooser (e.g. `Internal`); the default already avoids SSO/MFA options.
+
+For **interactive MFA / SSO**, the default `headed` mode handles it directly — you complete the challenge in the visible browser and qtea captures the session. (The `mcp` login can't complete such challenges headlessly.) Alternatively, use `script` mode with `--auth-headed`, or the one-shot `qtea auth-capture` below. In the **desktop UI**, set the mode via the `QTEA_AUTH_PREWARM_MODE` env var (there is no dedicated panel control).
 
 ### Storage-state reuse (skip auth in Step 9 self-heal)
 

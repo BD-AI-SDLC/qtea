@@ -46,6 +46,8 @@ from qtea.logging_setup import get_logger
 from qtea.schemas import is_valid, load_schema, normalize_arrays
 from qtea.steps.base import Step, StepContext, StepResult
 from qtea.steps.s07_live_explore import (
+    LoginSpec,
+    _resolve_base_url,
     explore_strategy_routes,
     render_live_map_for_prompt,
 )
@@ -72,6 +74,15 @@ _LOGIN_POM_RE = re.compile(
 _LOGIN_METHOD_RE = re.compile(
     r"log[_-]?in|sign[_-]?in|log[_-]?on|authenticate", re.IGNORECASE
 )
+# Open-before-login gate: a method that navigates to the app base URL. A UI
+# test that logs in on a fresh about:blank page (no open/navigate first) makes
+# every locator time out — the "blank page" defect. Lenient on purpose (catch
+# the missing-open case without false-rejecting valid plans).
+_OPEN_METHOD_RE = re.compile(r"open|goto|navigate|visit", re.IGNORECASE)
+_BROWSER_FRAMEWORKS = frozenset({
+    "playwright-ts", "playwright-js", "playwright-py", "cypress",
+    "selenium-py", "selenium-java", "wdio", "protractor", "nightwatch",
+})
 
 # Default budget (chars) for inlined POM/fixture/helper source. Sonnet 4.7 has a
 # 200K window; we leave headroom for sut_inventory (30-80K typical), strategy,
@@ -250,6 +261,21 @@ def _approved_dirs(active_module: dict | None) -> set[str]:
         v = src_layout.get(key)
         if isinstance(v, str) and v:
             dirs.add(v.rstrip("/"))
+    # Exemplar lane (non-POM): the POM src-layout dirs are None for Screenplay
+    # etc., so approve every captured exemplar's directory (e.g. framework/tasks)
+    # AND its parent (e.g. framework/) so new reusable units can land beside the
+    # SUT's own — the exemplar's `dir` is the only reliable placement signal
+    # when there is no `pages_object_dir`.
+    for ex in active_module.get("pattern_exemplars") or []:
+        if not isinstance(ex, dict):
+            continue
+        ex_dir = ex.get("dir")
+        if isinstance(ex_dir, str) and ex_dir and ex_dir != ".":
+            norm = ex_dir.replace("\\", "/").rstrip("/")
+            dirs.add(norm)
+            parent = norm.rsplit("/", 1)[0] if "/" in norm else ""
+            if parent:
+                dirs.add(parent)
     return dirs
 
 
@@ -723,17 +749,66 @@ def _validate_plan_against_inventory(
                         f"missing `reuse_justification` (one-sentence fit rationale)"
                     )
 
-        # Choreography gate: every steps[] entry must reference a POM and
-        # (optionally) a locator planned within the SAME test case. `pom` +
+        # Exemplar lane (non-POM): validate reusable_units placement + shape.
+        # Intentionally does NOT apply the POM-specific assertion-probe / void
+        # signature rules — the exemplar lane imitates the SUT's own idiom
+        # (decision: pattern-agnostic gates only).
+        for ru in tc.get("reusable_units") or []:
+            if not isinstance(ru, dict):
+                continue
+            runame = ru.get("name") or "<unit>"
+            if ru.get("source") == "create":
+                at = ru.get("at")
+                if not at:
+                    violations.append(
+                        f"{tc_id}: reusable_unit `{runame}` source=create "
+                        f"missing `at` field"
+                    )
+                elif not _path_under_approved(at, approved):
+                    violations.append(
+                        f"{tc_id}: reusable_unit `{runame}` create target `{at}` "
+                        f"not under an inventory-approved directory (approved: "
+                        f"{sorted(approved) or 'none-detected'})"
+                    )
+            for mb in ru.get("missing_behaviors") or []:
+                if not isinstance(mb, dict):
+                    continue
+                if not mb.get("signature"):
+                    violations.append(
+                        f"{tc_id}: reusable_unit `{runame}` behavior "
+                        f"`{mb.get('name')}` has no signature"
+                    )
+                if not mb.get("kind"):
+                    violations.append(
+                        f"{tc_id}: reusable_unit `{runame}` behavior "
+                        f"`{mb.get('name')}` has no `kind` (action|assertion|query)"
+                    )
+
+        # Choreography gate: every steps[] entry must reference a planned unit
+        # and (optionally) a locator planned within the SAME test case. `pom` +
         # `locator` are hard-checked against the TC's own page_objects /
-        # locators (a mismatch means the writer would emit a call on a class
-        # or constant that doesn't exist in this file). `method` is soft-
-        # checked: it may be an existing reused method (not enumerated in the
-        # plan) OR a missing_methods entry — so a miss only logs a warning.
-        tc_pom_names = {
+        # reusable_units / locators (a mismatch means the writer would emit a
+        # call on a class or constant that doesn't exist in this file). `method`
+        # is soft-checked: it may be an existing reused method (not enumerated in
+        # the plan) OR a missing_methods entry — so a miss only logs a warning.
+        #
+        # Architecture-agnostic: the `pom` slot is a GENERIC unit-reference. For
+        # non-POM SUTs (Screenplay) the planned units live in `reusable_units[]`
+        # (category task/question/…), not `page_objects[]` — fold both in, keyed
+        # on the union of {name, class_name}, so a Screenplay plan whose steps
+        # reference Tasks/Questions is not falsely rejected as "planned: none"
+        # (root cause of run 20260715-075512-f2dbad).
+        tc_pom_names: set[str] = {
             po.get("name") for po in (tc.get("page_objects") or [])
             if isinstance(po, dict) and po.get("name")
         }
+        for ru in tc.get("reusable_units") or []:
+            if not isinstance(ru, dict):
+                continue
+            if ru.get("name"):
+                tc_pom_names.add(ru["name"])
+            if ru.get("class_name"):
+                tc_pom_names.add(ru["class_name"])
         tc_locator_names = {
             lc.get("name") for lc in (tc.get("locators") or [])
             if isinstance(lc, dict) and lc.get("name")
@@ -752,6 +827,24 @@ def _validate_plan_against_inventory(
                 for mm in (po.get("missing_methods") or [])
                 if isinstance(mm, dict) and mm.get("name")
             }
+        # Fold reusable_units' behaviours into the same method maps (keyed by
+        # both name and class_name so a step referencing either resolves).
+        for ru in tc.get("reusable_units") or []:
+            if not isinstance(ru, dict) or not ru.get("name"):
+                continue
+            behaviours = {
+                mb.get("name") for mb in (ru.get("missing_behaviors") or [])
+                if isinstance(mb, dict) and mb.get("name")
+            }
+            kinds = {
+                mb.get("name"): mb.get("kind")
+                for mb in (ru.get("missing_behaviors") or [])
+                if isinstance(mb, dict) and mb.get("name")
+            }
+            for key in (ru.get("name"), ru.get("class_name")):
+                if key:
+                    tc_missing_methods[key] = behaviours
+                    tc_method_kinds[key] = kinds
         for fn in tc.get("test_functions") or []:
             for st in fn.get("steps") or []:
                 if not isinstance(st, dict):
@@ -857,6 +950,130 @@ def _validate_plan_against_inventory(
                         f"unused login page object."
                     )
 
+        # UI open-before-login gate (the "blank page" defect). A UI test that
+        # logs in MUST first navigate to the app base URL — logging in on a
+        # fresh about:blank page makes every locator time out. The open call
+        # lives in the before_each hook (preferred) or leading arrange steps.
+        # Fires only for UI SUTs (the SUT exposes an open/navigate method, or a
+        # browser framework is in use). A reused before_each hook replays the
+        # SUT's own open→login sequence and is trusted.
+        open_ref = _auth_flow.get("open_method") or ""
+        open_method_name = (
+            open_ref.rsplit(".", 1)[-1]
+            if ":" in open_ref and "." in open_ref.split(":", 1)[1]
+            else ""
+        )
+        _framework = (plan.get("framework") or "").lower()
+        if open_ref or _framework in _BROWSER_FRAMEWORKS:
+            hooks = tc.get("hooks") or []
+            reused_before_each = any(
+                isinstance(h, dict)
+                and h.get("event") == "before_each"
+                and h.get("source") == "reuse"
+                for h in hooks
+            )
+            if not reused_before_each:
+                seq: list[dict] = []
+                for h in hooks:
+                    if isinstance(h, dict) and h.get("event") == "before_each":
+                        seq.extend(
+                            c for c in (h.get("calls") or []) if isinstance(c, dict)
+                        )
+                for fn in tc.get("test_functions") or []:
+                    seq.extend(
+                        st for st in (fn.get("steps") or []) if isinstance(st, dict)
+                    )
+                login_idx = next(
+                    (
+                        i for i, c in enumerate(seq)
+                        if c.get("method") and _LOGIN_METHOD_RE.search(c["method"])
+                    ),
+                    None,
+                )
+                if login_idx is not None:
+                    def _is_open_call(c: dict) -> bool:
+                        m = c.get("method") or ""
+                        if open_method_name and m == open_method_name:
+                            return True
+                        return bool(_OPEN_METHOD_RE.search(m))
+                    open_before = any(_is_open_call(seq[i]) for i in range(login_idx))
+                    if not open_before:
+                        violations.append(
+                            f"{tc_id}: UI test logs in "
+                            f"(`{seq[login_idx].get('method')}`) but no "
+                            f"open/navigate-to-base-URL call precedes it "
+                            f"(expected `{open_method_name or 'openBaseURL'}` in a "
+                            f"before_each hook or leading arrange step). Login on a "
+                            f"blank page times out — add the open-base-URL call "
+                            f"before login."
+                        )
+
+        # Navigation-precondition gate (the "wrong screen" defect). Some reused
+        # POM methods act on a specific already-active view (grid/table/tab)
+        # with no in-code guard for it — the requirement is a pure calling
+        # convention, only visible in sut_inventory.navigation_preconditions[]
+        # (mined by Step 6 from the SUT's own real call sites). Unlike the
+        # open-before-login gate above, this ALWAYS builds the full sequence
+        # regardless of whether the before_each hook is reused or created: a
+        # trusted reused hook can legitimately satisfy a precondition, but the
+        # gap this catches is typically in a LATER steps[] entry, not the hook
+        # itself (a common shape: the hook is a verbatim, correct reuse; the
+        # missing call belonged before a later arrange step reusing a grid/
+        # filter POM method whose precondition wasn't declared in the hook).
+        nav_preconditions = [
+            np_ for np_ in (active_module or {}).get("navigation_preconditions") or []
+            if isinstance(np_, dict) and np_.get("method") and np_.get("requires_call")
+        ]
+        if nav_preconditions:
+            def _split_class_method(ref: str) -> tuple[str, str]:
+                if "." in ref:
+                    cls, _, meth = ref.rpartition(".")
+                    return cls, meth
+                return "", ref
+
+            def _call_matches(call: dict, cls: str, meth: str) -> bool:
+                call_method = call.get("method") or ""
+                if call_method != meth:
+                    return False
+                call_pom = call.get("pom") or ""
+                return not cls or not call_pom or call_pom == cls
+
+            full_seq: list[dict] = []
+            for h in tc.get("hooks") or []:
+                if isinstance(h, dict) and h.get("event") == "before_each":
+                    full_seq.extend(
+                        c for c in (h.get("calls") or []) if isinstance(c, dict)
+                    )
+            for fn in tc.get("test_functions") or []:
+                full_seq.extend(
+                    st for st in (fn.get("steps") or []) if isinstance(st, dict)
+                )
+
+            for np_ in nav_preconditions:
+                dep_cls, dep_method = _split_class_method(str(np_["method"]))
+                req_cls, req_method = _split_class_method(str(np_["requires_call"]))
+                for i, call in enumerate(full_seq):
+                    if not _call_matches(call, dep_cls, dep_method):
+                        continue
+                    satisfied = any(
+                        _call_matches(full_seq[j], req_cls, req_method)
+                        for j in range(i)
+                    )
+                    if satisfied:
+                        continue
+                    args_hint = np_.get("requires_args_hint")
+                    hint = f" (typically with `{args_hint}`)" if args_hint else ""
+                    evidence = np_.get("evidence") or "no evidence recorded"
+                    violations.append(
+                        f"{tc_id}: choreography calls "
+                        f"`{call.get('pom')}.{call.get('method')}` but its "
+                        f"required prior call `{np_['requires_call']}`{hint} does "
+                        f"not appear earlier in this test function's before_each "
+                        f"hook or steps[] (sut_inventory.navigation_preconditions "
+                        f"evidence: {evidence}). Add an arrange step invoking it "
+                        f"before this step."
+                    )
+
     return violations
 
 
@@ -948,6 +1165,45 @@ def _render_plan_markdown(plan: dict) -> str:
                     )
                 else:
                     lines.append(f"  - `{name}` - {src}")
+
+        # Exemplar (non-POM) lane: render reusable_units in place of
+        # page_objects, and surface their deferred_targets[] as TBD locators.
+        units = tc.get("reusable_units") or []
+        if units:
+            lines.append("- Reusable units:")
+            for u in units:
+                name = u.get("name") or "?"
+                src = u.get("source") or "?"
+                cat = u.get("category")
+                cat_s = f" [{cat}]" if cat else ""
+                if src == "reuse":
+                    ref = u.get("from") or "?"
+                    lines.append(f"  - `{name}`{cat_s} - reuse from `{ref}`")
+                else:
+                    at = u.get("at") or "?"
+                    extra = ""
+                    mb = u.get("missing_behaviors") or []
+                    if mb:
+                        # reusable_units signatures already include the method
+                        # name (e.g. "answered_by(self, actor) -> bool"), unlike
+                        # POM missing_methods — render the signature verbatim.
+                        sigs = ", ".join(
+                            f"`{m.get('signature') or m.get('name') or '?'}`"
+                            for m in mb
+                        )
+                        extra = f" + behaviors: {sigs}"
+                    lines.append(f"  - `{name}`{cat_s} - create at `{at}`{extra}")
+            tbd = [
+                (dt.get("name") or "?", dt.get("intent") or "?", u.get("name") or "?")
+                for u in units
+                for dt in (u.get("deferred_targets") or [])
+            ]
+            if tbd and not (tc.get("locators") or []):
+                lines.append("- Locators (TBD):")
+                for n, intent, owner in tbd:
+                    lines.append(
+                        f"  - `{n}` ({owner}) - create_tbd intent: \"{intent}\""
+                    )
         lines.append("")
 
     if not test_cases:
@@ -1016,11 +1272,29 @@ class TestArchitectStep(Step):
         if research_md.exists():
             inputs["research.md"] = research_md.read_text(encoding="utf-8")
 
-        # --- Pre-codegen live exploration (Gap A) ---
-        # Before the architect plans, open the SUT and confirm the routes named
-        # in the strategy actually exist + capture a light structural digest.
-        # Best-effort + gated (QTEA_LIVE_EXPLORE); on skip/failure live_map is
-        # None and planning proceeds from the static inventory as before.
+        # --- Pre-exploration authentication (mode-switchable) ------------
+        # mode=headed (default): open the base URL in a VISIBLE browser and let
+        #   the human log in by any means (MFA/SSO) — session captured to the SUT
+        #   convention path, which explore picks up via resolve() (no login_spec,
+        #   no SUT env). Falls back to mcp if qtea's Playwright isn't installed.
+        # mode=mcp: the site-explorer logs in via Playwright MCP and explores in
+        #   the SAME session — `login_spec` is passed to the explore call below.
+        # mode=script: run the SUT's own sign-in helper in a subprocess to
+        #   produce a storage-state (best-effort; needs the SUT env prewarmed).
+        # mode=off: explore unauthenticated.
+        from qtea import storage_state as _storage_state
+        from qtea.steps.s07_auth_prewarm import (
+            auth_prewarm_mode,
+            headed_mode_requested,
+            is_interactive_session,
+            login_identity_provider,
+            maybe_headed_prewarm,
+            maybe_prewarm_auth,
+            resolve_login_credentials,
+        )
+
+        # research.json feeds both mcp-login credential resolution (below) and
+        # live exploration (further down), so load it before the auth block.
         research_dict: dict | None = None
         research_json = ctx.workspace.step_dir(6) / "research.json"
         if research_json.exists():
@@ -1028,22 +1302,125 @@ class TestArchitectStep(Step):
                 research_dict = json.loads(research_json.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 research_dict = None
+
+        _prewarm_mode = auth_prewarm_mode(ctx.options)
+        login_spec: LoginSpec | None = None
+        if _prewarm_mode == "headed":
+            # Headed (human-driven) login is the default: open the base URL in a
+            # visible browser and let the operator complete MFA/SSO, then capture
+            # the session. Falls back to mcp when qtea's Playwright isn't
+            # installed. On success the storage-state lands at the SUT convention
+            # path and explore_strategy_routes picks it up via resolve() — so no
+            # login_spec is needed (creds never reach the model here).
+            try:
+                _status = await maybe_headed_prewarm(
+                    sut_root=sut_root,
+                    workspace_root=ctx.workspace.root,
+                    active_module=active_module,
+                    base_url=_resolve_base_url(research_dict),
+                    research=research_dict,
+                    cli_storage_state=getattr(ctx.options, "storage_state", None),
+                    no_auth_capture=getattr(ctx.options, "no_auth_capture", False),
+                    interactive=is_interactive_session(ctx.options),
+                )
+            except Exception as e:  # never let auth prewarm break Step 7
+                log.warning("step07.auth_prewarm_unexpected_error", error=str(e))
+                _status = "skipped"
+            if _status == "fallback_mcp":
+                _prewarm_mode = "mcp"  # qtea Playwright missing → automated login
+
+        if _prewarm_mode == "script":
+            try:
+                await maybe_prewarm_auth(
+                    sut_root=sut_root,
+                    workspace_root=ctx.workspace.root,
+                    active_module=active_module,
+                    cli_storage_state=getattr(ctx.options, "storage_state", None),
+                    no_auth_capture=getattr(ctx.options, "no_auth_capture", False),
+                    headed_requested=headed_mode_requested(ctx.options),
+                    interactive=is_interactive_session(ctx.options),
+                )
+            except Exception as e:  # never let auth prewarm break Step 7
+                log.warning("step07.auth_prewarm_unexpected_error", error=str(e))
+        elif _prewarm_mode == "mcp":
+            # Build a login only when no session already resolves (reuse first)
+            # and credentials are available. explore_strategy_routes registers
+            # the credentials for redaction before they enter the prompt.
+            try:
+                _has_state = _storage_state.resolve(
+                    sut_root=sut_root,
+                    workspace_root=ctx.workspace.root,
+                    cli_opt=getattr(ctx.options, "storage_state", None),
+                ) is not None
+                _creds = None if _has_state else resolve_login_credentials(active_module, research_dict)
+                if _creds is not None:
+                    login_spec = LoginSpec(
+                        username=_creds[0], password=_creds[1],
+                        provider=login_identity_provider(),
+                    )
+                    log.info("step07.mcp_login_enabled")
+                elif not _has_state:
+                    log.info("step07.mcp_login_skip", reason="no_credentials")
+            except Exception as e:  # never let login setup break Step 7
+                log.warning("step07.mcp_login_setup_error", error=str(e))
+
+        # --- Pre-codegen live exploration (Gap A) ---
+        # Before the architect plans, open the SUT and confirm the routes named
+        # in the strategy actually exist + capture a light structural digest.
+        # Best-effort + gated (QTEA_LIVE_EXPLORE); on skip/failure live_map is
+        # None and planning proceeds from the static inventory as before.
+        # Reuse across attempts: live exploration depends only on test-design.md
+        # (fixed for the whole step) and the running SUT, neither of which a
+        # retry changes — only the planning prompt does. A prior attempt's
+        # live-map.json is therefore still valid, so reload it instead of
+        # re-booting the Playwright MCP browser and re-probing every route
+        # (a full site-explorer agent run — the expensive part of Step 7).
         live_map = None
-        try:
-            live_map = await explore_strategy_routes(
-                strategy_text=inputs["test-design.md"],
-                research=research_dict,
-                sut_root=sut_root,
-                workspace_root=ctx.workspace.root,
-                out_dir=out_dir,
-                workdir=wd / "live-explore",
-                cli_storage_state=getattr(ctx.options, "storage_state", None),
-            )
-        except Exception as e:  # never let exploration break Step 7
-            log.warning("step07.live_explore_unexpected_error", error=str(e))
+        cached_map_path = out_dir / "live-map.json"
+        if cached_map_path.exists():
+            try:
+                live_map = json.loads(cached_map_path.read_text(encoding="utf-8"))
+                log.info(
+                    "step07.live_explore_reused",
+                    path=str(cached_map_path),
+                    routes=len(live_map.get("routes") or [])
+                    if isinstance(live_map, dict) else 0,
+                )
+            except (OSError, json.JSONDecodeError) as e:
+                log.warning("step07.live_explore_cache_unreadable", error=str(e))
+                live_map = None
+        if live_map is None:
+            try:
+                live_map = await explore_strategy_routes(
+                    strategy_text=inputs["test-design.md"],
+                    research=research_dict,
+                    sut_root=sut_root,
+                    workspace_root=ctx.workspace.root,
+                    out_dir=out_dir,
+                    workdir=wd / "live-explore",
+                    cli_storage_state=getattr(ctx.options, "storage_state", None),
+                    login=login_spec,
+                    auth_mode=_prewarm_mode,
+                )
+            except Exception as e:  # never let exploration break Step 7
+                log.warning("step07.live_explore_unexpected_error", error=str(e))
         live_map_clause = render_live_map_for_prompt(live_map)
         if live_map is not None:
             inputs["live-map.json"] = json.dumps(live_map, indent=2, ensure_ascii=False)
+            # Surface silent coverage loss when the driver truncated the plan.
+            # The plan asked for more targets than the run-time cap allowed —
+            # the operator should know so they can raise the cap or trim the
+            # plan rather than silently missing target pages.
+            _tel = live_map.get("_telemetry") if isinstance(live_map, dict) else None
+            if isinstance(_tel, dict):
+                _truncated = int(_tel.get("routes_truncated_by_cap") or 0)
+                if _truncated > 0:
+                    log.warning(
+                        "step07.live_explore_plan_truncated",
+                        truncated=_truncated,
+                        requested=_tel.get("routes_requested_by_plan"),
+                        explored=_tel.get("routes_explored"),
+                    )
 
         skill_path = (
             package_resource_root() / "skills"
@@ -1095,6 +1472,35 @@ class TestArchitectStep(Step):
             else ""
         )
 
+        # Pattern-aware branch. For POM-family SUTs the mature POM contract
+        # (page_objects[] + missing_methods + locators[]) applies unchanged.
+        # For non-POM SUTs (e.g. Screenplay) the inventory carries
+        # `pattern_exemplars[]` — verbatim snippets of the SUT's OWN reusable
+        # units — and the architect must plan `reusable_units[]` shaped like
+        # them instead of forcing POM.
+        arch_pattern = active_module.get("architecture_pattern") or "unknown"
+        exemplar_count = len(active_module.get("pattern_exemplars") or [])
+        if arch_pattern not in ("pom", "inline", "none", "unknown"):
+            pattern_clause = (
+                f"\n\n**ARCHITECTURE PATTERN = `{arch_pattern}` (NON-POM).** This "
+                f"SUT does NOT use Page Object Model. Do NOT emit `page_objects[]` "
+                f"or POM `missing_methods`. Instead, for each test case emit "
+                f"`reusable_units[]`: new or reused units (Tasks/Questions/"
+                f"Interactions/etc.) SHAPED LIKE the {exemplar_count} verbatim "
+                f"`pattern_exemplars[]` in `sut_inventory.json` (each has "
+                f"`category`, `class_name`, `dir`, and an `excerpt`). Place new "
+                f"units (`source: create`, `at: <path>`) in the SAME directory as "
+                f"the exemplar of the matching `category` (use its `dir`); set "
+                f"`shaped_like` to that exemplar's index. Describe behaviours the "
+                f"test needs in `missing_behaviors[]` (name, signature, kind). For "
+                f"element locators the unit needs, list `deferred_targets[]` "
+                f"(name + one-line intent) — Step 8 backs each with qtea's JIT "
+                f"resolver; do NOT hardcode selectors. Use `reusable_units` — "
+                f"NOT `page_objects` — for all reusable code in this plan."
+            )
+        else:
+            pattern_clause = ""
+
         user_prompt = (
             f"{clarification_block}"
             f"The inputs below are inlined: `sut_inventory.json` "
@@ -1122,6 +1528,7 @@ class TestArchitectStep(Step):
             f"matching dimension you observed in the source. If you cannot "
             f"name one, emit `source: create` instead. {skipped_clause}"
             f"{live_map_clause}"
+            f"{pattern_clause}"
         )
 
         result = await call_reasoning_llm(
@@ -1174,6 +1581,15 @@ class TestArchitectStep(Step):
             )
 
         plan = normalize_arrays(plan, "code-modification-plan")
+
+        # The design pattern is a deterministic Step-6 fact, not the agent's to
+        # invent — stamp it onto the plan authoritatively so Step 8 selects the
+        # right codegen lane. (The agent may echo it; the inventory wins.)
+        plan["architecture_pattern"] = (
+            active_module.get("architecture_pattern")
+            or plan.get("architecture_pattern")
+            or "pom"
+        )
 
         ok_schema, schema_err = is_valid(plan, "code-modification-plan")
         if not ok_schema:

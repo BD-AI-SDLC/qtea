@@ -84,6 +84,54 @@ def test_run_tests_unknown_framework_synthesises_runner_failure(
 
 
 # ---------------------------------------------------------------------------
+# Single-browser (--project) injection for Playwright Test
+# ---------------------------------------------------------------------------
+
+
+def test_inject_playwright_project_appends_when_absent() -> None:
+    from qtea.test_runner import _inject_playwright_project
+    out = _inject_playwright_project("npx playwright test --reporter=json", "chromium")
+    assert out == "npx playwright test --reporter=json --project=chromium"
+
+
+def test_inject_playwright_project_idempotent_when_present() -> None:
+    from qtea.test_runner import _inject_playwright_project
+    cmd = "npx playwright test --project=webkit --reporter=json"
+    assert _inject_playwright_project(cmd, "chromium") == cmd
+
+
+def test_inject_playwright_project_noop_when_none() -> None:
+    from qtea.test_runner import _inject_playwright_project
+    cmd = "npx playwright test --reporter=json"
+    assert _inject_playwright_project(cmd, None) == cmd
+    assert _inject_playwright_project(cmd, "") == cmd
+
+
+def test_resolve_command_pins_project_for_playwright_default(tmp_path: Path) -> None:
+    cmd, parser = resolve_command(
+        "playwright-ts", detected=None, cwd=tmp_path, playwright_project="chromium",
+    )
+    assert parser == "playwright-json"
+    assert "--project=chromium" in cmd
+
+
+def test_resolve_command_pins_project_for_playwright_detected(tmp_path: Path) -> None:
+    cmd, _ = resolve_command(
+        "playwright-ts", detected="npx playwright test",
+        cwd=tmp_path, playwright_project="firefox",
+    )
+    assert "--project=firefox" in cmd
+
+
+def test_resolve_command_no_project_for_pytest(tmp_path: Path) -> None:
+    """--project is Playwright-Test-only; pytest commands must never get it."""
+    cmd, _ = resolve_command(
+        "pytest", detected=None, cwd=tmp_path, playwright_project="chromium",
+    )
+    assert "--project" not in cmd
+
+
+# ---------------------------------------------------------------------------
 # resolve_command with StackProfile (wrapping)
 # ---------------------------------------------------------------------------
 
@@ -868,6 +916,56 @@ def test_classify_runner_failure_returns_none_for_normal_test_failures() -> None
 def test_classify_runner_failure_returns_none_for_empty_stderr() -> None:
     assert classify_runner_failure("", package_manager="poetry") is None
     assert classify_runner_failure(None, package_manager="poetry") is None  # type: ignore[arg-type]
+
+
+def test_classify_runner_failure_detects_broken_relative_ts_import() -> None:
+    # H1/H2 incident class (run 20260709-083909-223772): a nested POM ships
+    # a compile-fatal relative import to the wrong location. Node's runtime
+    # resolver reports it as a relative-path module — that must classify as
+    # a collection_error (broken local import), never missing_module.
+    stderr = (
+        "Error: Cannot find module './qtea-runtime'\n"
+        "Require stack:\n"
+        "- C:\\sut\\tests\\pages\\login.page.ts\n"
+    )
+    rf = classify_runner_failure(stderr, package_manager="npm")
+    assert rf is not None
+    assert rf["kind"] == "collection_error"
+    assert rf["module"] == "./qtea-runtime"
+    assert "local import" in rf["hint"]
+
+
+def test_classify_runner_failure_detects_tsc_missing_module_diagnostic() -> None:
+    stderr = (
+        "src/pages/login.page.ts:1:29 - error TS2307: Cannot find module "
+        "'../../tests/qtea-runtime' or its corresponding type declarations.\n"
+    )
+    rf = classify_runner_failure(stderr, package_manager="npm")
+    assert rf is not None
+    assert rf["kind"] == "collection_error"
+    assert rf["module"] == "../../tests/qtea-runtime"
+
+
+def test_classify_runner_failure_bare_node_module_is_missing_module() -> None:
+    stderr = "Error: Cannot find module 'left-pad'\n"
+    rf = classify_runner_failure(stderr, package_manager="npm")
+    assert rf is not None
+    assert rf["kind"] == "missing_module"
+    assert rf["module"] == "left-pad"
+    assert rf["hint"] == "npm install --save-dev left-pad"
+
+
+def test_classify_runner_failure_detects_generic_ts_compile_error() -> None:
+    # A TS syntax/type error with no missing-module signal at all — the
+    # TS/JS analogue of the pytest "ImportError while loading conftest"
+    # collection_error fallback.
+    stderr = (
+        "src/pages/login.page.ts:12:3 - error TS1005: ';' expected.\n"
+    )
+    rf = classify_runner_failure(stderr, package_manager="npm")
+    assert rf is not None
+    assert rf["kind"] == "collection_error"
+    assert rf["module"] is None
 
 
 def test_run_tests_attaches_runner_failure_to_synthetic_entry(tmp_path: Path) -> None:

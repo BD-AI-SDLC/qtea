@@ -109,6 +109,165 @@ def test_body_verify_flags_wrong_exact_count(tmp_path: Path):
     assert "toHaveCount(5)" in vs[0].message
 
 
+def test_body_verify_passes_on_exact_count_named_constant(tmp_path: Path):
+    """Regression against exact_count false-green: the spec asserts
+    ``toHaveCount(EXPECTED_NOTIFICATION_COUNT)`` where the constant equals the
+    contract literal (1). The getter-style POM returns the Locator; the
+    assertion lives at the spec call site. Before the fix, the exact_count
+    matcher had no symbol branch and misreported this correct assertion as
+    "missing toHaveCount(1)"."""
+    pom = tmp_path / "src" / "pages" / "BasePage.ts"
+    _write(pom,
+        "export class BasePage {\n"
+        "  getNotificationInboxItemsLocator(): Locator {\n"
+        "    return this.page.locator(BASE_LOCATORS.NOTIFICATION_INBOX_ITEMS);\n"
+        "  }\n"
+        "}\n",
+    )
+    spec = tmp_path / "tests" / "qtea_entity.spec.ts"
+    _write(spec,
+        "const EXPECTED_NOTIFICATION_COUNT = 1;\n"
+        "test('entity', async () => {\n"
+        "  await expect(basePage.getNotificationInboxItemsLocator()).toHaveCount(\n"
+        "    EXPECTED_NOTIFICATION_COUNT\n"
+        "  );\n"
+        "});\n",
+    )
+    missing = [{
+        "name": "getNotificationInboxItemsLocator",
+        "signature": "getNotificationInboxItemsLocator(): Locator",
+        "kind": "assertion",
+        "purpose": "Inbox contains exactly one new notification.",
+        "acceptance_criteria": [
+            {"check": "exact_count", "locator": "NOTIFICATION_INBOX_ITEMS",
+             "expected_literal": 1, "source_tc": "TC-ENTITY-001"},
+        ],
+    }]
+    assert verify_method_bodies(
+        pom, "BasePage", missing, test_files=[spec], language="typescript",
+    ) == []
+
+
+def test_body_verify_flags_named_constant_wrong_value(tmp_path: Path):
+    """A named count constant that folds to the WRONG value must still fail —
+    the symbol branch resolves the value, it does not blindly accept any
+    identifier."""
+    pom = tmp_path / "src" / "pages" / "BasePage.ts"
+    _write(pom,
+        "export class BasePage {\n"
+        "  getItemsLocator(): Locator {\n"
+        "    return this.page.locator(sel.ITEMS);\n"
+        "  }\n"
+        "}\n",
+    )
+    spec = tmp_path / "tests" / "qtea_x.spec.ts"
+    _write(spec,
+        "const EXPECTED = 2;\n"
+        "test('x', async () => {\n"
+        "  await expect(basePage.getItemsLocator()).toHaveCount(EXPECTED);\n"
+        "});\n",
+    )
+    missing = [{
+        "name": "getItemsLocator", "signature": "getItemsLocator(): Locator",
+        "kind": "assertion", "purpose": "Exactly one item.",
+        "acceptance_criteria": [{"check": "exact_count", "expected_literal": 1}],
+    }]
+    vs = verify_method_bodies(
+        pom, "BasePage", missing, test_files=[spec], language="typescript",
+    )
+    assert len(vs) == 1
+    assert "toHaveCount(1)" in vs[0].message
+    assert "EXPECTED" in vs[0].message
+
+
+def test_body_verify_passes_on_expected_symbol_name_match(tmp_path: Path):
+    """When the plan supplies ``expected_symbol``, a matching symbol name at the
+    call site passes even when the declaration is imported (not foldable in
+    view) — mirrors the exact_text/exact_attribute symbol path."""
+    pom = tmp_path / "src" / "pages" / "P.ts"
+    _write(pom,
+        "export class P {\n"
+        "  getItems(): Locator { return this.page.locator(sel.ITEMS); }\n"
+        "}\n",
+    )
+    spec = tmp_path / "tests" / "qtea_y.spec.ts"
+    _write(spec,
+        "import { ROW_COUNT } from './consts';\n"
+        "test('y', async () => {\n"
+        "  await expect(p.getItems()).toHaveCount(ROW_COUNT);\n"
+        "});\n",
+    )
+    missing = [{
+        "name": "getItems", "signature": "getItems(): Locator",
+        "kind": "assertion", "purpose": "row count",
+        "acceptance_criteria": [
+            {"check": "exact_count", "expected_literal": 3,
+             "expected_symbol": "ROW_COUNT"},
+        ],
+    }]
+    assert verify_method_bodies(
+        pom, "P", missing, test_files=[spec], language="typescript",
+    ) == []
+
+
+def test_body_verify_python_passes_named_constant(tmp_path: Path):
+    """Python analogue: ``to_have_count(EXPECTED_NOTIFICATION_COUNT)`` with the
+    constant declared in the test module folds to the contract literal."""
+    pom = tmp_path / "pages" / "base_page.py"
+    _write(pom,
+        "class BasePage:\n"
+        "    def notification_items(self):\n"
+        "        return self.page.locator(ITEMS)\n",
+    )
+    test = tmp_path / "tests" / "qtea_entity.py"
+    _write(test,
+        "EXPECTED_NOTIFICATION_COUNT = 1\n"
+        "def test_entity(page):\n"
+        "    expect(BasePage(page).notification_items())"
+        ".to_have_count(EXPECTED_NOTIFICATION_COUNT)\n",
+    )
+    missing = [{
+        "name": "notification_items", "signature": "()", "kind": "assertion",
+        "purpose": "exactly one notification",
+        "acceptance_criteria": [{"check": "exact_count", "expected_literal": 1}],
+    }]
+    assert verify_method_bodies(
+        pom, "BasePage", missing, test_files=[test], language="python",
+    ) == []
+
+
+def test_body_verify_java_passes_named_constant(tmp_path: Path):
+    """Java analogue: ``hasCount(EXPECTED_NOTIFICATION_COUNT)`` with the
+    constant declared ``static final int`` folds to the contract literal."""
+    pom = tmp_path / "pages" / "BasePage.java"
+    _write(pom,
+        "public class BasePage {\n"
+        "  public Locator notificationItems() {\n"
+        "    return page.locator(ITEMS);\n"
+        "  }\n"
+        "}\n",
+    )
+    test = tmp_path / "tests" / "QteaRopaTest.java"
+    _write(test,
+        "public class QteaRopaTest {\n"
+        "  static final int EXPECTED_NOTIFICATION_COUNT = 1;\n"
+        "  @Test void entity() {\n"
+        "    assertThat(basePage.notificationItems())"
+        ".hasCount(EXPECTED_NOTIFICATION_COUNT);\n"
+        "  }\n"
+        "}\n",
+    )
+    missing = [{
+        "name": "notificationItems",
+        "signature": "Locator notificationItems()",
+        "kind": "assertion", "purpose": "exactly one notification",
+        "acceptance_criteria": [{"check": "exact_count", "expected_literal": 1}],
+    }]
+    assert verify_method_bodies(
+        pom, "BasePage", missing, test_files=[test], language="java",
+    ) == []
+
+
 # ---------------------------------------------------------------------------
 # exact_text (with tautology detection)
 # ---------------------------------------------------------------------------

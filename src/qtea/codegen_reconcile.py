@@ -340,6 +340,12 @@ def _py_call_sites(tree: ast.AST, lines: list[str], rel: str) -> list[CallSite]:
 # ---------------------------------------------------------------------------
 
 _JS_CLASS_HEADER_RE = re.compile(r"\bclass\s+([A-Za-z_$][\w$]*)")
+# `class Sub extends Base` / `class Sub extends ns.Base` (TS/JS/Java). Group 2
+# is the base name (namespace prefix stripped by the caller). Used to walk the
+# inheritance closure so a call to an inherited base method resolves.
+_JS_EXTENDS_RE = re.compile(
+    r"\bclass\s+([A-Za-z_$][\w$]*)\s+extends\s+([A-Za-z_$][\w$.]*)"
+)
 _JS_IMPORT_RE = re.compile(
     r"import\s*(?:type\s*)?\{([^}]+)\}\s*from\s*['\"][^'\"]+['\"]"
 )
@@ -398,68 +404,163 @@ _JAVA_LIFECYCLE_NAMES: frozenset[str] = frozenset({
 })
 
 
+def _blank_js_template(src: str, out: list[str], i: int) -> int:
+    """Blank a template literal starting at ``src[i] == '`'`` in-place on ``out``.
+
+    Returns the index just past the closing backtick (or ``len(src)`` if the
+    template is unterminated). Backticks, ``${…}`` interpolations, and any
+    strings / nested templates inside those interpolations are all blanked to
+    spaces (newlines preserved), so no delimiter or brace/paren leaks out to
+    confuse the downstream brace/paren walks. Interpolation expressions are
+    blanked wholesale — they never contain a class-level method DEFINITION,
+    which is all the extractor cares about — but their ``{ }`` depth IS tracked
+    so the correct closing backtick is found even when an interpolation contains
+    braces, quotes, or a nested template.
+    """
+    n = len(src)
+    out[i] = " "  # opening backtick
+    i += 1
+    while i < n:
+        ch = src[i]
+        if ch == "\\" and i + 1 < n:  # escaped char (e.g. \` or \$)
+            out[i] = " "
+            if src[i + 1] != "\n":
+                out[i + 1] = " "
+            i += 2
+            continue
+        if ch == "`":
+            out[i] = " "
+            return i + 1
+        if ch == "$" and i + 1 < n and src[i + 1] == "{":
+            out[i] = " "
+            out[i + 1] = " "
+            i += 2
+            depth = 1
+            while i < n and depth > 0:
+                c = src[i]
+                if c == "{":
+                    depth += 1
+                    out[i] = " "
+                    i += 1
+                elif c == "}":
+                    depth -= 1
+                    out[i] = " "
+                    i += 1
+                elif c == "`":
+                    i = _blank_js_template(src, out, i)
+                elif c in ("'", '"'):
+                    i = _blank_js_string(src, out, i, keep_delims=False)
+                else:
+                    if c != "\n":
+                        out[i] = " "
+                    i += 1
+            continue
+        if ch != "\n":
+            out[i] = " "
+        i += 1
+    return i  # unterminated — consumed to EOF
+
+
+def _blank_js_string(
+    src: str, out: list[str], i: int, *, keep_delims: bool,
+) -> int:
+    """Blank a ``'…'`` / ``"…"`` string starting at ``src[i]`` on ``out``.
+
+    ``keep_delims`` leaves the opening/closing quote characters intact (used at
+    code level, matching the historical behaviour where quotes were preserved);
+    when False the quotes are blanked too (used inside template interpolations,
+    where a stray quote must not leak). Returns the index past the closing
+    quote. A valid JS/TS string cannot span a raw newline, so an unterminated
+    string stops at end-of-line rather than eating the rest of the file.
+    """
+    n = len(src)
+    quote = src[i]
+    if not keep_delims:
+        out[i] = " "
+    i += 1
+    while i < n:
+        c = src[i]
+        if c == "\n":  # unterminated string (source bug) — do not overrun
+            return i
+        if c == "\\" and i + 1 < n:
+            out[i] = " "
+            if src[i + 1] != "\n":
+                out[i + 1] = " "
+            i += 2
+            continue
+        if c == quote:
+            if not keep_delims:
+                out[i] = " "
+            return i + 1
+        out[i] = " "
+        i += 1
+    return i
+
+
 def _js_strip(src: str) -> str:
     """Blank out string literals + comments while preserving length AND newlines.
 
-    Historical bug (fixed): the original implementation processed strings
-    FIRST with ``re.DOTALL`` on a single alternation regex covering ``'``,
-    ``"``, and `` ` ``. A ``//`` line comment containing an apostrophe
-    (e.g. ``// verify it's about missing checkbox``) would trap the string
-    regex — the apostrophe was treated as an opening quote and the regex
-    consumed non-greedily until finding the next apostrophe elsewhere in
-    the file, blanking hundreds of intermediate newlines. The stripped
-    output collapsed enough lines that ``re.MULTILINE`` line-anchor
-    regexes downstream (like ``_JS_METHOD_HEAD_RE``) stopped matching
-    methods that had lost their leading ``\\n``.
+    Single-pass, context-aware scanner. Walks the source character by character
+    tracking exactly one lexical context at a time — code / line-comment /
+    block-comment / single-quoted / double-quoted / template-literal (with
+    ``${…}`` interpolation nesting) — and blanks the interior of every
+    non-code region to spaces, leaving newlines (and the code skeleton, incl.
+    every ``{`` / ``}`` / ``(`` / ``)`` outside a literal) untouched. Output is
+    byte-for-byte the same length as the input so downstream ``re.MULTILINE``
+    anchors, ``str.find`` offsets, and the brace/paren depth walks all stay
+    honest.
 
-    Fix: comments FIRST (line + block), and every blanking substitution
-    preserves newlines. Non-template strings run with ``re.DOTALL=off``
-    because valid TS/JS ``'...'`` / ``"..."`` cannot span a raw newline;
-    template literals (backticks) can, so their blanking preserves ``\\n``.
+    Why a scanner and not ordered regex passes: no ordering of independent
+    passes is safe, because the lexical contexts can each contain the others'
+    delimiters. The bug this replaces: a ``//``-prefixed XPath inside a template
+    literal (e.g. ``page.locator(`//a[@id="${x}"]`)``) was eaten by the
+    line-comment pass (which ran before the template pass), which consumed the
+    template's closing backtick; the template pass then blanked forward across
+    method boundaries, silently dropping every method whose header fell in the
+    swallowed span. A scanner that recognises the template context first never
+    misreads that ``//`` as a comment.
 
-    A ``//`` inside a URL like ``"http://x"`` is safe because the double
-    quote pass has already blanked the string content by that point? No —
-    order is comments-first now. Instead, safety comes from the string
-    regex being greedy enough: ``"http://x"`` is matched as a single
-    string BEFORE the line-comment pass, but under the new order the
-    line-comment pass runs first. The line comment regex ``//[^\\n]*``
-    would match ``//x"`` inside the string if we ran it against the raw
-    source. Preventing that: we skip line-comment substitution inside
-    strings by running the string blanker FIRST for double-quoted /
-    single-quoted (non-DOTALL, so it can't overrun a line), THEN the
-    comment blanker, THEN the template-literal blanker. Order:
-
-      1. Non-template strings (no DOTALL) — neutralises ``"http://x"``.
-      2. Line comments — safe now, ``//x"`` inside the ex-string is spaces.
-      3. Block comments (DOTALL, preserve ``\\n``).
-      4. Template literals (DOTALL, preserve ``\\n``).
+    Regex literals (``/…/flags``) are NOT tokenised — a ``/`` that is not part
+    of ``//`` or ``/*`` is treated as the division operator and left as code.
+    POM method bodies rarely use regex literals with embedded quotes/backticks;
+    the Part-2 inventory corroboration net is the backstop if one ever desyncs.
     """
-    # 1. Single-line strings (single- or double-quoted). NOT template literals.
-    #    NO re.DOTALL — valid TS/JS strings cannot span raw newlines, and
-    #    keeping DOTALL off means an unterminated string (source-code bug)
-    #    fails to match and doesn't consume the rest of the file.
-    src = re.sub(
-        r"(['\"])(?:\\.|(?!\1).)*?\1",
-        lambda m: m.group(1) + " " * (len(m.group(0)) - 2) + m.group(1),
-        src,
-    )
-    # 2. Line comments — apostrophes inside them are now safe because any
-    #    real string containing an apostrophe has already been blanked.
-    src = re.sub(r"//[^\n]*", lambda m: " " * len(m.group(0)), src)
-    # 3. Block comments — preserve newlines so downstream re.MULTILINE
-    #    anchors and line-number calculations stay honest.
-    src = re.sub(
-        r"/\*.*?\*/",
-        lambda m: re.sub(r"[^\n]", " ", m.group(0)),
-        src, flags=re.DOTALL,
-    )
-    # 4. Template literals (backticks). Can span newlines — preserve them.
-    src = re.sub(
-        r"`(?:\\.|[^`])*?`",
-        lambda m: re.sub(r"[^\n]", " ", m.group(0)),
-        src, flags=re.DOTALL,
-    )
-    return src
+    n = len(src)
+    out = list(src)
+    i = 0
+    while i < n:
+        ch = src[i]
+        # Line comment: blank `//` to end-of-line (newline preserved).
+        if ch == "/" and i + 1 < n and src[i + 1] == "/":
+            while i < n and src[i] != "\n":
+                out[i] = " "
+                i += 1
+            continue
+        # Block comment: blank `/* … */` across newlines.
+        if ch == "/" and i + 1 < n and src[i + 1] == "*":
+            out[i] = " "
+            out[i + 1] = " "
+            i += 2
+            while i < n and not (src[i] == "*" and i + 1 < n and src[i + 1] == "/"):
+                if src[i] != "\n":
+                    out[i] = " "
+                i += 1
+            if i < n:  # blank the closing `*/`
+                out[i] = " "
+                if i + 1 < n:
+                    out[i + 1] = " "
+                i += 2
+            continue
+        # Single / double quoted string: blank interior, keep delimiters.
+        if ch in ("'", '"'):
+            i = _blank_js_string(src, out, i, keep_delims=True)
+            continue
+        # Template literal (may span newlines; may nest via `${…}`).
+        if ch == "`":
+            i = _blank_js_template(src, out, i)
+            continue
+        i += 1
+    return "".join(out)
 
 
 def _find_balanced(src: str, open_idx: int) -> int:
@@ -776,11 +877,137 @@ def _scan_pom(
         return None, []
 
 
+_MAX_INHERITANCE_DEPTH = 8
+
+
+def inventory_method_index(sut_inventory: dict | None) -> dict[str, set[str]]:
+    """Map ``class_name -> {method names}`` from a Step-6 ``sut_inventory`` dict.
+
+    This is the corroboration source for `reconcile_codegen`: a method the
+    on-disk parser fails to enumerate but that the Step-6 inventory recorded is
+    treated as *present* (with a logged disagreement) rather than hard-failed —
+    so no single method-extractor bug can block the gate on a method that
+    demonstrably exists. Aggregated across all modules; keyed on both
+    ``class_name`` and ``name`` so either receiver resolution hits.
+    """
+    out: dict[str, set[str]] = {}
+    if not isinstance(sut_inventory, dict):
+        return out
+    for module in sut_inventory.get("modules") or []:
+        if not isinstance(module, dict):
+            continue
+        for po in module.get("existing_page_objects") or []:
+            if not isinstance(po, dict):
+                continue
+            methods = {m for m in (po.get("methods") or []) if isinstance(m, str)}
+            if not methods:
+                continue
+            for key in (po.get("class_name"), po.get("name")):
+                if key:
+                    out.setdefault(key, set()).update(methods)
+    return out
+
+
+def _class_parent(src_or_tree: Any, class_name: str, language: str) -> str | None:
+    """Immediate ``extends`` base-class name of ``class_name``, or None.
+
+    Python: reads ``ClassDef.bases`` (first Name/Attribute base). JS/TS/Java:
+    parses ``class Sub extends Base`` from the (string-stripped) source. Only
+    single inheritance is followed — sufficient for the POM/Screenplay layouts
+    this gate targets.
+    """
+    if language == "python":
+        for node in ast.walk(src_or_tree):
+            if isinstance(node, ast.ClassDef) and node.name == class_name:
+                for base in node.bases:
+                    if isinstance(base, ast.Name):
+                        return base.id
+                    if isinstance(base, ast.Attribute):
+                        return base.attr
+                return None
+        return None
+    for m in _JS_EXTENDS_RE.finditer(_js_strip(src_or_tree)):
+        if m.group(1) == class_name:
+            return m.group(2).rsplit(".", 1)[-1]
+    return None
+
+
+def _augment_with_inheritance(
+    pom_signatures: dict[str, list[_Sig]],
+    pom_by_class: dict[str, dict],
+    sut_root: Path,
+    language: str,
+) -> dict[str, list[_Sig]]:
+    """Union each POM's own methods with those inherited via its ``extends``
+    closure (subclass methods win on name conflict).
+
+    Without this, a call to a base-class method through a subclass receiver
+    false-flags ``method_not_found`` because the reconciler only ever parsed the
+    subclass's own body (the latent inheritance bug -- e.g.
+    ``EntityFormPage.someInheritedMethod`` inherited from ``BasePage``).
+    Ancestors are resolved via the manifest first, then a sibling-file heuristic
+    (``<dir>/<Base>.<ext>``); unresolvable ancestors are skipped (best-effort).
+    """
+
+    def own_and_parent(cls: str, rel: str) -> tuple[list[_Sig], str | None]:
+        path = sut_root / rel
+        if not path.is_file():
+            return [], None
+        if language == "python":
+            tree = parse_file(path)
+            if tree is None:
+                return [], None
+            return _py_pom_methods(tree, cls), _class_parent(tree, cls, "python")
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return [], None
+        if language == "java":
+            return _java_pom_methods(text, cls), _class_parent(text, cls, "java")
+        return _js_pom_methods(text, cls), _class_parent(text, cls, language)
+
+    def file_for(cls: str, from_rel: str) -> str | None:
+        if cls in pom_by_class:
+            return pom_by_class[cls].get("file")
+        if language == "python":
+            return None  # module naming unpredictable; rely on the manifest
+        parent_dir = Path(from_rel).parent.as_posix()
+        for ext in (".ts", ".tsx", ".js", ".jsx", ".java"):
+            cand = f"{cls}{ext}" if parent_dir in ("", ".") else f"{parent_dir}/{cls}{ext}"
+            if (sut_root / cand).is_file():
+                return cand
+        return None
+
+    def closure(cls: str, rel: str, seen: set[str], depth: int) -> list[_Sig]:
+        if depth > _MAX_INHERITANCE_DEPTH or cls in seen or not rel:
+            return []
+        seen.add(cls)
+        own, parent = own_and_parent(cls, rel)
+        by_name: dict[str, _Sig] = {s.name: s for s in own}
+        if parent and parent != cls:
+            prel = file_for(parent, rel)
+            if prel:
+                for s in closure(parent, prel, seen, depth + 1):
+                    by_name.setdefault(s.name, s)  # subclass override wins
+        return list(by_name.values())
+
+    augmented: dict[str, list[_Sig]] = {}
+    for cls, pom in pom_by_class.items():
+        rel = pom.get("file") or ""
+        # Only augment classes that scanned successfully; leave others as-is.
+        augmented[cls] = (
+            closure(cls, rel, set(), 0) if cls in pom_signatures
+            else pom_signatures.get(cls, [])
+        )
+    return augmented
+
+
 def reconcile_codegen(
     test_files: list[Path],
     pom_files: list[dict],
     sut_root: Path,
     language: str,
+    inventory_methods: dict[str, set[str]] | None = None,
 ) -> ReconciliationResult:
     """Cross-check call sites in generated tests against POM signatures on disk.
 
@@ -788,6 +1015,15 @@ def reconcile_codegen(
     imports or naming heuristic) to a POM listed in `pom_files`, and verifies
     method existence + arity compatibility. Calls on objects that don't resolve
     to any known POM are silently ignored (likely SUT-native helpers).
+
+    A method is considered PRESENT if it is found via any of three sources, in
+    order: (1) the resolved class's own methods parsed from disk, (2) methods
+    inherited through the class's ``extends`` closure, or (3) ``inventory_methods``
+    — the Step-6 ``sut_inventory`` map (see `inventory_method_index`). Source 3
+    is the corroboration net: it guarantees a method the inventory recorded can
+    never be hard-failed by a lone parser miss (a disagreement is logged
+    instead). ``method_not_found`` is therefore reserved for methods genuinely
+    absent from every source.
     """
     lang = (language or "").lower()
     if lang not in {"python", "typescript", "javascript", "java"}:
@@ -805,6 +1041,13 @@ def reconcile_codegen(
             continue
         pom_scanned += 1
         pom_signatures[pom["class_name"]] = sigs
+
+    # Fold in methods reachable through each class's `extends` closure so
+    # inherited base-class calls resolve instead of false-flagging.
+    pom_signatures = _augment_with_inheritance(
+        pom_signatures, pom_by_class, sut_root, lang,
+    )
+    inv_methods = inventory_methods or {}
 
     known = set(pom_by_class.keys())
     mismatches: list[Mismatch] = []
@@ -860,6 +1103,18 @@ def reconcile_codegen(
             existing = [s.name for s in sigs]
             match = next((s for s in sigs if s.name == site.method_name), None)
             if match is None:
+                # Corroboration net: a method the on-disk parser missed but the
+                # Step-6 inventory recorded is present — trust the second source
+                # rather than hard-fail on a lone parser miss. Arity is
+                # unverifiable here (no parsed signature), so it is not checked.
+                if site.method_name in inv_methods.get(resolved, frozenset()):
+                    log.info(
+                        "reconcile.parser_disagreement",
+                        pom=resolved,
+                        method=site.method_name,
+                        file=pom_file_rel,
+                    )
+                    continue
                 suggested = _find_typo_match(site.method_name, existing)
                 if suggested is not None:
                     mismatches.append(Mismatch(

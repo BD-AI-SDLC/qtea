@@ -30,6 +30,7 @@ POM tasks) so this module never has to open the plan itself.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,6 +39,7 @@ from qtea.codegen_body_verify import (
     _find_method_body_open,
     _java_method_bodies,
     _js_method_bodies,
+    _py_method_bodies,
 )
 from qtea.codegen_reconcile import (
     _JAVA_LIFECYCLE_NAMES,
@@ -216,6 +218,118 @@ def _compute_method_line_starts(
 def _snippet(text: str, offset: int, *, length: int = 80) -> str:
     end = min(len(text), offset + length)
     return text[offset:end].split("\n", 1)[0]
+
+
+# ---------------------------------------------------------------------------
+# Undefined create_tbd locator reference gate (Phase A3.5)
+# ---------------------------------------------------------------------------
+
+
+def find_undefined_locator_ref_violations(
+    pom_file: Path,
+    class_name: str,
+    agent_authored_methods: set[str],
+    tbd_locator_names: set[str],
+    *,
+    language: str,
+    definition_files: list[Path] | None = None,
+) -> list[HygieneViolation]:
+    """Flag a ``create_tbd`` locator that an agent-authored POM method
+    REFERENCES as a bag member-access (``BAG.NAME``) but that is never
+    DEFINED (``NAME:`` object key / ``NAME =`` assignment) in the POM or any
+    sibling locator file.
+
+    Root cause it guards: Step 6 inventory may miss a SUT's shared locator
+    bag, so some ``create_tbd`` locators fall to the "emit inline" deferral;
+    the extender then emits ``BAG.KEY`` references without adding the keys →
+    ``undefined`` at runtime → ``TypeError`` at Step 9. ``node --check``
+    (syntax-only) cannot see undefined-property access, so this ships past the
+    Phase B.6.5 parse gate; this gate turns it into an actionable Step-8
+    failure instead.
+
+    Language-agnostic: member-access ``.NAME`` and definition ``NAME:`` /
+    ``NAME =`` hold for TS/JS object bags, Python const modules, and Java
+    constant classes alike. A ``create_tbd`` locator the extender legitimately
+    INLINED (selector literal in the body, constant name absent) is never
+    referenced as ``.NAME`` and so is never flagged.
+
+    ``definition_files`` — sibling source files (locator bags / const modules)
+    scanned for the definition alongside the POM itself. Read RAW: a real
+    definition must never be masked, or a correct run would fail.
+    """
+    lang = (language or "").lower()
+    is_java = lang in ("java", "selenium-java", "playwright-java")
+    is_jsts = lang in ("typescript", "javascript")
+    is_py = lang in ("python", "pytest", "playwright-py", "selenium-py")
+    if not (is_jsts or is_java or is_py):
+        return []
+    if not tbd_locator_names or not agent_authored_methods:
+        return []
+    try:
+        pom_src = pom_file.read_text(encoding="utf-8")
+    except OSError:
+        return []
+
+    if is_py:
+        bodies = _py_method_bodies(pom_src, class_name)
+    elif is_java:
+        bodies = _java_method_bodies(pom_src, class_name)
+    else:
+        bodies = _js_method_bodies(pom_src, class_name)
+    if not bodies:
+        return []
+
+    # References: a create_tbd name used as a bag member-access `.NAME` inside
+    # an agent-authored body. Strip strings/comments first for JS/Java so a
+    # selector string mentioning the name isn't miscounted; Python segments
+    # are scanned raw (a `.NAME` inside a Python string is vanishingly rare).
+    referenced: dict[str, str] = {}  # name -> first owning method
+    for method_name, body in bodies.items():
+        if method_name not in agent_authored_methods:
+            continue
+        scan = body if is_py else _js_strip(body)
+        for name in tbd_locator_names:
+            if name in referenced:
+                continue
+            if re.search(rf"\.\s*{re.escape(name)}\b", scan):
+                referenced[name] = method_name
+    if not referenced:
+        return []
+
+    # Definitions: `NAME:` object key or `NAME =` assignment anywhere in the
+    # POM itself or the sibling definition files. The negative lookbehind
+    # `(?<!\.)` excludes a member-access comparison (`.NAME ==`) from counting
+    # as a definition, while still matching a top-level `const NAME = ...`,
+    # `NAME: '...'`, or `public static final ... NAME = ...`.
+    corpus = [pom_src]
+    for f in definition_files or []:
+        try:
+            corpus.append(f.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+    corpus_text = "\n".join(corpus)
+
+    violations: list[HygieneViolation] = []
+    for name, method_name in sorted(referenced.items()):
+        if re.search(rf"(?<!\.)\b{re.escape(name)}\s*[:=]", corpus_text):
+            continue  # defined somewhere reachable
+        ref = re.search(rf"\.\s*{re.escape(name)}\b", pom_src)
+        line = (pom_src.count("\n", 0, ref.start()) + 1) if ref else 1
+        violations.append(HygieneViolation(
+            rule="undefined-locator-ref",
+            file=str(pom_file),
+            line=line,
+            method=method_name,
+            message=(
+                f"references create_tbd locator {name!r} as a bag member-access "
+                f"but {name!r} is defined in neither the POM nor any locator "
+                f"file — it is `undefined` at runtime. Materialise it: add "
+                f"{name} to the locator bag/const source, or inline the "
+                f"selector in the method body. Never emit a dangling reference "
+                f"(a syntax-only parse check cannot catch it)."
+            ),
+        ))
+    return violations
 
 
 # ---------------------------------------------------------------------------

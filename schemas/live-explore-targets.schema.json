@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qtea/schemas/live-explore-targets.schema.json",
+  "title": "LiveExploreTargets",
+  "description": "Output of Step 7's live-explore-target-extractor pre-pass: the concrete UI pages/features a test design exercises, plus how a user reaches each. Recovers targets semantically from prose/journey test designs that name no URL paths (where the lexical route regex finds nothing). Consumed by s07_live_explore to build the site-explorer's TESTED TARGETS checklist and to size its turn budget. Non-authoritative grounding context, not a hand-off artifact.",
+  "type": "object",
+  "required": ["targets", "routes"],
+  "additionalProperties": true,
+  "properties": {
+    "targets": {
+      "type": "array",
+      "description": "The tested UI surfaces (pages/dialogs/panels). One entry per distinct screen; duplicates merged.",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "additionalProperties": true,
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Human name of the tested page/feature, in the app's own terms where possible (e.g. 'My Notifications inbox')."
+          },
+          "reach_via": {
+            "type": "string",
+            "description": "Shortest realistic user navigation path to the target, in the app's own nav/menu/button labels (e.g. 'My Pages menu -> My Notifications'). May be empty when the target is the app root."
+          },
+          "why": {
+            "type": "string",
+            "description": "One short phrase tying the target to what the tests do there."
+          }
+        }
+      }
+    },
+    "routes": {
+      "type": "array",
+      "description": "URL paths the test design states EXPLICITLY (may be empty). Never fabricated from a feature name.",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

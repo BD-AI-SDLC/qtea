@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -14,7 +15,14 @@ from rich.console import Console
 from rich.table import Table
 
 from qtea.config import get_settings, package_resource_root
-from qtea.mcp_manager import load_mcp_config, probe_server
+from qtea.mcp_manager import (
+    PLAYWRIGHT_SERVER_NAME,
+    ensure_playwright_mcp_browser,
+    ensure_playwright_mcp_installed,
+    load_mcp_config,
+    probe_server,
+    warm_mcp_server,
+)
 from qtea.proxy import detected_proxies, with_proxy_env
 
 Severity = Literal["ok", "warn", "fail", "info"]
@@ -121,8 +129,27 @@ def check_mcp_servers(target: Path) -> list[Check]:
     except Exception as e:
         return [Check("mcp servers", "fail", f"could not load: {e}")]
     out: list[Check] = []
+    # Provision the pinned direct-`node` Playwright launch (the setup step):
+    # install the pinned @playwright/mcp + its version-matched Chromium so the
+    # pipeline bypasses npx's ~186s-per-spawn overhead on AV-scanned Windows
+    # hosts. Idempotent — safe to re-run every doctor. Failures are `warn`, not
+    # `fail`: the pipeline still works via the npx fallback, only slower.
+    if PLAYWRIGHT_SERVER_NAME in servers:
+        ok_i, detail_i = ensure_playwright_mcp_installed()
+        out.append(Check("playwright-mcp install", "ok" if ok_i else "warn", detail_i))
+        ok_b, detail_b = ensure_playwright_mcp_browser(force=True)
+        out.append(Check("playwright-mcp chromium", "ok" if ok_b else "warn", detail_b))
+        # Re-load so the probe below sees the rewritten node-form server.
+        with contextlib.suppress(Exception):
+            servers = load_mcp_config(cfg_path)
     for name, srv in servers.items():
-        ok, detail = probe_server(srv)
+        # Direct-node Playwright gets a real MCP handshake (fast + meaningful);
+        # everything else (incl. the slow npx fallback) keeps the tolerant
+        # smoke probe so a slow-but-working npx host isn't falsely failed.
+        if name == PLAYWRIGHT_SERVER_NAME and srv.command == "node":
+            ok, detail = warm_mcp_server(srv, timeout_s=45.0)
+        else:
+            ok, detail = probe_server(srv)
         out.append(Check(f"mcp:{name}", "ok" if ok else "fail", detail))
     return out
 

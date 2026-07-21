@@ -196,11 +196,11 @@ def _wrapper_script(
     helper_path = (sut_root / file_part).resolve()
     try:
         helper_path.relative_to(sut_root.resolve())
-    except ValueError:
+    except ValueError as e:
         raise ValueError(
             f"entry_method file must be inside SUT root: {file_part!r} "
             f"resolves to {helper_path} which is outside {sut_root}"
-        )
+        ) from e
     headless_str = "False" if headed else "True"
     return (
         "import sys, json, inspect\n"
@@ -252,11 +252,11 @@ def _wrapper_script_node(
     helper_path = (sut_root / file_part).resolve()
     try:
         helper_path.relative_to(sut_root.resolve())
-    except ValueError:
+    except ValueError as e:
         raise ValueError(
             f"entry_method file must be inside SUT root: {file_part!r} "
             f"resolves to {helper_path} which is outside {sut_root}"
-        )
+        ) from e
     headless_str = "false" if headed else "true"
     sut_root_json = json.dumps(str(sut_root).replace("\\", "/"))
     helper_json = json.dumps(str(helper_path))
@@ -331,6 +331,7 @@ def cmd_auth_capture(
     output: Path | None = None,
     headed: bool = True,
     timeout_s: int = 600,
+    active_module: dict | None = None,
 ) -> Path:
     """Drive the SUT's sign-in helper to produce a storageState.json.
 
@@ -338,23 +339,32 @@ def cmd_auth_capture(
     unrecoverable error (missing inventory, missing auth_flow, missing
     venv, non-Playwright SUT, subprocess failure) with an actionable
     message.
+
+    ``active_module`` — when supplied (the in-pipeline auth-prewarm passes the
+    module it already loaded from ``<workspace>/artifacts/step06``), it is used
+    directly and the ``<sut>/.qtea/`` inventory-discovery step is skipped. The
+    standalone ``qtea auth-capture`` CLI omits it and discovers the inventory
+    from the SUT convention path.
     """
     sut_root = Path(sut).resolve()
     if not sut_root.is_dir():
         raise FileNotFoundError(f"SUT path not found or not a directory: {sut_root}")
 
-    inventory = _find_sut_inventory(sut_root)
-    if inventory is None:
-        raise FileNotFoundError(
-            f"No sut_inventory.json found under {sut_root}/.qtea/. "
-            f"Run a normal `qtea run` first so Step 6 can produce one."
-        )
-    module = _active_module(inventory)
-    if module is None:
-        raise ValueError(
-            "sut_inventory.json has no active_module set (or it points at "
-            "a name not in modules[]). Fix the inventory and retry."
-        )
+    if active_module is not None:
+        module = active_module
+    else:
+        inventory = _find_sut_inventory(sut_root)
+        if inventory is None:
+            raise FileNotFoundError(
+                f"No sut_inventory.json found under {sut_root}/.qtea/. "
+                f"Run a normal `qtea run` first so Step 6 can produce one."
+            )
+        module = _active_module(inventory)
+        if module is None:
+            raise ValueError(
+                "sut_inventory.json has no active_module set (or it points at "
+                "a name not in modules[]). Fix the inventory and retry."
+            )
     spec = _build_auth_flow_spec(module)
     if spec.language not in _PLAYWRIGHT_LANGUAGES:
         raise NotImplementedError(

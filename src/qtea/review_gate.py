@@ -743,6 +743,24 @@ async def _sync_md_to_json(
     return new_plan
 
 
+def _deferred_locators_from_units(units: list[dict]) -> list[dict]:
+    """Exemplar (non-POM) lane: TBD locators live inside each reusable unit's
+    ``deferred_targets[]`` (name + intent), not in the TC-level ``locators[]``.
+    Flatten them into locator-shaped dicts (source=create_tbd) so the plan
+    renderers can surface them with their owning unit."""
+    out: list[dict] = []
+    for u in units:
+        owner = u.get("name") or "?"
+        for dt in u.get("deferred_targets") or []:
+            out.append({
+                "name": dt.get("name") or "?",
+                "owning_page": dt.get("owning_unit") or owner,
+                "source": "create_tbd",
+                "intent": dt.get("intent") or "?",
+            })
+    return out
+
+
 def _render_plan(plan: dict, console: Console) -> None:
     test_cases = plan.get("test_cases") or []
     active_module = plan.get("active_module") or "?"
@@ -761,12 +779,13 @@ def _render_plan(plan: dict, console: Console) -> None:
     table.add_column("Target", style="dim", overflow="fold")
     table.add_column("Tests", overflow="fold")
     table.add_column("Fixtures", overflow="fold")
-    table.add_column("POMs", overflow="fold")
+    table.add_column("POMs / Units", overflow="fold")
     table.add_column("Locators", overflow="fold")
 
     totals = {
         "fixtures": {"reuse": 0, "create": 0},
         "page_objects": {"reuse": 0, "create": 0, "missing_methods": 0},
+        "reusable_units": {"reuse": 0, "create": 0, "missing_behaviors": 0},
         "locators": {"reuse": 0, "create_tbd": 0},
         "test_functions": 0,
     }
@@ -794,50 +813,99 @@ def _render_plan(plan: dict, console: Console) -> None:
         fix_cell = "\n".join(fix_lines) or "—"
 
         poms = tc.get("page_objects") or []
-        pom_lines = []
-        for p in poms:
-            src = p.get("source", "?")
-            totals["page_objects"][src] = totals["page_objects"].get(src, 0) + 1
-            mm = p.get("missing_methods") or []
-            totals["page_objects"]["missing_methods"] += len(mm)
-            tag = "[green]reuse[/]" if src == "reuse" else "[yellow]create[/]"
-            ref = p.get("from") or p.get("at") or "?"
-            suffix = f" (+{len(mm)} methods)" if mm else ""
-            pom_lines.append(f"{tag} {p.get('name')} ← {ref}{suffix}")
-        pom_cell = "\n".join(pom_lines) or "—"
-
-        locators = tc.get("locators") or []
-        loc_lines = []
-        for loc in locators:
-            src = loc.get("source", "?")
-            totals["locators"][src] = totals["locators"].get(src, 0) + 1
-            if src == "create_tbd":
-                intent = loc.get("intent") or "?"
-                tbd_intents.append(f"{loc.get('name')}: {intent}")
-                loc_lines.append(f"[yellow]TBD[/] {loc.get('name')}: \"{intent}\"")
-            else:
-                loc_lines.append(
-                    f"[green]reuse[/] {loc.get('name')} ← "
-                    f"{loc.get('from') or '?'}"
+        units = tc.get("reusable_units") or []
+        # Exemplar (non-POM) lane: the fifth column shows reusable units and the
+        # Locators column is sourced from each unit's deferred_targets[].
+        if units and not poms:
+            unit_lines = []
+            for u in units:
+                src = u.get("source", "?")
+                totals["reusable_units"][src] = (
+                    totals["reusable_units"].get(src, 0) + 1
                 )
-        loc_cell = "\n".join(loc_lines) or "—"
+                mb = u.get("missing_behaviors") or []
+                totals["reusable_units"]["missing_behaviors"] += len(mb)
+                tag = "[green]reuse[/]" if src == "reuse" else "[yellow]create[/]"
+                ref = u.get("from") or u.get("at") or "?"
+                cat = u.get("category")
+                cat_s = f" [dim]({cat})[/]" if cat else ""
+                suffix = f" (+{len(mb)} behaviors)" if mb else ""
+                unit_lines.append(f"{tag} {u.get('name')}{cat_s} ← {ref}{suffix}")
+            pom_cell = "\n".join(unit_lines) or "—"
+
+            loc_lines = []
+            for loc in _deferred_locators_from_units(units):
+                totals["locators"]["create_tbd"] += 1
+                intent = loc.get("intent") or "?"
+                owner = loc.get("owning_page") or "?"
+                tbd_intents.append(f"{loc.get('name')}: {intent}")
+                loc_lines.append(
+                    f"[yellow]TBD[/] {loc.get('name')} [dim]({owner})[/]: "
+                    f"\"{intent}\""
+                )
+            loc_cell = "\n".join(loc_lines) or "—"
+        else:
+            pom_lines = []
+            for p in poms:
+                src = p.get("source", "?")
+                totals["page_objects"][src] = (
+                    totals["page_objects"].get(src, 0) + 1
+                )
+                mm = p.get("missing_methods") or []
+                totals["page_objects"]["missing_methods"] += len(mm)
+                tag = "[green]reuse[/]" if src == "reuse" else "[yellow]create[/]"
+                ref = p.get("from") or p.get("at") or "?"
+                suffix = f" (+{len(mm)} methods)" if mm else ""
+                pom_lines.append(f"{tag} {p.get('name')} ← {ref}{suffix}")
+            pom_cell = "\n".join(pom_lines) or "—"
+
+            locators = tc.get("locators") or []
+            loc_lines = []
+            for loc in locators:
+                src = loc.get("source", "?")
+                totals["locators"][src] = totals["locators"].get(src, 0) + 1
+                if src == "create_tbd":
+                    intent = loc.get("intent") or "?"
+                    tbd_intents.append(f"{loc.get('name')}: {intent}")
+                    loc_lines.append(
+                        f"[yellow]TBD[/] {loc.get('name')}: \"{intent}\""
+                    )
+                else:
+                    loc_lines.append(
+                        f"[green]reuse[/] {loc.get('name')} ← "
+                        f"{loc.get('from') or '?'}"
+                    )
+            loc_cell = "\n".join(loc_lines) or "—"
 
         table.add_row(tc_id, target, test_cell, fix_cell, pom_cell, loc_cell)
 
     console.print()
     console.print(table)
 
+    ru = totals["reusable_units"]
+    has_units = bool(ru["reuse"] or ru["create"])
     footer = [
         f"test cases: [bold]{len(test_cases)}[/]",
         f"test functions: [bold]{totals['test_functions']}[/]",
         f"fixtures: [green]{totals['fixtures']['reuse']} reuse[/] · "
         f"[yellow]{totals['fixtures']['create']} create[/]",
-        f"page objects: [green]{totals['page_objects']['reuse']} reuse[/] · "
-        f"[yellow]{totals['page_objects']['create']} create[/] · "
-        f"+{totals['page_objects']['missing_methods']} missing methods",
-        f"locators: [green]{totals['locators']['reuse']} reuse[/] · "
-        f"[yellow]{totals['locators']['create_tbd']} TBD[/]",
     ]
+    if has_units:
+        footer.append(
+            f"reusable units: [green]{ru['reuse']} reuse[/] · "
+            f"[yellow]{ru['create']} create[/] · "
+            f"+{ru['missing_behaviors']} missing behaviors"
+        )
+    else:
+        footer.append(
+            f"page objects: [green]{totals['page_objects']['reuse']} reuse[/] · "
+            f"[yellow]{totals['page_objects']['create']} create[/] · "
+            f"+{totals['page_objects']['missing_methods']} missing methods"
+        )
+    footer.append(
+        f"locators: [green]{totals['locators']['reuse']} reuse[/] · "
+        f"[yellow]{totals['locators']['create_tbd']} TBD[/]"
+    )
     console.print(Panel(
         " · ".join(footer)
         + "\n\n[bold]\\[a\\][/]pprove and continue   "

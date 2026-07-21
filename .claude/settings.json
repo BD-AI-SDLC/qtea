@@ -1,0 +1,44 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(python -m py_compile \"c:/MAS/Production_ready/qtea/src/qtea/ui/components/hitl_dialog.py\" \"c:/MAS/Production_ready/qtea/src/qtea/review_gate.py\" \"c:/MAS/Production_ready/qtea/src/qtea/steps/s07_test_architect.py\")",
+      "Bash(mv test-strategy.json test-design.json)",
+      "Bash(mv test-strategy.md test-design.md)",
+      "Bash(python -c \"import json; s=json.load\\(open\\('state.json'\\)\\); print\\('JSON OK'\\); print\\('step4 hashes:', list\\(s['steps']['4']['output_hashes'].keys\\(\\)\\)\\); print\\('recorded steps:', sorted\\(int\\(k\\) for k in s['steps']\\)\\); print\\('step4 status:', s['steps']['4']['status']\\)\")",
+      "Bash(cat)",
+      "Bash(python /tmp/repro_strip.py)",
+      "Bash(python3 /tmp/repro_strip.py)",
+      "Bash(cat >/tmp/verify_strip.py *)",
+      "Bash(QTEA_RESOURCE_ROOT=c:/MAS/Production_ready/qtea python -c ' *)",
+      "Bash(npm view *)",
+      "WebFetch(domain:www.npmjs.com)",
+      "Bash(timeout 180 npx -y @playwright/mcp@0.0.78 --help)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(npx -y @playwright/mcp@0.0.78 --help)",
+      "Bash(npm ls *)",
+      "Bash(P=\"C:/Users/ets1wz/AppData/Local/npm-cache/_npx/86170c4cd1c5da32/node_modules/@playwright/mcp\"; echo \"=== version ===\"; python -c \"import json;d=json.load\\(open\\(r'$P/package.json'\\)\\);print\\('version',d.get\\('version'\\)\\);print\\('bin',d.get\\('bin'\\)\\);print\\('deps',json.dumps\\(d.get\\('dependencies'\\),indent=2\\)\\);print\\('scripts',json.dumps\\(d.get\\('scripts'\\),indent=2\\)\\)\"; echo \"=== bundled playwright version ===\"; find \"$P/../..\" -maxdepth 3 -path \"*playwright-core/package.json\" 2>/dev/null | head -1 | xargs -I{} python -c \"import json,sys;print\\('playwright-core',json.load\\(open\\('{}'\\)\\).get\\('version'\\)\\)\" 2>/dev/null; echo \"=== grep browser-install hints in dist ===\"; grep -roiE \"playwright install[a-z --]*|_playwrightBrowsersPath|install the browser|npx playwright install [a-z]+\" \"$P/lib\" \"$P/index.js\" \"$P/cli.js\" 2>/dev/null | sort -u | head -20)",
+      "Read(//c/Users/ets1wz/AppData/Local/npm-cache/_npx/86170c4cd1c5da32/node_modules/**)",
+      "Bash(mkdir -p 'C:\\\\Users\\\\ets1wz/.qtea/mcp')",
+      "Bash(echo \"NPM_EXIT=$?\")",
+      "Bash(./.venv/Scripts/qtea.exe doctor *)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\ets1wz\\.qtea\\20260709-083909-223772",
+      "\\tmp"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python tools/check_no_sut_tokens.py --hook-mode"
+          }
+        ]
+      }
+    ]
+  }
+}

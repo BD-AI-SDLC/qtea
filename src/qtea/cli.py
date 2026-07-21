@@ -23,6 +23,11 @@ app = typer.Typer(
 )
 console = Console()
 
+# Upper bound on operator-supplied context length. It competes for the same
+# agent context budget as the spec, so cap it; over-cap input is truncated
+# with a warning rather than rejected.
+MAX_OPERATOR_CONTEXT_CHARS = 8000
+
 
 class ReportMode(StrEnum):
     auto = "auto"
@@ -280,6 +285,30 @@ def run(
         exists=True,
         help="Path to a .env file whose values are loaded into the process environment (keys only flow to agents, never values).",
     ),
+    context: str | None = typer.Option(
+        None,
+        "--context",
+        help=(
+            "Optional operator context about the spec, supplied at run start. "
+            "Trusted free-text guidance (environment/URLs, scope focus, "
+            "known-flaky areas, out-of-scope notes, domain terms) injected "
+            "into Step 1 ticket enrichment and Step 2 refinement to sharpen "
+            "the refined spec. It augments — never overrides — the ticket's "
+            "acceptance criteria. Mutually exclusive with --context-file. "
+            "Persisted so a --run-id resume re-uses it."
+        ),
+    ),
+    context_file: Path | None = typer.Option(
+        None,
+        "--context-file",
+        exists=True,
+        dir_okay=False,
+        help=(
+            "Path to a text/markdown file whose contents are used as the "
+            "operator context (see --context). Mutually exclusive with "
+            "--context."
+        ),
+    ),
     module: str | None = typer.Option(
         None,
         "--module",
@@ -303,6 +332,49 @@ def run(
             "at pytest collection time. By default, known-safe missing deps "
             "(e.g. allure-pytest) are installed and committed to the qtea "
             "isolation branch; unknown ones trigger a HITL prompt."
+        ),
+    ),
+    no_auth_capture: bool = typer.Option(
+        False,
+        "--no-auth-capture",
+        help=(
+            "Disable the pre-Step-7 auth prewarm entirely (explore "
+            "unauthenticated). By default, when the SUT's inventory has an "
+            "`auth_flow.entry_method` and no valid storage-state exists, qtea "
+            "opens the base URL in a visible browser for you to log in (see "
+            "--auth-prewarm-mode) so site-exploration (Step 7) and heal (Step 9) "
+            "run authenticated. Use this to opt out. Equivalent: "
+            "QTEA_AUTH_CAPTURE=0."
+        ),
+    ),
+    auth_headed: bool = typer.Option(
+        False,
+        "--auth-headed",
+        help=(
+            "Force `headed` auth-prewarm mode: open the SUT base URL in a VISIBLE "
+            "browser so you complete the login (incl. MFA / SSO) by hand, then "
+            "qtea captures the session. This is already the default, so the flag "
+            "is only needed to override an explicit `--auth-prewarm-mode`. "
+            "Equivalent env: QTEA_AUTH_CAPTURE_HEADED=1."
+        ),
+    ),
+    auth_prewarm_mode: str | None = typer.Option(
+        None,
+        "--auth-prewarm-mode",
+        help=(
+            "How Step 7 authenticates before exploring: "
+            "`headed` (default) — open the SUT base URL in a VISIBLE browser and "
+            "let you log in by any means (MFA / SSO / captcha), then capture the "
+            "session; helper-independent and credentials never reach the model "
+            "(qtea is local-only, so a human is present). qtea auto-downloads the "
+            "browser on first use; falls back to `mcp` if that download fails. "
+            "`mcp` — an LLM explorer logs in by driving the login UI via "
+            "Playwright MCP (pattern-agnostic; QA credentials are sent to the "
+            "model, masked in on-disk artifacts). "
+            "`script` — run the SUT's own sign-in helper in a subprocess to "
+            "produce a storage-state (credentials never reach the model; needs "
+            "the SUT test env). "
+            "`off` — explore unauthenticated. Env: QTEA_AUTH_PREWARM_MODE."
         ),
     ),
     dev_locators: Path | None = typer.Option(
@@ -353,6 +425,16 @@ def run(
         "--no-cleanup",
         help="Disable automatic cleanup of step artifacts and debug directories when using --from-step. By default, --from-step cleans step-NN/, artifacts/stepNN/, and debug/step-NN-attempt* directories from the target step onward.",
     ),
+    no_incident_memory: bool = typer.Option(
+        False,
+        "--no-incident-memory",
+        help=(
+            "Disable cross-run incident memory: neither read prior diagnosed "
+            "incidents for this SUT before a new debug investigation, nor "
+            "persist this run's diagnosis to ~/.qtea/incident-memory/. "
+            "Equivalent to setting QTEA_NO_INCIDENT_MEMORY=1."
+        ),
+    ),
     no_static_check: bool = typer.Option(
         False,
         "--no-static-check",
@@ -367,10 +449,39 @@ def run(
             "QTEA_NO_STATIC_CHECK=1."
         ),
     ),
+    no_live_map_cache: bool = typer.Option(
+        False,
+        "--no-live-map-cache",
+        help=(
+            "Disable the cross-run cache of Step 7's live-map.json. By default, "
+            "identical SUT SHA + test-design.md + base URL + auth-prewarm mode "
+            "(plus a shallow liveness probe of the base URL) replays the prior "
+            "map instead of re-exploring. Pass this to force a fresh "
+            "exploration (e.g. after a UI change the liveness probe didn't "
+            "detect). Equivalent to setting QTEA_LIVE_MAP_CACHE=off."
+        ),
+    ),
 ) -> None:
     """Run the full SDLC pipeline."""
     from qtea.node_env import ensure_node
     from qtea.pipeline import PipelineOptions, run_pipeline
+
+    if context is not None and context_file is not None:
+        raise typer.BadParameter(
+            "--context and --context-file are mutually exclusive; supply only one."
+        )
+    operator_context: str | None = context
+    if context_file is not None:
+        operator_context = context_file.read_text(encoding="utf-8")
+    if operator_context is not None:
+        operator_context = operator_context.strip() or None
+    if operator_context is not None and len(operator_context) > MAX_OPERATOR_CONTEXT_CHARS:
+        console.print(
+            f"[yellow]context:[/] operator context is "
+            f"{len(operator_context)} chars; truncating to "
+            f"{MAX_OPERATOR_CONTEXT_CHARS}."
+        )
+        operator_context = operator_context[:MAX_OPERATOR_CONTEXT_CHARS]
 
     if no_static_check:
         # Phase B.6 reads this env var directly (matches the QTEA_SKIP_*
@@ -378,6 +489,17 @@ def run(
         # here from the flag means the flag and the env var are symmetric;
         # a user can drive the same behavior from either side.
         os.environ["QTEA_NO_STATIC_CHECK"] = "1"
+
+    if no_live_map_cache:
+        # Step 7 live-map cache (steps/s07/live_map_cache.py) reads this env
+        # var directly; the flag and env var are symmetric.
+        os.environ["QTEA_LIVE_MAP_CACHE"] = "off"
+
+    if no_incident_memory:
+        # incident_memory.incident_memory_enabled() checks this env var in
+        # addition to ctx.options.no_incident_memory, so the flag and env
+        # var are symmetric — a user can suppress from either side.
+        os.environ["QTEA_NO_INCIDENT_MEMORY"] = "1"
 
     ensure_node(console=console)
     settings = get_settings()
@@ -393,6 +515,7 @@ def run(
         headless=headless,
         debug=debug,
         no_fix=no_fix,
+        no_incident_memory=no_incident_memory,
         strict_xray=strict_xray,
         skip_steps=set(skip_step),
         report=report.value,
@@ -405,10 +528,14 @@ def run(
         isolated_tests=isolated_tests,
         yes=yes,
         no_auto_deps=no_auto_deps,
+        no_auth_capture=no_auth_capture,
+        auth_headed=auth_headed,
+        auth_prewarm_mode=auth_prewarm_mode,
         dev_locators=dev_locators,
         storage_state=storage_state,
         cache=cache,
         no_cleanup=no_cleanup,
+        operator_context=operator_context,
     )
     rc = asyncio.run(run_pipeline(opts, console=console))
     raise typer.Exit(code=rc)

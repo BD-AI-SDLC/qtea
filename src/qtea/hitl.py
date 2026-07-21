@@ -175,6 +175,11 @@ RESOLUTION_SKIPPED_LEGACY = "skipped"
 RESOLUTION_OVERLAY_PERSIST = "overlay_persist"
 RESOLUTION_OVERLAY_ONCE = "overlay_once"
 RESOLUTION_OVERLAY_BUG = "overlay_bug"
+# Headed-login (Step 7) HITL resolution — lets headed_auth_capture._default_confirm
+# distinguish "user confirmed login" from "user chose to skip auth" without
+# changing the CLI's press-Enter-to-confirm rendering. See metadata["type"] ==
+# "headed_login" branch in prompt_user().
+RESOLUTION_HEADED_LOGIN_SKIP = "headed_login_skip"
 
 
 @dataclass
@@ -1003,6 +1008,23 @@ def prompt_user(
             resolution, ans = _prompt_overlay_dismiss(console, q)
             if resolution is not None:
                 answers[q.id] = (resolution, ans)
+            continue
+
+        # Headed-login branch — same prompt/rendering the generic loop below
+        # would produce, but with an explicit resolution instead of relying
+        # on dict-presence (blank Enter and skip-intent text both `break`
+        # below with identical, indistinguishable outcomes).
+        if q.metadata and q.metadata.get("type") == "headed_login":
+            ans = Prompt.ask(f"[green]{q.prompt_text}[/green]", default="").strip()
+            if ans and looks_like_skip_intent(ans):
+                console.print(
+                    "[dim]→ recognized as skip; Step 7 will proceed "
+                    "unauthenticated.[/dim]"
+                )
+                log.info("hitl.headed_login_skip_intent", q_id=q.id, raw=ans)
+                answers[q.id] = (RESOLUTION_HEADED_LOGIN_SKIP, "")
+            else:
+                answers[q.id] = (RESOLUTION_ANSWERED, "")
             continue
 
         while True:

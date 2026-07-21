@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from qtea.checkpoints import (
+    AuxiliaryAgentRecord,
     RunState,
     StepRecord,
     hash_paths,
@@ -14,9 +15,44 @@ from qtea.checkpoints import (
     outputs_match,
     save_state,
 )
-from qtea.pipeline import PipelineOptions, _select_steps
+from qtea.pipeline import (
+    PipelineOptions,
+    _purge_step_aux,
+    _reset_steps_from,
+    _select_steps,
+)
 from qtea.steps.base import Step, StepContext, StepResult
 from qtea.workspace import create_workspace
+
+# ---------------------------------------------------------------------------
+# operator_context persistence
+# ---------------------------------------------------------------------------
+
+
+def test_operator_context_round_trips(tmp_path: Path):
+    state = RunState(
+        run_id="r", workspace=str(tmp_path), spec_source="x", sut_source=".",
+        operator_context="focus the checkout path",
+    )
+    save_state(state, tmp_path / "state.json")
+    loaded = load_state(tmp_path / "state.json")
+    assert loaded is not None
+    assert loaded.operator_context == "focus the checkout path"
+
+
+def test_operator_context_backward_compatible(tmp_path: Path):
+    """Old state.json without the key loads with operator_context=None."""
+    (tmp_path / "state.json").write_text(
+        json.dumps({
+            "run_id": "r", "workspace": str(tmp_path),
+            "spec_source": "x", "sut_source": ".",
+        }),
+        encoding="utf-8",
+    )
+    loaded = load_state(tmp_path / "state.json")
+    assert loaded is not None
+    assert loaded.operator_context is None
+
 
 # ---------------------------------------------------------------------------
 # outputs_match unit tests
@@ -98,6 +134,53 @@ def test_select_steps_skip_steps():
     assert 5 not in steps
     assert 8 not in steps
     assert 1 in steps
+
+
+# ---------------------------------------------------------------------------
+# Auxiliary-record purge on re-execute (regression: run 20260709-083909-223772
+# stacked 3 debug/critical/PSE trios across resumes for one Step-8 failure).
+# ---------------------------------------------------------------------------
+
+
+def _aux(step: int, phase: str) -> AuxiliaryAgentRecord:
+    return AuxiliaryAgentRecord(step=step, agent=f"{phase}.md", phase=phase)
+
+
+def _state_with_stacked_aux() -> RunState:
+    state = RunState(run_id="r", workspace="w", spec_source="x", sut_source=".")
+    # step 7 fix-chain (one trio) + step 8 fix-chain repeated twice (resumes)
+    state.auxiliary_records = [
+        _aux(7, "debug"), _aux(7, "critical_thinking"), _aux(7, "principal_engineer"),
+        _aux(8, "debug"), _aux(8, "critical_thinking"), _aux(8, "principal_engineer"),
+        _aux(8, "debug"), _aux(8, "critical_thinking"), _aux(8, "principal_engineer"),
+    ]
+    return state
+
+
+def test_purge_step_aux_drops_only_that_step():
+    state = _state_with_stacked_aux()
+    _purge_step_aux(state, 8)
+    steps = [a.step for a in state.auxiliary_records]
+    assert 8 not in steps
+    assert steps == [7, 7, 7]  # step-7 trio untouched
+
+
+def test_purge_step_aux_noop_when_no_records():
+    state = RunState(run_id="r", workspace="w", spec_source="x", sut_source=".")
+    _purge_step_aux(state, 8)
+    assert state.auxiliary_records == []
+
+
+def test_reset_steps_from_drops_aux_in_range():
+    state = _state_with_stacked_aux()
+    state.steps[7] = StepRecord(step=7, name="a", status="completed")
+    state.steps[8] = StepRecord(step=8, name="b", status="failed")
+    _reset_steps_from(state, 8)
+    # step-8 records (both stacked trios) gone; step-7 trio preserved
+    assert all(a.step < 8 for a in state.auxiliary_records)
+    assert len([a for a in state.auxiliary_records if a.step == 7]) == 3
+    assert 8 not in state.steps
+    assert 7 in state.steps
 
 
 # ---------------------------------------------------------------------------

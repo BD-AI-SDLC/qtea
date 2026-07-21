@@ -110,7 +110,7 @@ conftest problems are now IN scope, so fix them rather than punting.
 
 ## MCP Channel + per-stack source capture preference
 
-**Playwright MCP** (`@playwright/mcp@latest --headless`, server name
+**Playwright MCP** (`@playwright/mcp@0.0.78 --headless`, server name
 `playwright`) is the default capture channel for ALL stacks. Use
 `browser_navigate` → `browser_snapshot` (accessibility tree) for DOM
 inspection. Snapshot only — no trace/video recording.

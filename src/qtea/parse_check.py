@@ -6,14 +6,13 @@ catching a class of failure the type-checker cannot even reach: the file's
 first byte isn't valid for the target language, so tsc/pyright never get a
 chance to type-check it.
 
-Motivating incident: run 20260701-114656-9394eb Step 9 aborted because
-`qtea_ropa_approval_test.spec.ts` started with `# Stack: typescript+playwright`
-— a Python-style comment. Playwright's TS parser refused with
-``Unexpected token (1:0)`` and 0 tests ran. B.6 tsc was silently skipped
-(``ran=false, exit_code=127``) because tsc wasn't on PATH, so the invalid file
-reached Step 9 unchallenged. This gate closes that hole: it uses ``ast.parse``
-for Python (stdlib; never skips) and shells to a ladder of language-native
-tools for the others.
+Motivating pattern: a generated ``qtea_*.spec.ts`` began with
+``# Stack: typescript+playwright`` -- a Python-style comment in a TS file.
+Playwright's TS parser refused with ``Unexpected token (1:0)`` and 0 tests
+ran. B.6 tsc was silently skipped (``ran=false, exit_code=127``) because tsc
+wasn't on PATH, so the invalid file reached Step 9 unchallenged. This gate
+closes that hole: it uses ``ast.parse`` for Python (stdlib; never skips) and
+shells to a ladder of language-native tools for the others.
 
 Design contract:
 

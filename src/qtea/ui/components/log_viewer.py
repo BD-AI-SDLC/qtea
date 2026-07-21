@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import re
 
 import flet as ft
 
@@ -15,6 +16,7 @@ from qtea.ui.theme import (
     LOG_AGENT_COLOR,
     LOG_LEVEL_COLORS,
     LOG_MODEL_COLOR,
+    LOG_STEP_COLOR,
     LOG_TOKENS_COLOR,
     ON_SURFACE,
     ON_SURFACE_DIM,
@@ -22,6 +24,10 @@ from qtea.ui.theme import (
 )
 
 MAX_DISPLAY_LINES = 500
+
+# Matches a leading step token (e.g. "step08", "step1") so it can be tinted
+# orange while everything after the first '.' keeps the default event color.
+_STEP_PREFIX_RE = re.compile(r"^(step\d+)(.*)$", re.IGNORECASE)
 
 
 def scroll_to_end(scrollable: ft.Control) -> None:
@@ -87,17 +93,44 @@ def _build_log_line(line: LogLine) -> ft.Container:
         )
     )
 
-    # Event name
-    parts.append(
-        ft.TextSpan(
-            f"{line.event:36s}",
-            style=ft.TextStyle(
-                size=sz(11),
-                color=ON_SURFACE,
-                weight=ft.FontWeight.W_600,
-            ),
+    # Event name. A leading step token (e.g. "step08") is tinted orange; the
+    # rest ("...b55.started") keeps the default color. Pad to 36 chars first so
+    # the split preserves the column width and the following fields stay aligned.
+    event_text = f"{line.event:36s}"
+    step_match = _STEP_PREFIX_RE.match(event_text)
+    if step_match:
+        step_tok, rest = step_match.group(1), step_match.group(2)
+        parts.append(
+            ft.TextSpan(
+                step_tok,
+                style=ft.TextStyle(
+                    size=sz(11),
+                    color=LOG_STEP_COLOR,
+                    weight=ft.FontWeight.W_600,
+                ),
+            )
         )
-    )
+        parts.append(
+            ft.TextSpan(
+                rest,
+                style=ft.TextStyle(
+                    size=sz(11),
+                    color=ON_SURFACE,
+                    weight=ft.FontWeight.W_600,
+                ),
+            )
+        )
+    else:
+        parts.append(
+            ft.TextSpan(
+                event_text,
+                style=ft.TextStyle(
+                    size=sz(11),
+                    color=ON_SURFACE,
+                    weight=ft.FontWeight.W_600,
+                ),
+            )
+        )
 
     # Message / fields. If the event carries an `agent` field, extract it and
     # render it as a cyan span so the human can see at a glance which agent is

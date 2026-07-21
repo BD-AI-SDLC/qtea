@@ -260,6 +260,14 @@ traceability backbone -- they propagate through every downstream artifact.
    dependency files + imports + config files.
 4. **Critical output**: `detected_stack` determines which polyglot codegen
    path step 8 takes. If `null`, step 8 falls back to HITL.
+5. **`navigation_preconditions[]`** (per module, LLM-only — no deterministic
+   scanner): POM methods that act on a specific already-active view
+   (grid/table/tab/filtered list) with no in-code guard, mined from real call
+   sites across the SUT's own tests. Recorded as `{method, requires_call,
+   requires_args_hint, evidence}` only when every real call site agrees and
+   at least one is evidenced (same anti-fabrication discipline as
+   `auth_flow`). Step 7's phase gate cross-checks planned choreography
+   against this list; see Step 7 below.
 
 **Phase gate:** `sections` array is non-empty. If `detected_stack` is
 null, involve HITL.
@@ -297,6 +305,94 @@ JIT resolver respectively).
 - **Auth chaining:** when `auth_flow.fixture_entry` exists, any `source=create`
   fixture whose `yields` is a non-primitive type must include the auth fixture
   name in `depends_on`. Prevents generated fixtures from bypassing authentication.
+- **Navigation-precondition gate** (the "wrong screen" defect): for every
+  `sut_inventory.navigation_preconditions[]` entry whose `method` is reused in
+  a `hooks[].calls[]` or `steps[]` entry, the entry's `requires_call` must
+  appear earlier in that same test function's combined before_each-hook +
+  steps sequence. Catches reused POM methods that silently assume a
+  grid/tab/filtered view is already active (mirrors the UI open-before-login
+  gate one level more specific).
+
+**Pre-planning live exploration (best-effort, gated, never fatal).** Before the
+architect reasons, qtea authenticates then explores. **Auth is mode-switchable**
+(`QTEA_AUTH_PREWARM_MODE` / `--auth-prewarm-mode`, `s07_auth_prewarm.py`):
+- **`headed` (default):** qtea opens the SUT base URL in a **visible browser**
+  (its OWN Playwright — `headed_auth_capture.py`; chromium is auto-downloaded on
+  first use by `ensure_chromium`, proxy-aware and honoring
+  `PLAYWRIGHT_DOWNLOAD_HOST`/`PLAYWRIGHT_BROWSERS_PATH`, mirroring
+  `node_env.ensure_node`) and the human logs in by any means (MFA / SSO / captcha),
+  then the session is captured to `<sut>/.qtea/storage-state.json`.
+  Helper-independent (no dependency on the SUT's sign-in code), needs **no SUT
+  env**, and credentials **never reach the model** (typed into a real browser). A
+  **conservative auth-success probe** reuses an existing session unless a
+  high-confidence "not authenticated" signal is seen (login/SSO redirect, or a
+  visible password field on the landing page) — ambiguity ⇒ proceed, never a
+  needless re-login. qtea is local-only, so a human is present; non-interactive
+  runs skip, and if the one-time browser download fails it falls back to `mcp`
+  with a hint. Best-effort credential pre-fill (from
+  `auth_flow.credentials_env_vars`) so the human only completes MFA/submit.
+- **`mcp`:** the `site-explorer` logs in by driving the login UI via
+  Playwright MCP — navigate the base URL, pick the internal/username-password
+  provider (`QTEA_AUTH_IDENTITY_PROVIDER`, avoid SSO/MFA), type the credentials
+  from `auth_flow.credentials_env_vars` (override via
+  `QTEA_AUTH_USERNAME_VAR`/`_PASSWORD_VAR`), submit — then explores in the **same
+  session**. Pattern-agnostic (drives the UI, not the SUT's login code) and needs
+  **no SUT env** (uses qtea's bundled MCP browser). **Security:** the QA creds are
+  sent to the model to be typed; value-based masking
+  (`logging_setup.register_secret_values` + `claude_runner`) keeps them out of
+  on-disk prompt files, transcripts, and logs. For zero model exposure, use
+  `script`.
+- **`script`:** run the SUT's own sign-in helper in a subprocess (reusing
+  `cmd_auth_capture`) → `<sut>/.qtea/storage-state.json`; credentials **never
+  reach the model**. Needs the SUT test env, installed early by
+  `pipeline._prewarm_sut_env_for_auth` (this mode only; Step 9 then fast-paths).
+  Handles module-level sign-in functions; skips class-method (POM) logins with a
+  hint. `--auth-headed`/`QTEA_AUTH_CAPTURE_HEADED=1` opens a headed browser for
+  interactive MFA (TTY/UI only); SSO with a dedicated user stays headless.
+- **`off`:** explore unauthenticated.
+
+Then the *targeted visit* (`s07_live_explore.py`)
+— visits ONLY the target routes derived from `test-design.md` (Step 4); it does
+NOT crawl/discover pages by following links. Two mechanisms, dispatched by
+`QTEA_LIVE_EXPLORE_MODE`:
+
+- **`driver` (default via `auto`)** — a deterministic parent-side Playwright
+  driver (`src/qtea/steps/s07/live_driver.py`) navigates each target, snapshots
+  the AOM, runs the same `_DOM_PROBE_JS` locator probe as the agent, and emits
+  `live-map.json` with a `_telemetry` block. Narrow LLM callouts are made only
+  for genuine judgment: `live-explore-reveal-judge` decides which affordance to
+  click when a named target is hidden on initial paint, and
+  `live-explore-ambiguity-judge` picks between candidates when the DOM probe
+  can't verify uniqueness. No $10 spend ceiling — there is no runaway loop to
+  bound, and judgment callouts are single-turn Haiku calls.
+- **`agent`** — the original `site-explorer` LLM agent driving Playwright MCP,
+  bounded by dollar ceiling / turn budget / anti-rat-hole PreToolUse hook. Kept
+  as the rollback path. Set `QTEA_LIVE_EXPLORE_MODE=agent` to force.
+- **`auto`** (default) — try `driver` first; fall back to `agent` when the
+  driver returns nothing or an under-captured map (see `QTEA_LIVE_EXPLORE_MIN_ELEMENTS`).
+
+MCP-mode auth login (`--auth-prewarm-mode mcp`) still runs via the site-explorer
+agent, regardless of exploration mode — credentials never leak into the driver
+path. Step 6's known page objects are passed as existence context only. A
+zero-LLM **nav-label harvest** (qtea's own headless Playwright, authenticated
+via the resolved storage-state) reads the app's REAL primary-navigation labels
+from the live root and feeds both mechanisms so a tested feature maps to the
+right page on the first try — best-effort, session-only, toggle
+`QTEA_LIVE_EXPLORE_NAV_HARVEST`. Bounded by `QTEA_LIVE_EXPLORE_MAX_ROUTES`
+(target-list safety cap; nonzero `routes_truncated_by_cap` in `_telemetry`
+raises a Step 7 architect warning). Output at
+`artifacts/step07/live-map.json`, inlined into the architect prompt and reused
+by Step 8 (codegen grounding + JIT tier-1b intent-pool seed).
+
+**Cross-run cache** (`src/qtea/steps/s07/live_map_cache.py`): keyed on SUT SHA
++ `test-design.md` SHA + base URL + auth-prewarm mode + probe-version constant.
+A shallow liveness probe of the base URL (ETag / Last-Modified / body prefix
+SHA) guards deployed SUTs whose SHA doesn't change but whose content does. Hit
+skips exploration entirely regardless of chosen mechanism. Location:
+`~/.qtea/live-map-cache/` (override with `QTEA_LIVE_MAP_CACHE_DIR`); disable
+with `--no-live-map-cache` / `QTEA_LIVE_MAP_CACHE=off`.
+
+Disable auth prewarm with `--no-auth-capture` / `QTEA_AUTH_CAPTURE=0`.
 
 **Human review gate (post-step-7).** After the phase gate passes,
 `pipeline.py` invokes `review_step_7_plan` (`src/qtea/review_gate.py`):
@@ -337,6 +433,8 @@ plan);
 Step 8 also vendors the per-language JIT runtime into the SUT (Playwright
 stacks only — Python/TS/JS/Java) BEFORE any reasoning call, so that
 generated imports resolve and Step 9 can intercept sentinels at test runtime.
+
+**Lane selection.** The above is the **POM lane** (default: `architecture_pattern` ∈ `pom`/`inline`/`none`/`unknown`, incl. zero-existing-automation SUTs). A **non-POM** pattern (e.g. `screenplay`) takes the **exemplar lane** (`_run_exemplar_lane`): it vendors the runtime beside the SUT's package (e.g. `framework/qtea_runtime.py` + root conftest, since the stock `tests/` path doesn't fit), then `codegen-exemplar-writer` generates each `reusable_units[]` entry + test file shaped like the matching `pattern_exemplars[]`. Only pattern-agnostic gates run (xpath-norm, parse-check, type-check, `codegen-violation-fixer`); POM gates (tbd-compliance, pom-assertion, reconciliation, intent scoring) are skipped. Deferred locators use `page.locator(tbd("intent"))` — the only form reaching the JIT ladder — so they resolve at Step 9 as usual.
 
 **Phase gate:**
 - `framework` is a recognized enum value.
@@ -559,6 +657,12 @@ All variables are optional unless marked **required**. Defaults are applied in `
 | `JIRA_XRAY_CLIENT_SECRET` | — | Xray Cloud OAuth2 client secret. Masked in logs. |
 | `JIRA_XRAY_API_KEY` | — | Xray DC/Server API key (alternative to client ID/secret). Masked in logs. |
 
+### Docupedia / Confluence (Step 1)
+
+| Variable | Default | Description |
+|---|---|---|
+| `DOCUPEDIA_PAT` | — | Personal Access Token for Bosch Docupedia (Confluence DC), Bearer auth. Masked in logs. When set, Step 1 fetches Docupedia pages via REST — for a Docupedia `--spec` URL (hard-fails if unset) and for Docupedia links embedded in the spec/linked tickets (best-effort). Base URL derived from the link; text only (no attachments/images/child pages). |
+
 ### Azure DevOps (Step 1)
 
 | Variable | Default | Description |
@@ -603,9 +707,21 @@ All variables are optional unless marked **required**. Defaults are applied in `
 | Variable | Default | Description |
 |---|---|---|
 | `QTEA_LIVE_EXPLORE` | `1` | Set `0` to skip the live browser exploration pass in Step 7. |
-| `QTEA_LIVE_EXPLORE_MAX_ROUTES` | unlimited | Cap the number of routes explored per live-explore pass. |
-| `QTEA_LIVE_EXPLORE_MAX_TURNS` | `40` | Turn budget for the live-explore agent. |
-| `QTEA_LIVE_EXPLORE_TIMEOUT_S` | (step timeout) | Wall-clock timeout for the live-explore pass (seconds). |
+| `QTEA_LIVE_EXPLORE_MODE` | `auto` | Exploration mechanism: `driver` (deterministic parent-side Playwright + narrow LLM callouts), `agent` (site-explorer MCP agent — rollback path), `auto` (driver first, agent fallback when driver returns None / under-captured). |
+| `QTEA_LIVE_MAP_CACHE` | on | Set `off` (or pass `--no-live-map-cache`) to disable the cross-run live-map cache. |
+| `QTEA_LIVE_MAP_CACHE_DIR` | `~/.qtea/live-map-cache` | Override the cross-run cache location. |
+| `QTEA_LIVE_EXPLORE_MAX_ROUTES` | `12` | Safety cap on the target-page list (targets come from `test-design.md`; no link discovery). Nonzero `_telemetry.routes_truncated_by_cap` = silent coverage loss, logged as warning. |
+| `QTEA_LIVE_EXPLORE_MAX_REVEALS_PER_PAGE` | `4` | Max non-destructive reveal actions (tab/dialog/menu) per page — the primary cost lever. |
+| `QTEA_LIVE_EXPLORE_NAV_HARVEST` | `1` | Set `0` to skip the zero-LLM primary-nav label harvest fed to the site-explorer. |
+| `QTEA_LIVE_EXPLORE_MAX_TURNS` | *(derived)* | Turn budget; defaults to `targets × 6 + 15`. Set to override the derived value. |
+| `QTEA_LIVE_EXPLORE_TIMEOUT_S` | `600` | Wall-clock timeout for the live-explore pass (seconds). |
+| `QTEA_AUTH_PREWARM_MODE` | `headed` | Auth strategy: `headed` (open the base URL in a VISIBLE browser, human logs in by any means incl. MFA/SSO, session captured; helper-independent, creds never reach the model; chromium auto-downloaded on first use, falls back to `mcp` if that download fails) \| `mcp` (site-explorer logs in via Playwright MCP, then explores in-session — pattern-agnostic; **QA creds sent to the model**, masked in artifacts) \| `script` (run the SUT's sign-in helper in a subprocess → storage-state; creds never reach the model; needs the SUT env) \| `off`. CLI: `--auth-prewarm-mode`. |
+| `QTEA_AUTH_USERNAME_VAR` / `QTEA_AUTH_PASSWORD_VAR` | (heuristic) | Override which `credentials_env_vars` entries are used as username/password for `mcp` login. Default: first name containing `USER` / `PASS`. |
+| `QTEA_AUTH_IDENTITY_PROVIDER` | — | Hint for which identity-provider / business-unit option the `mcp` login picks on a chooser (e.g. `Internal`). Default: pick a username/password option, avoid SSO/MFA. |
+| `QTEA_AUTH_CAPTURE` | `1` | Set `0` (or `--no-auth-capture`) to force auth prewarm `off`. Auto-`off` in `QTEA_NO_LLM_RESOLVE=1` mode. |
+| `QTEA_AUTH_CAPTURE_HEADED` | `0` | Set `1` (or `--auth-headed`) to force `headed` mode (visible browser, human login incl. MFA/SSO). Already the default, so only needed to override an explicit `--auth-prewarm-mode`. Interactive session only. |
+| `QTEA_AUTH_CAPTURE_TIMEOUT_S` | `180` | (`script` mode) Timeout for the HEADLESS auth-prewarm subprocess (seconds). |
+| `QTEA_AUTH_CAPTURE_HEADED_TIMEOUT_S` | `600` | (`script` mode) Timeout for the HEADED auth-prewarm (seconds) — generous for human MFA. |
 | `QTEA_REUSE_SOURCE_BUDGET` | unlimited | Max source files scanned when classifying locators as `reuse` vs `create_tbd`. |
 
 ### Step 8 — Codegen Quality Gates

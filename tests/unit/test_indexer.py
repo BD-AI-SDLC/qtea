@@ -538,6 +538,91 @@ def test_zero_assertions_jsts_opt_out(tmp_path: Path):
     assert not any(v.rule == "zero-assertions" for v in result.violations)
 
 
+def test_zero_assertions_jsts_lifecycle_hooks_not_flagged(tmp_path: Path):
+    """Playwright/Jest lifecycle hooks (`test.beforeEach` etc.) carry no
+    assertion by design — they must NOT be flagged. Regression for the gate
+    being structurally unpassable on any hook-bearing spec."""
+    (tmp_path / "x.spec.ts").write_text(
+        "test.beforeEach(async ({ page }) => { await page.goto('/'); });\n"
+        "test.afterEach(async ({ page }) => { await page.close(); });\n"
+        "test.beforeAll(async () => {});\n"
+        "test.afterAll(async () => {});\n"
+        "test('real', async ({ page }) => { await expect(page).toHaveURL('/'); });\n",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="playwright-ts")
+    assert not any(v.rule == "zero-assertions" for v in result.violations)
+
+
+def test_zero_assertions_jsts_describe_and_step_not_flagged(tmp_path: Path):
+    """`test.describe` grouping and in-test `test.step` are not executable test
+    blocks — no assertion required. The enclosing `test()` still asserts."""
+    (tmp_path / "x.spec.ts").write_text(
+        "test.describe('group', () => {\n"
+        "  test('inner', async ({ page }) => {\n"
+        "    await test.step('do', async () => { await page.click('#a'); });\n"
+        "    await expect(page).toHaveURL('/');\n"
+        "  });\n"
+        "});\n",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="playwright-ts")
+    assert not any(v.rule == "zero-assertions" for v in result.violations)
+
+
+def test_zero_assertions_jsts_test_only_still_flagged(tmp_path: Path):
+    """Guards the hook deny-list: an assertion-less `test.only()` is a genuine
+    bug and must stay IN scope (it is NOT a lifecycle hook)."""
+    (tmp_path / "x.spec.ts").write_text(
+        "test.only('x', async ({ page }) => { await page.click('#a'); });\n",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="playwright-ts")
+    assert any(v.rule == "zero-assertions" for v in result.violations)
+
+
+def test_zero_assertions_python_fixture_not_flagged(tmp_path: Path):
+    """Agnostic guarantee (Python): pytest fixtures / setup helpers are not
+    named `test_*`, so the AST gate never treats them as assertion-requiring
+    tests — the Python analogue of the JS/TS hook exclusion."""
+    (tmp_path / "test_ok.py").write_text(
+        """import pytest
+
+@pytest.fixture
+def seed(page):
+    page.goto("/")
+
+def test_x(page):
+    assert page is not None
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="pytest")
+    assert not any(v.rule == "zero-assertions" for v in result.violations)
+
+
+def test_zero_assertions_java_before_hook_not_flagged(tmp_path: Path):
+    """Agnostic guarantee (Java): `@Before`/`@After` hooks lack `@Test`, so they
+    are never discovered as tests and cannot trip a zero-assertion violation."""
+    (tmp_path / "FooTest.java").write_text(
+        """public class FooTest {
+    @Before
+    public void setUp() {
+        driver.get("/");
+    }
+
+    @Test
+    public void realTest() {
+        Assertions.assertTrue(true);
+    }
+}
+""",
+        encoding="utf-8",
+    )
+    result = index_tests(tmp_path, framework="selenium-java")
+    assert not any(v.rule == "zero-assertions" for v in result.violations)
+
+
 def test_bare_assert_warning_for_locator_textcontent(tmp_path: Path):
     (tmp_path / "test_bad.py").write_text(
         """def test_x(page):

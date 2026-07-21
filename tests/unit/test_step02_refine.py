@@ -131,6 +131,38 @@ async def test_refine_step_inlines_spec_into_user_prompt(tmp_path: Path, monkeyp
     assert "spec.md" in user_content  # the filename header from _inline_inputs
 
 
+async def test_refine_step_injects_operator_context(tmp_path: Path, monkeypatch):
+    """When ctx.operator_context is set, it reaches the LLM under the
+    `user-context.md` header with the augments-not-overrides clause."""
+    captured: dict = {}
+    install_fake_anthropic(monkeypatch, text=REFINED_MD, on_call=captured.update)
+
+    ctx = _ctx(tmp_path)
+    ctx.operator_context = "OPERATOR_CONTEXT_MARKER_ABC"
+
+    result = await RefineStep().run(ctx)
+    assert result.success, result.error
+
+    user_content = captured["messages"][-1]["content"]
+    assert "user-context.md" in user_content
+    assert "OPERATOR_CONTEXT_MARKER_ABC" in user_content
+    # Precedence framing must be present so the agent doesn't override ACs.
+    assert "does NOT replace" in user_content
+
+
+async def test_refine_step_no_operator_context_omits_input(tmp_path: Path, monkeypatch):
+    """With no operator context, the user-context.md input is not staged."""
+    captured: dict = {}
+    install_fake_anthropic(monkeypatch, text=REFINED_MD, on_call=captured.update)
+
+    ctx = _ctx(tmp_path)  # operator_context defaults to None
+    result = await RefineStep().run(ctx)
+    assert result.success, result.error
+
+    user_content = captured["messages"][-1]["content"]
+    assert "user-context.md" not in user_content
+
+
 async def test_refine_step_missing_spec_fails(tmp_path: Path):
     ws = create_workspace(tmp_path / ".ws")
     state = RunState(
@@ -186,8 +218,25 @@ def _install_scripted_anthropic(monkeypatch, texts: list[str], on_call=None):
             usage=FakeUsage(),
         )
 
+    class _Stream:
+        def __init__(self, kwargs):
+            self._kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return None
+
+        async def get_final_message(self):
+            return await _create(**self._kwargs)
+
     class FakeMessages:
         create = staticmethod(_create)
+
+        @staticmethod
+        def stream(**kwargs):
+            return _Stream(kwargs)
 
     class FakeClient:
         def __init__(self, **_kw):

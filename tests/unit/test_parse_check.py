@@ -67,7 +67,7 @@ def test_ts_hash_header_caught_by_smoke_when_no_native_backend(tmp_path: Path):
     sut = tmp_path
     tests = sut / "tests" / "regression"
     tests.mkdir(parents=True)
-    bad = tests / "qtea_ropa_approval_test.spec.ts"
+    bad = tests / "qtea_entity_approval_test.spec.ts"
     bad.write_text(
         "# Stack: typescript+playwright\n"
         "\n"

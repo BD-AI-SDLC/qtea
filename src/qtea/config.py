@@ -97,6 +97,7 @@ SECRET_ENV_KEYS = frozenset(
         "ANTHROPIC_CUSTOM_HEADERS",
         "JIRA_API_TOKEN",
         "JIRA_PAT",
+        "DOCUPEDIA_PAT",
         "JIRA_XRAY_CLIENT_SECRET",
         "JIRA_XRAY_API_KEY",
         "JIRA_XRAY_CLIENT_ID",
@@ -135,6 +136,9 @@ class Settings:
     anthropic_base_url: str | None = None
     sut_base_url: str | None = None
     default_workspace: Path = field(default_factory=lambda: Path.home() / ".qtea")
+    incident_memory_dir: Path = field(
+        default_factory=lambda: Path.home() / ".qtea" / "incident-memory"
+    )
     max_step_timeout_s: int = MAX_STEP_TIMEOUT_S
 
 
@@ -152,6 +156,9 @@ def load_env(dotenv_path: Path | None = None) -> None:
 def get_settings() -> Settings:
     """Construct Settings from current env (call after load_env)."""
     ws_str = os.environ.get("QTEA_DEFAULT_WORKSPACE", str(Path.home() / ".qtea"))
+    incident_dir_str = os.environ.get(
+        "QTEA_INCIDENT_MEMORY_DIR", str(Path.home() / ".qtea" / "incident-memory")
+    )
     try:
         timeout = int(
             os.environ.get("QTEA_MAX_STEP_TIMEOUT_S", str(MAX_STEP_TIMEOUT_S))
@@ -166,6 +173,7 @@ def get_settings() -> Settings:
         anthropic_base_url=os.environ.get("ANTHROPIC_BASE_URL"),
         sut_base_url=os.environ.get("SUT_BASE_URL"),
         default_workspace=Path(ws_str),
+        incident_memory_dir=Path(incident_dir_str),
         max_step_timeout_s=timeout,
     )
 

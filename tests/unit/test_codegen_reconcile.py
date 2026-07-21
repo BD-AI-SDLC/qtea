@@ -1420,7 +1420,7 @@ def test_reconcile_fixtures_ts_reuse_test_wrapper_export(tmp_path: Path):
     _touch(tmp_path / file_rel, _TS_FIXTURE_TEST_EXTEND)
     plan = {
         "test_cases": [{
-            "id": "TC-ROPA-001",
+            "id": "TC-ENTITY-001",
             "fixtures": [{
                 "name": "test (extended)",
                 "source": "reuse",
@@ -1851,3 +1851,238 @@ def test_reconcile_codegen_java_private_methods_still_visible(tmp_path: Path):
     assert "internalHelper" in names    # private but present
     # Constructor and lifecycle should NOT appear in the POM method list.
     assert "LoginPage" not in names
+
+
+# ---------------------------------------------------------------------------
+# Regression: XPath-in-template-literal must not desync the TS/JS extractor.
+#
+# A Playwright locator uses `//`-prefixed XPath INSIDE a template literal:
+# `page.locator(`//a[@id="${x}"]`)`. The old `_js_strip` blanked line comments
+# before template literals, so it treated that `//` as a comment, ate the
+# template's closing backtick, and blanked forward across method boundaries —
+# silently dropping every method whose header fell in the swallowed span
+# (silently dropping several POM methods after the swallowed span).
+# ---------------------------------------------------------------------------
+
+_TS_POM_XPATH_TEMPLATES = """\
+import { Page, Locator } from '@playwright/test';
+
+export class EntityPage {
+  page: Page;
+  constructor(page: Page) { this.page = page; }
+
+  async clickEntity(name: string): Promise<void> {
+    const link = this.page.locator(`//a[contains(@data-test, "cell-${name}")]`);
+    await link.click();
+  }
+
+  async goToModule(): Promise<void> {
+    await this.page.locator(`//p[contains(normalize-space(.), "Systems")]`).click();
+  }
+
+  async selectFiltered(value: string): Promise<void> {
+    const opt = this.page.locator(
+      `//label[contains(normalize-space(.), "${value}")]//input`,
+    );
+    await opt.click();
+  }
+
+  async plainMethod(): Promise<void> {
+    await this.page.getByRole('button').click();
+  }
+}
+"""
+
+
+def test_js_extractor_survives_xpath_template_literals():
+    """All four methods must be extracted even though three bodies contain
+    `//`-prefixed XPath template literals (the desync-dropped case)."""
+    from qtea.codegen_reconcile import _js_pom_methods
+
+    names = {s.name for s in _js_pom_methods(_TS_POM_XPATH_TEMPLATES, "EntityPage")}
+    assert names == {
+        "clickEntity", "goToModule", "selectFiltered", "plainMethod",
+    }
+
+
+def test_reconcile_no_false_positive_on_xpath_template_pom(tmp_path: Path):
+    """A call to a method whose sibling methods use XPath templates must NOT
+    false-flag as method_not_found."""
+    pom_rel = "src/pages/EntityPage.ts"
+    test_rel = "tests/entity.spec.ts"
+    _touch(tmp_path / pom_rel, _TS_POM_XPATH_TEMPLATES)
+    _touch(tmp_path / test_rel, """\
+import { EntityPage } from '../src/pages/EntityPage';
+import { test } from '@playwright/test';
+
+test('t', async ({ page }) => {
+  const entityPage = new EntityPage(page);
+  await entityPage.goToModule();
+  await entityPage.selectFiltered('X');
+});
+""")
+    result = reconcile_codegen(
+        [tmp_path / test_rel],
+        [{"file": pom_rel, "class_name": "EntityPage"}],
+        tmp_path, "typescript",
+    )
+    assert result.mismatches == []
+
+
+# ---------------------------------------------------------------------------
+# Regression: inherited (`extends` closure) methods must resolve.
+# ---------------------------------------------------------------------------
+
+_TS_BASE_POM = """\
+import { Page } from '@playwright/test';
+
+export class BasePage {
+  page: Page;
+  constructor(page: Page) { this.page = page; }
+  async goToModule(): Promise<void> { await this.page.goto('/'); }
+}
+"""
+
+_TS_SUB_POM = """\
+import { Page } from '@playwright/test';
+import { BasePage } from './BasePage';
+
+export class EntityPage extends BasePage {
+  async createEntry(): Promise<void> { await this.page.click('#new'); }
+}
+"""
+
+
+def test_reconcile_resolves_inherited_method_via_manifest(tmp_path: Path):
+    """`entityPage.goToModule()` (defined on the BasePage the subclass extends)
+    must resolve when the base is in the manifest."""
+    _touch(tmp_path / "src/pages/BasePage.ts", _TS_BASE_POM)
+    _touch(tmp_path / "src/pages/EntityPage.ts", _TS_SUB_POM)
+    _touch(tmp_path / "tests/entity.spec.ts", """\
+import { EntityPage } from '../src/pages/EntityPage';
+import { test } from '@playwright/test';
+
+test('t', async ({ page }) => {
+  const entityPage = new EntityPage(page);
+  await entityPage.goToModule();     // inherited from BasePage
+  await entityPage.createEntry();
+});
+""")
+    result = reconcile_codegen(
+        [tmp_path / "tests/entity.spec.ts"],
+        [
+            {"file": "src/pages/BasePage.ts", "class_name": "BasePage"},
+            {"file": "src/pages/EntityPage.ts", "class_name": "EntityPage"},
+        ],
+        tmp_path, "typescript",
+    )
+    assert result.mismatches == []
+
+
+def test_reconcile_resolves_inherited_method_via_sibling(tmp_path: Path):
+    """Same as above but the base class is NOT in the manifest — it must be
+    resolved via the sibling-file heuristic (`<dir>/BasePage.ts`)."""
+    _touch(tmp_path / "src/pages/BasePage.ts", _TS_BASE_POM)
+    _touch(tmp_path / "src/pages/EntityPage.ts", _TS_SUB_POM)
+    _touch(tmp_path / "tests/entity.spec.ts", """\
+import { EntityPage } from '../src/pages/EntityPage';
+import { test } from '@playwright/test';
+
+test('t', async ({ page }) => {
+  const entityPage = new EntityPage(page);
+  await entityPage.goToModule();     // inherited; base not in manifest
+});
+""")
+    result = reconcile_codegen(
+        [tmp_path / "tests/entity.spec.ts"],
+        [{"file": "src/pages/EntityPage.ts", "class_name": "EntityPage"}],
+        tmp_path, "typescript",
+    )
+    assert result.mismatches == []
+
+
+# ---------------------------------------------------------------------------
+# Regression: the Step-6 inventory corroboration net.
+# ---------------------------------------------------------------------------
+
+
+def test_inventory_corroboration_net_rescues_missing_method(tmp_path: Path):
+    """A method absent from the parsed POM body but recorded in the Step-6
+    inventory must NOT hard-fail — the corroboration net trusts the second
+    source. (Simulates a parser miss without depending on a specific parser
+    bug: the POM file simply doesn't declare the method.)"""
+    pom_rel = "src/pages/EntityPage.ts"
+    _touch(tmp_path / pom_rel, _TS_BASE_POM.replace("BasePage", "EntityPage"))
+    _touch(tmp_path / "tests/entity.spec.ts", """\
+import { EntityPage } from '../src/pages/EntityPage';
+import { test } from '@playwright/test';
+
+test('t', async ({ page }) => {
+  const entityPage = new EntityPage(page);
+  await entityPage.switchUser('a', 'b');   // not in source, but in inventory
+});
+""")
+    pom_files = [{"file": pom_rel, "class_name": "EntityPage"}]
+    # Without the net → method_not_found.
+    bare = reconcile_codegen(
+        [tmp_path / "tests/entity.spec.ts"], pom_files, tmp_path, "typescript",
+    )
+    assert any(m.call_site.method_name == "switchUser" for m in bare.mismatches)
+    # With the net → rescued.
+    with_net = reconcile_codegen(
+        [tmp_path / "tests/entity.spec.ts"], pom_files, tmp_path, "typescript",
+        inventory_methods={"EntityPage": {"switchUser", "goToModule"}},
+    )
+    assert with_net.mismatches == []
+
+
+def test_inventory_net_does_not_mask_genuinely_absent_method(tmp_path: Path):
+    """The net only rescues methods the inventory actually records — a method
+    absent from BOTH the parsed body and the inventory still hard-fails (so a
+    genuine gap, e.g. an uncreated POM, is never masked)."""
+    pom_rel = "src/pages/EntityPage.ts"
+    _touch(tmp_path / pom_rel, _TS_BASE_POM.replace("BasePage", "EntityPage"))
+    _touch(tmp_path / "tests/entity.spec.ts", """\
+import { EntityPage } from '../src/pages/EntityPage';
+import { test } from '@playwright/test';
+
+test('t', async ({ page }) => {
+  const entityPage = new EntityPage(page);
+  await entityPage.neverDefined();
+});
+""")
+    result = reconcile_codegen(
+        [tmp_path / "tests/entity.spec.ts"],
+        [{"file": pom_rel, "class_name": "EntityPage"}],
+        tmp_path, "typescript",
+        inventory_methods={"EntityPage": {"goToModule"}},  # lacks neverDefined
+    )
+    assert any(
+        m.call_site.method_name == "neverDefined"
+        and m.kind == "method_not_found"
+        for m in result.mismatches
+    )
+
+
+def test_inventory_method_index_flattens_modules():
+    """`inventory_method_index` aggregates methods per class across modules,
+    keyed on both class_name and name."""
+    from qtea.codegen_reconcile import inventory_method_index
+
+    inv = {
+        "modules": [
+            {"existing_page_objects": [
+                {"class_name": "BasePage", "name": "BasePage",
+                 "methods": ["goToEntityModule", "switchUser"]},
+            ]},
+            {"existing_page_objects": [
+                {"class_name": "DirectoryPage", "name": "DirectoryPage",
+                 "methods": ["selectFilteredEntity"]},
+            ]},
+        ]
+    }
+    idx = inventory_method_index(inv)
+    assert idx["BasePage"] == {"goToEntityModule", "switchUser"}
+    assert idx["DirectoryPage"] == {"selectFilteredEntity"}
+    assert inventory_method_index(None) == {}
+    assert inventory_method_index({}) == {}

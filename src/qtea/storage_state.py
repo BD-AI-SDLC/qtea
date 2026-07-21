@@ -86,6 +86,97 @@ def resolve(
     return None
 
 
+def write_target(
+    sut_root: Path | None,
+    cli_opt: Path | None,
+    env: dict[str, str] | None = None,
+) -> Path:
+    """Where a *fresh* capture should be WRITTEN — the counterpart to
+    :func:`resolve` (which finds an existing file to READ).
+
+    Mirrors ``resolve``'s operator-controlled precedence so a configured
+    location is both written to AND read from — log in once, reuse across
+    runs. Unlike ``resolve`` this is existence-independent: it returns the
+    override even when the file doesn't exist yet (so the first capture lands
+    there) and even when it's stale (so a re-login overwrites it in place).
+
+      1. ``cli_opt`` — ``--storage-state <path>``
+      2. ``QTEA_STORAGE_STATE`` env var
+      3. ``<sut_root>/.qtea/storage-state.json`` (per-SUT convention)
+
+    Raises ``ValueError`` if no override is set and ``sut_root`` is None (the
+    convention path is SUT-relative, so there'd be nowhere to write).
+    """
+    import os as _os
+
+    if cli_opt is not None:
+        return Path(cli_opt)
+    src_env = env if env is not None else _os.environ
+    env_path = src_env.get("QTEA_STORAGE_STATE")
+    if env_path:
+        return Path(env_path)
+    if sut_root is not None:
+        return Path(sut_root) / _SUT_CONVENTION_REL
+    raise ValueError("write_target needs a storage-state override or a sut_root")
+
+
+def _gitignore_covers(text: str, entry: str) -> bool:
+    """True when an existing ``.gitignore`` already ignores *entry* (a
+    SUT-relative POSIX path). Recognizes exact lines, directory prefixes
+    (``.qtea/`` covers ``.qtea/storage-state.json``) and bare basename
+    patterns (``storage-state.json`` matches the file in any directory).
+    Comment/blank lines are skipped.
+    """
+    name = entry.rsplit("/", 1)[-1]
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line == entry:
+            return True
+        if line.endswith("/") and (entry == line[:-1] or entry.startswith(line)):
+            return True
+        if "/" not in line and line == name:
+            return True
+    return False
+
+
+def ensure_gitignored(sut_root: Path | None, target: Path) -> None:
+    """Ensure *target* (a storage-state credential) is git-ignored in the SUT.
+
+    storage-state holds live session cookies; without this, ``commit_step``'s
+    ``git add -A`` would stage it into the qtea branch a human reviews / opens
+    a PR from. The per-SUT convention path is already seeded at Step 6, but a
+    custom ``--storage-state`` target inside the SUT would not be — this closes
+    that gap for any write location.
+
+    No-op when *target* is outside ``sut_root`` (e.g. a stable path in the
+    user's home dir — nothing in the SUT to leak) or when ``sut_root`` is None.
+    Idempotent and best-effort — never raises.
+    """
+    if sut_root is None:
+        return
+    try:
+        rel = Path(target).resolve().relative_to(Path(sut_root).resolve())
+    except (ValueError, OSError):
+        return  # outside the SUT tree → nothing to ignore
+    entry = rel.as_posix()
+    gitignore = Path(sut_root) / ".gitignore"
+    try:
+        text = (
+            gitignore.read_text(encoding="utf-8", errors="replace")
+            if gitignore.exists()
+            else ""
+        )
+        if _gitignore_covers(text, entry):
+            return
+        if text and not text.endswith("\n"):
+            text += "\n"
+        gitignore.write_text(text + entry + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
 def to_mcp_arg(path: Path | None) -> str:
     """Render the ``@playwright/mcp`` CLI flag for a resolved storage-state
     path. Empty string when ``path`` is ``None`` so the ``.mcp.json``
@@ -99,6 +190,43 @@ def to_mcp_arg(path: Path | None) -> str:
     if path is None:
         return ""
     return f"--storage-state={Path(path).resolve()}"
+
+
+def mcp_browser_env(
+    storage_state_path: Path | None, user_data_dir: Path | str,
+) -> dict[str, str]:
+    """Build the ``@playwright/mcp`` browser-mode env args for ``.mcp.json``
+    token substitution (``QTEA_MCP_ISOLATED_ARG`` / ``QTEA_STORAGE_STATE_ARG``
+    / ``QTEA_MCP_USER_DATA_DIR_ARG``).
+
+    The critical rule: ``@playwright/mcp`` treats ``--storage-state`` as a seed
+    for an ISOLATED (in-memory) context — a persistent ``--user-data-dir``
+    launches a persistent profile that IGNORES ``--storage-state`` entirely. So
+    a captured session (headed manual login, auth-replay, prior run) only
+    actually loads when we pass ``--isolated`` and DROP ``--user-data-dir``
+    (Observed failure mode: the live-explore crawl bounced straight to SSO
+    because both flags were passed and the storage-state was silently ignored.)
+
+    - storage-state present → ``--isolated`` + ``--storage-state`` (no
+      user-data-dir; in-memory profiles are independent, so this also avoids
+      the "browser already in use" profile-lock contention that motivated a
+      per-caller user-data-dir).
+    - storage-state absent → persistent ``--user-data-dir`` (nothing to seed;
+      a stable profile is fine and gives each caller its own dir).
+
+    Empty values are dropped by ``mcp_manager._filter_empty_args`` before the
+    subprocess spawns, so the unset flags never reach the CLI as stray args."""
+    if storage_state_path is not None:
+        return {
+            "QTEA_MCP_ISOLATED_ARG": "--isolated",
+            "QTEA_STORAGE_STATE_ARG": to_mcp_arg(storage_state_path),
+            "QTEA_MCP_USER_DATA_DIR_ARG": "",
+        }
+    return {
+        "QTEA_MCP_ISOLATED_ARG": "",
+        "QTEA_STORAGE_STATE_ARG": "",
+        "QTEA_MCP_USER_DATA_DIR_ARG": f"--user-data-dir={user_data_dir}",
+    }
 
 
 def summary_for_prompt(path: Path | None) -> str:
@@ -158,4 +286,11 @@ def mask_path(p: Path) -> str:
     return Path(p).name
 
 
-__all__ = ["mask_path", "resolve", "summary_for_prompt", "to_mcp_arg"]
+__all__ = [
+    "ensure_gitignored",
+    "mask_path",
+    "resolve",
+    "summary_for_prompt",
+    "to_mcp_arg",
+    "write_target",
+]

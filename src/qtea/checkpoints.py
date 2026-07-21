@@ -67,6 +67,12 @@ class RunState:
     workspace: str
     spec_source: str | None
     sut_source: str | None
+    # Optional operator-supplied free-text context about the spec, captured
+    # at run start (CLI --context/--context-file or the UI pre-run screen).
+    # Trusted operator guidance injected into Step 1 ticket enrichment and
+    # Step 2 refinement. Persisted here so a --run-id resume re-hydrates it
+    # the same way spec_source/sut_source are recovered.
+    operator_context: str | None = None
     steps: dict[int, StepRecord] = field(default_factory=dict)
     auxiliary_records: list[AuxiliaryAgentRecord] = field(default_factory=list)
     started_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
@@ -86,6 +92,7 @@ class RunState:
             "workspace": self.workspace,
             "spec_source": self.spec_source,
             "sut_source": self.sut_source,
+            "operator_context": self.operator_context,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "pid": self.pid,
@@ -102,6 +109,7 @@ class RunState:
             workspace=d["workspace"],
             spec_source=d.get("spec_source"),
             sut_source=d.get("sut_source"),
+            operator_context=d.get("operator_context"),
         )
         rs.started_at = d.get("started_at", rs.started_at)
         rs.finished_at = d.get("finished_at")

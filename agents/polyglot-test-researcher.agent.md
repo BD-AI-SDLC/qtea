@@ -47,11 +47,16 @@ The full step-by-step procedure (stack catalogs, regex signals, universal fallba
        - { name: <function>, file: <path>, signature: <text>, purpose: <one-line> }
      existing_fixtures:
        - { name: <fixture>, file: <path>, scope: <function|class|session>, yields: <type>, depends_on: [<dep>] }
+     lifecycle_hooks:
+       - { event: <before_all|after_all|before_each|after_each>, framework_construct: <beforeEach|@BeforeEach|setUp|...>, file: <path>, scope: <text-or-null>, calls: [<obj.method>, <obj.method>] }
+     navigation_preconditions:
+       - { method: <ClassName.methodName>, requires_call: <ClassName.methodName>, requires_args_hint: <text-or-null>, evidence: <path:line> }
      auth_flow:
        type: <sso|oauth|basic|none|unknown>
        entry_method: <file:Class.method-or-file:func>
        credentials_env_vars: [<ENV_VAR>, <ENV_VAR>]
        fixture_entry: <file:func>
+       open_method: <file:Class.method-that-navigates-to-base-url-or-null>
      custom_test_id_attribute: <data-testid|data-test|data-cy|data-qa|null>
    ```
 

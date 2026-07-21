@@ -91,7 +91,8 @@ _TS_ASSERT_PATTERNS: dict[str, re.Pattern[str]] = {
         r"""(?:(?P<q>['"`])(?P<val>[^\n]*?)(?P=q)|(?P<sym>\w[\w$]*))""",
     ),
     "exact_count": re.compile(
-        r"""\.\s*toHaveCount\s*\(\s*(?P<n>\d+)\s*\)""",
+        r"""\.\s*toHaveCount\s*\(\s*"""
+        r"""(?:(?P<n>\d+)|(?P<sym>\w[\w$]*))\s*\)""",
     ),
     "exact_attribute": re.compile(
         r"""\.\s*toHaveAttribute\s*\("""
@@ -359,6 +360,62 @@ def _match_expected(
     return False
 
 
+# `NAME = <int>` declaration — covers TS/JS `const NAME = 1`, Python
+# `NAME = 1`, and Java `... NAME = 1` (any leading type keyword is ignored
+# because we anchor on the name). Used to const-fold a named count constant.
+_COUNT_CONST_DECL_TMPL = r"\b{name}\s*=\s*(\d+)\b"
+
+
+def _resolve_count_literal(text: str, symbol: str) -> int | None:
+    """Fold a named numeric constant to its int value by scanning ``text``
+    for a ``symbol = <int>`` declaration. Returns None when the symbol is
+    not declared as a bare integer.
+
+    Deliberately narrow (top-level ``NAME = <literal>`` only): imported
+    constants, arithmetic, and enum members are out of scope — a resolved
+    match is a strong positive signal, an unresolved one falls through to
+    the normal "missing/wrong count" path rather than passing silently."""
+    m = re.search(_COUNT_CONST_DECL_TMPL.format(name=re.escape(symbol)), text)
+    return int(m.group(1)) if m else None
+
+
+def _count_matches_expected(
+    matches: list[re.Match[str]], combined: str,
+    expected: int, expected_symbol,
+) -> bool:
+    """True when any count-matcher match resolves to ``expected``.
+
+    A match carries either a numeric group ``n`` (``toHaveCount(1)``) or a
+    symbol group ``sym`` (``toHaveCount(EXPECTED_COUNT)``). A symbol resolves
+    by expected_symbol name-match first, else by const-folding it against
+    ``combined`` (POM body + test text). This closes the false-green where a
+    correct assertion written with a named constant was misreported as
+    "missing toHaveCount(N)" — the count matcher was the only check lacking
+    the symbol branch that exact_text / exact_attribute / value_equals have."""
+    for m in matches:
+        gd = m.groupdict()
+        n = gd.get("n")
+        if n is not None:
+            if int(n) == expected:
+                return True
+            continue
+        sym = gd.get("sym")
+        if not sym:
+            continue
+        if expected_symbol and sym == expected_symbol:
+            return True
+        folded = _resolve_count_literal(combined, sym)
+        if folded is not None and folded == expected:
+            return True
+    return False
+
+
+def _count_match_text(m: re.Match[str]) -> str:
+    """Render a count match's argument (literal or symbol) for diagnostics."""
+    gd = m.groupdict()
+    return gd.get("n") or gd.get("sym") or "?"
+
+
 def _verify_criterion(
     check: str, crit: dict, pom_body: str, test_body: str,
     sibling_pom_text: str = "",
@@ -407,10 +464,10 @@ def _verify_criterion(
         matches = list(pat.finditer(combined))
         if not matches:
             return f"missing toHaveCount({expected}) assertion"
-        if expected is not None and not any(
-            int(m.group("n")) == expected for m in matches
+        if expected is not None and not _count_matches_expected(
+            matches, combined, expected, expected_symbol
         ):
-            actual = ", ".join(m.group("n") for m in matches)
+            actual = ", ".join(_count_match_text(m) for m in matches)
             return f"expected toHaveCount({expected}) — got toHaveCount({actual})"
         return None
 
@@ -535,7 +592,8 @@ _PY_ASSERT_PATTERNS: dict[str, re.Pattern[str]] = {
         r"""(?:(?P<q>['"])(?P<val>[^\n]*?)(?P=q)|(?P<sym>\w[\w$]*))""",
     ),
     "exact_count": re.compile(
-        r"""\.\s*to_have_count\s*\(\s*(?P<n>\d+)\s*\)""",
+        r"""\.\s*to_have_count\s*\(\s*"""
+        r"""(?:(?P<n>\d+)|(?P<sym>\w[\w$]*))\s*\)""",
     ),
     "exact_attribute": re.compile(
         r"""\.\s*to_have_attribute\s*\("""
@@ -630,9 +688,9 @@ def _verify_criterion_py(
         if not matches and not num_asserts:
             return f"missing to_have_count({expected}) / `== {expected}` assertion"
         if expected is not None:
-            ok = any(int(m.group("n")) == expected for m in matches) or any(
-                int(m.group("n")) == expected for m in num_asserts
-            )
+            ok = _count_matches_expected(
+                matches, combined, expected, expected_symbol
+            ) or any(int(m.group("n")) == expected for m in num_asserts)
             if not ok:
                 return f"count assertion does not check exact value {expected}"
         return None
@@ -723,7 +781,8 @@ _JAVA_ASSERT_PATTERNS: dict[str, re.Pattern[str]] = {
         r"""(?:"(?P<val>[^\n]*?)"|(?P<sym>[A-Za-z_]\w*))""",
     ),
     "exact_count": re.compile(
-        r"""\.\s*hasCount\s*\(\s*(?P<n>\d+)\s*\)""",
+        r"""\.\s*hasCount\s*\(\s*"""
+        r"""(?:(?P<n>\d+)|(?P<sym>\w[\w$]*))\s*\)""",
     ),
     "exact_attribute": re.compile(
         r"""\.\s*hasAttribute\s*\("""
@@ -797,9 +856,9 @@ def _verify_criterion_java(
         if not matches and not num_asserts:
             return f"missing hasCount({expected}) / assertEquals({expected}, ...) assertion"
         if expected is not None:
-            ok = any(int(m.group("n")) == expected for m in matches) or any(
-                int(m.group("n")) == expected for m in num_asserts
-            )
+            ok = _count_matches_expected(
+                matches, combined, expected, expected_symbol
+            ) or any(int(m.group("n")) == expected for m in num_asserts)
             if not ok:
                 return f"count assertion does not check exact value {expected}"
         return None

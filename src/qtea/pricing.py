@@ -82,7 +82,7 @@ def _model_family_fallback(model: str) -> tuple[float, float, float, float] | No
     if "-4-" not in lower and "-5" not in lower:
         return None
     if "opus" in lower:
-        return _MODEL_PRICING["claude-opus-4-8"]
+        return _MODEL_PRICING["claude-opus-4-7"]
     if "sonnet" in lower:
         return _MODEL_PRICING["claude-sonnet-5"]
     if "haiku" in lower:
