@@ -73,6 +73,11 @@ class RunState:
     # Step 2 refinement. Persisted here so a --run-id resume re-hydrates it
     # the same way spec_source/sut_source are recovered.
     operator_context: str | None = None
+    # Optional operator-supplied context images, materialized under
+    # ``<workspace>/operator-context/images/``. Stored as workspace-relative
+    # path strings (JSON-safe — never base64). Trusted supplementary context
+    # for Step 2 refinement; persisted so a --run-id resume re-hydrates them.
+    operator_context_images: list[str] = field(default_factory=list)
     steps: dict[int, StepRecord] = field(default_factory=dict)
     auxiliary_records: list[AuxiliaryAgentRecord] = field(default_factory=list)
     started_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
@@ -93,6 +98,7 @@ class RunState:
             "spec_source": self.spec_source,
             "sut_source": self.sut_source,
             "operator_context": self.operator_context,
+            "operator_context_images": list(self.operator_context_images),
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "pid": self.pid,
@@ -110,6 +116,7 @@ class RunState:
             spec_source=d.get("spec_source"),
             sut_source=d.get("sut_source"),
             operator_context=d.get("operator_context"),
+            operator_context_images=list(d.get("operator_context_images") or []),
         )
         rs.started_at = d.get("started_at", rs.started_at)
         rs.finished_at = d.get("finished_at")

@@ -159,6 +159,39 @@ def _inline_inputs(user_prompt: str, inputs: dict[str, str] | None) -> str:
     return "\n".join(parts)
 
 
+def _redact_images_in_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return a copy of ``messages`` with base64 image data blanked out.
+
+    Keeps ``transcript-NN.jsonl`` small and free of opaque base64 blobs while
+    preserving the message shape (role, block types, media_type) for audit.
+    """
+    redacted: list[dict[str, Any]] = []
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            redacted.append(msg)
+            continue
+        new_content: list[Any] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "image":
+                src = block.get("source") or {}
+                data = src.get("data") or ""
+                new_content.append({
+                    "type": "image",
+                    "source": {
+                        "type": src.get("type"),
+                        "media_type": src.get("media_type"),
+                        "data": f"<redacted:image bytes={len(data)}>",
+                    },
+                })
+            else:
+                new_content.append(block)
+        redacted.append({**msg, "content": new_content})
+    return redacted
+
+
 def _write_audit(
     workdir: Path,
     *,
@@ -202,6 +235,7 @@ async def call_reasoning_llm(
     timeout_s: int | None = None,
     step: int | None = None,
     hitl_history: list[dict] | None = None,
+    images: list[dict] | None = None,
 ) -> AgentResult:
     """Direct-SDK transport for pure-reasoning steps.
 
@@ -239,6 +273,12 @@ async def call_reasoning_llm(
     hitl_history:
         Prior conversation turns for HITL re-invoke. Each entry is a
         ``{"role": ..., "content": ...}`` message dict.
+    images:
+        Optional Anthropic image content blocks
+        (``{"type": "image", "source": {...}}``) to attach to the new user
+        turn. When present, the user message becomes a ``text + image[]``
+        content-block list instead of a bare string. Base64 image data is
+        redacted from the audit transcript.
 
     Returns
     -------
@@ -283,9 +323,16 @@ async def call_reasoning_llm(
     system_prompt = agent_path.read_text(encoding="utf-8")
     full_prompt = _inline_inputs(user_prompt, inputs)
 
-    # Messages list: optional HITL history + new user turn.
+    # Messages list: optional HITL history + new user turn. When images are
+    # attached, the user turn is a text + image[] content-block list; otherwise
+    # a bare string (unchanged behavior).
     messages: list[dict[str, Any]] = list(hitl_history or [])
-    messages.append({"role": "user", "content": full_prompt})
+    if images:
+        user_content: list[dict[str, Any]] = [{"type": "text", "text": full_prompt}]
+        user_content.extend(images)
+        messages.append({"role": "user", "content": user_content})
+    else:
+        messages.append({"role": "user", "content": full_prompt})
 
     # Lazy import: don't pay anthropic SDK import cost for non-LLM steps.
     import anthropic  # type: ignore[import-untyped]
@@ -421,7 +468,7 @@ async def call_reasoning_llm(
                     "model": create_kwargs["model"],
                     "messages_count": len(messages),
                     "has_schema": output_schema is not None,
-                    "messages": messages,
+                    "messages": _redact_images_in_messages(messages),
                 })
                 stop_reason = getattr(response, "stop_reason", None)
 
@@ -576,6 +623,7 @@ async def call_reasoning_llm_with_hitl(
     step: int | None = None,
     agent_label: str,
     max_iterations: int = _HITL_MAX_ITERATIONS,
+    images: list[dict] | None = None,
 ) -> AgentResult:
     """HITL-aware wrapper around :func:`call_reasoning_llm`.
 
@@ -676,6 +724,9 @@ async def call_reasoning_llm_with_hitl(
             timeout_s=timeout_s,
             step=step,
             hitl_history=current_history,
+            # Attach images to iteration 1's user turn only; on later
+            # iterations they are already carried in current_history.
+            images=images if iteration == 1 else None,
         )
 
         if not result.success or not result.final_text:
@@ -803,7 +854,16 @@ async def call_reasoning_llm_with_hitl(
         # user turn with the answers.
         if current_history is None:
             current_history = []
-        current_history.append({"role": "user", "content": current_prompt})
+        # Preserve iteration-1's images in the replayed history so later
+        # iterations keep seeing them (call_reasoning_llm only attaches them on
+        # iteration 1's live turn).
+        if iteration == 1 and images:
+            current_history.append({
+                "role": "user",
+                "content": [{"type": "text", "text": current_prompt}, *images],
+            })
+        else:
+            current_history.append({"role": "user", "content": current_prompt})
         current_history.append({"role": "assistant", "content": result.final_text})
 
         answers_md = format_answers_md(

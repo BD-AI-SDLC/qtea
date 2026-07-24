@@ -169,8 +169,10 @@ def main(page: ft.Page):
     # ── File pickers (registered ONCE as page services) ──────────────────
     spec_picker = ft.FilePicker()
     sut_picker = ft.FilePicker()
+    context_image_picker = ft.FilePicker()
     page.services.append(spec_picker)
     page.services.append(sut_picker)
+    page.services.append(context_image_picker)
 
     # ── Timer task for live elapsed updates ──────────────────────────────
 
@@ -258,6 +260,7 @@ def main(page: ft.Page):
             from_step=_state.from_step,
             ui_mode=True,
             operator_context=_state.operator_context or None,
+            operator_context_images=list(_state.operator_context_images) or None,
         )
 
         # Capture the Flet event loop so bridges running work on the worker
@@ -535,6 +538,7 @@ def main(page: ft.Page):
     @_safe_handler
     def on_context_skip() -> None:
         _state.operator_context = ""
+        _state.operator_context_images = []
         on_start_pipeline()
 
     @_safe_handler
@@ -656,6 +660,7 @@ def main(page: ft.Page):
                                     _state,
                                     on_context_skip,
                                     on_context_continue,
+                                    context_image_picker,
                                 ),
                                 "/context",
                             )
