@@ -21,7 +21,8 @@
       "Read(//c/Users/ets1wz/AppData/Local/npm-cache/_npx/86170c4cd1c5da32/node_modules/**)",
       "Bash(mkdir -p 'C:\\\\Users\\\\ets1wz/.qtea/mcp')",
       "Bash(echo \"NPM_EXIT=$?\")",
-      "Bash(./.venv/Scripts/qtea.exe doctor *)"
+      "Bash(./.venv/Scripts/qtea.exe doctor *)",
+      "Bash(./.venv/Scripts/qtea.exe --help)"
     ],
     "additionalDirectories": [
       "C:\\Users\\ets1wz\\.qtea\\20260709-083909-223772",
@@ -29,13 +30,35 @@
     ]
   },
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"$CLAUDE_PROJECT_DIR/tools/check_no_secret_exposure.py\" --hook-mode"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write",
         "hooks": [
           {
             "type": "command",
-            "command": "python tools/check_no_sut_tokens.py --hook-mode"
+            "command": "python \"$CLAUDE_PROJECT_DIR/tools/check_no_sut_tokens.py\" --hook-mode"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR/.venv/Scripts/python.exe\" -m pytest \"$CLAUDE_PROJECT_DIR/tests/unit/\" --collect-only -q --no-header 2>&1 | tail -5",
+            "timeout": 30,
+            "statusMessage": "Checking test collection (imports/fixtures)..."
           }
         ]
       }

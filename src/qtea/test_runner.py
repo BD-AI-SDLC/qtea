@@ -37,12 +37,17 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-from qtea.logging_setup import get_logger
+from qtea.logging_setup import get_logger, mask_secret_values
 from qtea.md_parser import slugify
 from qtea.proxy import safe_subprocess_env
 from qtea.stack_profile import PYTHON_VENV_MANAGERS, StackProfile, wrap_command
 
 log = get_logger(__name__)
+
+
+def _mask_opt(text: str | None) -> str | None:
+    """`mask_secret_values` for an Optional[str] field."""
+    return mask_secret_values(text) if text else text
 
 
 # ---------------------------------------------------------------------------
@@ -126,16 +131,24 @@ class TestRunEntry:
     runner_failure: dict | None = None
 
     def as_dict(self) -> dict:
+        # `message`/`traceback`/`stdout`/`stderr` are raw text captured
+        # verbatim from the framework under test — they can echo request
+        # headers, cookies, or storage-state fragments the SUT itself
+        # printed on failure. This is the single point every parser
+        # (pytest, Playwright, Cypress, JUnit/Surefire, Robot) funnels
+        # through before the fields reach run-results.json, the HTML
+        # report, and the bug classifier, so mask here rather than at
+        # each of those downstream readers.
         return {
             "id": self.id,
             "name": self.name,
             "file": self.file,
             "status": self.status,
             "duration_s": self.duration_s,
-            "message": self.message,
-            "traceback": self.traceback,
-            "stdout": self.stdout,
-            "stderr": self.stderr,
+            "message": _mask_opt(self.message),
+            "traceback": _mask_opt(self.traceback),
+            "stdout": _mask_opt(self.stdout),
+            "stderr": _mask_opt(self.stderr),
             "attachments": self.attachments,
             "runner_failure": self.runner_failure,
         }
@@ -1816,7 +1829,8 @@ def prepare_sut_env(
     # invoke subsequent commands via its bin dir directly (equivalent to
     # activating the venv) — bypasses poetry's slower venv resolution.
     swapped = profile
-    if profile and profile.venv_path:
+    _pm = (profile.package_manager or "").lower() if profile else ""
+    if profile and profile.venv_path and _pm in PYTHON_VENV_MANAGERS:
         venv_abs = cwd / profile.venv_path
         if venv_abs.exists():
             bin_dir = str(venv_abs / ("Scripts" if os.name == "nt" else "bin"))

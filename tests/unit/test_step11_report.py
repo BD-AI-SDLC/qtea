@@ -173,12 +173,83 @@ def test_summary_uses_totals_when_present(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# advisory_findings — Step 8 shadow-judge findings surfaced in the report
+# ---------------------------------------------------------------------------
+
+
+def test_build_report_advisory_findings_absent_when_no_shadow_files(tmp_path: Path):
+    ctx = _ctx(tmp_path)
+    _seed(ctx, results=_sample_results())
+    report = build_report(ctx.workspace)
+    assert report.advisory_findings == {}
+
+
+def test_build_report_reads_assertion_judge_shadow(tmp_path: Path):
+    ctx = _ctx(tmp_path)
+    _seed(ctx, results=_sample_results())
+    s8 = ctx.workspace.step_dir(8)
+    shadow = {
+        "summary": {"mode": "shadow", "total": 2, "flagged": 1, "ok": 1},
+        "verdicts": [
+            {"test": "test_login_invalid_password", "verifies_intent": False,
+             "binds_oracle": False, "weakness": "missing_oracle",
+             "reasoning": "Only checks banner visibility, not its text."},
+            {"test": "test_login_valid", "verifies_intent": True,
+             "binds_oracle": True, "weakness": "none"},
+        ],
+    }
+    (s8 / "assertion-judge-shadow.json").write_text(json.dumps(shadow), encoding="utf-8")
+    report = build_report(ctx.workspace)
+    assert report.advisory_findings["assertion"]["summary"]["flagged"] == 1
+    assert "purpose_fidelity" not in report.advisory_findings
+
+
+def test_build_report_reads_both_shadow_judges(tmp_path: Path):
+    ctx = _ctx(tmp_path)
+    _seed(ctx, results=_sample_results())
+    s8 = ctx.workspace.step_dir(8)
+    (s8 / "assertion-judge-shadow.json").write_text(
+        json.dumps({"summary": {"mode": "shadow", "total": 1, "flagged": 0, "ok": 1},
+                    "verdicts": []}),
+        encoding="utf-8",
+    )
+    (s8 / "purpose-fidelity-shadow.json").write_text(
+        json.dumps({"summary": {"mode": "shadow", "total": 1, "flagged": 1, "ok": 0},
+                    "verdicts": [{"method": "getDiscountRate", "pom": "TrialPage",
+                                  "fulfills_purpose": False, "weakness": "stub_or_noop"}]}),
+        encoding="utf-8",
+    )
+    report = build_report(ctx.workspace)
+    assert "assertion" in report.advisory_findings
+    assert "purpose_fidelity" in report.advisory_findings
+    assert report.advisory_findings["purpose_fidelity"]["verdicts"][0]["method"] == "getDiscountRate"
+
+
+def test_to_dict_validates_against_schema_with_advisory_findings(tmp_path: Path):
+    ctx = _ctx(tmp_path)
+    _seed(ctx, results=_sample_results(), bugs=[_sample_bug(ctx.workspace.run_id)])
+    s8 = ctx.workspace.step_dir(8)
+    (s8 / "assertion-judge-shadow.json").write_text(
+        json.dumps({"summary": {"mode": "shadow", "total": 1, "flagged": 1, "ok": 0},
+                    "verdicts": [{"test": "test_x", "verifies_intent": False,
+                                  "binds_oracle": False, "weakness": "tautology"}]}),
+        encoding="utf-8",
+    )
+    report = build_report(ctx.workspace)
+    data = to_dict(report)
+    ok, err = is_valid(data, "report-data")
+    assert ok, err
+    assert data["advisory_findings"]["assertion"]["summary"]["flagged"] == 1
+
+
+# ---------------------------------------------------------------------------
 # html_renderer tests
 # ---------------------------------------------------------------------------
 
 
 def _make_report(
     results=None, bugs=None, plan=None, strategy=None, run_id="test-run",
+    advisory_findings=None,
 ) -> RunReport:
     rr = _run_results(results)
     br = _bug_reports(run_id, bugs)
@@ -190,6 +261,7 @@ def _make_report(
         run_results=rr,
         bug_reports=br,
         summary=_compute_summary(rr, br),
+        advisory_findings=advisory_findings or {},
     )
 
 
@@ -209,6 +281,87 @@ def test_render_html_zero_failures():
     html = render_html(report)
     assert "100%" in html
     assert "#22c55e" in html
+
+
+def test_render_html_no_advisory_section_when_nothing_flagged():
+    """Most runs won't have flagged findings — the section must not render
+    empty clutter (no heading, no card) when there's nothing to show."""
+    report = _make_report(
+        results=_sample_results(),
+        advisory_findings={
+            "assertion": {"summary": {"mode": "shadow", "total": 1, "flagged": 0, "ok": 1},
+                          "verdicts": [{"test": "test_x", "verifies_intent": True,
+                                        "binds_oracle": True, "weakness": "none"}]},
+        },
+    )
+    html = render_html(report)
+    assert "Advisory Findings" not in html
+
+
+def test_render_html_shows_flagged_assertion_findings():
+    report = _make_report(
+        results=_sample_results(),
+        advisory_findings={
+            "assertion": {
+                "summary": {"mode": "shadow", "total": 1, "flagged": 1, "ok": 0},
+                "verdicts": [{
+                    "test": "test_login_invalid_password", "verifies_intent": False,
+                    "binds_oracle": False, "weakness": "missing_oracle",
+                    "reasoning": "Only checks banner visibility, not its text.",
+                }],
+            },
+        },
+    )
+    html = render_html(report)
+    assert "Advisory Findings" in html
+    assert "test_login_invalid_password" in html
+    assert "missing_oracle" in html
+    assert "#fef3c7" in html  # amber advisory palette, distinct from bug cards
+
+
+def test_render_html_shows_flagged_sequence_findings():
+    """A verdict can have perfect assertions (weakness: none) yet still be
+    flagged for skipping a required act-phase step before asserting."""
+    report = _make_report(
+        results=_sample_results(),
+        advisory_findings={
+            "assertion": {
+                "summary": {"mode": "shadow", "total": 1, "flagged": 1, "ok": 0},
+                "verdicts": [{
+                    "test": "test_complete_checkout", "verifies_intent": True,
+                    "binds_oracle": True, "weakness": "none",
+                    "sequence_complete": False,
+                    "missing_steps": ["CheckoutPage.clickPlaceOrder (order 5) never called"],
+                    "reasoning": "Stops after filling the address; never places the order.",
+                }],
+            },
+        },
+    )
+    html = render_html(report)
+    assert "Advisory Findings" in html
+    assert "test_complete_checkout" in html
+    assert "missing steps" in html
+    assert "CheckoutPage.clickPlaceOrder (order 5) never called" in html
+
+
+def test_render_html_shows_flagged_purpose_fidelity_findings():
+    report = _make_report(
+        results=_sample_results(),
+        advisory_findings={
+            "purpose_fidelity": {
+                "summary": {"mode": "shadow", "total": 1, "flagged": 1, "ok": 0},
+                "verdicts": [{
+                    "method": "getDiscountRate", "pom": "TrialPage",
+                    "fulfills_purpose": False, "weakness": "stub_or_noop",
+                    "reasoning": "Method returns a hardcoded constant.",
+                }],
+            },
+        },
+    )
+    html = render_html(report)
+    assert "Advisory Findings" in html
+    assert "TrialPage.getDiscountRate" in html
+    assert "stub_or_noop" in html
 
 
 def test_render_html_includes_bug_cards():

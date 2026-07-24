@@ -13,6 +13,8 @@ from qtea.steps.base import (
     StepContext,
     StepResult,
     _agent_failure_placeholder,
+    _extract_agent_prior_investigation,
+    _finalize_truncated_agent,
     _record_aux_agent,
     _run_debug_rca,
     _run_fix_proposal,
@@ -276,6 +278,7 @@ async def test_fix_proposal_invoked_on_double_failure(tmp_path: Path):
     with patch("qtea.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
         mock_agent.return_value = type("R", (), {
             "success": False, "final_text": "mock analysis", "error": None,
+            "hit_max_turns": False,
         })()
         result = await step.execute(ctx)
 
@@ -333,6 +336,7 @@ async def test_run_fix_proposal_writes_files(tmp_path: Path):
     with patch("qtea.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
         mock_agent.return_value = type("R", (), {
             "success": False, "final_text": "analysis text", "error": None,
+            "hit_max_turns": False,
         })()
         path = await _run_fix_proposal(
             42, ctx, "# Step 42 failure\n\nSomething broke",
@@ -354,13 +358,19 @@ async def test_run_fix_proposal_writes_files(tmp_path: Path):
 
 
 def _mock_result(*, success: bool, final_text: str = "", error: str | None = None,
-                 transcript_path: Path | None = None):
-    """Build a duck-typed AgentResult stand-in for tests that mock run_agent."""
+                 transcript_path: Path | None = None, hit_max_turns: bool = False):
+    """Build a duck-typed AgentResult stand-in for tests that mock run_agent.
+
+    ``hit_max_turns`` defaults to False so pre-existing tests keep their
+    semantics; turn-cap tests must set it True to exercise the finalizer
+    salvage path in _run_debug_rca / _run_fix_proposal.
+    """
     return type("R", (), {
         "success": success,
         "final_text": final_text,
         "error": error,
         "transcript_path": transcript_path,
+        "hit_max_turns": hit_max_turns,
     })()
 
 
@@ -409,12 +419,15 @@ def test_agent_failure_placeholder_truncates_long_final_text():
     assert out.count("x") < 5000
 
 
-async def test_run_debug_rca_writes_placeholder_on_turn_cap(tmp_path: Path):
+async def test_run_debug_rca_writes_placeholder_when_finalizer_cannot_salvage(tmp_path: Path):
     """Regression: run 20260701-114656-9394eb saw the SDK cut off the debug
     agent at ``max_turns`` and its last ``AssistantMessage`` block (pre-
     tool-call thinking, ``\"Let me check X\"``) was written verbatim to
-    ``step-NN-attemptM-debug-rca.md`` as if it were the RCA. Now the code
-    must emit a labelled placeholder instead.
+    ``step-NN-attemptM-debug-rca.md`` as if it were the RCA. The code
+    now attempts a finalizer salvage first; when NO transcript exists to
+    salvage from (this test's mocked run_agent never writes one), the
+    salvage must degrade gracefully to the labelled placeholder — never
+    promote the pre-tool thinking as the RCA.
     """
     ctx = _ctx(tmp_path, no_fix=True)
 
@@ -423,6 +436,7 @@ async def test_run_debug_rca_writes_placeholder_on_turn_cap(tmp_path: Path):
             success=False,
             final_text="Now I have a complete picture. Let me also quickly check the `tbd` function.",
             error="sdk error: Reached maximum number of turns (10) | api: ...",
+            hit_max_turns=True,
         )
         out_path = await _run_debug_rca(
             9, ctx, "# Step 9 failure\n\nsomething broke", attempt=2,
@@ -569,8 +583,10 @@ async def test_run_debug_rca_uses_config_max_turns_and_timeout(tmp_path: Path):
     assert call.kwargs["max_turns"] == DEBUG_AGENT_MAX_TURNS
     assert call.kwargs["timeout_s"] == DEBUG_AGENT_TIMEOUT_S
     # Defaults must be materially higher than the old 10 / 300 to close the
-    # regression — treat this as the design guarantee.
-    assert DEBUG_AGENT_MAX_TURNS >= 20
+    # regression — treat this as the design guarantee. Bumped further to
+    # 60 after run 20260709-083909-223772 exhausted 40 turns on a Step 9
+    # broken-import investigation.
+    assert DEBUG_AGENT_MAX_TURNS >= 40
     assert DEBUG_AGENT_TIMEOUT_S >= 600
 
 
@@ -595,8 +611,68 @@ async def test_run_fix_proposal_uses_config_max_turns_and_timeout(tmp_path: Path
     for call in mock_agent.await_args_list:
         assert call.kwargs["max_turns"] == FIX_AGENT_MAX_TURNS
         assert call.kwargs["timeout_s"] == FIX_AGENT_TIMEOUT_S
-    assert FIX_AGENT_MAX_TURNS >= 20
+    assert FIX_AGENT_MAX_TURNS >= 30
     assert FIX_AGENT_TIMEOUT_S >= 600
+
+
+async def test_run_fix_proposal_grants_pipeline_source_read(tmp_path: Path):
+    """critical-thinking and principal-software-engineer must get the same
+    read-only pipeline-source + workspace-root grant as the debug agent, so
+    they can verify the RCA's Affected Surface instead of trusting it blindly
+    (see agents/critical-thinking.agent.md, agents/principal-software-engineer.agent.md)."""
+    import qtea
+
+    qtea_pkg_src = Path(qtea.__file__).resolve().parent
+
+    ctx = _ctx(tmp_path)
+    seeded_rca = tmp_path / "seeded-rca.md"
+    seeded_rca.write_text("# Real RCA\n\nroot cause", encoding="utf-8")
+
+    with patch("qtea.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
+        mock_agent.return_value = _mock_result(success=True, final_text="ok")
+        await _run_fix_proposal(
+            42, ctx, "# ctx",
+            result=StepResult(success=False, status="failed", outputs=[], error="fail"),
+            debug_rca_path=seeded_rca,
+        )
+
+    assert mock_agent.await_count == 2
+    for call in mock_agent.await_args_list:
+        add_dirs = call.kwargs["add_dirs"]
+        add_dirs_set = {Path(d).resolve() for d in add_dirs}
+        assert qtea_pkg_src in add_dirs_set
+        assert ctx.workspace.root.resolve() in add_dirs_set
+        prompt = call.kwargs["user_prompt"]
+        assert "no filesystem access" not in prompt.lower()
+        assert "will fail" not in prompt.lower()
+
+
+async def test_run_fix_proposal_pipeline_source_opt_out(tmp_path: Path, monkeypatch):
+    """`QTEA_FIX_NO_PIPELINE_SRC=1` withholds the package-source grant for the
+    fix chain, independently of `QTEA_DEBUG_NO_PIPELINE_SRC`."""
+    import qtea
+
+    qtea_pkg_src = Path(qtea.__file__).resolve().parent
+    monkeypatch.setenv("QTEA_FIX_NO_PIPELINE_SRC", "1")
+
+    ctx = _ctx(tmp_path)
+    seeded_rca = tmp_path / "seeded-rca.md"
+    seeded_rca.write_text("# Real RCA\n\nroot cause", encoding="utf-8")
+
+    with patch("qtea.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
+        mock_agent.return_value = _mock_result(success=True, final_text="ok")
+        await _run_fix_proposal(
+            42, ctx, "# ctx",
+            result=StepResult(success=False, status="failed", outputs=[], error="fail"),
+            debug_rca_path=seeded_rca,
+        )
+
+    assert mock_agent.await_count == 2
+    for call in mock_agent.await_args_list:
+        add_dirs = call.kwargs["add_dirs"]
+        add_dirs_set = {Path(d).resolve() for d in add_dirs}
+        assert qtea_pkg_src not in add_dirs_set
+        assert ctx.workspace.root.resolve() in add_dirs_set
 
 
 async def test_aggregated_rca_not_overwritten_by_smaller_content(tmp_path: Path):
@@ -653,10 +729,12 @@ async def test_aggregated_rca_overwritten_when_new_is_larger(tmp_path: Path):
     assert prior_rca.read_text(encoding="utf-8") == larger_text
 
 
-async def test_run_fix_proposal_eng_placeholder_on_turn_cap(tmp_path: Path):
-    """Principal-eng hitting turn cap must not ship its pre-tool thinking
-    as ``fix-proposal.md``. Placeholder header + upstream RCA + strategy
-    embedded so the operator still has a manual hand-off path.
+async def test_run_fix_proposal_eng_placeholder_when_finalizer_cannot_salvage(tmp_path: Path):
+    """Principal-eng hitting turn cap fires the finalizer; when the
+    finalizer itself has nothing to salvage from (no transcript on disk
+    because run_agent is mocked and never wrote one), the code must fall
+    back to the labelled placeholder + upstream RCA + strategy — never
+    ship the pre-tool thinking as the proposal.
     """
     ctx = _ctx(tmp_path)
     seeded_rca = tmp_path / "seeded-rca.md"
@@ -670,6 +748,7 @@ async def test_run_fix_proposal_eng_placeholder_on_turn_cap(tmp_path: Path):
                 success=False,
                 final_text="Let me check the transcript log for the actual test code.",
                 error="sdk error: Reached maximum number of turns (25) | api: ...",
+                hit_max_turns=True,
             ),
         ]
         proposal_path = await _run_fix_proposal(
@@ -705,6 +784,7 @@ async def test_fix_proposal_uses_debug_rca_when_available(tmp_path: Path):
     with patch("qtea.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
         mock_agent.return_value = type("R", (), {
             "success": False, "final_text": "strategy text", "error": None,
+            "hit_max_turns": False,
         })()
         await _run_fix_proposal(
             42, ctx, "# raw failure context",
@@ -826,6 +906,7 @@ async def test_fix_proposal_writes_two_aux_records(tmp_path: Path):
     with patch("qtea.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
         mock_agent.return_value = type("R", (), {
             "success": True, "final_text": "text", "error": None,
+            "hit_max_turns": False,
         })()
         await _run_fix_proposal(
             42, ctx, "# ctx",
@@ -856,6 +937,7 @@ async def test_double_failure_produces_debug_ct_pse_aux_rows(tmp_path: Path):
     with patch("qtea.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
         mock_agent.return_value = type("R", (), {
             "success": True, "final_text": "text", "error": None,
+            "hit_max_turns": False,
         })()
         await step.execute(ctx)
 
@@ -1089,3 +1171,428 @@ def test_html_renderer_no_aux_section_when_empty():
 
     html = render_html(report)
     assert "Fix Chain" not in html
+
+
+# ---------------------------------------------------------------------------
+# Finalizer tests — turn-cap salvage via bounded synthesis sub-invocation.
+# ---------------------------------------------------------------------------
+
+
+def _write_fake_transcript(workdir: Path, events: list[dict]) -> Path:
+    """Write a fake transcript-00.jsonl into workdir/logs/, mirroring the
+    real run_agent layout."""
+    logs = workdir / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    path = logs / "transcript-00.jsonl"
+    with path.open("w", encoding="utf-8") as f:
+        for evt in events:
+            import json as _json
+            f.write(_json.dumps(evt) + "\n")
+    return path
+
+
+def test_extract_prior_investigation_returns_none_when_no_transcript(tmp_path: Path):
+    """Empty workdir → no transcript → salvage impossible → returns None
+    so the caller falls through to the placeholder path."""
+    workdir = tmp_path / "empty"
+    workdir.mkdir()
+    assert _extract_agent_prior_investigation(workdir) is None
+
+
+def test_extract_prior_investigation_returns_none_when_transcript_empty(tmp_path: Path):
+    """Zero-event transcript is unusable — return None so we don't ship an
+    empty prior-investigation.md to the finalizer (which would then
+    fabricate a full report from nothing)."""
+    workdir = tmp_path / "empty-transcript"
+    _write_fake_transcript(workdir, [])
+    assert _extract_agent_prior_investigation(workdir) is None
+
+
+def test_extract_prior_investigation_tolerates_malformed_lines(tmp_path: Path):
+    """A single garbled line must not sink the whole extraction — real
+    transcripts occasionally have a truncated final line."""
+    workdir = tmp_path / "mixed"
+    logs = workdir / "logs"
+    logs.mkdir(parents=True)
+    path = logs / "transcript-00.jsonl"
+    path.write_text(
+        '{"type":"AssistantMessage","message":{"content":[{"type":"text","text":"good line"}]}}\n'
+        '{"type":"AssistantMessage","message":{"content":[{"type":"text","tex\n'  # truncated JSON
+        '{"type":"ResultMessage","result":"end_turn"}\n',
+        encoding="utf-8",
+    )
+    result = _extract_agent_prior_investigation(workdir)
+    assert result is not None
+    assert "good line" in result
+    assert "end_turn" in result
+
+
+def test_extract_prior_investigation_preserves_assistant_thinking_and_tool_use(tmp_path: Path):
+    """The finalizer's evidence base needs the agent's own thinking prose
+    AND its tool_use calls (name + inputs), so the salvage pass can
+    synthesize what the agent found without re-running any tools."""
+    workdir = tmp_path / "rich"
+    _write_fake_transcript(workdir, [
+        {"type": "SystemMessage", "subtype": "init"},
+        {"type": "AssistantMessage", "message": {"content": [
+            {"type": "text", "text": "I need to check the failing test's stack trace."},
+            {"type": "tool_use", "name": "Read",
+             "input": {"file_path": "/ws/artifacts/step09/run-results.json"}},
+        ]}},
+        {"type": "UserMessage", "message": {"content": [
+            {"type": "tool_result", "content": [
+                {"type": "text", "text": "The stack trace shows a missing import path."},
+            ]},
+        ]}},
+        {"type": "AssistantMessage", "message": {"content": [
+            {"type": "text", "text": "Root cause is the nested-directory path bug."},
+        ]}},
+    ])
+    result = _extract_agent_prior_investigation(workdir)
+    assert result is not None
+    assert "I need to check the failing test" in result
+    assert "tool_use `Read`" in result
+    assert "run-results.json" in result  # tool input preserved
+    assert "The stack trace shows a missing import path" in result
+    assert "Root cause is the nested-directory path bug" in result
+
+
+def test_extract_prior_investigation_trims_to_budget(tmp_path: Path):
+    """Very large transcripts get trimmed tail-first (oldest entries dropped)
+    so the newest — most-recently-concluded — thinking survives."""
+    workdir = tmp_path / "huge"
+    events = []
+    for i in range(500):
+        events.append({
+            "type": "AssistantMessage",
+            "message": {"content": [{"type": "text", "text": f"turn {i} thinking " + ("x" * 500)}]},
+        })
+    _write_fake_transcript(workdir, events)
+    result = _extract_agent_prior_investigation(workdir, max_bytes=20_000)
+    assert result is not None
+    assert len(result.encode("utf-8")) <= 20_000
+    # Newest survives; oldest dropped.
+    assert "turn 499" in result
+    assert "turn 0 thinking" not in result
+
+
+async def test_finalizer_no_prior_transcript_returns_none(tmp_path: Path):
+    """When no transcript exists on disk to synthesize from, the finalizer
+    must return None so the caller can fall back to the placeholder — it
+    must NEVER invoke run_agent on empty evidence."""
+    agent_path = tmp_path / "fake.agent.md"
+    agent_path.write_text("# Fake agent", encoding="utf-8")
+    parent = tmp_path / "parent"
+    parent.mkdir()
+
+    with patch("qtea.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
+        result = await _finalize_truncated_agent(
+            agent_path=agent_path,
+            parent_workdir=parent,
+            expected_filename="debug-rca.md",
+            output_path=tmp_path / "out.md",
+            agent_label="fake.agent",
+            failure_context="# ctx\n\nbroken",
+            add_dirs=None,
+        )
+
+    assert result is None
+    assert mock_agent.await_count == 0  # never invoked on empty evidence
+
+
+async def test_finalizer_writes_output_when_agent_produces_expected_file(tmp_path: Path):
+    """Happy path: transcript exists, finalizer runs, agent writes
+    ./debug-rca.md — the file is copied to the caller's output_path."""
+    agent_path = tmp_path / "fake.agent.md"
+    agent_path.write_text("# Fake agent", encoding="utf-8")
+    parent = tmp_path / "parent"
+    _write_fake_transcript(parent, [
+        {"type": "AssistantMessage", "message": {"content": [
+            {"type": "text", "text": "The failing import path is wrong."},
+        ]}},
+    ])
+
+    async def fake_run_agent(*args, **kwargs):
+        # The finalizer creates its workdir under parent/finalize; simulate
+        # the agent writing its expected output there.
+        workdir = kwargs["workdir"]
+        (workdir / "debug-rca.md").write_text(
+            "# RCA (from finalizer)\n\nSynthesized from prior investigation.",
+            encoding="utf-8",
+        )
+        return _mock_result(success=True, final_text="")
+
+    out_path = tmp_path / "out.md"
+    with patch("qtea.steps.base.run_agent", new=fake_run_agent):
+        result = await _finalize_truncated_agent(
+            agent_path=agent_path,
+            parent_workdir=parent,
+            expected_filename="debug-rca.md",
+            output_path=out_path,
+            agent_label="fake.agent",
+            failure_context="# ctx",
+            add_dirs=None,
+        )
+
+    assert result == out_path
+    assert out_path.exists()
+    content = out_path.read_text(encoding="utf-8")
+    assert "RCA (from finalizer)" in content
+    # Confirm the prior-investigation was staged for the agent.
+    prior = parent / "finalize" / "prior-investigation.md"
+    assert prior.exists()
+    assert "The failing import path is wrong" in prior.read_text(encoding="utf-8")
+
+
+async def test_finalizer_promotes_final_text_when_agent_inlines_output(tmp_path: Path):
+    """Second-preference path: agent didn't write the file but returned
+    success=True with useful final_text — that text becomes the artifact."""
+    agent_path = tmp_path / "fake.agent.md"
+    agent_path.write_text("# Fake agent", encoding="utf-8")
+    parent = tmp_path / "parent"
+    _write_fake_transcript(parent, [
+        {"type": "AssistantMessage", "message": {"content": [
+            {"type": "text", "text": "Prior thinking."},
+        ]}},
+    ])
+
+    out_path = tmp_path / "out.md"
+    with patch("qtea.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
+        mock_agent.return_value = _mock_result(
+            success=True, final_text="# Inlined RCA\n\nHere it is."
+        )
+        result = await _finalize_truncated_agent(
+            agent_path=agent_path,
+            parent_workdir=parent,
+            expected_filename="debug-rca.md",
+            output_path=out_path,
+            agent_label="fake.agent",
+            failure_context="# ctx",
+            add_dirs=None,
+        )
+
+    assert result == out_path
+    assert out_path.read_text(encoding="utf-8") == "# Inlined RCA\n\nHere it is."
+
+
+async def test_finalizer_returns_none_when_own_invocation_fails(tmp_path: Path):
+    """If the finalizer sub-invocation itself hits turn cap / errors and
+    produces neither file nor final_text, return None so the caller
+    surfaces a proper labelled placeholder."""
+    agent_path = tmp_path / "fake.agent.md"
+    agent_path.write_text("# Fake agent", encoding="utf-8")
+    parent = tmp_path / "parent"
+    _write_fake_transcript(parent, [
+        {"type": "AssistantMessage", "message": {"content": [
+            {"type": "text", "text": "Prior thinking."},
+        ]}},
+    ])
+
+    with patch("qtea.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
+        mock_agent.return_value = _mock_result(
+            success=False, final_text="", hit_max_turns=True,
+            error="Reached maximum number of turns (8)",
+        )
+        result = await _finalize_truncated_agent(
+            agent_path=agent_path,
+            parent_workdir=parent,
+            expected_filename="debug-rca.md",
+            output_path=tmp_path / "out.md",
+            agent_label="fake.agent",
+            failure_context="# ctx",
+            add_dirs=None,
+        )
+
+    assert result is None
+
+
+async def test_finalizer_gracefully_handles_run_agent_exception(tmp_path: Path):
+    """A raised exception during finalizer sub-invocation (e.g. transport
+    error) must not propagate — return None so the outer placeholder
+    path still runs."""
+    agent_path = tmp_path / "fake.agent.md"
+    agent_path.write_text("# Fake agent", encoding="utf-8")
+    parent = tmp_path / "parent"
+    _write_fake_transcript(parent, [
+        {"type": "AssistantMessage", "message": {"content": [
+            {"type": "text", "text": "Prior thinking."},
+        ]}},
+    ])
+
+    with patch(
+        "qtea.steps.base.run_agent",
+        new=AsyncMock(side_effect=RuntimeError("transport dead")),
+    ):
+        result = await _finalize_truncated_agent(
+            agent_path=agent_path,
+            parent_workdir=parent,
+            expected_filename="debug-rca.md",
+            output_path=tmp_path / "out.md",
+            agent_label="fake.agent",
+            failure_context="# ctx",
+            add_dirs=None,
+        )
+
+    assert result is None
+
+
+async def test_run_debug_rca_invokes_finalizer_on_hit_max_turns_and_salvages(tmp_path: Path):
+    """End-to-end wiring: when the debug agent hits max_turns AND a real
+    transcript exists on disk, the finalizer runs and its synthesis
+    output becomes debug-rca.md — the placeholder path is skipped.
+    """
+    ctx = _ctx(tmp_path, no_fix=True)
+
+    call_count = {"n": 0}
+
+    async def fake_run_agent(*args, **kwargs):
+        call_count["n"] += 1
+        workdir = kwargs["workdir"]
+        if call_count["n"] == 1:
+            # Primary invocation: write a transcript to disk (like real
+            # run_agent would), then return turn-cap failure.
+            _write_fake_transcript(workdir, [
+                {"type": "AssistantMessage", "message": {"content": [
+                    {"type": "text", "text": "Investigation found broken import path."},
+                    {"type": "tool_use", "name": "Read",
+                     "input": {"file_path": "/some/test.spec.ts"}},
+                ]}},
+            ])
+            return _mock_result(
+                success=False,
+                final_text="Now let me check one more thing…",
+                error="Reached maximum number of turns (60)",
+                hit_max_turns=True,
+            )
+        # Finalizer invocation: write the salvaged RCA.
+        (workdir / "debug-rca.md").write_text(
+            "# Salvaged RCA\n\nRoot cause per prior investigation: broken import.",
+            encoding="utf-8",
+        )
+        return _mock_result(success=True, final_text="")
+
+    with patch("qtea.steps.base.run_agent", new=fake_run_agent):
+        out_path = await _run_debug_rca(
+            9, ctx, "# Step 9 failure\n\nimport path broken", attempt=2,
+        )
+
+    assert out_path is not None
+    content = out_path.read_text(encoding="utf-8")
+    # Salvaged content wins — NOT the placeholder header.
+    assert "agent failed to produce artifact" not in content
+    assert "Salvaged RCA" in content
+    assert "broken import" in content
+    # Both invocations happened.
+    assert call_count["n"] == 2
+
+
+async def test_run_debug_rca_skips_finalizer_when_not_turn_cap(tmp_path: Path):
+    """Non-turn-cap failures (timeout / storm / crash) should NOT trigger
+    the finalizer — the transcript is likely empty or aborted, and
+    spending another LLM call on it is wasted. Placeholder is the right
+    outcome here."""
+    ctx = _ctx(tmp_path, no_fix=True)
+
+    with patch("qtea.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
+        mock_agent.return_value = _mock_result(
+            success=False,
+            final_text="",
+            error="timeout after 900s",
+            hit_max_turns=False,  # explicitly NOT a turn-cap failure
+        )
+        out_path = await _run_debug_rca(9, ctx, "# ctx", attempt=2)
+
+    # Exactly ONE run_agent call — no finalizer sub-invocation.
+    assert mock_agent.await_count == 1
+    content = out_path.read_text(encoding="utf-8")
+    assert content.startswith("# debug.agent — agent failed to produce artifact")
+
+
+async def test_debug_prompt_includes_budget_awareness(tmp_path: Path):
+    """The debug user_prompt must tell the agent about its turn budget and
+    when to start writing — a self-managed budget is cheaper insurance
+    than the salvage pass."""
+    ctx = _ctx(tmp_path, no_fix=True)
+
+    with patch("qtea.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
+        mock_agent.return_value = _mock_result(success=True, final_text="rca")
+        await _run_debug_rca(9, ctx, "# ctx", attempt=1)
+
+    prompt = mock_agent.await_args_list[0].kwargs["user_prompt"]
+    assert "Turn budget" in prompt
+    # A specific turn number for the "start writing" checkpoint must be
+    # present so the model has an unambiguous cue.
+    from qtea.config import DEBUG_AGENT_MAX_TURNS
+    assert str(DEBUG_AGENT_MAX_TURNS) in prompt
+    assert str(int(DEBUG_AGENT_MAX_TURNS * 0.75)) in prompt
+
+
+# ---------------------------------------------------------------------------
+# Back-edge suppression — when a step queues a replay (e.g. Step 9 -> 8),
+# the failure-diagnosis aux agents (debug RCA + CT + PSE) must NOT fire.
+# The replay IS the fix attempt; diagnosing before it lands wastes tokens
+# on a report the operator cannot act on.
+#
+# Regression guard for run 20260709-083909-223772 where Step 9 flagged a
+# structural codegen defect (broken local import -> zero tests collected),
+# set ctx.extras["rerun_step"]=8, and Step.execute() still fired the
+# attempt-2 debug agent AND the full fix chain before the pipeline could
+# consume the back-edge.
+# ---------------------------------------------------------------------------
+
+
+class _BackEdgeFailStep(Step):
+    """Always fails and queues a Step-9->8 back-edge on ctx.extras — the
+    structural-defect signature Step 9 emits when zero tests were collected
+    or a generated import is missing."""
+
+    number = 9
+    name = "back-edge-fail"
+    timeout_s = 60
+
+    async def run(self, ctx: StepContext) -> StepResult:
+        ctx.extras["rerun_step"] = 8
+        ctx.extras["rerun_kind"] = "naming_defect"
+        return StepResult(
+            success=False,
+            status="failed",
+            outputs=[],
+            error="playwright-ts produced zero parseable test results",
+        )
+
+
+async def test_back_edge_suppresses_debug_and_fix_chain(tmp_path: Path):
+    ctx = _ctx(tmp_path)  # no_fix=False — fix chain would normally fire on final failure
+    step = _BackEdgeFailStep()
+
+    with patch("qtea.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
+        mock_agent.return_value = _mock_result(success=True, final_text="unused")
+        result = await step.execute(ctx)
+
+    assert not result.success
+    # Neither attempt-1 nor attempt-2 debug RCA, nor CT + PSE, should fire.
+    assert mock_agent.await_count == 0, (
+        "aux agents fired despite pending back-edge — labels: "
+        f"{[c.kwargs.get('agent_label') for c in mock_agent.await_args_list]}"
+    )
+    # rerun_step stays intact for the pipeline loop to consume.
+    assert ctx.extras.get("rerun_step") == 8
+
+
+async def test_back_edge_already_used_lets_aux_agents_fire(tmp_path: Path):
+    """After the pipeline consumes the back-edge (`_rerun8_used=True`), a
+    second failure is terminal — the aux agents fire so the operator gets a
+    diagnosis for the case the regen also could not fix."""
+    ctx = _ctx(tmp_path)
+    ctx.extras["_rerun8_used"] = True
+    step = _BackEdgeFailStep()
+
+    with patch("qtea.steps.base.run_agent", new_callable=AsyncMock) as mock_agent:
+        mock_agent.return_value = _mock_result(success=True, final_text="rca")
+        await step.execute(ctx)
+
+    # attempt-2 debug + critical-thinking + principal-software-engineer.
+    assert mock_agent.await_count >= 3, (
+        f"expected debug+CT+PSE (>=3 aux agent calls) once back-edge is used, "
+        f"got {mock_agent.await_count}"
+    )

@@ -112,7 +112,7 @@
               "existing_fixtures": { "type": "array" },
               "lifecycle_hooks": {
                 "type": "array",
-                "description": "Test setup/teardown hooks discovered in the SUT's own tests, classified by canonical trigger event so Step 7 can reuse them and Step 8 can regenerate them in the target framework's idiom. Populate for non-Python/TS stacks (Java @BeforeEach/@AfterEach, etc.) that Tier 1/2 can't scan. `calls` is the ordered list of method-call expressions in the hook body (e.g. ['basePage.openBaseURL','basePage.logIn']).",
+                "description": "Test setup/teardown hooks discovered in the SUT's own tests, classified by canonical trigger event so Step 7 can reuse them and Step 8 can regenerate them in the target framework's idiom. Populate for non-Python/TS stacks (Java @BeforeEach/@AfterEach, etc.) that Tier 1/2 can't scan. `calls` is the ordered list of calls in the hook body. Each item is EITHER an object `{method, args}` (preferred — captures argument expressions verbatim so Step 7 can replay them without arg-drop) OR a bare string like 'basePage.openBaseURL' (legacy shape — accepted for backward compatibility but args are unknown). New deterministic scanners always emit the object form; the LLM-augment merge normalizes strings to `{method, args: []}`.",
                 "items": {
                   "type": "object",
                   "properties": {
@@ -120,7 +120,24 @@
                     "framework_construct": { "type": ["string", "null"], "description": "Raw framework keyword/decorator, e.g. 'beforeEach', '@BeforeEach', 'setUp', '@pytest.fixture(scope=module, autouse=True)'." },
                     "file": { "type": "string", "description": "SUT-relative path to the file defining the hook." },
                     "scope": { "type": ["string", "null"] },
-                    "calls": { "type": "array", "items": { "type": "string" }, "description": "Ordered method-call expressions in the hook body." }
+                    "calls": {
+                      "type": "array",
+                      "description": "Ordered calls in the hook body. Object form `{method, args}` preserves argument expressions verbatim (e.g. args=['MENU_ITEMS.HOME'] or ['USER','PASS']). Legacy string form (bare method name) is accepted for backward compatibility with pre-existing artifacts but carries no argument information.",
+                      "items": {
+                        "oneOf": [
+                          { "type": "string", "description": "Legacy: bare method-call expression, e.g. 'basePage.logIn'. Args unknown." },
+                          {
+                            "type": "object",
+                            "required": ["method"],
+                            "additionalProperties": true,
+                            "properties": {
+                              "method": { "type": "string", "minLength": 1, "description": "Callee reference as source text, e.g. 'basePage.logIn'." },
+                              "args": { "type": "array", "items": { "type": "string" }, "description": "Ordered positional argument expressions, verbatim source text. Kwargs intentionally not captured (hook bodies use positional args)." }
+                            }
+                          }
+                        ]
+                      }
+                    }
                   },
                   "required": ["event", "file"],
                   "additionalProperties": true

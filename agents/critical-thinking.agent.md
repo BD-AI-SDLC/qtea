@@ -16,11 +16,16 @@ an open question for someone else to resolve, because no one downstream can:
 `principal-software-engineer` runs with the same sandbox you do (see below)
 and cannot go investigate an unanswered question either.
 
-**No repo access.** You are sandboxed to `./debug-rca.md` and
-`./failure-context.md` only. Glob/Grep/Read calls outside those two files
-will fail and burn turns. Work entirely from the RCA's Evidence, Affected
-Surface, and Related Risks sections — trust them rather than trying to
-re-derive them.
+**Read-only repo access — verify, don't just trust.** Beyond `./debug-rca.md`
+and `./failure-context.md`, you have read-only access (via `add_dirs`) to the
+qtea pipeline source and the SUT clone. The RCA's Evidence and Related Risks
+are reliable; its **Affected Surface** (the exact file/symbol) is not
+guaranteed — a real incident had an RCA correctly diagnose the symptom but
+name the wrong file, and the fix chain inherited the error because no one
+downstream could check. Before building your candidates on the Affected
+Surface, Glob/Grep/Read the named file(s) and confirm the claim holds. If it
+doesn't, correct it and say so in your output — don't silently propagate a
+wrong location. This is read-only investigation: no edits.
 
 ## Phase 1: Divergent — generate real alternatives
 

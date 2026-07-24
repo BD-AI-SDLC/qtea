@@ -64,14 +64,20 @@ def set_ui_prompt_hook(hook: Callable[..., tuple[str, str]] | None) -> None:
     """Install / clear the UI prompt hook.
 
     Hook signature:
-    ``hook(step, title, summary_text, *, kind="", data=None) -> tuple[str, str]``
-    where the first element is the decision (``"approve"`` / ``"reject"`` /
-    ``"edit"``) and the second is the user-typed edit instructions
-    (``""`` for non-edit decisions).
+    ``hook(step, title, summary_text, *, kind="", data=None, edit_error=None)
+    -> tuple[str, str]`` where the first element is the decision
+    (``"approve"`` / ``"reject"`` / ``"edit"``) and the second is the
+    user-typed edit instructions (``""`` for non-edit decisions).
 
     ``kind`` + ``data`` carry the structured payload (strategy / plan /
     intents dict). The UI renders a real table from ``data`` and uses
     ``summary_text`` only as a fallback for unknown kinds.
+
+    ``edit_error`` is an optional string set when the *previous* loop
+    iteration's edit was rejected (LLM failure, schema failure, or a
+    phase-gate violation) — it must be surfaced to the reviewer so a
+    rejected edit doesn't silently look like a no-op. ``None`` when the
+    previous iteration wasn't an edit, or the edit succeeded.
     """
     global _UI_PROMPT_HOOK
     _UI_PROMPT_HOOK = hook
@@ -153,6 +159,11 @@ async def review_step_4_strategy(
         log.warning("step04.review_gate.no_md", path=str(md_path))
         return True
 
+    # Set when an edit is rejected (LLM/schema failure); surfaced on the
+    # *next* render so the reviewer sees why nothing changed. Never
+    # persisted — purely a transient annotation for one render pass.
+    pending_edit_error: str | None = None
+
     while True:
         try:
             strategy = json.loads(json_path.read_text(encoding="utf-8"))
@@ -165,12 +176,15 @@ async def review_step_4_strategy(
         # only a fallback if the dialog doesn't recognise the kind.
         if _UI_PROMPT_HOOK is not None:
             summary_text = _capture_render(_render_strategy, strategy)
+            error_to_show = pending_edit_error
+            pending_edit_error = None
             decision, edit_instructions = _UI_PROMPT_HOOK(
                 step=4,
                 title="Test Design Review",
                 summary_text=summary_text,
                 kind="strategy",
                 data=strategy,
+                edit_error=error_to_show,
             )
             if decision == "reject":
                 log.info("step04.review_gate.rejected", source="ui")
@@ -180,10 +194,12 @@ async def review_step_4_strategy(
                     "step04.review_gate.ui_edit",
                     instructions_preview=edit_instructions[:80],
                 )
-                await _apply_strategy_nlp_edit(
+                result = await _apply_strategy_nlp_edit(
                     md_path, json_path, ctx, console,
                     instructions=edit_instructions,
                 )
+                if result is not None:
+                    _, pending_edit_error = result
                 # Loop back to re-show the (possibly updated) artifact;
                 # the top of the while-loop reloads JSON from disk.
                 continue
@@ -206,14 +222,14 @@ async def review_step_4_strategy(
             return False
 
         if choice == "e":
-            updated = await _apply_strategy_nlp_edit(
+            result = await _apply_strategy_nlp_edit(
                 md_path, json_path, ctx, console,
             )
         else:
-            updated = await _apply_strategy_file_edit(
+            result = await _apply_strategy_file_edit(
                 md_path, json_path, _project_strategy, ctx, console,
             )
-        if updated is None:
+        if result is None:
             return False
 
 
@@ -282,11 +298,11 @@ async def _apply_strategy_file_edit(
     project_strategy_fn,
     ctx: StepContext,
     console: Console,
-) -> dict | None:
+) -> tuple[dict, str | None] | None:
     """Open test-design.md in $EDITOR, re-project JSON on save."""
     if not _open_in_editor(md_path, console):
         console.print("[dim]file unchanged or editor failed — skipping[/]")
-        return {}  # non-None signals "stay in loop"
+        return {}, None  # non-None signals "stay in loop"
 
     return _reproject_strategy(md_path, json_path, project_strategy_fn, ctx, console)
 
@@ -297,7 +313,7 @@ async def _apply_strategy_nlp_edit(
     ctx: StepContext,
     console: Console,
     instructions: str | None = None,
-) -> dict | None:
+) -> tuple[dict, str | None] | None:
     """Apply free-text instructions to test-design.md via LLM.
 
     *instructions* is optional: ``None`` triggers the CLI ``Prompt.ask`` flow
@@ -305,6 +321,11 @@ async def _apply_strategy_nlp_edit(
     directly so the ``Prompt.ask`` is skipped — the LLM-failure recover
     prompt is also skipped on the UI path so the caller can loop back via
     the dialog instead of hanging on stdin.
+
+    Returns ``(strategy, error_reason)`` — *error_reason* is ``None`` on
+    success/no-op, or a message describing why the edit was rejected (only
+    meaningful to UI callers; CLI callers already saw it via ``console``).
+    Returns ``None`` only when the CLI user explicitly quits.
     """
     from qtea.steps.s04_strategy import _project_strategy
 
@@ -327,7 +348,7 @@ async def _apply_strategy_nlp_edit(
     assert instructions is not None
     if not instructions.strip():
         console.print("[dim]empty input — skipping edit[/]")
-        return {}
+        return {}, None
 
     agent = package_resource_root() / "agents" / "design-editor.agent.md"
     workdir = ctx.workspace.step_dir(4) / "design-editor"
@@ -346,18 +367,17 @@ async def _apply_strategy_nlp_edit(
     )
 
     if not llm_result.success or not llm_result.final_text:
-        console.print(
-            f"[red]LLM edit failed:[/] {llm_result.error or 'no output'}"
-        )
+        error_msg = f"LLM edit failed: {llm_result.error or 'no output'}"
+        console.print(f"[red]{error_msg}[/]")
         if ui_mode:
-            return {}  # loop back; the dialog re-renders the unchanged artifact
+            return {}, error_msg  # loop back; the dialog re-renders the unchanged artifact
         recover = Prompt.ask(
             r"\[r\]etry, \[q\]uit",
             choices=["r", "q"],
             default="r",
             show_choices=False,
         )
-        return None if recover == "q" else {}
+        return None if recover == "q" else ({}, None)
 
     md_path.write_text(llm_result.final_text, encoding="utf-8")
     return _reproject_strategy(
@@ -372,43 +392,47 @@ def _reproject_strategy(
     ctx: StepContext,
     console: Console,
     ui_mode: bool = False,
-) -> dict | None:
+) -> tuple[dict, str | None] | None:
     """Re-project test-design.md → .json, validate, persist.
 
     *ui_mode* suppresses the interactive ``Prompt.ask`` recover prompts so
     the worker thread doesn't hang on stdin the UI user can't reach.
+
+    Returns ``(strategy, error_reason)`` — see ``_apply_strategy_nlp_edit``.
     """
     new_md = md_path.read_text(encoding="utf-8")
     projection = project_strategy_fn(new_md)
 
     dup_ids = projection.pop("_duplicate_tc_ids", [])
     if dup_ids:
-        console.print(
-            f"[red]duplicate TC IDs:[/] {', '.join(dup_ids)}. "
+        error_msg = (
+            f"duplicate TC IDs: {', '.join(dup_ids)}. "
             f"Fix them in the markdown and retry."
         )
+        console.print(f"[red]{error_msg}[/]")
         if ui_mode:
-            return {}  # loop back; dialog re-renders the prior JSON
+            return {}, error_msg  # loop back; dialog re-renders the prior JSON
         recover = Prompt.ask(
             r"\[r\]etry file edit, \[q\]uit",
             choices=["r", "q"],
             default="r",
             show_choices=False,
         )
-        return None if recover == "q" else {}
+        return None if recover == "q" else ({}, None)
 
     ok, err = is_valid(projection, "test-design")
     if not ok:
-        console.print(f"[red]edited strategy failed schema validation:[/] {err}")
+        error_msg = f"edited strategy failed schema validation: {err}"
+        console.print(f"[red]{error_msg}[/]")
         if ui_mode:
-            return {}
+            return {}, error_msg
         recover = Prompt.ask(
             r"\[r\]etry, \[q\]uit",
             choices=["r", "q"],
             default="r",
             show_choices=False,
         )
-        return None if recover == "q" else {}
+        return None if recover == "q" else ({}, None)
 
     json_path.write_text(
         json.dumps(projection, indent=2, ensure_ascii=False), encoding="utf-8",
@@ -418,7 +442,7 @@ def _reproject_strategy(
         record.output_hashes = hash_paths(
             [p for p in json_path.parent.iterdir() if p.is_file()]
         )
-    return projection
+    return projection, None
 
 
 # ---------------------------------------------------------------------------
@@ -457,6 +481,15 @@ async def review_step_7_plan(
         log.warning("step07.review_gate.no_plan", path=str(plan_path))
         return True
 
+    # Set after a successful edit, consumed on the *next* iteration's render
+    # so the reviewer sees what the edit changed. Never persisted to
+    # plan_path — purely a transient annotation for one render pass.
+    pending_edit_note: dict | None = None
+    # Set after a rejected edit (LLM/schema/hook-gate failure), consumed the
+    # same way — surfaces WHY the plan looks unchanged instead of silently
+    # dropping the reviewer's request.
+    pending_edit_error: str | None = None
+
     while True:
         try:
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
@@ -467,12 +500,20 @@ async def review_step_7_plan(
 
         if _UI_PROMPT_HOOK is not None:
             summary_text = _capture_render(_render_plan, plan)
+            render_data = (
+                {**plan, "_recent_edit": pending_edit_note}
+                if pending_edit_note else plan
+            )
+            pending_edit_note = None
+            error_to_show = pending_edit_error
+            pending_edit_error = None
             decision, edit_instructions = _UI_PROMPT_HOOK(
                 step=7,
                 title="Code Modification Plan Review",
                 summary_text=summary_text,
                 kind="plan",
-                data=plan,
+                data=render_data,
+                edit_error=error_to_show,
             )
             if decision == "reject":
                 log.info("step07.review_gate.rejected", source="ui")
@@ -482,10 +523,15 @@ async def review_step_7_plan(
                     "step07.review_gate.ui_edit",
                     instructions_preview=edit_instructions[:80],
                 )
-                await _apply_nlp_edit(
+                _, diff_text, pending_edit_error = await _apply_nlp_edit(
                     plan, plan_path, ctx, console,
                     instructions=edit_instructions,
                 )
+                if diff_text:
+                    pending_edit_note = {
+                        "instructions": edit_instructions,
+                        "diff": diff_text,
+                    }
                 # Loop back; the top of the while-loop reloads the plan
                 # JSON from disk so we re-render the LLM-edited version.
                 continue
@@ -508,14 +554,69 @@ async def review_step_7_plan(
             return False
 
         if choice == "e":
-            edited_plan = await _apply_nlp_edit(plan, plan_path, ctx, console)
+            result = await _apply_nlp_edit(plan, plan_path, ctx, console)
+            if result is None:
+                return False
+            _, diff_text, _err = result
+            if diff_text:
+                console.print(Panel(
+                    diff_text, title="Applied changes", border_style="cyan",
+                ))
         else:
             edited_plan = await _apply_plan_file_edit(
                 plan, plan_path, step_dir, ctx, console,
             )
-        if edited_plan is None:
-            return False
+            if edited_plan is None:
+                return False
         # Loop back to re-render the updated plan and re-prompt.
+
+
+def _load_active_module_for_gate(ctx: StepContext) -> dict | None:
+    """Best-effort load of sut_inventory's active module for the hook-reuse
+    gate. Returns ``None`` (never raises) when step 6 hasn't run — callers
+    degrade to skipping the gate rather than crashing the HITL edit flow."""
+    from qtea.steps.s07_auth_prewarm import load_active_module
+
+    try:
+        return load_active_module(ctx.workspace.step_dir(6))
+    except Exception:
+        log.warning("step07.review_gate.active_module_load_failed", exc_info=True)
+        return None
+
+
+def _check_hook_gate_violations(plan: dict, active_module: dict | None) -> list[str]:
+    """Run the Step-7 phase gate against an edited plan. Delegates to the
+    SAME function the original generate-validate-retry loop uses, so an
+    edited plan is held to the identical bar as a freshly generated one."""
+    if active_module is None:
+        return []
+    from qtea.steps.s07_test_architect import _validate_plan_against_inventory
+
+    return _validate_plan_against_inventory(plan, active_module)
+
+
+def _diff_plan_markdown(old_plan: dict, new_plan: dict, workdir: Path) -> str | None:
+    """Unified-diff the markdown rendering of two plan dicts.
+
+    Persists the diff (if any) to a numbered ``plan-diff-NN.txt`` in
+    *workdir* for a permanent on-disk record, and returns it so callers can
+    surface it to the reviewer immediately. Returns ``None`` if the two
+    plans render identically.
+    """
+    from qtea.steps.s07_test_architect import _render_plan_markdown
+
+    old_md = _render_plan_markdown(old_plan)
+    new_md = _render_plan_markdown(new_plan)
+    diff_lines = list(difflib.unified_diff(
+        old_md.splitlines(), new_md.splitlines(),
+        fromfile="before", tofile="after", lineterm="",
+    ))
+    if not diff_lines:
+        return None
+    diff_text = "\n".join(diff_lines)
+    idx = len(list(workdir.glob("plan-diff-*.txt")))
+    (workdir / f"plan-diff-{idx:02d}.txt").write_text(diff_text, encoding="utf-8")
+    return diff_text
 
 
 async def _apply_nlp_edit(
@@ -524,7 +625,7 @@ async def _apply_nlp_edit(
     ctx: StepContext,
     console: Console,
     instructions: str | None = None,
-) -> dict | None:
+) -> tuple[dict, str | None, str | None] | None:
     """Apply free-text instructions to the code-modification plan via LLM.
 
     *instructions* is optional: ``None`` triggers the CLI ``Prompt.ask`` flow
@@ -532,9 +633,14 @@ async def _apply_nlp_edit(
     on the UI path the LLM-failure / schema-failure recover prompts are
     skipped (the dialog loops back so the user can retry or reject).
 
-    Returns the updated plan dict on success, ``plan`` (unchanged) for the
-    "loop back" outcomes, or ``None`` only when the CLI user explicitly quits.
-    Writes the updated JSON to *plan_path* and refreshes checkpoint hashes.
+    Returns ``(plan, diff_text, error_reason)`` — *diff_text* is a unified
+    diff of what the edit changed (``None`` if the plan is unchanged, e.g.
+    failed / rejected edits); *error_reason* is ``None`` on success/no-op or
+    a message describing why the edit was rejected (LLM failure, schema
+    failure, or a hook-reuse phase-gate violation — only meaningful to UI
+    callers, since CLI callers already saw it via ``console``). Returns
+    ``None`` only when the CLI user explicitly quits. Writes the updated
+    JSON to *plan_path* and refreshes checkpoint hashes.
     """
     ui_mode = instructions is not None
     if not ui_mode:
@@ -555,28 +661,34 @@ async def _apply_nlp_edit(
     assert instructions is not None
     if not instructions.strip():
         console.print("[dim]empty input — skipping edit[/]")
-        return plan
+        return plan, None, None
 
     agent = package_resource_root() / "agents" / "plan-editor.agent.md"
     workdir = ctx.workspace.step_dir(7) / "plan-editor"
     workdir.mkdir(parents=True, exist_ok=True)
+
+    active_module = _load_active_module_for_gate(ctx)
+    llm_inputs = {"code-modification-plan.json": json.dumps(plan, indent=2)}
+    if active_module and active_module.get("lifecycle_hooks"):
+        llm_inputs["sut_inventory.lifecycle_hooks.json"] = json.dumps(
+            active_module["lifecycle_hooks"], indent=2,
+        )
 
     console.print("[dim]applying edits…[/]")
     llm_result = await call_reasoning_llm(
         agent,
         workdir=workdir,
         user_prompt=instructions,
-        inputs={"code-modification-plan.json": json.dumps(plan, indent=2)},
+        inputs=llm_inputs,
         output_schema=load_schema("code-modification-plan"),
         step=7,
     )
 
     if not llm_result.success or not llm_result.final_text:
-        console.print(
-            f"[red]LLM edit failed:[/] {llm_result.error or 'no output'}"
-        )
+        error_msg = f"LLM edit failed: {llm_result.error or 'no output'}"
+        console.print(f"[red]{error_msg}[/]")
         if ui_mode:
-            return plan
+            return plan, None, error_msg
         recover = Prompt.ask(
             r"\[r\]etry, \[q\]uit",
             choices=["r", "q"],
@@ -585,19 +697,21 @@ async def _apply_nlp_edit(
         )
         if recover == "q":
             return None
-        return plan  # loop back, plan unchanged
+        return plan, None, None  # loop back, plan unchanged
 
     try:
         new_plan: dict = json.loads(llm_result.final_text)
     except json.JSONDecodeError as e:
-        console.print(f"[red]LLM returned unparseable JSON:[/] {e}")
-        return plan
+        error_msg = f"LLM returned unparseable JSON: {e}"
+        console.print(f"[red]{error_msg}[/]")
+        return plan, None, error_msg
 
     ok, err = is_valid(new_plan, "code-modification-plan")
     if not ok:
-        console.print(f"[red]edited plan failed schema validation:[/] {err}")
+        error_msg = f"edited plan failed schema validation: {err}"
+        console.print(f"[red]{error_msg}[/]")
         if ui_mode:
-            return plan
+            return plan, None, error_msg
         recover = Prompt.ask(
             r"\[r\]etry, \[a\]pprove anyway (risky), \[q\]uit",
             choices=["r", "a", "q"],
@@ -607,12 +721,35 @@ async def _apply_nlp_edit(
         if recover == "q":
             return None
         if recover == "a":
+            diff_text = _diff_plan_markdown(plan, new_plan, workdir)
             _persist_and_refresh_hashes(new_plan, plan_path, ctx)
-            return new_plan
-        return plan  # loop back with original plan
+            return new_plan, diff_text, None
+        return plan, None, None  # loop back with original plan
 
+    gate_violations = _check_hook_gate_violations(new_plan, active_module)
+    if gate_violations:
+        error_msg = (
+            f"edited plan failed the hook-reuse phase gate: "
+            f"{gate_violations[0]}"
+            + (f" (+{len(gate_violations) - 1} more)" if len(gate_violations) > 1 else "")
+        )
+        console.print(f"[red]{error_msg}[/]")
+        if ui_mode:
+            return plan, None, error_msg
+        recover = Prompt.ask(
+            r"\[r\]etry, \[a\]pprove anyway (risky), \[q\]uit",
+            choices=["r", "a", "q"],
+            default="r",
+            show_choices=False,
+        )
+        if recover == "q":
+            return None
+        if recover != "a":
+            return plan, None, None
+
+    diff_text = _diff_plan_markdown(plan, new_plan, workdir)
     _persist_and_refresh_hashes(new_plan, plan_path, ctx)
-    return new_plan
+    return new_plan, diff_text, None
 
 
 def _persist_and_refresh_hashes(
@@ -683,6 +820,15 @@ async def _sync_md_to_json(
     workdir = plan_path.parent / "plan-editor"
     workdir.mkdir(parents=True, exist_ok=True)
 
+    active_module = _load_active_module_for_gate(ctx)
+    llm_inputs = {
+        "code-modification-plan.json": json.dumps(current_plan, indent=2),
+    }
+    if active_module and active_module.get("lifecycle_hooks"):
+        llm_inputs["sut_inventory.lifecycle_hooks.json"] = json.dumps(
+            active_module["lifecycle_hooks"], indent=2,
+        )
+
     console.print("[dim]syncing markdown edits to plan JSON…[/]")
     llm_result = await call_reasoning_llm(
         agent,
@@ -693,11 +839,7 @@ async def _sync_md_to_json(
             "changes to the JSON plan. Preserve all fields the diff "
             "doesn't touch.\n\n```diff\n" + diff_text + "\n```"
         ),
-        inputs={
-            "code-modification-plan.json": json.dumps(
-                current_plan, indent=2,
-            ),
-        },
+        inputs=llm_inputs,
         output_schema=load_schema("code-modification-plan"),
         step=7,
     )
@@ -735,6 +877,24 @@ async def _sync_md_to_json(
             _persist_and_refresh_hashes(new_plan, plan_path, ctx)
             return new_plan
         return current_plan
+
+    gate_violations = _check_hook_gate_violations(new_plan, active_module)
+    if gate_violations:
+        console.print(
+            f"[red]synced plan failed the hook-reuse phase gate:[/] "
+            f"{gate_violations[0]}"
+            + (f" (+{len(gate_violations) - 1} more)" if len(gate_violations) > 1 else "")
+        )
+        recover = Prompt.ask(
+            r"\[r\]etry, \[a\]pprove anyway (risky), \[q\]uit",
+            choices=["r", "a", "q"],
+            default="r",
+            show_choices=False,
+        )
+        if recover == "q":
+            return None
+        if recover != "a":
+            return current_plan
 
     _persist_and_refresh_hashes(new_plan, plan_path, ctx)
     # Re-render .md from the updated JSON for consistency.
@@ -943,15 +1103,22 @@ async def review_step_8_intents(
     if not warnings:
         return True
 
+    # Set after a rejected edit (LLM/parse/count-mismatch failure), consumed
+    # on the next render so the reviewer sees why the list looks unchanged.
+    pending_edit_error: str | None = None
+
     while True:
         if _UI_PROMPT_HOOK is not None:
             summary_text = _capture_render(_render_intent_warnings, warnings)
+            error_to_show = pending_edit_error
+            pending_edit_error = None
             decision, edit_instructions = _UI_PROMPT_HOOK(
                 step=8,
                 title="TBD Intent Quality Review",
                 summary_text=summary_text,
                 kind="intents",
                 data=warnings,
+                edit_error=error_to_show,
             )
             if decision == "reject":
                 log.info("step08.intent_review_gate.rejected", source="ui")
@@ -961,12 +1128,12 @@ async def review_step_8_intents(
                     "step08.intent_review_gate.ui_edit",
                     instructions_preview=edit_instructions[:80],
                 )
-                edited = await _apply_intent_edit(
+                result = await _apply_intent_edit(
                     warnings, ctx, console,
                     instructions=edit_instructions,
                 )
-                if edited is not None:
-                    warnings = edited
+                if result is not None:
+                    warnings, pending_edit_error = result
                     ctx.extras["step8_intent_warnings"] = warnings
                 continue
             log.info(
@@ -992,10 +1159,10 @@ async def review_step_8_intents(
             log.info("step08.intent_review_gate.rejected")
             return False
 
-        edited = await _apply_intent_edit(warnings, ctx, console)
-        if edited is None:
+        result = await _apply_intent_edit(warnings, ctx, console)
+        if result is None:
             return False
-        warnings = edited
+        warnings, _err = result
         ctx.extras["step8_intent_warnings"] = warnings
 
 
@@ -1048,7 +1215,7 @@ async def _apply_intent_edit(
     ctx: StepContext,
     console: Console,
     instructions: str | None = None,
-) -> list[dict] | None:
+) -> tuple[list[dict], str | None] | None:
     """Rewrite flagged TBD intents via LLM and patch the SUT source files.
 
     *instructions* is optional: ``None`` triggers the CLI ``Prompt.ask`` flow
@@ -1056,8 +1223,11 @@ async def _apply_intent_edit(
     on the UI path the LLM-failure recover prompt is skipped (the dialog
     loops back so the user can retry or reject).
 
-    Returns the updated warnings list on success (with edited intents
-    substituted), ``warnings`` (unchanged) for "loop back" outcomes, or
+    Returns ``(warnings, error_reason)`` — the updated warnings list on
+    success (with edited intents substituted) or the unchanged ``warnings``
+    for "loop back" outcomes; *error_reason* is ``None`` on success/no-op or
+    a message describing why the edit was rejected (LLM failure, unparseable
+    JSON, entry-count mismatch — only meaningful to UI callers). Returns
     ``None`` only when the CLI user explicitly quits. Rewrites sentinel
     call-sites in the SUT sources in-place using the file:line anchors.
     """
@@ -1083,7 +1253,7 @@ async def _apply_intent_edit(
     assert instructions is not None
     if not instructions.strip():
         console.print("[dim]empty input — skipping edit[/]")
-        return warnings
+        return warnings, None
 
     agent = package_resource_root() / "agents" / "tbd-intent-editor.agent.md"
     workdir = ctx.workspace.step_dir(8) / "intent-editor"
@@ -1102,11 +1272,10 @@ async def _apply_intent_edit(
     )
 
     if not llm_result.success or not llm_result.final_text:
-        console.print(
-            f"[red]intent edit failed:[/] {llm_result.error or 'no output'}"
-        )
+        error_msg = f"intent edit failed: {llm_result.error or 'no output'}"
+        console.print(f"[red]{error_msg}[/]")
         if ui_mode:
-            return warnings
+            return warnings, error_msg
         recover = Prompt.ask(
             r"\[r\]etry, \[q\]uit",
             choices=["r", "q"],
@@ -1115,21 +1284,23 @@ async def _apply_intent_edit(
         )
         if recover == "q":
             return None
-        return warnings
+        return warnings, None
 
     try:
         edited = json.loads(llm_result.final_text)
     except json.JSONDecodeError as e:
-        console.print(f"[red]LLM returned unparseable JSON:[/] {e}")
-        return warnings
+        error_msg = f"LLM returned unparseable JSON: {e}"
+        console.print(f"[red]{error_msg}[/]")
+        return warnings, error_msg
 
     new_intents = edited.get("intents") or []
     if len(new_intents) != len(warnings):
-        console.print(
-            f"[red]editor returned {len(new_intents)} entries; expected "
-            f"{len(warnings)} — refusing to apply[/]"
+        error_msg = (
+            f"editor returned {len(new_intents)} entries; expected "
+            f"{len(warnings)} — refusing to apply"
         )
-        return warnings
+        console.print(f"[red]{error_msg}[/]")
+        return warnings, error_msg
 
     # Rewrite source files in place. We do this best-effort: if a file write
     # fails for one entry, log it and keep going for the rest.
@@ -1193,7 +1364,7 @@ async def _apply_intent_edit(
            f"({'; '.join(failed[:3])}{'…' if len(failed) > 3 else ''})"
            if failed else "")
     )
-    return updated_warnings
+    return updated_warnings, None
 
 
 _INTENT_EDITOR_SCHEMA: dict = {

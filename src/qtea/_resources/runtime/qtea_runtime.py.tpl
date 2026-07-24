@@ -2136,9 +2136,9 @@ class _RetryingLocator(_SyncLocatorBase):
         if self._retried:
             return attr
 
-        import asyncio
+        import inspect
 
-        if asyncio.iscoroutinefunction(attr):
+        if inspect.iscoroutinefunction(attr):
             async def _async_retry_wrapper(*args, **kwargs):
                 # Walk any in-bundle fallbacks first (zero-cost resilience).
                 _overlay_retried = False

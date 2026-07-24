@@ -158,3 +158,46 @@ def test_load_returns_none_on_missing_file(cache_dir):
         auth_mode="headed", probe_version=PROBE_VERSION,
     )
     assert load(key, verify_liveness=False) is None
+
+
+def test_save_prunes_entries_older_than_ttl(cache_dir, monkeypatch):
+    monkeypatch.setenv("QTEA_LIVE_MAP_CACHE_TTL_DAYS", "1")
+    old_key = CacheKey(
+        sut_hash="old", design_hash="x", base_url="https://x",
+        auth_mode="headed", probe_version=PROBE_VERSION,
+    )
+    new_key = CacheKey(
+        sut_hash="new", design_hash="x", base_url="https://x",
+        auth_mode="headed", probe_version=PROBE_VERSION,
+    )
+    with patch.object(live_map_cache, "_liveness_fingerprint", return_value="FP"):
+        old_path = save(old_key, {"routes": []})
+        assert old_path is not None
+        # Back-date the entry beyond the 1-day TTL.
+        stale_mtime = old_path.stat().st_mtime - (2 * 86400)
+        import os
+        os.utime(old_path, (stale_mtime, stale_mtime))
+        # Saving a second entry triggers the opportunistic prune sweep.
+        new_path = save(new_key, {"routes": []})
+    assert not old_path.exists()
+    assert new_path is not None and new_path.exists()
+
+
+def test_save_does_not_prune_when_ttl_disabled(cache_dir, monkeypatch):
+    monkeypatch.setenv("QTEA_LIVE_MAP_CACHE_TTL_DAYS", "0")
+    old_key = CacheKey(
+        sut_hash="old", design_hash="x", base_url="https://x",
+        auth_mode="headed", probe_version=PROBE_VERSION,
+    )
+    new_key = CacheKey(
+        sut_hash="new", design_hash="x", base_url="https://x",
+        auth_mode="headed", probe_version=PROBE_VERSION,
+    )
+    with patch.object(live_map_cache, "_liveness_fingerprint", return_value="FP"):
+        old_path = save(old_key, {"routes": []})
+        assert old_path is not None
+        stale_mtime = old_path.stat().st_mtime - (365 * 86400)
+        import os
+        os.utime(old_path, (stale_mtime, stale_mtime))
+        save(new_key, {"routes": []})
+    assert old_path.exists()

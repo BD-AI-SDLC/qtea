@@ -7,7 +7,7 @@
   "required": ["entries"],
   "additionalProperties": true,
   "properties": {
-    "run_id": { "type": "string" },
+    "run_id": { "type": ["string", "null"] },
     "produced_at": { "type": "string", "format": "date-time" },
     "entries": {
       "type": "array",
@@ -82,8 +82,8 @@
           },
           "source": {
             "type": "string",
-            "enum": ["dev_verified", "dev_unverified", "cached", "agent", "hitl", "unresolvable"],
-            "description": "Where this entry came from. `dev_verified` = supplied by the dev file AND confirmed by Playwright count()>0 at first access. `dev_unverified` = present in dev file, not yet exercised at runtime. `cached` = hit on a previous run. `agent` = LLM-resolved via `qtea resolve`. `hitl` = user-supplied via interactive prompt. `unresolvable` = resolver gave up after bounded retry."
+            "enum": ["dev", "dev-pool", "cached", "heuristic", "agent", "hitl", "unresolvable", "none"],
+            "description": "Where this entry came from. `dev` = exact constant-name match in the dev-locators file (tier 1a). `dev-pool` = fuzzy intent-pool match against the dev-locators file (tier 1b), promoted into tier 2. `cached` = hit on a previous run. `heuristic` = in-process AOM role+name match (tier 3). `agent` = LLM-resolved via `qtea resolve` (tier 4). `hitl` = user-supplied via interactive prompt. `unresolvable` = resolver gave up after bounded retry. `none` = resolution failed (tier ladder exhausted); not normally persisted as a standalone cache entry."
           },
           "page_url": {
             "type": ["string", "null"],

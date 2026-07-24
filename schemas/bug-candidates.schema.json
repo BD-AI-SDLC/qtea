@@ -15,7 +15,7 @@
           "id": { "type": "string" },
           "test_id": { "type": "string" },
           "title": { "type": "string" },
-          "file": { "type": "string" },
+          "file": { "type": ["string", "null"] },
           "status": { "type": "string", "enum": ["failed", "error"] },
           "message": { "type": ["string", "null"] },
           "traceback": { "type": ["string", "null"] },
@@ -31,7 +31,7 @@
               }
             }
           },
-          "first_seen": { "type": "string" }
+          "first_seen": { "type": ["string", "null"] }
         }
       }
     }

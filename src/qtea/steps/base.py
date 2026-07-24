@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import sys
@@ -239,6 +240,284 @@ def _agent_failure_placeholder(
     return "\n".join(lines)
 
 
+# Finalizer: bounded second sub-invocation used to salvage an agent output
+# when the primary invocation exhausted its ``max_turns`` budget without
+# writing the expected file. Turn cap is deliberately tight — this pass is
+# synthesis over the prior transcript, NOT fresh investigation. A synthesis
+# call that thinks-and-writes rarely needs more than 3-4 turns; 8 is
+# generous headroom. Timeout matches: 3 min covers a slow model + one long
+# tool result. Overridable so operators can dial it up on very large
+# transcripts. Kept separate from DEBUG/FIX agent budgets because those
+# govern the *primary* investigation pass; this governs the salvage.
+FINALIZER_MAX_TURNS: int = int(os.environ.get("QTEA_FINALIZER_MAX_TURNS", "8"))
+FINALIZER_TIMEOUT_S: int = int(os.environ.get("QTEA_FINALIZER_TIMEOUT_S", "180"))
+
+# Cap on the prior-investigation.md payload handed to the finalizer.
+# ~200 kB keeps the synthesis prompt tractable while retaining the most
+# recent thinking + tool activity. Older turns are dropped tail-first
+# (the agent's LAST N turns are what it was closest to concluding on).
+_PRIOR_INVESTIGATION_MAX_BYTES: int = 200_000
+
+
+def _extract_agent_prior_investigation(
+    workdir: Path, *, max_bytes: int = _PRIOR_INVESTIGATION_MAX_BYTES
+) -> str | None:
+    """Distill the highest-numbered transcript in ``workdir/logs/`` into a
+    compact markdown record of what the truncated agent thought, tried, and
+    saw before it ran out of turns.
+
+    The primary consumer is :func:`_finalize_truncated_agent` — the finalizer
+    reads this file as its evidence base so it can synthesize the agent's
+    output without repeating the investigation. Structure prioritizes
+    *recency* (the agent was closest to concluding on the final turns)
+    and drops older material tail-first when the size cap bites.
+
+    Returns None when no transcript exists or the file is empty/unparseable
+    — the caller then falls through to the labelled placeholder path.
+    """
+    logs_dir = workdir / "logs"
+    if not logs_dir.exists():
+        return None
+    transcripts = sorted(logs_dir.glob("transcript-*.jsonl"))
+    if not transcripts:
+        return None
+    transcript = transcripts[-1]
+
+    events: list[dict[str, Any]] = []
+    try:
+        with transcript.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return None
+    if not events:
+        return None
+
+    # Walk in reverse so we keep the newest turns when the budget bites.
+    entries: list[str] = []
+    for evt in reversed(events):
+        etype = evt.get("type")
+        if etype == "AssistantMessage":
+            msg = evt.get("message", {}) or {}
+            content = msg.get("content", [])
+            blocks: list[str] = []
+            if isinstance(content, list):
+                for c in content:
+                    if not isinstance(c, dict):
+                        continue
+                    ctype = c.get("type")
+                    if ctype == "text":
+                        text = str(c.get("text", "")).strip()
+                        if text:
+                            blocks.append(text)
+                    elif ctype == "thinking":
+                        text = str(c.get("thinking", "")).strip()
+                        if text:
+                            blocks.append(f"_[thinking]_ {text}")
+                    elif ctype == "tool_use":
+                        name = c.get("name", "?")
+                        raw_input = c.get("input", {})
+                        try:
+                            input_repr = json.dumps(raw_input)[:500]
+                        except (TypeError, ValueError):
+                            input_repr = str(raw_input)[:500]
+                        blocks.append(f"**→ tool_use `{name}`**: `{input_repr}`")
+            elif isinstance(content, str):
+                text = content.strip()
+                if text:
+                    blocks.append(text)
+            if blocks:
+                entries.append("### Assistant\n\n" + "\n\n".join(blocks))
+        elif etype == "UserMessage":
+            msg = evt.get("message", {}) or {}
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                for c in content:
+                    if not isinstance(c, dict):
+                        continue
+                    if c.get("type") == "tool_result":
+                        raw = c.get("content", "")
+                        if isinstance(raw, list):
+                            parts = []
+                            for sub in raw:
+                                if isinstance(sub, dict) and sub.get("type") == "text":
+                                    parts.append(str(sub.get("text", "")))
+                            text = "\n".join(parts).strip()
+                        else:
+                            text = str(raw).strip()
+                        if text:
+                            snippet = text if len(text) < 1500 else (text[:1500] + " …[truncated]")
+                            entries.append(f"### Tool result\n\n```\n{snippet}\n```")
+        elif etype == "ResultMessage":
+            result = evt.get("subtype") or evt.get("result", "")
+            entries.append(f"### Terminal event\n\n`{result}`")
+
+    if not entries:
+        return None
+
+    # entries are newest-first; reverse to chronological for readability.
+    entries.reverse()
+    header = (
+        f"# Prior investigation transcript summary\n\n"
+        f"Source: `{transcript}`  \n"
+        f"Total events: {len(events)}  \n"
+        f"Entries preserved: {len(entries)}\n\n"
+        f"_The primary agent invocation hit its `max_turns` budget before "
+        f"writing its expected output file. The turns below are the record "
+        f"of what it thought, tried, and saw. Use them as your evidence "
+        f"base — do NOT restart the investigation._\n\n"
+        f"---\n\n"
+    )
+    body = "\n\n".join(entries)
+    combined = header + body
+    if len(combined.encode("utf-8")) <= max_bytes:
+        return combined
+    # Trim body tail-first (keep newest turns) until under cap.
+    header_bytes = len(header.encode("utf-8"))
+    while entries and len(("\n\n".join(entries)).encode("utf-8")) + header_bytes > max_bytes:
+        entries.pop(0)
+    if not entries:
+        return header + "_(All entries dropped — transcript too large to include.)_\n"
+    body = "\n\n".join(entries)
+    return header + (
+        f"_Note: {len(events)} total events; oldest entries dropped to fit "
+        f"the {max_bytes // 1000} kB synthesis budget._\n\n---\n\n{body}"
+    )
+
+
+async def _finalize_truncated_agent(
+    *,
+    agent_path: Path,
+    parent_workdir: Path,
+    expected_filename: str,
+    output_path: Path,
+    agent_label: str,
+    failure_context: str,
+    add_dirs: list[Path] | None,
+    extra_inputs: dict[str, Path] | None = None,
+) -> Path | None:
+    """Salvage the artifact from a max_turns-exhausted agent invocation.
+
+    Fires a bounded second call to the SAME agent with the prior run's
+    transcript summary as its sole evidence base and a single mandate: read
+    the summary, synthesize the expected output, do NOT re-investigate.
+
+    This decouples INVESTIGATION budget from WRITE-UP budget — the primary
+    call blew its budget exploring the failure; the finalizer needs only
+    2-4 turns to consolidate what was found into the expected file.
+    Guarantees an artifact from tokens already spent on the primary pass
+    rather than collapsing to a labelled placeholder.
+
+    Returns the output path when the finalizer produces the expected file
+    (or a usable ``final_text``); returns None when the finalizer itself
+    fails or the prior transcript is unrecoverable — the caller then
+    falls back to :func:`_agent_failure_placeholder`.
+    """
+    if not agent_path.exists():
+        return None
+
+    prior_investigation = _extract_agent_prior_investigation(parent_workdir)
+    if not prior_investigation:
+        log.warning(
+            "finalizer.no_prior_transcript",
+            agent=agent_label,
+            workdir=str(parent_workdir),
+        )
+        return None
+
+    finalizer_workdir = parent_workdir / "finalize"
+    finalizer_workdir.mkdir(parents=True, exist_ok=True)
+
+    prior_file = finalizer_workdir / "prior-investigation.md"
+    prior_file.write_text(prior_investigation, encoding="utf-8")
+
+    context_file = finalizer_workdir / "failure-context.md"
+    context_file.write_text(failure_context, encoding="utf-8")
+
+    inputs: dict[str, Path] = {
+        "prior-investigation.md": prior_file,
+        "failure-context.md": context_file,
+    }
+    if extra_inputs:
+        for name, path in extra_inputs.items():
+            if path.exists():
+                inputs[name] = path
+
+    synthesis_prompt = (
+        "SALVAGE MODE — your previous invocation on this same failure hit "
+        f"its `max_turns` budget before writing `./{expected_filename}`. "
+        "Read `./prior-investigation.md` (your own chronological transcript "
+        "of that run — thinking, tool calls, tool results) and "
+        "`./failure-context.md` (the framing). Synthesize what you found "
+        f"into `./{expected_filename}` using the report structure from your "
+        "agent contract.\n\n"
+        "Hard rules for this pass:\n"
+        f"  • You have ONLY {FINALIZER_MAX_TURNS} turns — do not start a new "
+        "investigation. One or two targeted follow-up reads are acceptable if "
+        "the transcript points to a specific unread file; otherwise write "
+        "directly.\n"
+        f"  • If evidence for a required section is thin, say so explicitly "
+        "(\"Evidence insufficient — see prior-investigation.md above\") "
+        "rather than fabricating. A partial-but-honest report with named "
+        "unknowns is more useful than a plausible-sounding fabrication.\n"
+        f"  • Your output MUST land at `./{expected_filename}`. Do not "
+        "inline it in your final message."
+    )
+
+    try:
+        result = await run_agent(
+            agent_path,
+            workdir=finalizer_workdir,
+            inputs=inputs,
+            user_prompt=synthesis_prompt,
+            add_dirs=add_dirs,
+            timeout_s=FINALIZER_TIMEOUT_S,
+            max_turns=FINALIZER_MAX_TURNS,
+        )
+    except Exception as e:
+        log.warning(
+            "finalizer.invocation_failed",
+            agent=agent_label,
+            error=str(e),
+        )
+        return None
+
+    produced = finalizer_workdir / expected_filename
+    if produced.exists() and produced.stat().st_size > 0:
+        shutil.copy2(produced, output_path)
+        log.info(
+            "finalizer.artifact_written",
+            agent=agent_label,
+            path=str(output_path),
+            source="expected_file",
+        )
+        return output_path
+
+    if result.success and result.final_text:
+        output_path.write_text(result.final_text, encoding="utf-8")
+        log.info(
+            "finalizer.artifact_written",
+            agent=agent_label,
+            path=str(output_path),
+            source="final_text",
+        )
+        return output_path
+
+    log.warning(
+        "finalizer.no_output",
+        agent=agent_label,
+        error=result.error,
+        hit_max_turns=result.hit_max_turns,
+    )
+    return None
+
+
 def _should_run_debug_rca(ctx: StepContext, has_more_attempts: bool) -> bool:
     """Gate the debug-RCA invocation.
 
@@ -252,6 +531,47 @@ def _should_run_debug_rca(ctx: StepContext, has_more_attempts: bool) -> bool:
     if not has_more_attempts:
         return True
     return bool(getattr(ctx.options, "debug", False))
+
+
+def _back_edge_pending(ctx: StepContext) -> bool:
+    """True when the just-failed step queued a back-edge replay that the
+    pipeline has not yet consumed.
+
+    A step signals a back-edge by setting ``ctx.extras["rerun_step"] = N`` —
+    currently only Step 9 does this, when it detects a structural codegen
+    defect (zero tests collected, missing generated import) that no self-heal
+    can fix and the pipeline needs to regenerate Step N and replay downward.
+    The pipeline consumes that request once per run and sets
+    ``_rerunN_used=True`` as a cycle guard.
+
+    The back-edge IS the fix attempt. Firing the debug agent + critical-
+    thinking + principal-software-engineer fix chain BEFORE the replay wastes
+    tokens on a diagnosis the operator does not need and cannot act on. Reserve
+    those aux agents for terminal failures — no back-edge queued, or the
+    queued one has already been used once and the replay also failed.
+    """
+    target = ctx.extras.get("rerun_step")
+    if not target:
+        return False
+    return not ctx.extras.get(f"_rerun{target}_used")
+
+
+def _pipeline_and_workspace_dirs(ctx: StepContext, opt_out_env: str) -> list[Path]:
+    """Read-only ``add_dirs`` grant shared by the debug agent and the
+    fix-proposal chain: the run's workspace root (covers ``ctx.workspace.sut``,
+    ``artifacts/``, and other steps' output) plus the qtea package source,
+    unless withheld via ``opt_out_env``.
+
+    Scoped to the package dir (not the repo root) so the add_dirs quarantine
+    never touches qtea's own CLAUDE.md/.claude. Callers use distinct env vars
+    (``QTEA_DEBUG_NO_PIPELINE_SRC``, ``QTEA_FIX_NO_PIPELINE_SRC``) so an
+    operator can gate the debug step and the fix chain independently.
+    """
+    qtea_pkg_src = Path(__file__).resolve().parent.parent
+    dirs = [ctx.workspace.root]
+    if os.environ.get(opt_out_env, "").strip() not in ("1", "true", "yes"):
+        dirs.append(qtea_pkg_src)
+    return [d for d in dirs if d.exists()]
 
 
 async def _run_debug_rca(
@@ -300,13 +620,12 @@ async def _run_debug_rca(
     # when it lives in test_indexer.py) and downstream fix-proposals inherit the
     # wrong location. Granting read of the package dir lets the RCA confirm the
     # exact gate logic. Read-only by the agent's diagnosis-only contract — same
-    # add_dirs-as-read-only pattern Step 6 already uses. Scoped to the package
-    # dir (not the repo root) so the add_dirs quarantine never touches qtea's
-    # own CLAUDE.md/.claude. `QTEA_DEBUG_NO_PIPELINE_SRC=1` opts out.
+    # add_dirs-as-read-only pattern Step 6 already uses. `QTEA_DEBUG_NO_PIPELINE_SRC=1`
+    # opts out (see `_pipeline_and_workspace_dirs`).
     qtea_pkg_src = Path(__file__).resolve().parent.parent
-    _dir_candidates = [step_workdir, step_artifacts, ctx.workspace.root]
-    if os.environ.get("QTEA_DEBUG_NO_PIPELINE_SRC", "").strip() not in ("1", "true", "yes"):
-        _dir_candidates.append(qtea_pkg_src)
+    _dir_candidates = [step_workdir, step_artifacts] + _pipeline_and_workspace_dirs(
+        ctx, "QTEA_DEBUG_NO_PIPELINE_SRC"
+    )
     add_dirs = [d for d in _dir_candidates if d.exists()] or None
 
     out_path = ctx.workspace.debug / f"step-{step_num:02d}-attempt{attempt}-debug-rca.md"
@@ -366,7 +685,15 @@ async def _run_debug_rca(
                 f"location. Produce a "
                 f"structured root-cause analysis at `./debug-rca.md` "
                 f"following the Phase 1-3 protocol in your agent.md. "
-                f"Diagnosis only — do NOT edit source, fixtures, or env."
+                f"Diagnosis only — do NOT edit source, fixtures, or env.\n\n"
+                f"**Turn budget: {DEBUG_AGENT_MAX_TURNS} turns total.** "
+                f"By turn ~{int(DEBUG_AGENT_MAX_TURNS * 0.75)}, stop investigating "
+                f"and start writing `./debug-rca.md` with what you have — a "
+                f"complete report with a named unknown ('Evidence insufficient "
+                f"for X, need to read Y') is worth far more than a truncated "
+                f"one. If you hit the cap without writing the file, the "
+                f"orchestrator's salvage pass loses much of the evidence you "
+                f"gathered."
                 f"{prior_note}"
             ),
             add_dirs=add_dirs,
@@ -404,6 +731,34 @@ async def _run_debug_rca(
             path=str(out_path),
         )
         return out_path
+    # Turn-cap salvage: the primary invocation exhausted its max_turns
+    # without writing debug-rca.md. Rather than collapse to a placeholder
+    # (which loses everything the agent already thought about), fire a
+    # bounded finalizer that synthesizes the transcript into the artifact.
+    if result.hit_max_turns:
+        log.info(
+            "debug.rca_finalizer_start",
+            step=step_num,
+            attempt=attempt,
+        )
+        finalized = await _finalize_truncated_agent(
+            agent_path=agent,
+            parent_workdir=rca_workdir,
+            expected_filename="debug-rca.md",
+            output_path=out_path,
+            agent_label="debug.agent",
+            failure_context=failure_context,
+            add_dirs=add_dirs,
+            extra_inputs={"failure-context.md": context_file},
+        )
+        if finalized is not None:
+            log.info(
+                "debug.rca_finalized",
+                step=step_num,
+                attempt=attempt,
+                path=str(finalized),
+            )
+            return finalized
     placeholder = _agent_failure_placeholder(
         agent_label="debug.agent",
         result=result,
@@ -447,6 +802,15 @@ async def _run_fix_proposal(
 
     context_file = fix_workdir / "failure-context.md"
     context_file.write_text(failure_context, encoding="utf-8")
+
+    # Read-only grant so critical-thinking/principal-software-engineer can
+    # verify the debug RCA's "Affected Surface" against the real pipeline
+    # source and SUT clone instead of trusting it blindly — a documented
+    # incident had the fix-proposal name the wrong file (s08_codegen.py
+    # instead of test_indexer.py) because neither agent could check.
+    # `QTEA_FIX_NO_PIPELINE_SRC=1` opts out (see `_pipeline_and_workspace_dirs`).
+    qtea_pkg_src = Path(__file__).resolve().parent.parent
+    fix_add_dirs = _pipeline_and_workspace_dirs(ctx, "QTEA_FIX_NO_PIPELINE_SRC")
 
     debug_rca_text = ""
     if debug_rca_path is not None:
@@ -506,12 +870,23 @@ async def _run_fix_proposal(
                     user_prompt=(
                         "The debug agent has identified the root cause of a "
                         "test/step failure in ./debug-rca.md (raw failure context "
-                        "in ./failure-context.md). Think critically about HOW to "
+                        "in ./failure-context.md). Its \"Affected Surface\" "
+                        "(file/symbol) can be wrong — before reasoning about fix "
+                        "approaches, confirm it against the real code: you have "
+                        f"read-only access to the qtea pipeline source under "
+                        f"{qtea_pkg_src}/ and the SUT clone under "
+                        f"{ctx.workspace.sut}/. Think critically about HOW to "
                         "fix this problem: challenge assumptions about the fix "
                         "approach, consider alternative fixes and their tradeoffs, "
                         "and identify risks. Write your fix-strategy to "
-                        "./fix-strategy.md"
+                        "./fix-strategy.md\n\n"
+                        f"**Turn budget: {FIX_AGENT_MAX_TURNS} turns total.** "
+                        f"By turn ~{int(FIX_AGENT_MAX_TURNS * 0.75)}, stop "
+                        f"exploring and write ./fix-strategy.md — a strategy that "
+                        f"names what it couldn't verify is worth more than a "
+                        f"truncated one that never landed on disk."
                     ),
+                    add_dirs=fix_add_dirs,
                     timeout_s=FIX_AGENT_TIMEOUT_S,
                     max_turns=FIX_AGENT_MAX_TURNS,
                 ),
@@ -521,12 +896,49 @@ async def _run_fix_proposal(
                 strategy_text = strategy_file.read_text(encoding="utf-8")
             elif ct_result.success and ct_result.final_text:
                 strategy_text = ct_result.final_text
+            elif ct_result.hit_max_turns:
+                # Turn-cap salvage: synthesize the transcript into
+                # fix-strategy.md via a bounded finalizer before falling
+                # through to the placeholder path.
+                log.info("fix.strategy_finalizer_start", step=step_num)
+                finalized = await _finalize_truncated_agent(
+                    agent_path=ct_agent,
+                    parent_workdir=thinking_workdir,
+                    expected_filename="fix-strategy.md",
+                    output_path=thinking_workdir / "fix-strategy.md",
+                    agent_label="critical-thinking.agent",
+                    failure_context=failure_context,
+                    add_dirs=fix_add_dirs,
+                    extra_inputs={
+                        "debug-rca.md": ct_debug_rca,
+                        "failure-context.md": context_file,
+                    },
+                )
+                if finalized is not None and finalized.exists():
+                    strategy_text = finalized.read_text(encoding="utf-8")
+                    log.info(
+                        "fix.strategy_finalized",
+                        step=step_num,
+                        path=str(finalized),
+                    )
+                else:
+                    log.warning(
+                        "fix.strategy_placeholder_written",
+                        step=step_num,
+                        agent_error=ct_result.error,
+                        finalizer_failed=True,
+                    )
+                    strategy_text = _agent_failure_placeholder(
+                        agent_label="critical-thinking.agent",
+                        result=ct_result,
+                        failure_context=failure_context,
+                    )
             else:
-                # Turn cap / timeout / storm on the CT agent: don't promote
-                # pre-tool thinking as strategy. Emit a labelled placeholder
-                # so the eng agent sees a real diagnosis of the CT failure
-                # rather than a "Let me check X..." stub masquerading as
-                # analysis.
+                # Non-turn-cap failure (timeout / storm / crash): salvaging
+                # from an empty or aborted transcript isn't productive.
+                # Emit the labelled placeholder so the eng agent sees a
+                # real diagnosis of the CT failure rather than a
+                # "Let me check X..." stub masquerading as analysis.
                 log.warning(
                     "fix.strategy_placeholder_written",
                     step=step_num,
@@ -576,15 +988,25 @@ async def _run_fix_proposal(
                         "The debug agent's root-cause analysis is in "
                         "./debug-rca.md — its \"Affected Surface\" section is "
                         "the file/symbol list the investigation already "
-                        "confirmed; cite it directly rather than re-deriving "
-                        "it. You have no filesystem access beyond these two "
-                        "input files, so do not attempt Glob/Grep/Read calls "
-                        "outside this workdir — they will fail and only burn "
-                        "turns. The critical-thinking analysis of fix "
+                        "identified, but it can be wrong. You have read-only "
+                        f"access to the qtea pipeline source under "
+                        f"{qtea_pkg_src}/ and the SUT clone under "
+                        f"{ctx.workspace.sut}/ — use it to confirm the exact "
+                        "file and symbol before citing the Affected Surface in "
+                        "your proposal; if it doesn't hold up, correct it and "
+                        "say so. The critical-thinking analysis of fix "
                         "approaches is in ./fix-strategy.md. Produce a concrete "
                         "fix proposal at ./fix-proposal.md. Do NOT edit any "
-                        "source code directly."
+                        "source code directly — this is read-only "
+                        "investigation, and the proposal is a hand-off to the "
+                        "operator.\n\n"
+                        f"**Turn budget: {FIX_AGENT_MAX_TURNS} turns total.** "
+                        f"By turn ~{int(FIX_AGENT_MAX_TURNS * 0.75)}, stop "
+                        f"verifying and write ./fix-proposal.md — a proposal "
+                        f"that flags a remaining verification step is worth "
+                        f"more than a truncated one that never landed on disk."
                     ),
+                    add_dirs=fix_add_dirs,
                     timeout_s=FIX_AGENT_TIMEOUT_S,
                     max_turns=FIX_AGENT_MAX_TURNS,
                 ),
@@ -596,10 +1018,50 @@ async def _run_fix_proposal(
                 # Agent finished cleanly but inlined the proposal in its
                 # final message instead of writing the file. Trust it.
                 proposal_path.write_text(eng_result.final_text, encoding="utf-8")
+            elif eng_result.hit_max_turns:
+                # Turn-cap salvage: fire a bounded finalizer that
+                # synthesizes the PSE transcript into fix-proposal.md
+                # before collapsing to a placeholder-only proposal.
+                log.info("fix.eng_finalizer_start", step=step_num)
+                finalized = await _finalize_truncated_agent(
+                    agent_path=fix_agent,
+                    parent_workdir=eng_workdir,
+                    expected_filename="fix-proposal.md",
+                    output_path=proposal_path,
+                    agent_label="principal-software-engineer.agent",
+                    failure_context=failure_context,
+                    add_dirs=fix_add_dirs,
+                    extra_inputs={
+                        "debug-rca.md": eng_debug_rca,
+                        "fix-strategy.md": eng_strategy,
+                    },
+                )
+                if finalized is None:
+                    log.warning(
+                        "fix.eng_placeholder_written",
+                        step=step_num,
+                        agent_error=eng_result.error,
+                        finalizer_failed=True,
+                    )
+                    header = _agent_failure_placeholder(
+                        agent_label="principal-software-engineer.agent",
+                        result=eng_result,
+                        failure_context=failure_context,
+                    )
+                    proposal_path.write_text(
+                        f"{header}\n\n## Upstream Debug RCA\n\n{debug_rca_text}\n\n"
+                        f"## Upstream Fix Strategy\n\n{strategy_text}\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    log.info(
+                        "fix.eng_finalized",
+                        step=step_num,
+                        path=str(finalized),
+                    )
             elif not eng_result.success:
-                # Agent hit turn cap / timeout / storm before writing.
-                # `final_text` is almost always pre-tool thinking here —
-                # don't ship it as the "proposal". Emit a labelled
+                # Non-turn-cap failure (timeout / storm / crash) — nothing
+                # useful in the transcript to salvage. Emit a labelled
                 # placeholder with the upstream RCA + strategy inlined so
                 # the operator can still take the hand-off manually.
                 log.warning(
@@ -1021,8 +1483,17 @@ class Step(ABC):
         # only when this is the FINAL failure (last attempt); --debug
         # promotes it to fire on every failed attempt. See
         # `_should_run_debug_rca`.
-        if not result.success and _should_run_debug_rca(
-            ctx, has_more_attempts=record.attempts < MAX_ATTEMPTS
+        #
+        # Skipped when the step queued a back-edge replay (`_back_edge_pending`):
+        # the pipeline is about to regenerate an upstream step and re-enter
+        # this one, so a diagnosis now is premature. If the replay also fails,
+        # the guard flips and the aux agents fire on the terminal attempt.
+        if (
+            not result.success
+            and _should_run_debug_rca(
+                ctx, has_more_attempts=record.attempts < MAX_ATTEMPTS
+            )
+            and not _back_edge_pending(ctx)
         ):
             fc = _build_failure_context(self.number, self.name, record, result)
             rca = await _record_aux_agent(
@@ -1034,6 +1505,13 @@ class Step(ABC):
             )
             if rca:
                 ctx.extras[f"step{self.number}_rca_path"] = str(rca)
+        elif not result.success and _back_edge_pending(ctx):
+            log.info(
+                "step.aux_agents_skipped_back_edge",
+                step=self.number,
+                phase="debug_attempt1",
+                target=ctx.extras.get("rerun_step"),
+            )
 
         if not result.success and record.attempts < MAX_ATTEMPTS:
             # Classify the failure for audit + hint propagation. The
@@ -1179,8 +1657,12 @@ class Step(ABC):
 
             # Debug RCA on attempt-2 failure. This is always the FINAL
             # failure path (MAX_ATTEMPTS=2), so `has_more_attempts=False`.
-            if not result.success and _should_run_debug_rca(
-                ctx, has_more_attempts=False
+            # Same back-edge guard as attempt 1: if the step queued a replay,
+            # the pipeline will handle the fix — no diagnosis needed yet.
+            if (
+                not result.success
+                and _should_run_debug_rca(ctx, has_more_attempts=False)
+                and not _back_edge_pending(ctx)
             ):
                 fc = _build_failure_context(self.number, self.name, record, result)
                 rca = await _record_aux_agent(
@@ -1192,6 +1674,13 @@ class Step(ABC):
                 )
                 if rca:
                     ctx.extras[f"step{self.number}_rca_path"] = str(rca)
+            elif not result.success and _back_edge_pending(ctx):
+                log.info(
+                    "step.aux_agents_skipped_back_edge",
+                    step=self.number,
+                    phase="debug_attempt2",
+                    target=ctx.extras.get("rerun_step"),
+                )
 
             if result.success and result.status not in ("skipped",):
                 result.status = "warned"
@@ -1205,7 +1694,16 @@ class Step(ABC):
         # constituent agent (critical-thinking, principal-engineer) with
         # `_record_aux_agent` individually so each surfaces as its own row
         # in the summary table.
-        if not result.success and not getattr(ctx.options, "no_fix", False):
+        #
+        # Same back-edge guard as the debug RCA above: the fix chain has no
+        # useful input when the pipeline is about to attempt its own fix by
+        # regenerating an upstream step. It re-fires on the terminal attempt
+        # if the replay also fails.
+        if (
+            not result.success
+            and not getattr(ctx.options, "no_fix", False)
+            and not _back_edge_pending(ctx)
+        ):
             failure_context = _build_failure_context(
                 self.number, self.name, record, result
             )
@@ -1214,6 +1712,13 @@ class Step(ABC):
             await _run_fix_proposal(
                 self.number, ctx, failure_context, result,
                 debug_rca_path=debug_rca_path,
+            )
+        elif not result.success and _back_edge_pending(ctx):
+            log.info(
+                "step.aux_agents_skipped_back_edge",
+                step=self.number,
+                phase="fix_proposal",
+                target=ctx.extras.get("rerun_step"),
             )
 
         return result
@@ -1237,6 +1742,10 @@ class Step(ABC):
             except Exception as e:
                 duration = time.monotonic() - started
                 record.status = "failed"
+                # A prior attempt may have left e.g. sub_status="bugs_found"
+                # (Step 9). Clear it so a checkpoint read after this failed
+                # attempt can't be misread as the earlier attempt's outcome.
+                record.sub_status = None
                 record.finished_at = datetime.now(UTC).isoformat()
                 record.duration_s = round(duration, 3)
                 record.notes = f"unhandled exception: {e}"

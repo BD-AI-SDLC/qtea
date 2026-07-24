@@ -42,6 +42,11 @@ def _stub_aux_agents(request, monkeypatch):
         "final_text": "",
         "error": "[aux agent stubbed in unit tests]",
         "transcript_path": None,
+        # Turn-cap salvage path in _run_debug_rca / _run_fix_proposal reads
+        # this attribute; keep it False so the stub mimics a
+        # non-turn-cap failure (avoids kicking off the finalizer
+        # sub-invocation, which would need its own stubbing).
+        "hit_max_turns": False,
     })()
     monkeypatch.setattr(
         "qtea.steps.base.run_agent", AsyncMock(return_value=result),

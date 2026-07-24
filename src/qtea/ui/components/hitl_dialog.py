@@ -1443,6 +1443,49 @@ def _render_plan_fixtures(fixtures: list[dict]) -> ft.Control:
     return ft.Column(controls=rows, spacing=3, tight=True)
 
 
+def _render_plan_hooks(hooks: list[dict]) -> ft.Control:
+    """Setup/teardown lifecycle hooks (beforeEach/afterEach/etc.) — one of
+    the fields Step 8 actually consumes (``s08_codegen.py``) but which
+    previously had no visual surface in either the CLI markdown render or
+    this accordion, making hook-source edits invisible to reviewers.
+    """
+    if not hooks:
+        return ft.Text(
+            "hooks: —", size=sz(11), color=ON_SURFACE_DIM, italic=True,
+        )
+    rows: list[ft.Control] = [_plan_section_header("Hooks", len(hooks))]
+    for h in hooks:
+        src = h.get("source") or "?"
+        event = h.get("event") or "?"
+        head_children: list[ft.Control] = [
+            ft.Text("•", size=sz(12), color=ON_SURFACE_DIM, width=14),
+            _source_badge(src),
+            ft.Text(
+                event, size=sz(12), color=ON_SURFACE, selectable=True,
+                font_family="Courier New",
+            ),
+        ]
+        if src == "reuse":
+            head_children.append(ft.Text(
+                f"← {h.get('from') or '?'}", size=sz(11),
+                color=ON_SURFACE_DIM, selectable=True,
+            ))
+        rows.append(ft.Row(
+            controls=head_children, spacing=6,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER, wrap=True,
+        ))
+        calls = [c for c in (h.get("calls") or []) if isinstance(c, dict)]
+        if calls:
+            calls_str = ", ".join(
+                f"{c.get('pom')}.{c.get('method')}(...)" for c in calls
+            )
+            rows.append(ft.Container(
+                content=_plan_meta_line(f"calls: {calls_str}"),
+                padding=ft.Padding.only(left=20),
+            ))
+    return ft.Column(controls=rows, spacing=3, tight=True)
+
+
 def _render_plan_page_objects(poms: list[dict]) -> ft.Control:
     if not poms:
         return ft.Text(
@@ -1689,9 +1732,10 @@ def _render_plan_locators(locators: list[dict]) -> ft.Control:
 
 
 def _plan_tc_details_body(tc: dict) -> ft.Control:
-    """All five plan sections for one TC. Built lazily on first expand."""
+    """All plan sections for one TC. Built lazily on first expand."""
     fns = list(tc.get("test_functions") or tc.get("tests") or [])
     fixtures = list(tc.get("fixtures") or [])
+    hooks = list(tc.get("hooks") or [])
     poms = list(tc.get("page_objects") or [])
     units = list(tc.get("reusable_units") or [])
     helpers = list(tc.get("helpers") or [])
@@ -1704,10 +1748,17 @@ def _plan_tc_details_body(tc: dict) -> ft.Control:
         _render_plan_test_functions(fns),
         ft.Container(height=6),
         _render_plan_fixtures(fixtures),
+    ]
+    if hooks:
+        children.extend([
+            ft.Container(height=6),
+            _render_plan_hooks(hooks),
+        ])
+    children.extend([
         ft.Container(height=6),
         _render_plan_reusable_units(units) if units
         else _render_plan_page_objects(poms),
-    ]
+    ])
     if helpers:
         children.extend([
             ft.Container(height=6),
@@ -1724,6 +1775,7 @@ def _summarise_plan_tc(tc: dict) -> str:
     """Compact one-line counts string for the collapsed accordion header."""
     fns = list(tc.get("test_functions") or tc.get("tests") or [])
     fixtures = list(tc.get("fixtures") or [])
+    hooks = list(tc.get("hooks") or [])
     poms = list(tc.get("page_objects") or [])
     units = list(tc.get("reusable_units") or [])
     helpers = list(tc.get("helpers") or [])
@@ -1758,6 +1810,8 @@ def _summarise_plan_tc(tc: dict) -> str:
         parts.append(f"loc: {loc_r}r/{loc_t}t")
     if helpers:
         parts.append(f"helpers: {len(helpers)}")
+    if hooks:
+        parts.append(f"hooks: {len(hooks)}")
     return " · ".join(parts)
 
 
@@ -1887,6 +1941,115 @@ def _make_plan_accordion_row(
     return ft.Column(controls=children, spacing=0, tight=True)
 
 
+def _make_recent_edit_banner(recent_edit: dict) -> ft.Control:
+    """Collapsed-by-default banner showing what the last free-text edit
+    changed. ``recent_edit`` is the transient ``{"instructions", "diff"}``
+    dict review_gate.py attaches to the plan for exactly one render pass —
+    it is never persisted to ``code-modification-plan.json``.
+
+    Reuses the chevron-toggle pattern from ``_make_plan_accordion_row``.
+    """
+    instructions = str(recent_edit.get("instructions") or "").strip()
+    diff_text = str(recent_edit.get("diff") or "")
+
+    expanded = {"v": False}
+    diff_container = ft.Container(
+        content=None,
+        visible=False,
+        padding=ft.Padding.only(left=30, right=10, top=4, bottom=8),
+    )
+    chevron = ft.Icon(ft.Icons.CHEVRON_RIGHT, color=ON_SURFACE_DIM, size=sz(16))
+
+    def _toggle(_e: ft.ControlEvent) -> None:
+        expanded["v"] = not expanded["v"]
+        if expanded["v"] and diff_container.content is None:
+            diff_container.content = ft.Container(
+                content=ft.Text(
+                    diff_text,
+                    size=sz(10),
+                    font_family="Courier New",
+                    selectable=True,
+                    color=ON_SURFACE,
+                ),
+                bgcolor=BACKGROUND,
+                border=ft.Border.all(1, DIVIDER),
+                border_radius=4,
+                padding=8,
+                height=220,
+            )
+        diff_container.visible = expanded["v"]
+        chevron.name = (
+            ft.Icons.KEYBOARD_ARROW_DOWN if expanded["v"]
+            else ft.Icons.CHEVRON_RIGHT
+        )
+        try:
+            diff_container.update()
+            chevron.update()
+        except Exception:
+            pass
+
+    header_bar = ft.Container(
+        content=ft.Row(
+            controls=[
+                chevron,
+                ft.Icon(ft.Icons.CHECK_CIRCLE, color="#66BB6A", size=sz(14)),
+                ft.Text(
+                    f'Edit applied: "{instructions}"' if instructions
+                    else "Edit applied",
+                    size=sz(11),
+                    color=ON_SURFACE,
+                    max_lines=1,
+                    overflow=ft.TextOverflow.ELLIPSIS,
+                    expand=True,
+                ),
+            ],
+            spacing=8,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        ),
+        padding=ft.Padding.symmetric(horizontal=10, vertical=6),
+        on_click=_toggle,
+        ink=True,
+        bgcolor=CARD_BG,
+        border=ft.Border.all(1, DIVIDER),
+        border_radius=6,
+    )
+
+    return ft.Column(
+        controls=[header_bar, diff_container],
+        spacing=0,
+        tight=True,
+    )
+
+
+def _make_edit_error_banner(error_text: str) -> ft.Control:
+    """Banner shown when the reviewer's previous free-text edit was
+    rejected (LLM failure, schema failure, or a phase-gate violation like
+    the Step-7 hook-reuse gate). Kind-agnostic — rendered above the
+    review body regardless of "strategy" / "plan" / "intents" so it never
+    needs to touch those kind-specific renderers.
+    """
+    return ft.Container(
+        content=ft.Row(
+            controls=[
+                ft.Icon(ft.Icons.ERROR_OUTLINE, color="#EF5350", size=sz(16)),
+                ft.Text(
+                    f"Edit rejected: {error_text}",
+                    size=sz(11),
+                    color=ON_SURFACE,
+                    selectable=True,
+                    expand=True,
+                ),
+            ],
+            spacing=8,
+            vertical_alignment=ft.CrossAxisAlignment.START,
+        ),
+        padding=ft.Padding.symmetric(horizontal=10, vertical=8),
+        bgcolor=CARD_BG,
+        border=ft.Border.all(1, "#EF5350"),
+        border_radius=6,
+    )
+
+
 def _render_plan_summary(
     plan: dict,
     on_edit_submit: PerRowEditCallback | None = None,
@@ -1898,8 +2061,13 @@ def _render_plan_summary(
 
     When *on_edit_submit* is provided, each row carries an edit icon that
     opens an inline panel for instructions scoped to that TC.
+
+    If ``plan["_recent_edit"]`` is set (transient, review_gate.py-only —
+    never persisted to disk), a collapsible banner is shown above the plan
+    summarizing the last free-text edit's diff.
     """
     test_cases = list(plan.get("test_cases") or [])
+    recent_edit = plan.get("_recent_edit")
 
     # Top-level chips: module / language / framework + TC count.
     chips: list[ft.Control] = [
@@ -2010,8 +2178,16 @@ def _render_plan_summary(
         tight=True,
     )
 
+    top_controls: list[ft.Control] = []
+    if recent_edit:
+        top_controls.extend([
+            _make_recent_edit_banner(recent_edit),
+            ft.Container(height=6),
+        ])
+    top_controls.extend([header, ft.Container(height=6), accordion])
+
     return ft.Column(
-        controls=[header, ft.Container(height=6), accordion],
+        controls=top_controls,
         spacing=4,
         tight=False,
         expand=True,
@@ -2357,10 +2533,26 @@ def show_review_gate_dialog(page: ft.Page, state: AppState) -> None:
         content=ft.Container(
             content=ft.Column(
                 controls=[
-                    # Review body fills remaining vertical space.
+                    # Review body fills remaining vertical space. When the
+                    # previous edit was rejected, a kind-agnostic error
+                    # banner is stacked above it — this avoids threading
+                    # the error through _render_plan_summary /
+                    # _render_strategy_table / _render_intents_list.
                     ft.Container(
-                        content=_build_review_body(
-                            req, on_edit_submit=on_per_row_edit_submit,
+                        content=ft.Column(
+                            controls=[
+                                *([_make_edit_error_banner(req.edit_error)]
+                                  if req.edit_error else []),
+                                ft.Container(
+                                    content=_build_review_body(
+                                        req, on_edit_submit=on_per_row_edit_submit,
+                                    ),
+                                    expand=True,
+                                ),
+                            ],
+                            spacing=6,
+                            tight=True,
+                            expand=True,
                         ),
                         expand=True,
                     ),

@@ -65,6 +65,10 @@ LOG_MODEL_COLOR = "#FFD54F"
 LOG_TOKENS_COLOR = "#FF5252"
 # Orange highlight for a leading step token (e.g. "step08") in an event name.
 LOG_STEP_COLOR = "#FF9800"
+# Orange highlight for an `error=...` field on any log line (e.g. step.end
+# on a failed step) — draws the eye to the failure reason without changing
+# the INFO-level badge color.
+LOG_ERROR_FIELD_COLOR = "#FF9800"
 
 # ── Text/icon scale (Ctrl+/Ctrl- zoom) ──────────────────────────────────────
 

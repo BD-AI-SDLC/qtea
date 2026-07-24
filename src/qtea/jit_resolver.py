@@ -26,6 +26,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from qtea.logging_setup import get_logger
+from qtea.schemas import is_valid
+
+log = get_logger(__name__)
+
 # Locator-priority chain. Canonical authority for the JIT path; downstream
 # tooling (Step 7 codegen rules, Step 8 self-heal scope) honours the same
 # order. Keep in sync with CLAUDE.md § Locator priority.
@@ -448,6 +453,9 @@ def write_cache(
         "produced_at": datetime.now(UTC).isoformat(),
         "entries": safe_entries,
     }
+    ok_schema, schema_err = is_valid(payload, "locator-cache")
+    if not ok_schema:
+        log.warning("jit_resolver.locator_cache_schema_invalid", error=schema_err)
     tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(cache_path)

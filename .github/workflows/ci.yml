@@ -42,6 +42,9 @@ jobs:
       - name: Markdown size check
         run: uv run python tools/check_md_size.py
 
+      - name: SUT-token denylist check (full scan)
+        run: uv run python tools/check_no_sut_tokens.py
+
   package:
     name: "package / ${{ matrix.os }}"
     runs-on: ${{ matrix.os }}

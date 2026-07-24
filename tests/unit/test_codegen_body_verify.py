@@ -754,6 +754,147 @@ def test_body_verify_java_ignores_non_assertion_kinds(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# Bare-value assertion fallback (exact_attribute / value_equals) + AssertJ
+#
+# Regression coverage: exact_attribute/value_equals previously had NO
+# bare-assert fallback in ANY of the three stacks (only exact_count/
+# exact_text did), and Java's existing bare-fallback regex could not match
+# AssertJ's fluent `assertThat(x).isEqualTo(y)` despite the module comment
+# claiming AssertJ coverage. TS/JS had no bare-value fallback at all.
+# ---------------------------------------------------------------------------
+
+
+def test_body_verify_ts_passes_value_equals_via_bare_toBe(tmp_path: Path):
+    """A probe returning a raw (non-Locator) value, asserted via bare Jest
+    `toBe(...)`, satisfies `value_equals` — TS/JS previously had no
+    bare-value fallback at all."""
+    pom = tmp_path / "src" / "pages" / "TrialPage.ts"
+    _write(pom,
+        "export class TrialPage {\n"
+        "  async getDiscountRate(): Promise<number> {\n"
+        "    return Number(await this.page.locator(sel.DISCOUNT).textContent());\n"
+        "  }\n"
+        "}\n",
+    )
+    test = tmp_path / "tests" / "trial.spec.ts"
+    _write(test,
+        "test('discount', async ({page}) => {\n"
+        "  const pom = new TrialPage(page);\n"
+        "  expect(await pom.getDiscountRate()).toBe(EXPECTED_DISCOUNT_RATE);\n"
+        "});\n",
+    )
+    missing = [{
+        "name": "getDiscountRate", "signature": "(): Promise<number>",
+        "kind": "assertion",
+        "purpose": "Discount rate shown on the trial page matches the strategy.",
+        "acceptance_criteria": [
+            {"check": "value_equals", "expected_symbol": "EXPECTED_DISCOUNT_RATE"},
+        ],
+    }]
+    assert verify_method_bodies(
+        pom, "TrialPage", missing, test_files=[test],
+    ) == []
+
+
+def test_body_verify_python_passes_value_equals_via_bare_assert(tmp_path: Path):
+    """Python analogue: a raw-value probe asserted via bare `assert x == y`
+    satisfies `value_equals` — previously only exact_count/exact_text had
+    this fallback in Python."""
+    pom = tmp_path / "pages" / "trial_page.py"
+    _write(pom,
+        "class TrialPage:\n"
+        "    def discount_rate(self):\n"
+        "        return int(self.page.locator(DISCOUNT).text_content())\n",
+    )
+    test = tmp_path / "tests" / "qtea_trial.py"
+    _write(test,
+        "def test_discount(page):\n"
+        "    assert TrialPage(page).discount_rate() == EXPECTED_DISCOUNT_RATE\n",
+    )
+    missing = [{
+        "name": "discount_rate", "signature": "()", "kind": "assertion",
+        "purpose": "Discount rate shown on the trial page matches the strategy.",
+        "acceptance_criteria": [
+            {"check": "value_equals", "expected_symbol": "EXPECTED_DISCOUNT_RATE"},
+        ],
+    }]
+    assert verify_method_bodies(
+        pom, "TrialPage", missing, test_files=[test], language="python",
+    ) == []
+
+
+def test_body_verify_java_passes_value_equals_via_bare_assert_equals(tmp_path: Path):
+    """Java analogue: JUnit `assertEquals(EXPECTED, actual)` satisfies
+    `value_equals` — previously exact_attribute/value_equals had no bare
+    fallback in Java either, only exact_count/exact_text did."""
+    pom = tmp_path / "pages" / "TrialPage.java"
+    _write(pom,
+        "public class TrialPage {\n"
+        "    public int discountRate() {\n"
+        "        return Integer.parseInt(page.locator(sel.DISCOUNT).textContent());\n"
+        "    }\n"
+        "}\n",
+    )
+    test = tmp_path / "src" / "test" / "java" / "QteaTrialTest.java"
+    _write(test,
+        "public class QteaTrialTest {\n"
+        "    @Test\n"
+        "    void discountMatchesStrategy() {\n"
+        "        assertEquals(EXPECTED_DISCOUNT_RATE, trialPage.discountRate());\n"
+        "    }\n"
+        "}\n",
+    )
+    missing = [{
+        "name": "discountRate", "signature": "()", "kind": "assertion",
+        "purpose": "Discount rate shown on the trial page matches the strategy.",
+        "acceptance_criteria": [
+            {"check": "value_equals", "expected_symbol": "EXPECTED_DISCOUNT_RATE"},
+        ],
+    }]
+    assert verify_method_bodies(
+        pom, "TrialPage", missing, test_files=[test], language="java",
+    ) == []
+
+
+def test_body_verify_java_passes_exact_text_via_assertj_fluent(tmp_path: Path):
+    """Regression: the module comment claims AssertJ bare-asserts are
+    covered, but the pre-fix regex only matched JUnit/TestNG's
+    `assertEquals(...)` call shape — AssertJ's fluent
+    `assertThat(x).isEqualTo(y)` was silently NOT matched. Confirms it now
+    is."""
+    pom = tmp_path / "pages" / "TrialPage.java"
+    _write(pom,
+        "public class TrialPage {\n"
+        "    public String marketingConsentLabel() {\n"
+        "        return page.locator(sel.MARKETING_CONSENT_LABEL).textContent();\n"
+        "    }\n"
+        "}\n",
+    )
+    test = tmp_path / "src" / "test" / "java" / "QteaTrialTest.java"
+    _write(test,
+        "public class QteaTrialTest {\n"
+        "    @Test\n"
+        "    void marketingConsentLabelMatchesStrategy() {\n"
+        "        assertThat(trialPage.marketingConsentLabel())\n"
+        "            .isEqualTo(EXPECTED_MARKETING_CONSENT_LABEL);\n"
+        "    }\n"
+        "}\n",
+    )
+    missing = [{
+        "name": "marketingConsentLabel", "signature": "()", "kind": "assertion",
+        "purpose": "Get the marketing consent label so tests can assert exact text.",
+        "acceptance_criteria": [{
+            "check": "exact_text",
+            "locator": "MARKETING_CONSENT_LABEL",
+            "expected_symbol": "EXPECTED_MARKETING_CONSENT_LABEL",
+        }],
+    }]
+    assert verify_method_bodies(
+        pom, "TrialPage", missing, test_files=[test], language="java",
+    ) == []
+
+
+# ---------------------------------------------------------------------------
 # BodyViolation formatting
 # ---------------------------------------------------------------------------
 

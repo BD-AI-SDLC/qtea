@@ -13,15 +13,23 @@ compares its response fingerprint (ETag / Last-Modified / body SHA) to the
 fingerprint stored alongside the cache entry. This guards deployed SUTs whose
 git SHA never changes but whose content does.
 
-Two toggles:
+Three toggles:
 
   * ``QTEA_LIVE_MAP_CACHE=off`` — bypass the cache entirely.
   * ``QTEA_LIVE_MAP_CACHE_DIR=<dir>`` — override the cache location.
+  * ``QTEA_LIVE_MAP_CACHE_TTL_DAYS=<days>`` — override the prune age (default
+    30; ``<=0`` disables pruning).
 
 Cache location default: ``~/.qtea/live-map-cache/`` (workspace-independent so
 a clean workspace re-run still benefits). Storage-state files are NEVER cached
 here — they hold credentials and have their own lifecycle in
 :mod:`qtea.storage_state`.
+
+Entries are invalidated lazily on ``load()`` (fingerprint / liveness mismatch)
+but a miss never deletes the stale file, so the directory grows unbounded
+across SUT/design/URL changes. ``save()`` opportunistically sweeps the
+directory for entries older than the TTL on every write, so the cache
+self-cleans without a separate cron/CLI step.
 
 Best-effort: any error (unreadable cache file, network error on liveness probe,
 missing git) returns ``None`` and the caller re-explores. Never raises.
@@ -56,6 +64,10 @@ _DEFAULT_CACHE_ROOT = Path.home() / ".qtea" / "live-map-cache"
 
 # Cap on how long a liveness probe may run before we give up and re-explore.
 _LIVENESS_TIMEOUT_S = 5
+
+# Age after which a cache entry is pruned on the next save(). Override with
+# QTEA_LIVE_MAP_CACHE_TTL_DAYS (float days; <=0 disables pruning).
+_DEFAULT_TTL_DAYS = 30.0
 
 
 @dataclass
@@ -231,6 +243,47 @@ def load(key: CacheKey, *, verify_liveness: bool = True) -> dict[str, Any] | Non
     return live_map
 
 
+def _ttl_seconds() -> float | None:
+    """TTL in seconds from ``QTEA_LIVE_MAP_CACHE_TTL_DAYS``, or the default.
+
+    Returns ``None`` when pruning is disabled (``<=0`` days).
+    """
+    raw = (os.environ.get("QTEA_LIVE_MAP_CACHE_TTL_DAYS", "") or "").strip()
+    days = _DEFAULT_TTL_DAYS
+    if raw:
+        try:
+            days = float(raw)
+        except ValueError:
+            days = _DEFAULT_TTL_DAYS
+    if days <= 0:
+        return None
+    return days * 86400.0
+
+
+def _prune_stale(root: Path) -> None:
+    """Best-effort sweep of ``root`` for entries older than the TTL.
+
+    Age is judged by file mtime rather than the ``saved_at`` payload field —
+    cheaper (no parse) and immune to a corrupt/partial entry. Never raises;
+    any per-file error is logged and skipped.
+    """
+    ttl_s = _ttl_seconds()
+    if ttl_s is None:
+        return
+    now = time.time()
+    try:
+        entries = list(root.glob("*.json"))
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if now - entry.stat().st_mtime > ttl_s:
+                entry.unlink()
+                log.info("step07.cache.pruned", path=str(entry))
+        except OSError as e:
+            log.info("step07.cache.prune_error", path=str(entry), error=str(e))
+
+
 def save(key: CacheKey, live_map: dict[str, Any]) -> Path | None:
     """Persist ``live_map`` under ``key``. Returns the file path on success or
     ``None`` on any I/O error / disabled cache.
@@ -266,4 +319,5 @@ def save(key: CacheKey, live_map: dict[str, Any]) -> Path | None:
         log.info("step07.cache.write_error", path=str(path), error=str(e))
         return None
     log.info("step07.cache.saved", path=str(path), key=key.fingerprint)
+    _prune_stale(root)
     return path

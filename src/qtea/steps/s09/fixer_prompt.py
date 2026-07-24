@@ -40,6 +40,7 @@ def _build_fixer_prompt(
     storage_state_path: Path | None = None,
     generated_files: set[str] | None = None,
     failure_class: str | None = None,
+    failure_url: str | None = None,
 ) -> str:
     raw_snippet = (entry.traceback or entry.message or "(no traceback)")[-3000:]
     from qtea.hitl import _looks_like_secret_value
@@ -65,23 +66,41 @@ def _build_fixer_prompt(
         # workflow remains.
         from qtea import storage_state as _storage_state_mod
         storage_state_block = _storage_state_mod.summary_for_prompt(storage_state_path)
-        # Step (1) of the workflow varies based on storage-state availability.
-        # When pre-loaded, the agent skips the sign-in helper outright.
-        # When absent, the agent follows the SUT's auth flow as before.
+        # Step (1) of the workflow varies based on storage-state availability
+        # and whether we could extract the exact failure URL from the trace.
+        # When failure_url is set, the agent jumps straight there instead of
+        # reconstructing the location from the traceback (Playwright trace
+        # already recorded it — no reason to make the agent guess).
+        if failure_url:
+            nav_target = f"`{failure_url}`"
+            nav_context = (
+                " This is the exact URL the page was at when attempt 1 "
+                "failed, extracted from the Playwright trace — starting here "
+                "matches your DOM probe to the actual failure state instead "
+                "of walking there from the base URL."
+            )
+        else:
+            nav_target = (
+                "the failing page URL (reconstruct from the traceback)"
+                if storage_state_path is not None
+                else f"`{sut_base_url}`"
+            )
+            nav_context = ""
         if storage_state_path is not None:
             step_one = (
-                "(1) The browser is already authenticated via the pre-loaded "
-                "storage state described above. Call `mcp__playwright__browser_navigate` "
-                "to go directly to the failing page URL — do NOT call the SUT's "
-                "sign-in helper. (If the page redirects to login, the state "
-                "is stale: log a note and fall back to the auth-replay path "
-                "via the helpers below.) "
+                f"(1) The browser is already authenticated via the pre-loaded "
+                f"storage state described above. Call "
+                f"`mcp__playwright__browser_navigate` with {nav_target} — do "
+                f"NOT call the SUT's sign-in helper.{nav_context} (If the "
+                f"page redirects to login, the state is stale: log a note "
+                f"and fall back to the auth-replay path via the helpers "
+                f"below.) "
             )
         else:
             step_one = (
                 f"(1) Call `mcp__playwright__browser_navigate` to open "
-                f"`{sut_base_url}` and follow the SUT's auth flow via the "
-                f"existing sign-in helper above. "
+                f"{nav_target} and follow the SUT's auth flow via the "
+                f"existing sign-in helper above.{nav_context} "
             )
         live_block = (
             f"\n--- LIVE DIAGNOSIS ---\n"

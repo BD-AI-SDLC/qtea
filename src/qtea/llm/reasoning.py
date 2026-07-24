@@ -421,20 +421,23 @@ async def call_reasoning_llm(
                     "model": create_kwargs["model"],
                     "messages_count": len(messages),
                     "has_schema": output_schema is not None,
+                    "messages": messages,
                 })
                 stop_reason = getattr(response, "stop_reason", None)
-                transcript.append({
-                    "type": "response",
-                    "stop_reason": stop_reason,
-                    "id": getattr(response, "id", None),
-                    "model": getattr(response, "model", None),
-                })
 
                 # Extract final text from content blocks. Last text block wins
                 # (mirrors ``_extract_text_from_blocks`` in claude_runner).
                 for block in getattr(response, "content", []) or []:
                     if getattr(block, "type", None) == "text":
                         final_text = getattr(block, "text", "") or final_text
+
+                transcript.append({
+                    "type": "response",
+                    "stop_reason": stop_reason,
+                    "id": getattr(response, "id", None),
+                    "model": getattr(response, "model", None),
+                    "text": final_text,
+                })
 
                 # When a JSON schema was requested but server-side enforcement
                 # was unavailable (Vertex policy), the model may have wrapped

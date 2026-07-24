@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from qtea.test_runner import (
+    TestRunEntry,
     _normalize_id,
     _python_prod_files,
     audit_missing_deps,
@@ -1300,3 +1301,42 @@ def test_audit_test_file_wins_source_attribution_when_both_import(
     warnings = audit_missing_deps(sut, package_manager="poetry")
     by_module = {w["module"]: w for w in warnings}
     assert by_module["some_missing_dep"]["source_file"].endswith("tests/conftest.py")
+
+
+# ---------------------------------------------------------------------------
+# TestRunEntry.as_dict() secret masking
+# ---------------------------------------------------------------------------
+
+
+def test_as_dict_masks_token_shaped_secrets_in_captured_streams() -> None:
+    """run-results.json (and everything downstream: report, bug classifier)
+    is fed straight from ``as_dict()``. A SUT test that fails after printing
+    a real credential (e.g. a leaked GitHub token in a request header dump)
+    must not carry it verbatim into that artifact."""
+    leaked_token = "ghp_" + ("a" * 36)
+    entry = TestRunEntry(
+        id="T-1",
+        name="test_login",
+        file="test_login.py",
+        status="failed",
+        message=f"assertion failed, saw header Authorization: token {leaked_token}",
+        traceback=f"raise AssertionError('token={leaked_token}')",
+        stdout=f"request sent with {leaked_token}\n",
+        stderr=f"warning: cached {leaked_token}",
+    )
+    d = entry.as_dict()
+    for field in ("message", "traceback", "stdout", "stderr"):
+        assert leaked_token not in d[field]
+        assert "***REDACTED***" in d[field]
+
+
+def test_as_dict_leaves_none_stream_fields_as_none() -> None:
+    """No captured output shouldn't be coerced into an empty/masked string."""
+    entry = TestRunEntry(
+        id="T-1", name="test_x", file="test_x.py", status="passed",
+    )
+    d = entry.as_dict()
+    assert d["message"] is None
+    assert d["traceback"] is None
+    assert d["stdout"] is None
+    assert d["stderr"] is None

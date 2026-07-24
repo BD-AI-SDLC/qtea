@@ -171,10 +171,10 @@ def _summarize_resolver_spend(jit_cache_dir: Path) -> dict | None:
     # otherwise the consumer can compute it from input/output tokens.
     est_cost_usd: float | None = None
     try:
-        from qtea.llm.cost import estimate_cost  # type: ignore[import-not-found]
+        from qtea.pricing import estimate_cost
         for m in (models or {""}):
             est_cost_usd = (est_cost_usd or 0.0) + estimate_cost(
-                m, total_input, total_output,
+                m, input_tokens=total_input, output_tokens=total_output,
             )
     except Exception:
         est_cost_usd = None

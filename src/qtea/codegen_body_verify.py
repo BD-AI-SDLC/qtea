@@ -114,6 +114,20 @@ _TS_ASSERT_PATTERNS: dict[str, re.Pattern[str]] = {
     "boundingbox_above": re.compile(r"""boundingBox\s*\(\s*\)"""),
 }
 
+# Bare Jest/Vitest fallback — value-binding fallback when the POM probe
+# returns a raw (non-Locator) value and the test asserts on it directly
+# (`expect(await pom.getX()).toBe(EXPECTED)`) instead of a Playwright-locator
+# matcher. Mirrors Python's bare `assert x == y` / Java's `assertEquals(...)`
+# fallback below — TS/JS previously had none, despite the module's own
+# design notes describing exactly this pattern.
+_TS_ASSERT_EQ_STR = re.compile(
+    r"""\.\s*(?:toBe|toEqual|toStrictEqual)\s*\(\s*"""
+    r"""(?:(?P<q>['"`])(?P<val>[^\n]*?)(?P=q)|(?P<sym>\w[\w$]*))\s*\)""",
+)
+_TS_ASSERT_EQ_NUM = re.compile(
+    r"""\.\s*(?:toBe|toEqual|toStrictEqual)\s*\(\s*(?P<n>\d+)\s*\)""",
+)
+
 # Presence-check regex used ONLY inside the boundingbox verifier.
 _BOUNDING_Y_COMPARE = re.compile(
     r"""\.y\s*[<>]|toBeGreaterThan\s*\([^)]*\.y|toBeLessThan\s*\([^)]*\.y"""
@@ -462,25 +476,28 @@ def _verify_criterion(
                     f"(anti-pattern from run 20260708 marketing consent)"
                 )
         matches = list(pat.finditer(combined))
-        if not matches:
+        num_asserts = list(_TS_ASSERT_EQ_NUM.finditer(combined))
+        if not matches and not num_asserts:
             return f"missing toHaveCount({expected}) assertion"
-        if expected is not None and not _count_matches_expected(
-            matches, combined, expected, expected_symbol
+        if expected is not None and not (
+            _count_matches_expected(matches, combined, expected, expected_symbol)
+            or any(int(m.group("n")) == expected for m in num_asserts)
         ):
-            actual = ", ".join(_count_match_text(m) for m in matches)
+            actual = ", ".join(_count_match_text(m) for m in matches) or "bare assert"
             return f"expected toHaveCount({expected}) — got toHaveCount({actual})"
         return None
 
     if check == "exact_text":
         matches = list(pat.finditer(combined))
-        if not matches:
+        eq_matches = list(_TS_ASSERT_EQ_STR.finditer(combined))
+        if not matches and not eq_matches:
             return (
                 f"missing toHaveText assertion for expected value "
                 f"{expected_symbol or expected_literal!r}"
             )
-        if not any(
-            _match_expected(m, expected_literal, expected_symbol)
-            for m in matches
+        if not (
+            any(_match_expected(m, expected_literal, expected_symbol) for m in matches)
+            or any(_match_expected(m, expected_literal, expected_symbol) for m in eq_matches)
         ):
             return (
                 f"toHaveText present but does not reference "
@@ -496,7 +513,8 @@ def _verify_criterion(
 
     if check == "exact_attribute":
         matches = list(pat.finditer(combined))
-        if not matches:
+        eq_matches = list(_TS_ASSERT_EQ_STR.finditer(combined))
+        if not matches and not eq_matches:
             return (
                 f"missing toHaveAttribute for expected value "
                 f"{expected_symbol or expected_literal!r}"
@@ -504,8 +522,9 @@ def _verify_criterion(
         # Bind the expected value: a toHaveAttribute that asserts a DIFFERENT
         # value (or no value) does not satisfy an exact-attribute oracle
         # (finding 27 — presence-only checks that ignore the expected value).
-        if (expected_literal is not None or expected_symbol) and not any(
-            _match_expected(m, expected_literal, expected_symbol) for m in matches
+        if (expected_literal is not None or expected_symbol) and not (
+            any(_match_expected(m, expected_literal, expected_symbol) for m in matches)
+            or any(_match_expected(m, expected_literal, expected_symbol) for m in eq_matches)
         ):
             return (
                 f"toHaveAttribute present but does not reference expected value "
@@ -515,10 +534,12 @@ def _verify_criterion(
 
     if check == "value_equals":
         matches = list(pat.finditer(combined))
-        if not matches:
+        eq_matches = list(_TS_ASSERT_EQ_STR.finditer(combined))
+        if not matches and not eq_matches:
             return "missing toHaveValue assertion"
-        if (expected_literal is not None or expected_symbol) and not any(
-            _match_expected(m, expected_literal, expected_symbol) for m in matches
+        if (expected_literal is not None or expected_symbol) and not (
+            any(_match_expected(m, expected_literal, expected_symbol) for m in matches)
+            or any(_match_expected(m, expected_literal, expected_symbol) for m in eq_matches)
         ):
             return (
                 f"toHaveValue present but does not reference expected value "
@@ -715,10 +736,12 @@ def _verify_criterion_py(
 
     if check in ("exact_attribute", "value_equals"):
         matches = list(pat.finditer(combined))
-        if not matches:
+        eq_matches = list(_PY_ASSERT_EQ_STR.finditer(combined))
+        if not matches and not eq_matches:
             return f"missing {check} assertion for {expected_symbol or expected_literal!r}"
-        if has_expected and not any(
-            _match_expected(m, expected_literal, expected_symbol) for m in matches
+        if has_expected and not (
+            any(_match_expected(m, expected_literal, expected_symbol) for m in matches)
+            or any(_match_expected(m, expected_literal, expected_symbol) for m in eq_matches)
         ):
             return (
                 f"{check} present but does not reference expected value "
@@ -811,6 +834,20 @@ _JAVA_ASSERT_EQ_STR = re.compile(
 _JAVA_ASSERT_EQ_NUM = re.compile(
     r"""[Aa]ssert(?:Equals)?\s*\([^;]*?(?P<n>\d+)[^;]*?\)""",
 )
+# AssertJ fluent fallback — `assertThat(actual).isEqualTo(expected)`. The
+# comment above claims "AssertJ" is covered, but `_JAVA_ASSERT_EQ_STR`/
+# `_JAVA_ASSERT_EQ_NUM` only match the JUnit/TestNG `assertEquals(...)` call
+# shape: AssertJ's expected value lives inside a separate `.isEqualTo(...)`
+# call chained off `assertThat(...)`, which `[Aa]ssert(?:Equals)?\(` cannot
+# match (`assertThat(` is not `assert(` or `assertEquals(`). This closes
+# that gap for AssertJ's fluent idiom specifically.
+_JAVA_ASSERTTHAT_EQ_STR = re.compile(
+    r"""assertThat\s*\([^;]*?\)\s*\.\s*isEqualTo\s*\(\s*"""
+    r"""(?:"(?P<val>[^\n]*?)"|(?P<sym>[A-Za-z_]\w*))\s*\)""",
+)
+_JAVA_ASSERTTHAT_EQ_NUM = re.compile(
+    r"""assertThat\s*\([^;]*?\)\s*\.\s*isEqualTo\s*\(\s*(?P<n>\d+)\s*\)""",
+)
 _JAVA_COUNT_DRIFT = re.compile(r"""(?:>=|>)\s*(?P<n>\d+)\b""")
 _JAVA_TAUTOLOGY = re.compile(
     r"""\.size\(\)\s*[><]=?\s*0\b|\.length\s*[><]=?\s*0\b""",
@@ -852,7 +889,10 @@ def _verify_criterion_java(
                         f"'{dm.group(0)}' — count-drift (weaker than exact)"
                     )
         matches = list(pat.finditer(combined))
-        num_asserts = list(_JAVA_ASSERT_EQ_NUM.finditer(combined))
+        num_asserts = (
+            list(_JAVA_ASSERT_EQ_NUM.finditer(combined))
+            + list(_JAVA_ASSERTTHAT_EQ_NUM.finditer(combined))
+        )
         if not matches and not num_asserts:
             return f"missing hasCount({expected}) / assertEquals({expected}, ...) assertion"
         if expected is not None:
@@ -865,7 +905,10 @@ def _verify_criterion_java(
 
     if check == "exact_text":
         matches = list(pat.finditer(combined))
-        eq_matches = list(_JAVA_ASSERT_EQ_STR.finditer(combined))
+        eq_matches = (
+            list(_JAVA_ASSERT_EQ_STR.finditer(combined))
+            + list(_JAVA_ASSERTTHAT_EQ_STR.finditer(combined))
+        )
         if not matches and not eq_matches:
             return (
                 f"missing hasText / assertEquals(\"{expected_symbol or expected_literal}\") "
@@ -883,10 +926,15 @@ def _verify_criterion_java(
 
     if check in ("exact_attribute", "value_equals"):
         matches = list(pat.finditer(combined))
-        if not matches:
+        eq_matches = (
+            list(_JAVA_ASSERT_EQ_STR.finditer(combined))
+            + list(_JAVA_ASSERTTHAT_EQ_STR.finditer(combined))
+        )
+        if not matches and not eq_matches:
             return f"missing {check} assertion for {expected_symbol or expected_literal!r}"
-        if has_expected and not any(
-            _match_expected(m, expected_literal, expected_symbol) for m in matches
+        if has_expected and not (
+            any(_match_expected(m, expected_literal, expected_symbol) for m in matches)
+            or any(_match_expected(m, expected_literal, expected_symbol) for m in eq_matches)
         ):
             return (
                 f"{check} present but does not reference expected value "
