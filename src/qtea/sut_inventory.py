@@ -190,6 +190,26 @@ class AuthFlow:
 
 
 @dataclass
+class HookCall:
+    """One call expression inside a lifecycle-hook body.
+
+    `method` is the callee reference as source-text (e.g. ``"basePage.logIn"``).
+    `args` is the ordered list of positional argument expressions, each as
+    verbatim source text (e.g. ``["USERNAME", "PASSWORD"]`` or
+    ``["MENU_ITEMS.HOME"]``). Keyword arguments are intentionally not
+    captured — hook bodies use positional args almost exclusively.
+
+    Preserving args here (rather than just method names) is what lets the
+    Step-7 architect replay the reused hook without dropping arguments,
+    which would otherwise surface downstream as an ``arity_mismatch`` in
+    Step-8 codegen reconciliation.
+    """
+
+    method: str
+    args: list[str] = field(default_factory=list)
+
+
+@dataclass
 class LifecycleHook:
     """A SUT test setup/teardown hook, classified by canonical trigger event.
 
@@ -203,19 +223,20 @@ class LifecycleHook:
     | before_each  | beforeEach         | @fixture(scope="function")/auto | setUp          | @BeforeEach  |
     | after_each   | afterEach          | @fixture+yield                  | tearDown       | @AfterEach   |
 
-    `calls` is the ordered list of call expressions in the hook body (e.g.
-    ``["basePage.openBaseURL", "basePage.logIn", "basePage.goToEntityModule"]``)
-    so Step 7 can replay the SUT's canonical sequence and Step 8 can
-    regenerate it. `framework_construct` records the raw keyword/decorator for
-    traceability. A single yielding pytest fixture can produce TWO hooks (a
-    before_* from its pre-yield body and an after_* from its post-yield body).
+    `calls` is the ordered list of ``HookCall`` entries in the hook body (e.g.
+    ``[HookCall("basePage.openBaseURL"), HookCall("basePage.logIn", ["USER","PASS"])]``)
+    so Step 7 can replay the SUT's canonical sequence — including argument
+    expressions — and Step 8 can regenerate it. `framework_construct` records
+    the raw keyword/decorator for traceability. A single yielding pytest
+    fixture can produce TWO hooks (a before_* from its pre-yield body and an
+    after_* from its post-yield body).
     """
 
     event: str  # before_all | after_all | before_each | after_each
     file: str
     framework_construct: str = ""  # e.g. "beforeEach", "@pytest.fixture(scope=module)", "setUp", "@BeforeEach"
     scope: str | None = None
-    calls: list[str] = field(default_factory=list)
+    calls: list[HookCall] = field(default_factory=list)
 
 
 @dataclass
@@ -1596,12 +1617,12 @@ _PYTEST_MODULE_HOOK_EVENTS: dict[str, str] = {
 }
 
 
-def _stmt_outermost_call(stmt: ast.stmt) -> str | None:
-    """The primary call expression of a statement, as dotted source text.
+def _stmt_outermost_call_node(stmt: ast.stmt) -> ast.Call | None:
+    """The primary ``ast.Call`` node of a statement, if any.
 
     Unwraps ``Expr`` / ``Await`` / ``Assign`` / ``Return`` so that a body of
     ``await base.openBaseURL()`` / ``x = await make()`` yields the readable
-    high-level callee (``base.openBaseURL``), not the inner sub-calls.
+    high-level Call node (``base.openBaseURL(...)``), not any inner sub-call.
     """
     node: ast.AST = stmt
     if isinstance(node, ast.Expr):
@@ -1615,19 +1636,34 @@ def _stmt_outermost_call(stmt: ast.stmt) -> str | None:
     if isinstance(node, ast.Await):
         node = node.value
     if isinstance(node, ast.Call):
-        try:
-            return ast.unparse(node.func)
-        except Exception:  # pragma: no cover - defensive
-            return None
+        return node
     return None
 
 
-def _ordered_calls_from_body(body: list[ast.stmt]) -> list[str]:
-    out: list[str] = []
+def _ordered_calls_from_body(body: list[ast.stmt]) -> list[HookCall]:
+    """Extract ordered ``HookCall`` entries (method + args) from a hook body.
+
+    Positional args are captured verbatim via ``ast.unparse``; keyword args
+    are intentionally skipped — hook bodies are overwhelmingly positional,
+    and consumers that need kwargs can extend ``HookCall`` later without
+    breaking the schema.
+    """
+    out: list[HookCall] = []
     for stmt in body:
-        c = _stmt_outermost_call(stmt)
-        if c:
-            out.append(c)
+        call = _stmt_outermost_call_node(stmt)
+        if call is None:
+            continue
+        try:
+            method = ast.unparse(call.func)
+        except Exception:  # pragma: no cover - defensive
+            continue
+        args: list[str] = []
+        for arg in call.args:
+            try:
+                args.append(ast.unparse(arg))
+            except Exception:  # pragma: no cover - defensive
+                continue
+        out.append(HookCall(method=method, args=args))
         if len(out) >= _HOOK_CALLS_CAP:
             break
     return out
@@ -2001,6 +2037,85 @@ _TS_CALL_CHAIN_RE = re.compile(
 )
 
 
+def _ts_split_top_level_args(args_text: str) -> list[str]:
+    """Split a call's arg span on top-level commas, respecting nested
+    ``()`` / ``[]`` / ``{}`` and single/double/backtick string quotes so
+    that e.g. ``foo, [a, b], {x: 1}, "a, b"`` splits into 4 args.
+    Escapes inside quoted strings are honoured. Returns each arg stripped
+    of surrounding whitespace; empty arg spans (``""``) yield an empty list.
+    """
+    text = args_text.strip()
+    if not text:
+        return []
+    out: list[str] = []
+    depth_paren = depth_bracket = depth_brace = 0
+    quote: str | None = None
+    start = 0
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote is not None:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"', "`"):
+            quote = ch
+        elif ch == "(":
+            depth_paren += 1
+        elif ch == ")":
+            depth_paren -= 1
+        elif ch == "[":
+            depth_bracket += 1
+        elif ch == "]":
+            depth_bracket -= 1
+        elif ch == "{":
+            depth_brace += 1
+        elif ch == "}":
+            depth_brace -= 1
+        elif ch == "," and depth_paren == 0 and depth_bracket == 0 and depth_brace == 0:
+            out.append(text[start:i].strip())
+            start = i + 1
+        i += 1
+    tail = text[start:].strip()
+    if tail:
+        out.append(tail)
+    return out
+
+
+def _ts_call_args_span(text: str, after_open: int) -> tuple[str, int] | None:
+    """Return ``(args_text, index_past_close)`` for the args between a
+    call's ``(`` and its matching ``)``. ``after_open`` is the index of the
+    first character *after* the opening paren. Respects nested parens and
+    quoted strings so args containing nested calls / strings with parens
+    don't confuse the balancer.
+    """
+    depth = 1
+    quote: str | None = None
+    j = after_open
+    while j < len(text):
+        ch = text[j]
+        if quote is not None:
+            if ch == "\\":
+                j += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"', "`"):
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return text[after_open:j], j + 1
+        j += 1
+    return None
+
+
 def _ts_balanced_parens_after(text: str, after_open: int) -> str | None:
     """Return the text between a hook's ``(`` and its matching ``)``.
 
@@ -2022,10 +2137,20 @@ def _ts_balanced_parens_after(text: str, after_open: int) -> str | None:
     return None
 
 
-def _ts_call_chains(block: str) -> list[str]:
-    out: list[str] = []
+def _ts_call_chains(block: str) -> list[HookCall]:
+    """Extract ordered ``HookCall`` entries from a JS/TS hook body.
+
+    For each ``object.method(...)`` match, the args span is extracted via
+    paren-balanced scanning (nested calls, string literals with parens,
+    object/array literals with commas are all handled) and split on
+    top-level commas.
+    """
+    out: list[HookCall] = []
     for m in _TS_CALL_CHAIN_RE.finditer(block):
-        out.append(m.group(1))
+        method = m.group(1)
+        span = _ts_call_args_span(block, m.end())
+        args = _ts_split_top_level_args(span[0]) if span is not None else []
+        out.append(HookCall(method=method, args=args))
         if len(out) >= _HOOK_CALLS_CAP:
             break
     return out
@@ -2984,7 +3109,8 @@ def _clone_module_inventory(src: ModuleInventory) -> ModuleInventory:
             LifecycleHook(
                 event=hk.event, file=hk.file,
                 framework_construct=hk.framework_construct,
-                scope=hk.scope, calls=list(hk.calls),
+                scope=hk.scope,
+                calls=[HookCall(method=c.method, args=list(c.args)) for c in hk.calls],
             )
             for hk in src.lifecycle_hooks
         ],
@@ -3189,12 +3315,29 @@ def merge_llm_inventory(
         if key in existing_hook_keys:
             continue
         existing_hook_keys.add(key)
-        calls = hk.get("calls") or []
+        raw_calls = hk.get("calls") or []
+        normalized_calls: list[HookCall] = []
+        for c in raw_calls:
+            if isinstance(c, dict):
+                method = str(c.get("method") or "").strip()
+                if not method:
+                    continue
+                raw_args = c.get("args") or []
+                args = [
+                    str(a) for a in raw_args
+                    if isinstance(a, (str, int, float, bool))
+                ] if isinstance(raw_args, list) else []
+                normalized_calls.append(HookCall(method=method, args=args))
+            elif isinstance(c, (str, int)):
+                # Legacy string form ("<obj>.<method>") — args unknown.
+                method = str(c).strip()
+                if method:
+                    normalized_calls.append(HookCall(method=method, args=[]))
         out.lifecycle_hooks.append(LifecycleHook(
             event=event, file=str(hk["file"]),
             framework_construct=str(hk.get("framework_construct", "")),
             scope=hk.get("scope"),
-            calls=[str(c) for c in calls if isinstance(c, (str, int))],
+            calls=normalized_calls,
         ))
 
     # Navigation preconditions: LLM-only field, no deterministic producer
@@ -3338,6 +3481,7 @@ __all__ = [
     "AuthFlow",
     "Fixture",
     "Helper",
+    "HookCall",
     "LifecycleHook",
     "NavigationPrecondition",
     "LocatorClass",

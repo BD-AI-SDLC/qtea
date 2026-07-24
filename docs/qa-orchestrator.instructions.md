@@ -125,6 +125,14 @@ Nothing auto-edits — `fix-proposal.md` is a hand-off to the operator.
 Models for `debug`, `critical-thinking`, and `principal-software-engineer`
 live in `src/qtea/agent_models.yaml`.
 
+`critical-thinking` and `principal-software-engineer` get the same read-only
+`add_dirs` grant as the debug agent (qtea pipeline source + the run's
+workspace root, which covers the SUT clone) so they can verify the debug
+RCA's "Affected Surface" against the real code instead of trusting it
+blindly — still no edit capability. `QTEA_FIX_NO_PIPELINE_SRC=1` withholds
+the pipeline-source part of the grant, independently of
+`QTEA_DEBUG_NO_PIPELINE_SRC`.
+
 1. On first failure, increment `attempts` to 2, set `status: "in_progress"`.
 2. Re-invoke the same agent with the same inputs. If `--debug` was set, an
    attempt-1 debug RCA was already written.
@@ -701,6 +709,8 @@ All variables are optional unless marked **required**. Defaults are applied in `
 | `QTEA_FIX_AGENT_MAX_TURNS` | `25` | Turn budget for the `critical-thinking` fix-strategy agent. |
 | `QTEA_FIX_AGENT_TIMEOUT_S` | `600` | Wall-clock timeout for the fix-strategy agent (seconds). |
 | `QTEA_AUTOFIX_MAX_TURNS` | `40` | Turn budget for the `principal-software-engineer` fix-proposal agent. |
+| `QTEA_DEBUG_NO_PIPELINE_SRC` | unset | Set to `1`/`true`/`yes` to withhold the debug agent's read-only grant of the qtea pipeline source (keeps the workspace-root grant). |
+| `QTEA_FIX_NO_PIPELINE_SRC` | unset | Same as above, scoped to `critical-thinking` + `principal-software-engineer` — independent of `QTEA_DEBUG_NO_PIPELINE_SRC`. |
 
 ### Step 7 — Live Explore
 

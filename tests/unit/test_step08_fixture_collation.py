@@ -21,8 +21,10 @@ from pathlib import Path
 
 from qtea.steps.s08_codegen import (
     _create_fixtures,
+    _create_helpers,
     _FixtureTask,
     _group_fixture_tasks_by_file,
+    _HelperTask,
 )
 
 
@@ -260,3 +262,129 @@ def test_create_fixtures_restores_prior_content_on_syntax_error(
     ))
     assert results == [("tests/fixtures/z.py", False)]
     assert target.read_text(encoding="utf-8") == prior
+
+
+def test_create_fixtures_uses_playwright_idiom_for_ts_target(
+    tmp_path: Path, monkeypatch,
+):
+    """Regression for run 20260709-083909-223772: `_create_fixtures` told
+    the LLM to write a "pytest fixture" / "valid Python" even when the
+    target was `tests/pageFixtures.ts`, so the LLM wrote literal
+    `@pytest.fixture def ...` into a `.ts` file and reconciliation failed
+    every attempt. The prompt must be stack-aware and the `existing_file`
+    input key must carry the target's real extension."""
+    tasks = [_FixtureTask(name="notificationInboxPage", at="tests/pageFixtures.ts")]
+    sut_root = tmp_path / "sut"
+    workdir = tmp_path / "wd"
+    agents_root = tmp_path / "agents"
+    for p in (sut_root, workdir, agents_root):
+        p.mkdir()
+    (agents_root / "codegen-pom-extender.agent.md").write_text("agent", encoding="utf-8")
+
+    captured: dict = {}
+
+    async def _stub(agent_path, *, workdir, user_prompt, inputs, step, timeout_s, max_tokens):
+        captured["prompt"] = user_prompt
+        captured["input_keys"] = set(inputs.keys())
+        return _StubResult(
+            success=True,
+            final_text=(
+                "import { test as base } from '@playwright/test';\n\n"
+                "export const test = base.extend({\n"
+                "  notificationInboxPage: async ({ page }, use) => {\n"
+                "    await use(new NotificationInboxPage(page));\n"
+                "  },\n"
+                "});\n"
+            ),
+        )
+
+    monkeypatch.setattr(
+        "qtea.steps.s08_codegen.call_reasoning_llm", _stub,
+    )
+
+    results = asyncio.run(_create_fixtures(
+        tasks, sut_root, workdir, agents_root,
+        active_module=None, step=8, rules_content="", language="typescript",
+    ))
+
+    assert results == [("tests/pageFixtures.ts", True)]
+    assert "pytest" not in captured["prompt"].lower()
+    assert "playwright" in captured["prompt"].lower()
+    assert "valid python" not in captured["prompt"].lower()
+    assert "existing_file.py" not in captured["input_keys"]
+
+
+def test_create_fixtures_rejects_python_body_written_to_ts_target(
+    tmp_path: Path, monkeypatch,
+):
+    """Safety net: even if a misbehaving agent still returns pytest-style
+    Python for a `.ts` target, the stack-aware symbol scanner (the same one
+    Phase B.5 reconciliation uses) must catch it rather than accepting a
+    file with no `test.extend(...)` fixture surface."""
+    tasks = [_FixtureTask(name="notificationInboxPage", at="tests/pageFixtures.ts")]
+    sut_root = tmp_path / "sut"
+    workdir = tmp_path / "wd"
+    agents_root = tmp_path / "agents"
+    for p in (sut_root, workdir, agents_root):
+        p.mkdir()
+    (agents_root / "codegen-pom-extender.agent.md").write_text("agent", encoding="utf-8")
+
+    async def _stub(agent_path, *, workdir, user_prompt, inputs, step, timeout_s, max_tokens):
+        return _StubResult(
+            success=True,
+            final_text=(
+                "import pytest\n\n"
+                "@pytest.fixture\n"
+                "def notificationInboxPage(page):\n"
+                "    yield NotificationInboxPage(page)\n"
+            ),
+        )
+
+    monkeypatch.setattr(
+        "qtea.steps.s08_codegen.call_reasoning_llm", _stub,
+    )
+
+    results = asyncio.run(_create_fixtures(
+        tasks, sut_root, workdir, agents_root,
+        active_module=None, step=8, rules_content="", language="typescript",
+    ))
+    assert results == [("tests/pageFixtures.ts", False)]
+
+
+def test_create_helpers_uses_ts_idiom_for_ts_target(tmp_path: Path, monkeypatch):
+    """`_create_helpers` had the same Python-only hardcoding as
+    `_create_fixtures`; verify it is now stack-aware for a `.ts` target."""
+    tasks = [_HelperTask(name="waitForToast", at="tests/helpers/toast.ts")]
+    sut_root = tmp_path / "sut"
+    workdir = tmp_path / "wd"
+    agents_root = tmp_path / "agents"
+    for p in (sut_root, workdir, agents_root):
+        p.mkdir()
+    (agents_root / "codegen-pom-extender.agent.md").write_text("agent", encoding="utf-8")
+
+    captured: dict = {}
+
+    async def _stub(agent_path, *, workdir, user_prompt, inputs, step, timeout_s, max_tokens):
+        captured["prompt"] = user_prompt
+        captured["input_keys"] = set(inputs.keys())
+        return _StubResult(
+            success=True,
+            final_text=(
+                "export async function waitForToast(page) {\n"
+                "  await page.waitForSelector('.toast');\n"
+                "}\n"
+            ),
+        )
+
+    monkeypatch.setattr(
+        "qtea.steps.s08_codegen.call_reasoning_llm", _stub,
+    )
+
+    results = asyncio.run(_create_helpers(
+        tasks, sut_root, workdir, agents_root,
+        active_module=None, step=8, rules_content="", language="typescript",
+    ))
+
+    assert results == [("tests/helpers/toast.ts", True)]
+    assert "valid python" not in captured["prompt"].lower()
+    assert "existing_file.py" not in captured["input_keys"]

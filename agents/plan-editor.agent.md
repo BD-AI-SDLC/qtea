@@ -1,7 +1,7 @@
 ---
 name: plan-editor
 description: Applies free-text user edits to a code-modification-plan JSON.
-model: claude-sonnet-4-6
+model: claude-sonnet-5
 transport: reasoning
 ---
 
@@ -24,4 +24,5 @@ Apply the user's requested changes to the plan and return the **complete updated
    - `fixture.source` ∈ `{reuse, create}` — `reuse` needs `from`, `create` needs `at`
    - `locator.source` ∈ `{reuse, create_tbd}` — `create_tbd` needs `intent` (≤120 chars)
    - Valid markers: `qtea_smoke`, `qtea_regression`, `qtea_e2e`, `qtea_exploratory`
-4. **Return JSON only.** No prose, no markdown fences, no explanation. The response is consumed by `json.loads()` directly.
+4. **Resync stale hook `calls[]` after a `from` change.** If the edit changes a `hooks[].from` pointer (or adds a new `source: "reuse"` hook), and a `sut_inventory.lifecycle_hooks.json` input is provided, find the entry whose `file` matches the new `from`'s file (ignore any `:<symbol>` suffix) and whose `event` matches. Replace `calls[]` with that entry's sequence (each raw `"owner.method"` string → `{"pom": "<owner>", "method": "<method>"}`), preserving `args` from the OLD `calls[]` for any method name that still appears (inventory calls never carry args). If no matching entry is provided, leave `calls[]` as-is — do not fabricate a sequence.
+5. **Return JSON only.** No prose, no markdown fences, no explanation. The response is consumed by `json.loads()` directly.

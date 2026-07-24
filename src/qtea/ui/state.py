@@ -48,6 +48,10 @@ class StepUIState:
     status: str = "pending"
     started_at: float | None = None
     elapsed_s: float = 0.0
+    # Snapshot of AppState.paused_total_s taken at step.start — see
+    # AppState._active_seconds_from() for why this is needed: pauses from
+    # *earlier* steps must not be re-subtracted from this step's own clock.
+    paused_at_start: float = 0.0
     attempts: int = 0
     tokens_in: int = 0
     tokens_out: int = 0
@@ -113,6 +117,11 @@ class ReviewGateRequest:
     # unknown, the dialog falls back to ``summary`` rendered in monospace.
     data: Any = None
     kind: str = ""
+    # Set when the *previous* free-text edit was rejected (LLM failure,
+    # schema failure, or a phase-gate violation like the Step-7 hook-reuse
+    # gate) — surfaced as a banner so a rejected edit doesn't silently look
+    # like a no-op. ``None`` when the prior iteration wasn't a rejected edit.
+    edit_error: str | None = None
 
 
 # ── Preferences persistence ─────────────────────────────────────────────────
@@ -290,10 +299,21 @@ class AppState:
             s.agent_calls for s in self.steps.values()
         ) + sum(a.agent_calls for a in self.auxiliary_records)
 
-    def _active_seconds_from(self, started_at: float) -> float:
-        """Wall-clock seconds since ``started_at`` minus any paused windows."""
+    def _active_seconds_from(self, started_at: float, paused_baseline: float = 0.0) -> float:
+        """Wall-clock seconds since ``started_at`` minus paused windows.
+
+        ``paused_baseline`` is the value of ``paused_total_s`` at the moment
+        ``started_at`` was recorded. ``paused_total_s`` accumulates HITL /
+        review-gate pause time across the *whole run*, so the pipeline-level
+        clock (baseline 0) must subtract all of it, but a per-step clock must
+        only subtract pauses that happened *during that step* — otherwise a
+        pause from an earlier step (e.g. a Step 4/7 review gate) gets
+        re-subtracted from every later step's elapsed time, and once the
+        cumulative pause total exceeds the current step's real running time
+        the result clamps to 0 for the rest of that step's duration.
+        """
         now = time.monotonic()
-        active = (now - started_at) - self.paused_total_s
+        active = (now - started_at) - (self.paused_total_s - paused_baseline)
         if self.pause_started_at is not None:
             active -= now - self.pause_started_at
         return max(0.0, active)
@@ -305,7 +325,7 @@ class AppState:
         if self.current_step and self.current_step in self.steps:
             s = self.steps[self.current_step]
             if s.started_at is not None and s.status == "in_progress":
-                s.elapsed_s = self._active_seconds_from(s.started_at)
+                s.elapsed_s = self._active_seconds_from(s.started_at, s.paused_at_start)
 
     def pause_clock(self) -> None:
         """Mark the start of a paused window (e.g. a HITL wait)."""

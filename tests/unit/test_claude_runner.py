@@ -10,6 +10,8 @@ import pytest
 
 from qtea.claude_runner import (
     _agent_key,
+    _build_destructive_op_deny_hook,
+    _destructive_bash_reason,
     _force_cleanup,
     _is_model_unavailable,
     _stage_inputs,
@@ -774,6 +776,90 @@ async def test_run_agent_no_fallback_on_non_model_error(tmp_path: Path, monkeypa
 
     assert result.success is False
     assert call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Destructive-op deny hook — mechanical enforcement of CLAUDE.md's
+# git-safety hard rules (defense-in-depth against prompt-injected Bash
+# commands, not just prose in agent instructions).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("command", [
+    "git reset --hard",
+    "git reset --hard HEAD~1",
+    "git push --force origin main",
+    "git push -f origin qtea/run-1",
+    "git branch -D feature/old",
+    "git checkout main",
+    "git checkout master",
+    "git rebase -i HEAD~3",
+    "git filter-branch --tree-filter 'rm secrets'",
+    "git clean -fdx",
+    "rm -rf /some/path",
+    "rm -rf ./build",
+])
+def test_destructive_bash_reason_denies_known_patterns(command: str):
+    assert _destructive_bash_reason(command) is not None
+
+
+@pytest.mark.parametrize("command", [
+    "git status",
+    "git add -A",
+    'git commit -m "wip"',
+    "git log --oneline -5",
+    "git diff",
+    "npm install",
+    "npm run build",
+    "pytest -x tests/unit",
+    "python -m pytest",
+    "npx playwright test",
+])
+def test_destructive_bash_reason_allows_legitimate_commands(command: str):
+    assert _destructive_bash_reason(command) is None
+
+
+@pytest.mark.asyncio
+async def test_destructive_op_deny_hook_denies_bash_reset_hard():
+    hooks = _build_destructive_op_deny_hook()
+    callback = hooks["PreToolUse"][0].hooks[0]
+    result = await callback(
+        {"tool_name": "Bash", "tool_input": {"command": "git reset --hard"}},
+        "tool-use-1",
+        None,
+    )
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "git-safety" in result["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+@pytest.mark.asyncio
+async def test_destructive_op_deny_hook_allows_normal_bash():
+    hooks = _build_destructive_op_deny_hook()
+    callback = hooks["PreToolUse"][0].hooks[0]
+    result = await callback(
+        {"tool_name": "Bash", "tool_input": {"command": "npm install"}},
+        "tool-use-2",
+        None,
+    )
+    assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_destructive_op_deny_hook_ignores_non_bash_tools():
+    """A non-Bash tool call is never inspected, even if its input happens to
+    contain destructive-looking text (e.g. a Write tool writing a file whose
+    CONTENT mentions `git reset --hard` in a comment)."""
+    hooks = _build_destructive_op_deny_hook()
+    callback = hooks["PreToolUse"][0].hooks[0]
+    result = await callback(
+        {
+            "tool_name": "Write",
+            "tool_input": {"file_path": "x.md", "content": "git reset --hard"},
+        },
+        "tool-use-3",
+        None,
+    )
+    assert result == {}
 
 
 # Keep a reference to asyncio so unused-import linters don't strip it.

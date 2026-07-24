@@ -42,7 +42,7 @@ from qtea.config import (
     package_resource_root,
     step_timeout,
 )
-from qtea.logging_setup import get_logger
+from qtea.logging_setup import get_logger, mask_secret_values
 from qtea.overlay_handling import (
     reclassify_bug_candidates,
 )
@@ -157,6 +157,7 @@ from qtea.steps.s09.fixer_prompt import (
     _build_fixer_prompt,
     _filter_command_for_tests,
 )
+from qtea.steps.s09 import trace_parser as _trace_parser
 
 # Heal-scope predicates + git revert helpers live in a dedicated submodule.
 # Re-exported here so tests using `monkeypatch.setattr("qtea.steps.s09_execute._foo", ...)`
@@ -313,6 +314,23 @@ def _persist_env_vars(workspace: Any, env_vars: dict[str, str]) -> None:
     merge_dotenv_file(workspace.sut / ".env", env_vars)
 
 
+def _validate_published_locator_cache(cache_text: str) -> None:
+    """Schema-validate a published `locator-cache.json` (non-blocking).
+
+    The vendored runtime template's own `_write_cache` (injected into the
+    SUT subprocess) can't import `qtea.schemas` — it's deliberately
+    dependency-free so it runs inside the SUT's own venv. This is the first
+    point the artifact re-enters qtea's own process, so validate here
+    instead. Logs a warning on mismatch; never raises or blocks the publish.
+    """
+    try:
+        ok, err = is_valid(json.loads(cache_text), "locator-cache")
+        if not ok:
+            log.warning("step09.locator_cache_schema_invalid", error=err)
+    except json.JSONDecodeError as e:
+        log.warning("step09.locator_cache_unparseable", error=str(e))
+
+
 def _compose_runner_stream_diagnostics(
     stderr: str | None, stdout: str | None,
 ) -> str:
@@ -330,8 +348,8 @@ def _compose_runner_stream_diagnostics(
     See run 20260701-114656-9394eb for the incident.
     """
     parts: list[str] = []
-    stderr_s = (stderr or "").strip()
-    stdout_s = (stdout or "").strip()
+    stderr_s = mask_secret_values((stderr or "").strip())
+    stdout_s = mask_secret_values((stdout or "").strip())
     if stderr_s:
         if len(stderr_s) <= 3000:
             parts.append(f"\n\n--- stderr ---\n{stderr_s}")
@@ -683,6 +701,10 @@ class ExecuteStep(Step):
             json.dumps(bug_payload, indent=2, ensure_ascii=False), encoding="utf-8"
         )
 
+        ok_bug_schema, bug_schema_err = is_valid(bug_payload, "bug-candidates")
+        if not ok_bug_schema:
+            log.warning("step09.bug_candidates_schema_invalid", error=bug_schema_err)
+
         # JIT cache publish — if the runtime plugin populated locator-cache.json
         # during the test run, copy it into artifacts/step09 so step 11 can
         # surface per-TBD resolution sources in the report. Best-effort; absence
@@ -690,11 +712,11 @@ class ExecuteStep(Step):
         jit_cache_src = ctx.workspace.root / "locator-cache" / "locator-cache.json"
         if jit_cache_src.exists():
             try:
+                jit_cache_text = jit_cache_src.read_text(encoding="utf-8")
                 jit_cache_dst = out_dir / "locator-cache.json"
-                jit_cache_dst.write_text(
-                    jit_cache_src.read_text(encoding="utf-8"), encoding="utf-8"
-                )
+                jit_cache_dst.write_text(jit_cache_text, encoding="utf-8")
                 log.info("step09.jit_cache_published", entries_path=str(jit_cache_dst))
+                _validate_published_locator_cache(jit_cache_text)
             except OSError as e:
                 log.warning("step09.jit_cache_publish_failed", error=str(e))
 
@@ -1101,7 +1123,8 @@ class ExecuteStep(Step):
         # rely on ``stack_profile.wrapper_prefix`` pointing at the venv
         # bin dir. Without this branch, attempt 2 would fall back to
         # ``poetry run pytest`` (slow path) instead of ``.venv/bin/pytest``.
-        if stack_profile and stack_profile.venv_path:
+        _pm = (stack_profile.package_manager or "").lower() if stack_profile else ""
+        if stack_profile and stack_profile.venv_path and _pm in PYTHON_VENV_MANAGERS:
             venv_abs = ctx.workspace.sut / stack_profile.venv_path
             log.info(
                 "step09.venv_check",
@@ -2085,12 +2108,34 @@ class ExecuteStep(Step):
 
                     _entry_class = _classify_failure(entry)
 
+                    # Extract the URL the page was at when the test failed
+                    # from the Playwright trace, if one was recorded. Passed
+                    # into the fixer prompt so the heal agent's first MCP
+                    # call navigates straight to the failure point instead
+                    # of reconstructing the location from the traceback or
+                    # walking from the base URL. Best-effort — silent no-op
+                    # for non-Playwright stacks or when tracing was disabled.
+                    _failure_url: str | None = None
+                    try:
+                        _trace_path = _trace_parser.find_trace_path(
+                            entry, ctx.workspace.sut,
+                        )
+                        if _trace_path is not None:
+                            _failure_url = _trace_parser.extract_failure_url(_trace_path)
+                    except Exception as _exc:  # noqa: BLE001 — best-effort
+                        log.debug(
+                            "step09.failure_url_lookup_failed",
+                            test_id=entry.id,
+                            error=repr(_exc),
+                        )
+
                     log.info(
                         "step09.heal_start",
                         test_id=entry.id,
                         test_name=entry.name,
                         test_file=entry.file,
                         failure_class=_entry_class,
+                        failure_url=_failure_url,
                     )
                     async with _heal_sem:
                         agent_res = await run_agent(
@@ -2106,6 +2151,7 @@ class ExecuteStep(Step):
                                 storage_state_path=_storage_state_path,
                                 generated_files=generated_files,
                                 failure_class=_entry_class,
+                                failure_url=_failure_url,
                             ),
                             extra_paths=[
                                 package_resource_root() / "skills" / "diagnose-test-failure",

@@ -96,6 +96,15 @@
           "agent_calls": { "type": "integer", "minimum": 0 }
         }
       }
+    },
+    "advisory_findings": {
+      "type": "object",
+      "description": "Step 8's shadow-mode LLM judge findings (assertion-intent, purpose-fidelity) — advisory only, never blocking a step. Kept structurally separate from bug_reports (confirmed test failures) since these are an AI's opinion, not a confirmed bug. Absent/empty keys mean that judge was disabled or found nothing to flag.",
+      "additionalProperties": true,
+      "properties": {
+        "assertion": { "type": ["object", "null"] },
+        "purpose_fidelity": { "type": ["object", "null"] }
+      }
     }
   }
 }

@@ -7,6 +7,8 @@ import shutil
 import sys
 from pathlib import Path
 
+import pytest
+
 from qtea.checkpoints import RunState
 from qtea.pipeline import PipelineOptions
 from qtea.steps.base import StepContext
@@ -27,6 +29,22 @@ from qtea.steps.s09_execute import (
     _run_dep_install,
     _save_attempt_state,
 )
+from qtea.overlay_handling import (
+    RESOLUTION_OVERLAY_BUG,
+    RESOLUTION_OVERLAY_ONCE,
+    RESOLUTION_OVERLAY_PERSIST,
+    load_interceptors,
+)
+from qtea.steps.s09.jit_hitl import (
+    _append_resolved_to_dev_locators,
+    _hitl_resolve_unresolvable,
+)
+from qtea.steps.s09.jit_prewarm import (
+    _derive_scan_roots,
+    _prewarm_jit_cache_dev_pool,
+    _summarize_resolver_spend,
+)
+from qtea.steps.s09.overlay_sweep import _hitl_overlay_sweep
 from qtea.test_runner import TestRunEntry
 from qtea.workspace import create_workspace
 
@@ -2453,3 +2471,585 @@ async def test_step09_empty_collection_trusts_classified_collection_error(
     assert "broken local import" in (result.error or "")
     assert ctx.extras.get("rerun_step") == 8
     assert ctx.extras.get("rerun_kind") == "collection_error"
+
+
+# ---------------------------------------------------------------------------
+# Coverage-gap stubs (added 2026-07-24) — see coverage audit for context.
+# Each stub documents the exact uncovered code path it should exercise.
+# TODO: implement all stubs below.
+# ---------------------------------------------------------------------------
+
+
+def test_jit_hitl_resolve_unresolvable_skips_when_non_interactive(monkeypatch):
+    """src/qtea/steps/s09/jit_hitl.py:71-83 — `_hitl_resolve_unresolvable`.
+
+    Covers the three non-interactive short-circuits that must return
+    ``([], pendings)`` untouched: (a) ``QTEA_UI_MODE`` env var set (Flet
+    worker thread has no reachable stdin), (b) ``no_hitl=True`` (CI/
+    --no-hitl), and (c) ``sys.stdin`` not a TTY. Also assert the
+    "hitl_pending_skipped" log fires with the correct `reason` for (a) vs
+    (b), and that an empty `pendings` list short-circuits before any of
+    these checks matter.
+    """
+    from unittest.mock import Mock
+
+    pendings = [{"constant_name": "SUBMIT_BTN"}, {"constant_name": "LOGIN_BTN"}]
+
+    # (a) QTEA_UI_MODE set -> ([], pendings), logged with reason="ui_mode".
+    monkeypatch.setenv("QTEA_UI_MODE", "1")
+    fake_log = Mock()
+    monkeypatch.setattr("qtea.steps.s09.jit_hitl.log", fake_log)
+    resolved, remaining = _hitl_resolve_unresolvable(
+        pendings, dev_locators_path=None, no_hitl=False,
+    )
+    assert (resolved, remaining) == ([], pendings)
+    fake_log.info.assert_called_once()
+    assert fake_log.info.call_args[0][0] == "step09.hitl_pending_skipped"
+    assert fake_log.info.call_args[1]["reason"] == "ui_mode"
+    monkeypatch.delenv("QTEA_UI_MODE", raising=False)
+
+    # (b) no_hitl=True -> ([], pendings), logged with reason="no_hitl".
+    fake_log = Mock()
+    monkeypatch.setattr("qtea.steps.s09.jit_hitl.log", fake_log)
+    resolved, remaining = _hitl_resolve_unresolvable(
+        pendings, dev_locators_path=None, no_hitl=True,
+    )
+    assert (resolved, remaining) == ([], pendings)
+    fake_log.info.assert_called_once()
+    assert fake_log.info.call_args[0][0] == "step09.hitl_pending_skipped"
+    assert fake_log.info.call_args[1]["reason"] == "no_hitl"
+
+    # (c) sys.stdin not a TTY (default under pytest, no ui/no_hitl) ->
+    # ([], pendings), no skip log (neither is_ui nor no_hitl was set).
+    fake_log = Mock()
+    monkeypatch.setattr("qtea.steps.s09.jit_hitl.log", fake_log)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False, raising=False)
+    resolved, remaining = _hitl_resolve_unresolvable(
+        pendings, dev_locators_path=None, no_hitl=False,
+    )
+    assert (resolved, remaining) == ([], pendings)
+    fake_log.info.assert_not_called()
+
+    # Empty pendings short-circuits before any of the above checks matter.
+    fake_log = Mock()
+    monkeypatch.setattr("qtea.steps.s09.jit_hitl.log", fake_log)
+    resolved, remaining = _hitl_resolve_unresolvable(
+        [], dev_locators_path=None, no_hitl=False,
+    )
+    assert (resolved, remaining) == ([], [])
+    fake_log.info.assert_not_called()
+
+
+def test_jit_hitl_resolve_unresolvable_rejects_xpath_answer(tmp_path: Path, monkeypatch):
+    """src/qtea/steps/s09/jit_hitl.py:94-119 — `_hitl_resolve_unresolvable`.
+
+    Covers the interactive TTY prompt loop: simulate a TTY stdin, feed an
+    answer starting with `//`, `xpath=`, or containing `By.XPATH` via a
+    monkeypatched `input()`, and assert the entry is rejected (goes to
+    `remaining`, NOT `resolved`) per the hard "Never XPath in generated
+    locators" rule — even when a human supplies it interactively. Also
+    cover the ENTER-to-skip path (empty answer -> remaining) and a valid
+    non-XPath selector answer (-> resolved, pending file unlinked, and
+    `_append_resolved_to_dev_locators` invoked).
+    """
+    from unittest.mock import Mock
+
+    pending_file = tmp_path / "hitl-pending-ok.json"
+    pending_file.write_text("{}", encoding="utf-8")
+
+    pendings = [
+        {"constant_name": "SLASH_XPATH", "intent": "x", "_pending_path": "no-such-1"},
+        {"constant_name": "XPATH_EQ", "intent": "x", "_pending_path": "no-such-2"},
+        {"constant_name": "BY_XPATH_CALL", "intent": "x", "_pending_path": "no-such-3"},
+        {"constant_name": "SKIPPED", "intent": "x", "_pending_path": "no-such-4"},
+        {"constant_name": "OK_BTN", "intent": "ok button", "_pending_path": str(pending_file)},
+    ]
+    answers = iter([
+        "//div[@id='x']",       # starts with "//"
+        "xpath=//div",          # starts with "xpath="
+        "By.XPATH('//div')",    # contains "By.XPATH"
+        "",                     # ENTER-to-skip
+        "#ok-btn",               # valid non-XPath selector
+    ])
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+    monkeypatch.setattr("builtins.input", lambda *_a, **_kw: next(answers))
+    append_mock = Mock()
+    monkeypatch.setattr(
+        "qtea.steps.s09.jit_hitl._append_resolved_to_dev_locators", append_mock,
+    )
+
+    resolved, remaining = _hitl_resolve_unresolvable(
+        pendings, dev_locators_path=tmp_path / "dev-locators.json", no_hitl=False,
+    )
+
+    assert [e["constant_name"] for e in remaining] == [
+        "SLASH_XPATH", "XPATH_EQ", "BY_XPATH_CALL", "SKIPPED",
+    ]
+    assert [e["constant_name"] for e in resolved] == ["OK_BTN"]
+    assert resolved[0]["_user_selector"] == "#ok-btn"
+    assert not pending_file.exists()  # unlinked after successful resolution
+    append_mock.assert_called_once()
+    assert append_mock.call_args[0][0] == resolved
+
+
+def test_append_resolved_to_dev_locators_recovers_from_corrupt_file(
+    tmp_path: Path, monkeypatch,
+):
+    """src/qtea/steps/s09/jit_hitl.py:122-162 — `_append_resolved_to_dev_locators`.
+
+    Covers: (1) `dev_locators_path` exists but contains invalid JSON or a
+    non-dict root -> falls back to `{}` instead of raising; (2) merges new
+    `constant_name` -> {selector, source="hitl", intent, page_url} entries
+    into the `locators` dict without clobbering pre-existing unrelated
+    keys; (3) an entry missing `constant_name` or `_user_selector` is
+    silently skipped; (4) an `OSError` on write is caught and logged
+    (`step09.hitl_dev_locators_write_failed`) rather than propagated.
+    """
+    from unittest.mock import Mock
+
+    # (1a) invalid JSON -> falls back to {}, still writes the merged entry.
+    p1 = tmp_path / "invalid.json"
+    p1.write_text("{not json", encoding="utf-8")
+    _append_resolved_to_dev_locators(
+        [{"constant_name": "OK_BTN", "_user_selector": "#ok", "intent": "ok", "page_url": "/x"}],
+        p1,
+    )
+    raw1 = json.loads(p1.read_text(encoding="utf-8"))
+    assert raw1["locators"]["OK_BTN"] == {
+        "selector": "#ok", "source": "hitl", "intent": "ok", "page_url": "/x",
+    }
+
+    # (1b) non-dict root (e.g. a JSON list) -> falls back to {}.
+    p2 = tmp_path / "non_dict_root.json"
+    p2.write_text("[1, 2, 3]", encoding="utf-8")
+    _append_resolved_to_dev_locators(
+        [{"constant_name": "OK_BTN2", "_user_selector": "#ok2"}], p2,
+    )
+    raw2 = json.loads(p2.read_text(encoding="utf-8"))
+    assert raw2["locators"]["OK_BTN2"]["selector"] == "#ok2"
+
+    # (2) merges new entries without clobbering pre-existing unrelated keys.
+    p3 = tmp_path / "existing.json"
+    p3.write_text(json.dumps({
+        "locators": {"EXISTING_BTN": {"selector": "#existing", "source": "dev"}},
+        "unrelated_top_level_key": "keep-me",
+    }), encoding="utf-8")
+    _append_resolved_to_dev_locators(
+        [{"constant_name": "NEW_BTN", "_user_selector": "#new"}], p3,
+    )
+    raw3 = json.loads(p3.read_text(encoding="utf-8"))
+    assert raw3["unrelated_top_level_key"] == "keep-me"
+    assert raw3["locators"]["EXISTING_BTN"]["selector"] == "#existing"
+    assert raw3["locators"]["NEW_BTN"]["selector"] == "#new"
+
+    # (3) an entry missing constant_name or _user_selector is silently skipped.
+    p4 = tmp_path / "skips.json"
+    _append_resolved_to_dev_locators(
+        [
+            {"constant_name": "NO_SELECTOR"},
+            {"_user_selector": "#no-name"},
+            {"constant_name": "GOOD", "_user_selector": "#good"},
+        ],
+        p4,
+    )
+    raw4 = json.loads(p4.read_text(encoding="utf-8"))
+    assert list(raw4["locators"].keys()) == ["GOOD"]
+
+    # (4) OSError on write is caught and logged, never propagates.
+    p5 = tmp_path / "write_fails.json"
+    fake_log = Mock()
+    monkeypatch.setattr("qtea.steps.s09.jit_hitl.log", fake_log)
+
+    def _raise_write_text(self, *args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Path, "write_text", _raise_write_text)
+    _append_resolved_to_dev_locators(
+        [{"constant_name": "X", "_user_selector": "#x"}], p5,
+    )
+    fake_log.warning.assert_called_once()
+    assert fake_log.warning.call_args[0][0] == "step09.hitl_dev_locators_write_failed"
+
+
+def _write_overlay_event(path: Path, **overrides) -> None:
+    base = {
+        "ts": "2026-07-24T00:00:00Z",
+        "test_id": "tests/test_x.py::test_x",
+        "target_intent": "submit form",
+        "overlay_role": "dialog",
+        "overlay_name": "Cookie banner",
+        "page_url": "https://sut.example/checkout",
+        "screenshot_path": "",
+        "overlay_frame": "top",
+        "overlay_bbox": None,
+        "heuristic_attempted": True,
+        "heuristic_succeeded": False,
+        "candidates": [],
+    }
+    base.update(overrides)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(base) + "\n")
+
+
+def test_hitl_overlay_sweep_dispatches_bug_persist_and_once_resolutions(
+    tmp_path: Path, monkeypatch,
+):
+    """src/qtea/steps/s09/overlay_sweep.py:56-189 — `_hitl_overlay_sweep`.
+
+    Covers the full end-to-end dispatch with a monkeypatched `prompt_user`
+    returning one answer per resolution kind: (1) `RESOLUTION_OVERLAY_BUG`
+    -> event kept unpersisted + screenshot deleted, NOT added to
+    `interceptors.json`; (2) `RESOLUTION_OVERLAY_PERSIST` -> written via
+    `append_interceptor` and its `dedup_key()` included in the returned
+    `persisted_keys` set; (3) `RESOLUTION_OVERLAY_ONCE` -> logged but NOT
+    persisted to disk. Also cover: no events file present -> `([], set())`
+    with no HITL prompt; all events already in `interceptors.json` ->
+    early return before `prompt_user` is called; `no_hitl=True` -> skip
+    prompting entirely and return `(deduped, set())`; and `prompt_user`
+    raising -> caught, logged (`step09.overlay_sweep_hitl_failed`), and
+    `(deduped, set())` returned instead of propagating.
+    """
+    from unittest.mock import Mock
+
+    # (a) no events file present -> ([], set()), no HITL prompt.
+    ws1 = tmp_path / "ws1"
+    sut1 = tmp_path / "sut1"
+    ws1.mkdir()
+    sut1.mkdir()
+    prompt_mock = Mock()
+    monkeypatch.setattr("qtea.steps.s09.overlay_sweep.prompt_user", prompt_mock)
+    events, persisted = _hitl_overlay_sweep(ws1, sut1, no_hitl=False)
+    assert (events, persisted) == ([], set())
+    prompt_mock.assert_not_called()
+
+    # (b) all events already registered in interceptors.json -> early return
+    # before prompt_user is called.
+    ws2 = tmp_path / "ws2"
+    sut2 = tmp_path / "sut2"
+    ws2.mkdir()
+    sut2.mkdir()
+    _write_overlay_event(ws2 / "overlay-events.jsonl", overlay_role="dialog", overlay_name="Cookie banner")
+    interceptors2 = sut2 / ".qtea" / "interceptors.json"
+    interceptors2.parent.mkdir(parents=True)
+    interceptors2.write_text(json.dumps({
+        "schema_version": 1,
+        "entries": [{
+            "overlay": {"kind": "role", "role": "dialog", "name": "Cookie banner", "name_op": "equals"},
+            "dismiss": {"kind": "press_escape"},
+            "handler_config": {"times": 100, "no_wait_after": True},
+        }],
+    }), encoding="utf-8")
+    prompt_mock = Mock()
+    monkeypatch.setattr("qtea.steps.s09.overlay_sweep.prompt_user", prompt_mock)
+    events, persisted = _hitl_overlay_sweep(ws2, sut2, no_hitl=False)
+    assert persisted == set()
+    assert len(events) == 1
+    prompt_mock.assert_not_called()
+
+    # (c) no_hitl=True -> skip prompting entirely, return (deduped, set()).
+    ws3 = tmp_path / "ws3"
+    sut3 = tmp_path / "sut3"
+    ws3.mkdir()
+    sut3.mkdir()
+    _write_overlay_event(ws3 / "overlay-events.jsonl", overlay_role="dialog", overlay_name="Unregistered banner")
+    prompt_mock = Mock()
+    monkeypatch.setattr("qtea.steps.s09.overlay_sweep.prompt_user", prompt_mock)
+    events, persisted = _hitl_overlay_sweep(ws3, sut3, no_hitl=True)
+    assert persisted == set()
+    assert len(events) == 1
+    prompt_mock.assert_not_called()
+
+    # (d) prompt_user raising -> caught, logged, (deduped, set()) returned.
+    ws4 = tmp_path / "ws4"
+    sut4 = tmp_path / "sut4"
+    ws4.mkdir()
+    sut4.mkdir()
+    _write_overlay_event(ws4 / "overlay-events.jsonl", overlay_role="dialog", overlay_name="Raising banner")
+    monkeypatch.setattr(
+        "qtea.steps.s09.overlay_sweep.prompt_user",
+        Mock(side_effect=RuntimeError("hitl channel down")),
+    )
+    fake_log = Mock()
+    monkeypatch.setattr("qtea.steps.s09.overlay_sweep.log", fake_log)
+    events, persisted = _hitl_overlay_sweep(ws4, sut4, no_hitl=False)
+    assert persisted == set()
+    assert len(events) == 1
+    assert any(
+        c.args and c.args[0] == "step09.overlay_sweep_hitl_failed"
+        for c in fake_log.warning.call_args_list
+    )
+
+    # (e) full dispatch: one event per resolution kind.
+    ws5 = tmp_path / "ws5"
+    sut5 = tmp_path / "sut5"
+    ws5.mkdir()
+    sut5.mkdir()
+    shot_bug = ws5 / "bug-shot.png"
+    shot_persist = ws5 / "persist-shot.png"
+    shot_once = ws5 / "once-shot.png"
+    for shot in (shot_bug, shot_persist, shot_once):
+        shot.write_bytes(b"fake-png")
+
+    events_path = ws5 / "overlay-events.jsonl"
+    _write_overlay_event(
+        events_path, overlay_role="dialog", overlay_name="Bug banner",
+        screenshot_path=str(shot_bug),
+    )
+    _write_overlay_event(
+        events_path, overlay_role="dialog", overlay_name="Persist banner",
+        screenshot_path=str(shot_persist),
+    )
+    _write_overlay_event(
+        events_path, overlay_role="dialog", overlay_name="Once banner",
+        screenshot_path=str(shot_once),
+    )
+
+    def _fake_prompt_user(questions, *, agent_label):
+        answers = {}
+        for q in questions:
+            name = q.metadata["overlay_name"]
+            if name == "Bug banner":
+                answers[q.id] = (RESOLUTION_OVERLAY_BUG, json.dumps({"kind": "bug"}))
+            elif name == "Persist banner":
+                answers[q.id] = (RESOLUTION_OVERLAY_PERSIST, json.dumps({"kind": "press_escape"}))
+            elif name == "Once banner":
+                answers[q.id] = (RESOLUTION_OVERLAY_ONCE, json.dumps({"kind": "press_escape"}))
+        return answers
+
+    monkeypatch.setattr("qtea.steps.s09.overlay_sweep.prompt_user", _fake_prompt_user)
+    fake_log = Mock()
+    monkeypatch.setattr("qtea.steps.s09.overlay_sweep.log", fake_log)
+
+    events, persisted = _hitl_overlay_sweep(ws5, sut5, no_hitl=False)
+
+    assert len(events) == 3
+    assert persisted == {("dialog", "Persist banner")}
+    assert not shot_bug.exists()
+    assert not shot_persist.exists()
+    assert not shot_once.exists()
+
+    interceptors_on_disk = load_interceptors(sut5 / ".qtea" / "interceptors.json")
+    names_on_disk = {e.overlay_name for e in interceptors_on_disk}
+    assert names_on_disk == {"Persist banner"}
+    assert any(
+        c.args and c.args[0] == "step09.overlay_marked_as_bug"
+        for c in fake_log.info.call_args_list
+    )
+    assert any(
+        c.args and c.args[0] == "step09.overlay_one_shot"
+        for c in fake_log.info.call_args_list
+    )
+
+
+def test_prewarm_jit_cache_dev_pool_noop_when_no_tbds_or_no_dev_locators(tmp_path, monkeypatch):
+    """src/qtea/steps/s09/jit_prewarm.py:65-120 — `_prewarm_jit_cache_dev_pool`.
+
+    Covers the no-op short-circuits: (1) `scan_tbd_intents` returns no
+    hits -> returns 0 without loading dev-locators; (2) hits exist but all
+    dedupe to nothing usable (blank intent, or every hit's
+    (intent, constant_name) pair is a duplicate) -> returns 0; (3) hits
+    exist but `load_dev_locators` returns an empty pool -> returns 0
+    without calling `jit_resolver.prewarm_dev_pool_cache`. Also cover the
+    happy path: hits with a mix of bare-`tbd()` (constant_name=None,
+    falls back to intent text) and named constants dedupe correctly and
+    are forwarded to `prewarm_dev_pool_cache` with the run_id.
+    """
+    from unittest.mock import Mock
+
+    from qtea.tbd_scanner import TbdIntent
+
+    ctx = _ctx(tmp_path)
+    jit_cache_dir = tmp_path / "jit-cache"
+    jit_cache_dir.mkdir()
+    dev_locators_path = tmp_path / "dev-locators.json"
+
+    load_mock = Mock(return_value=({}, None, []))
+    prewarm_mock = Mock(return_value=0)
+    monkeypatch.setattr("qtea.runtime.dev_locators.load_dev_locators", load_mock)
+    monkeypatch.setattr("qtea.jit_resolver.prewarm_dev_pool_cache", prewarm_mock)
+
+    def _call():
+        return _prewarm_jit_cache_dev_pool(
+            ctx=ctx, jit_cache_dir=jit_cache_dir, dev_locators_path=dev_locators_path,
+        )
+
+    # (1) no hits at all -> 0 without ever loading the dev-locator pool.
+    monkeypatch.setattr("qtea.tbd_scanner.scan_tbd_intents", Mock(return_value=[]))
+    assert _call() == 0
+    load_mock.assert_not_called()
+
+    # (2) hits exist but every one has a blank intent -> nothing usable,
+    # still 0 without loading dev-locators.
+    blank_a = TbdIntent(file=Path("a.py"), line=1, constant_name="X", intent="   ", language="python")
+    blank_b = TbdIntent(file=Path("a.py"), line=2, constant_name=None, intent="", language="python")
+    monkeypatch.setattr("qtea.tbd_scanner.scan_tbd_intents", Mock(return_value=[blank_a, blank_b]))
+    assert _call() == 0
+    load_mock.assert_not_called()
+
+    # (3) hits exist and dedupe fine, but the dev-locator pool is empty ->
+    # 0 without ever calling the resolver's prewarm function.
+    valid_hit = TbdIntent(
+        file=Path("a.py"), line=3, constant_name="BTN", intent="click btn", language="python",
+    )
+    monkeypatch.setattr("qtea.tbd_scanner.scan_tbd_intents", Mock(return_value=[valid_hit]))
+    assert _call() == 0
+    load_mock.assert_called_once()
+    prewarm_mock.assert_not_called()
+
+    # (4) happy path: a bare tbd() (constant_name=None -> falls back to the
+    # intent text) plus a named constant, with a duplicate (intent,
+    # constant_name) pair deduped away, all forwarded with the run_id.
+    load_mock.reset_mock()
+    bare = TbdIntent(
+        file=Path("t1.py"), line=5, constant_name=None, intent="login button", language="python",
+    )
+    named = TbdIntent(
+        file=Path("t2.py"), line=7, constant_name="SUBMIT_BTN", intent="submit button", language="python",
+    )
+    duplicate_of_named = TbdIntent(
+        file=Path("t2.py"), line=9, constant_name="SUBMIT_BTN", intent="submit button", language="python",
+    )
+    monkeypatch.setattr(
+        "qtea.tbd_scanner.scan_tbd_intents",
+        Mock(return_value=[bare, named, duplicate_of_named]),
+    )
+    load_mock.return_value = ({"SUBMIT_BTN": Mock()}, dev_locators_path, [])
+    prewarm_mock.return_value = 2
+
+    assert _call() == 2
+    load_mock.assert_called_once()
+    prewarm_mock.assert_called_once()
+    call_kwargs = prewarm_mock.call_args.kwargs
+    assert call_kwargs["tbd_intents"] == [
+        {"intent": "login button", "constant_name": "login button", "test_file": "t1.py"},
+        {"intent": "submit button", "constant_name": "SUBMIT_BTN", "test_file": "t2.py"},
+    ]
+    assert call_kwargs["dev_locators"] == load_mock.return_value[0]
+    assert call_kwargs["cache_path"] == jit_cache_dir / "locator-cache.json"
+    assert call_kwargs["run_id"] == ctx.workspace.run_id
+
+
+def test_derive_scan_roots_includes_inventory_derived_dirs_for_non_pom_layout(tmp_path):
+    """src/qtea/steps/s09/jit_prewarm.py:35-62 — `_derive_scan_roots`.
+
+    Covers the Screenplay/non-POM layout branch: a `research.json` whose
+    active module's `src_directory_layout.package_root`,
+    `pattern_exemplars[].dir`, and `test_directory_layout.base_dir` point
+    outside the conventional `src`/`tests`/`pages` roots (e.g. a
+    `framework/` dir) -> those first path segments are added to the scan
+    set and only directories that actually exist on disk are returned.
+    Also cover: `research.json` missing or containing invalid JSON ->
+    falls back to the conventional `{src, tests, pages}` set; and no
+    resolved dir exists at all -> falls back to `[sut_root]`.
+    """
+    ctx = _ctx(tmp_path)
+    sut_root = ctx.workspace.sut
+    research_path = ctx.workspace.step_dir(6) / "research.json"
+
+    # (1) no research.json at all, and none of the conventional dirs exist
+    # on disk -> falls all the way back to [sut_root].
+    assert _derive_scan_roots(ctx, sut_root) == [sut_root]
+
+    # (2) research.json present but invalid JSON -> same fallback path.
+    research_path.write_text("{not valid json", encoding="utf-8")
+    assert _derive_scan_roots(ctx, sut_root) == [sut_root]
+
+    # Once the conventional dirs exist, the fallback set resolves to them
+    # (alphabetical order; "src" stays excluded since it was never created).
+    (sut_root / "tests").mkdir()
+    (sut_root / "pages").mkdir()
+    assert _derive_scan_roots(ctx, sut_root) == [sut_root / "pages", sut_root / "tests"]
+
+    # (3) Screenplay/non-POM layout: inventory-derived roots outside the
+    # conventional set are added, keyed off the ACTIVE module only.
+    research_path.write_text(
+        json.dumps({
+            "sut_inventory": {
+                "active_module": "app",
+                "modules": [
+                    {
+                        "name": "other-module",
+                        "src_directory_layout": {"package_root": "ignored/should_not_appear"},
+                    },
+                    {
+                        "name": "app",
+                        "src_directory_layout": {"package_root": "framework/pages"},
+                        "pattern_exemplars": [{"dir": "framework/screenplay/tasks"}],
+                        "test_directory_layout": {"base_dir": "framework/specs"},
+                    },
+                ],
+            },
+        }),
+        encoding="utf-8",
+    )
+    (sut_root / "framework").mkdir()
+    roots = _derive_scan_roots(ctx, sut_root)
+    assert roots == [sut_root / "framework", sut_root / "pages", sut_root / "tests"]
+    assert (sut_root / "ignored") not in roots
+
+
+def test_summarize_resolver_spend_aggregates_tiers_and_skips_bad_lines(tmp_path, monkeypatch):
+    """src/qtea/steps/s09/jit_prewarm.py:123-196 — `_summarize_resolver_spend`.
+
+    Covers: (1) no `resolver-spend.jsonl` file -> returns None; (2) file
+    exists but every line is blank/unparseable JSON -> `count == 0` ->
+    returns None (bad lines don't crash the summarizer); (3) a mix of
+    valid entries across tiers 1-4 with `success=False` and
+    `fallback_promoted=True` flags -> `unresolvable_count` and
+    `fallback_promoted_count` increment correctly and `median_duration_ms`
+    is computed from `duration_ms` values, with a real cost estimate
+    computed via `qtea.pricing.estimate_cost`; (4) cost estimation raising
+    -> `est_cost_usd` is None instead of propagating the exception.
+    """
+    from unittest.mock import Mock
+
+    jit_cache_dir = tmp_path / "jit-cache"
+    jit_cache_dir.mkdir()
+
+    # (1) no resolver-spend.jsonl at all.
+    assert _summarize_resolver_spend(jit_cache_dir) is None
+
+    # (2) file exists but every line is blank/unparseable JSON.
+    spend_path = jit_cache_dir / "resolver-spend.jsonl"
+    spend_path.write_text("\n   \nnot json at all\n{also not json\n", encoding="utf-8")
+    assert _summarize_resolver_spend(jit_cache_dir) is None
+
+    # (3) a mix of valid entries across tiers 1-4, plus one with an
+    # unrecognized tier (still counted, just not bucketed), interleaved
+    # with a trailing garbage line that must not crash the summarizer.
+    entries = [
+        {"tier": 1, "input_tokens": 10, "output_tokens": 5, "duration_ms": 100, "model": "claude-haiku-4-5"},
+        {"tier": 2, "input_tokens": 20, "output_tokens": 8, "duration_ms": 200, "success": False},
+        {"tier": 3, "input_tokens": 0, "output_tokens": 0, "duration_ms": 300, "fallback_promoted": True, "model": "claude-sonnet-5"},
+        {"tier": 4, "input_tokens": 50, "output_tokens": 30, "duration_ms": 400, "model": "claude-haiku-4-5"},
+        {"tier": 99, "input_tokens": 1, "output_tokens": 1},
+    ]
+    lines = "\n".join(json.dumps(e) for e in entries) + "\ngarbage-line-not-json\n"
+    spend_path.write_text(lines, encoding="utf-8")
+
+    summary = _summarize_resolver_spend(jit_cache_dir)
+    assert summary is not None
+    assert summary["total_resolutions"] == 5
+    assert summary["total_input_tokens"] == 81
+    assert summary["total_output_tokens"] == 44
+    assert summary["tier_1_hits"] == 1
+    assert summary["tier_2_hits"] == 1
+    assert summary["tier_3_hits"] == 1
+    assert summary["tier_4_hits"] == 1
+    assert summary["unresolvable_count"] == 1
+    assert summary["fallback_promoted_count"] == 1
+    assert summary["models"] == ["claude-haiku-4-5", "claude-sonnet-5"]
+    assert summary["median_duration_ms"] == 300
+    # Real pricing table: haiku (1.00/5.00 per M) + sonnet (3.00/15.00 per M)
+    # each costed against the full aggregate totals (rough estimate).
+    expected_cost = round((81 * 1.00 + 44 * 5.00) / 1_000_000, 6) + round(
+        (81 * 3.00 + 44 * 15.00) / 1_000_000, 6
+    )
+    assert summary["est_cost_usd"] == pytest.approx(expected_cost)
+
+    # (4) cost estimation raising -> est_cost_usd is None, no propagation.
+    monkeypatch.setattr("qtea.pricing.estimate_cost", Mock(side_effect=RuntimeError("no pricing")))
+    summary2 = _summarize_resolver_spend(jit_cache_dir)
+    assert summary2 is not None
+    assert summary2["est_cost_usd"] is None

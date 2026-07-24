@@ -73,3 +73,16 @@ def test_stdout_only_still_surfaces_stdout():
     )
     assert "stdout" in out
     assert "SyntaxError" in out
+
+
+def test_token_shaped_secrets_are_masked_in_both_streams():
+    """result.error (built from this appendix) flows into run-results.json,
+    the HTML report, and the bug classifier — a token the SUT printed on
+    failure must not ride along verbatim."""
+    leaked_token = "ghp_" + ("b" * 36)
+    out = _compose_runner_stream_diagnostics(
+        f"stderr had a cached token {leaked_token}",
+        f"stdout dumped header Authorization: token {leaked_token}",
+    )
+    assert leaked_token not in out
+    assert out.count("***REDACTED***") == 2

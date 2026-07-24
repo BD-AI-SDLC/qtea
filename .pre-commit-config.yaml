@@ -5,3 +5,10 @@ repos:
       - id: ruff
         args: [--fix]
       - id: ruff-format
+  - repo: local
+    hooks:
+      - id: check-no-sut-tokens
+        name: SUT-token denylist check
+        entry: python tools/check_no_sut_tokens.py --diff-only
+        language: system
+        pass_filenames: false

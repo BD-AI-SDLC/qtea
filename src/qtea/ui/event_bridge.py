@@ -82,6 +82,11 @@ class _UILogHandler(logging.Handler):
                 s.status = "in_progress"
                 s.attempts = event_dict.get("attempt", 1)
                 s.started_at = time.monotonic()
+                # Snapshot cumulative pause time so far — see
+                # AppState._active_seconds_from() for why the per-step clock
+                # must not re-subtract pauses that happened before this step
+                # started (e.g. an earlier step's HITL/review-gate wait).
+                s.paused_at_start = state.paused_total_s
                 state.current_step = step_num
                 self._notify()
 

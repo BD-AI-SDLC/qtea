@@ -69,20 +69,26 @@ MAX_HEAL_ITERS: int = max(1, int(os.environ.get("QTEA_MAX_HEAL_ITERS", "3")))
 # _run_fix_proposal). The debug agent does fresh investigation of a failed
 # step (reads transcripts, source, POM, fixtures) before writing its RCA;
 # the principal-software-engineer does the same before writing the fix
-# proposal. The previous 10-turn / 5-min cap truncated both agents mid-
-# investigation on complex failures (run 20260701-114656-9394eb hit
-# "Reached maximum number of turns (10)" for debug AND principal-eng —
-# each agent's last pre-tool-call thinking prose ended up written to disk
-# as if it were the "RCA" / "fix proposal", turning the operator-facing
-# artifacts into 150-byte "Let me check X..." stubs). Aligned with
-# HEAL_AGENT_MAX_TURNS for the investigation-heavy debug agent; the fix
-# chain gets a smaller cap because critical-thinking + principal-eng
-# consume prior artifacts rather than doing fresh discovery. Overridable
-# via QTEA_DEBUG_AGENT_{MAX_TURNS,TIMEOUT_S} and
-# QTEA_FIX_AGENT_{MAX_TURNS,TIMEOUT_S}.
-DEBUG_AGENT_MAX_TURNS: int = int(os.environ.get("QTEA_DEBUG_AGENT_MAX_TURNS", "40"))
+# proposal. History:
+#   - The original 10-turn / 5-min cap truncated both agents mid-
+#     investigation on complex failures (run 20260701-114656-9394eb hit
+#     "Reached maximum number of turns (10)" for debug AND principal-eng);
+#     each agent's last pre-tool-call thinking prose ended up written to
+#     disk as if it were the "RCA" / "fix proposal", turning the operator-
+#     facing artifacts into 150-byte "Let me check X..." stubs).
+#   - Raised to 40 (debug) / 25 (fix) — still hit the cap on multi-file
+#     investigations (run 20260709-083909-223772 exhausted 40 debug turns
+#     on a Step 9 broken-import failure without ever writing debug-rca.md).
+#   - Now 60 (debug) / 40 (fix). Independent of the raise, `steps.base.
+#     _finalize_truncated_agent` auto-fires a bounded synthesis pass when
+#     `hit_max_turns` trips, so the artifact is guaranteed even if the
+#     complex-failure tail exceeds the cap. The bump is headroom for the
+#     common case; the finalizer is the completion guarantee. Overridable
+#     via QTEA_DEBUG_AGENT_{MAX_TURNS,TIMEOUT_S} and
+#     QTEA_FIX_AGENT_{MAX_TURNS,TIMEOUT_S}.
+DEBUG_AGENT_MAX_TURNS: int = int(os.environ.get("QTEA_DEBUG_AGENT_MAX_TURNS", "60"))
 DEBUG_AGENT_TIMEOUT_S: int = int(os.environ.get("QTEA_DEBUG_AGENT_TIMEOUT_S", "900"))
-FIX_AGENT_MAX_TURNS: int = int(os.environ.get("QTEA_FIX_AGENT_MAX_TURNS", "25"))
+FIX_AGENT_MAX_TURNS: int = int(os.environ.get("QTEA_FIX_AGENT_MAX_TURNS", "40"))
 FIX_AGENT_TIMEOUT_S: int = int(os.environ.get("QTEA_FIX_AGENT_TIMEOUT_S", "600"))
 
 # Markdown size enforcement.

@@ -1,7 +1,7 @@
 ---
 name: tbd-intent-editor
 description: Applies free-text user edits to a list of TBD locator intents flagged by the post-Phase-D review gate.
-model: claude-sonnet-4-6
+model: claude-sonnet-5
 transport: reasoning
 ---
 

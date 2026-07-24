@@ -97,6 +97,15 @@ class RunReport:
     steps_summary: list[StepTiming] = field(default_factory=list)
     auxiliary_summary: list[AuxTiming] = field(default_factory=list)
     bug_classification_fallback: bool = False
+    # Step 8's shadow-mode LLM judges (assertion-intent + purpose-fidelity)
+    # write their findings to disk every run, but nothing surfaced them to a
+    # human before this — they were a dead end. Kept structurally separate
+    # from `bug_reports` (whose schema models confirmed test failures via a
+    # `status: failed|error` enum): these are an AI's advisory opinion, not
+    # a confirmed bug, and conflating the two would be a new and unexamined
+    # risk. `None` per judge when its shadow file doesn't exist (judge
+    # disabled, or nothing flagged).
+    advisory_findings: dict[str, Any] = field(default_factory=dict)
 
 
 def _empty_run_results() -> dict[str, Any]:
@@ -256,6 +265,16 @@ def build_report(ws: Workspace) -> RunReport:
     steps_summary = _steps_summary_from_state(state)
     auxiliary_summary = _aux_summary_from_state(state)
 
+    # Step 8's shadow-mode judges (never blocking) — surface whatever they
+    # found instead of leaving it buried in artifacts/step08/*.json.
+    advisory_findings: dict[str, Any] = {}
+    assertion_shadow = _load_json(ws.step_dir(8) / "assertion-judge-shadow.json")
+    if assertion_shadow:
+        advisory_findings["assertion"] = assertion_shadow
+    purpose_shadow = _load_json(ws.step_dir(8) / "purpose-fidelity-shadow.json")
+    if purpose_shadow:
+        advisory_findings["purpose_fidelity"] = purpose_shadow
+
     # Detect step 10 fallback from checkpoint notes
     step10_rec = state.steps.get(10) if state else None
     fallback = bool(
@@ -277,6 +296,7 @@ def build_report(ws: Workspace) -> RunReport:
         steps_summary=steps_summary,
         auxiliary_summary=auxiliary_summary,
         bug_classification_fallback=fallback,
+        advisory_findings=advisory_findings,
     )
 
 
@@ -337,4 +357,5 @@ def to_dict(report: RunReport) -> dict[str, Any]:
             }
             for aux in report.auxiliary_summary
         ],
+        "advisory_findings": report.advisory_findings,
     }

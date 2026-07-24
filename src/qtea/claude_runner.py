@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import shutil
 import time
 from dataclasses import dataclass, field, is_dataclass
@@ -136,6 +137,83 @@ _MCP_ALLOWLIST: tuple[str, ...] = (
     "mcp__playwright__*",
     "mcp__atlassian__*",
 )
+
+# Destructive-operation denylist — mechanical enforcement of CLAUDE.md's
+# git-safety hard rules for every agent-initiated Bash call, on every step.
+# Prose-only enforcement (agent instructions) is not a real defense against
+# a prompt-injected instruction reaching the Bash tool later in a run — Step
+# 1 already treats injected ticket content as a real threat and strips it on
+# intake (`[SYSTEM]`, `<|im_start|>`, etc.), but nothing downstream stopped
+# an injected instruction from reaching an agent's Bash tool call. There is
+# no legitimate-use conflict: qtea's own retry-cleanup `git reset --hard`
+# (`s06_research.py:_rollback_sut_to_before_step`) runs via direct
+# `subprocess.run`, never through an agent's Bash tool call, so this can
+# only ever fire on agent-initiated commands. Matching is deliberately
+# broad — a false positive just makes the agent retry a different way; a
+# false negative lets a destructive/injected command through.
+_DESTRUCTIVE_BASH_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"git\s+reset\s+--hard"),
+    re.compile(r"git\s+push\s+[^\n]*(--force\b|-f\b)"),
+    re.compile(r"git\s+branch\s+[^\n]*-D\b"),
+    re.compile(r"git\s+checkout\s+[^\n]*\b(main|master|develop)\b"),
+    re.compile(r"git\s+rebase\s+[^\n]*-i\b"),
+    re.compile(r"filter-branch"),
+    re.compile(r"git\s+clean\s+[^\n]*-f"),
+    re.compile(r"\brm\s+-rf\b"),
+)
+
+
+def _destructive_bash_reason(command: str) -> str | None:
+    """Return a deny reason when ``command`` matches the destructive-op
+    denylist, else ``None``."""
+    for pat in _DESTRUCTIVE_BASH_PATTERNS:
+        if pat.search(command):
+            return (
+                "Command matches a forbidden destructive-operation pattern "
+                f"({pat.pattern!r}) per CLAUDE.md's git-safety hard rules. "
+                "Agents may only commit to the per-run qtea isolation "
+                "branch; forced/destructive git operations and recursive "
+                "deletes are never legitimate here — if this command is "
+                "genuinely needed, it belongs in qtea's own step code "
+                "(a direct subprocess call), not an agent's Bash tool."
+            )
+    return None
+
+
+def _build_destructive_op_deny_hook() -> dict[str, Any]:
+    """Build the ``PreToolUse`` hook that denies destructive Bash/git
+    commands from any agent's tool loop.
+
+    Merged into every `run_agent` call unconditionally (see below) rather
+    than opt-in per step — there is no legitimate reason for an LLM agent's
+    Bash tool call to run `git reset --hard`, `push --force`, `branch -D`,
+    etc. anywhere in the 11-step pipeline. Modeled directly on
+    `s07_live_explore.py`'s `_build_explorer_budget_hook` (the only other
+    `PreToolUse` hook in the codebase): a `HookMatcher(matcher=None, ...)`
+    so the callback sees every tool call and does its own discrimination.
+    """
+    from claude_agent_sdk import HookMatcher
+
+    async def _pre_tool(hook_input, tool_use_id, context):  # noqa: ANN001
+        if str((hook_input or {}).get("tool_name") or "") != "Bash":
+            return {}
+        command = str(
+            (hook_input or {}).get("tool_input", {}).get("command") or ""
+        )
+        reason = _destructive_bash_reason(command)
+        if reason is None:
+            return {}
+        log.warning("agent.destructive_bash_denied", command=command[:200])
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        }
+
+    return {"PreToolUse": [HookMatcher(matcher=None, hooks=[_pre_tool])]}
+
 
 # Sanity threshold for an unusually large agent file (informational only).
 _AGENT_PROMPT_WARN_BYTES = 30_000
@@ -922,11 +1000,19 @@ async def run_agent(
     }
     if max_turns is not None:
         sdk_options_kwargs["max_turns"] = max_turns
-    if hooks:
-        # Mechanical tool-use enforcement (PreToolUse/PostToolUse callbacks).
-        # Passed straight to the SDK; the callbacks run in-process in this event
-        # loop. Used by Step 7 live-explore to hard-cap per-page snapshots.
-        sdk_options_kwargs["hooks"] = hooks
+    # Mechanical tool-use enforcement (PreToolUse/PostToolUse callbacks), run
+    # in-process in this event loop. The destructive-op deny hook is merged
+    # in unconditionally for every agent (see `_build_destructive_op_deny_hook`)
+    # — not opt-in — alongside whatever the caller passed (e.g. Step 7
+    # live-explore's turn-budget hook). Multiple `PreToolUse` HookMatchers on
+    # the same event compose independently, so this never conflicts with a
+    # caller-supplied hook.
+    merged_hooks: dict[Any, list[Any]] = {
+        event: list(matchers) for event, matchers in (hooks or {}).items()
+    }
+    for event, matchers in _build_destructive_op_deny_hook().items():
+        merged_hooks.setdefault(event, []).extend(matchers)
+    sdk_options_kwargs["hooks"] = merged_hooks
     if resume:
         sdk_options_kwargs["resume"] = resume
     if add_dirs:

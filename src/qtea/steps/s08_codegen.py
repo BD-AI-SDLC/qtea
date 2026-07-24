@@ -43,6 +43,7 @@ from qtea._sut_git import commit_step, files_in_commit
 from qtea.claude_runner import run_agent
 from qtea.codegen_reconcile import (
     _js_strip,
+    _scan_fixture_symbols,
     fixture_mismatches_to_fixture_tasks,
     inventory_method_index,
     mismatches_to_pom_tasks,
@@ -1454,6 +1455,7 @@ async def _create_helpers(
     active_module: dict[str, Any] | None,
     step: int,
     rules_content: str = "",
+    language: str | None = None,
 ) -> list[tuple[str, bool]]:
     """Phase A5: create new helper functions via call_reasoning_llm.
 
@@ -1468,6 +1470,7 @@ async def _create_helpers(
 
     existing_helpers = (active_module or {}).get("existing_helpers") or []
     style_ref = ""
+    style_ref_ext = ".py"
     if existing_helpers and existing_helpers[0].get("file"):
         ref_path = sut_root / existing_helpers[0]["file"]
         if ref_path.is_file():
@@ -1476,6 +1479,7 @@ async def _create_helpers(
                 head = raw_ref[:3000]
                 last_nl = head.rfind("\n")
                 style_ref = head[:last_nl] if last_nl > 0 else head
+                style_ref_ext = ref_path.suffix or ".py"
             except OSError:
                 pass
 
@@ -1490,20 +1494,24 @@ async def _create_helpers(
         ]
         existing = ""
         target = sut_root / file_path
+        target_ext = target.suffix or style_ref_ext
         if target.is_file():
             with contextlib.suppress(OSError):
                 existing = target.read_text(encoding="utf-8")
 
+        existing_key = f"existing_file{target_ext}"
+        style_key = f"style_reference{style_ref_ext}"
         inputs: dict[str, str] = {
             "helper_specs.json": json.dumps(specs, indent=2),
         }
         if existing:
-            inputs["existing_file.py"] = existing
+            inputs[existing_key] = existing
         if style_ref:
-            inputs["style_reference.py"] = style_ref
+            inputs[style_key] = style_ref
         if rules_content:
             inputs["codegen-rules.md"] = rules_content
 
+        helper_noun, syntax_note = _helper_idiom(language, target_ext)
         names = ", ".join(t.name for t in tasks)
         async with sem:
             log.info(
@@ -1516,13 +1524,13 @@ async def _create_helpers(
                 agent_path,
                 workdir=workdir,
                 user_prompt=(
-                    f"Create {len(tasks)} helper function(s) — {names} — "
+                    f"Create {len(tasks)} {helper_noun} — {names} — "
                     f"matching the specs in `helper_specs.json`. "
-                    f"If `existing_file.py` is provided, append the new "
+                    f"If `{existing_key}` is provided, append the new "
                     f"helpers to it and return the complete updated file. "
                     f"Otherwise return a complete new file. "
-                    f"`style_reference.py` shows coding conventions only. "
-                    f"The output must be syntactically valid Python."
+                    f"`{style_key}` shows coding conventions only. "
+                    f"{syntax_note}"
                 ),
                 inputs=inputs,
                 step=step,
@@ -1575,10 +1583,7 @@ async def _create_helpers(
                         return file_path, False
                 missing = [
                     t.name for t in tasks
-                    if _re.search(
-                        rf"^\s*def\s+{_re.escape(t.name)}\s*\(",
-                        clean, _re.M,
-                    ) is None
+                    if not _helper_symbol_defined(clean, t.name, target_ext)
                 ]
                 if missing:
                     log.error(
@@ -3271,6 +3276,68 @@ def _group_fixture_tasks_by_file(
     return by_file
 
 
+def _stack_is_jsts(language: str | None, suffix: str) -> bool:
+    return (language or "").lower() in ("typescript", "javascript") or suffix in _TS_IMPORT_EXTS
+
+
+def _stack_is_java(language: str | None, suffix: str) -> bool:
+    return (language or "").lower() == "java" or suffix == ".java"
+
+
+def _fixture_idiom(language: str | None, suffix: str) -> tuple[str, str]:
+    """Describe (fixture_noun, syntax_note) for the target file's stack.
+
+    `_create_fixtures` used to hard-code "pytest fixture(s)" / "valid
+    Python" regardless of the actual target extension, so on a TS/Playwright
+    SUT the LLM dutifully wrote literal `@pytest.fixture def ...` bodies into
+    a `.ts` file (run 20260709-083909-223772, tests/pageFixtures.ts).
+    """
+    if _stack_is_jsts(language, suffix):
+        return (
+            "Playwright fixture(s) declared inside a "
+            "`test.extend({ <name>: async ({...}, use) => { ... "
+            "await use(value); } })` block",
+            "The output must be syntactically valid TypeScript/JavaScript.",
+        )
+    if _stack_is_java(language, suffix):
+        return (
+            "JUnit/TestNG setup method(s) annotated with "
+            "`@Before`/`@BeforeEach`",
+            "The output must be syntactically valid Java.",
+        )
+    return ("pytest fixture(s)", "The output must be syntactically valid Python.")
+
+
+def _helper_idiom(language: str | None, suffix: str) -> tuple[str, str]:
+    """Describe (helper_noun, syntax_note) for the target file's stack."""
+    if _stack_is_jsts(language, suffix):
+        return (
+            "helper function(s)",
+            "The output must be syntactically valid TypeScript/JavaScript "
+            "(`function name(...)`, `export function name(...)`, or an "
+            "exported arrow-function constant).",
+        )
+    if _stack_is_java(language, suffix):
+        return (
+            "helper method(s)", "The output must be syntactically valid Java.",
+        )
+    return ("helper function(s)", "The output must be syntactically valid Python.")
+
+
+def _helper_symbol_defined(text: str, name: str, suffix: str) -> bool:
+    """Check helper *name* is defined in *text*, per the target stack's idiom."""
+    esc = _re.escape(name)
+    if suffix in _TS_IMPORT_EXTS:
+        patterns = (
+            rf"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s+{esc}\s*[(<]",
+            rf"^\s*(?:export\s+)?(?:const|let|var)\s+{esc}\s*(?::[^=]+)?=\s*(?:async\s*)?\(",
+        )
+        return any(_re.search(p, text, _re.M) for p in patterns)
+    if suffix == ".java":
+        return _re.search(rf"\b{esc}\s*\(", text) is not None
+    return _re.search(rf"^\s*def\s+{esc}\s*\(", text, _re.M) is not None
+
+
 async def _create_fixtures(
     fixture_tasks: list[_FixtureTask],
     sut_root: Path,
@@ -3279,6 +3346,7 @@ async def _create_fixtures(
     active_module: dict[str, Any] | None,
     step: int,
     rules_content: str = "",
+    language: str | None = None,
 ) -> list[tuple[str, bool]]:
     """Phase A4: create new fixtures via call_reasoning_llm.
 
@@ -3294,6 +3362,7 @@ async def _create_fixtures(
 
     existing_fixtures = (active_module or {}).get("existing_fixtures") or []
     style_ref = ""
+    style_ref_ext = ".py"
     if existing_fixtures and existing_fixtures[0].get("file"):
         ref_path = sut_root / existing_fixtures[0]["file"]
         if ref_path.is_file():
@@ -3308,6 +3377,7 @@ async def _create_fixtures(
                 head = raw_ref[:3000]
                 last_nl = head.rfind("\n")
                 style_ref = head[:last_nl] if last_nl > 0 else head
+                style_ref_ext = ref_path.suffix or ".py"
             except OSError:
                 pass
 
@@ -3325,17 +3395,20 @@ async def _create_fixtures(
         ]
         existing = ""
         target = sut_root / file_path
+        target_ext = target.suffix or style_ref_ext
         if target.is_file():
             with contextlib.suppress(OSError):
                 existing = target.read_text(encoding="utf-8")
 
+        existing_key = f"existing_file{target_ext}"
+        style_key = f"style_reference{style_ref_ext}"
         inputs: dict[str, str] = {
             "fixture_specs.json": json.dumps(specs, indent=2),
         }
         if existing:
-            inputs["existing_file.py"] = existing
+            inputs[existing_key] = existing
         if style_ref:
-            inputs["style_reference.py"] = style_ref
+            inputs[style_key] = style_ref
         if rules_content:
             inputs["codegen-rules.md"] = rules_content
 
@@ -3357,7 +3430,8 @@ async def _create_fixtures(
                                     encoding="utf-8",
                                 )
                                 inputs[
-                                    f"dep_fixture_{inv_fix['name']}.py"
+                                    f"dep_fixture_{inv_fix['name']}"
+                                    f"{dep_path.suffix or target_ext}"
                                 ] = dep_source
                             except OSError:
                                 pass
@@ -3368,14 +3442,17 @@ async def _create_fixtures(
             dep_clause = (
                 f" The new fixture(s) depend on existing fixture(s): "
                 f"{dep_names}. The source of each depended-on fixture is "
-                f"provided as `dep_fixture_<name>.py`. The new fixture(s) "
-                f"MUST request the depended-on fixture as a pytest "
-                f"parameter and build on top of its yielded object — do "
-                f"NOT re-implement authentication or session setup. If "
-                f"`auth_flow.json` is provided, it describes the SUT's "
-                f"authentication mechanism."
+                f"provided as a `dep_fixture_<name>` input file (same "
+                f"extension as its source). The new fixture(s) MUST request "
+                f"the depended-on fixture as an input parameter, using this "
+                f"stack's fixture-dependency idiom, and build on top of its "
+                f"yielded/returned object — do NOT re-implement "
+                f"authentication or session setup. If `auth_flow.json` is "
+                f"provided, it describes the SUT's authentication "
+                f"mechanism."
             )
 
+        fixture_noun, syntax_note = _fixture_idiom(language, target_ext)
         names = ", ".join(t.name for t in tasks)
         async with sem:
             log.info(
@@ -3388,18 +3465,18 @@ async def _create_fixtures(
                 agent_path,
                 workdir=workdir,
                 user_prompt=(
-                    f"Create {len(tasks)} pytest fixture(s) — {names} — "
+                    f"Create {len(tasks)} {fixture_noun} — {names} — "
                     f"matching the specs in `fixture_specs.json`. ALL "
                     f"specified fixtures must appear in the output. "
-                    f"If `existing_file.py` is provided, append the new "
+                    f"If `{existing_key}` is provided, append the new "
                     f"fixtures to it and return the complete updated file "
                     f"(existing content + new fixtures). Otherwise return "
                     f"a complete new file containing ONLY the requested "
                     f"fixtures plus the imports they need. "
-                    f"`style_reference.py` shows coding conventions only "
+                    f"`{style_key}` shows coding conventions only "
                     f"(import grouping, fixture scope, naming) — do NOT "
-                    f"copy its content into your output. The output must "
-                    f"be syntactically valid Python.{dep_clause}"
+                    f"copy its content into your output. "
+                    f"{syntax_note}{dep_clause}"
                 ),
                 inputs=inputs,
                 step=step,
@@ -3455,14 +3532,14 @@ async def _create_fixtures(
                             hint="rolled back; next attempt will regenerate",
                         )
                         return file_path, False
-                # Verify each requested fixture name actually appears as a
-                # `def <name>` in the written file. A missing name surfaces
-                # immediately in the log AND fails the file so reconcile
-                # (Fix 2) catches it.
-                missing = [
-                    t.name for t in tasks
-                    if _re.search(rf"^\s*def\s+{_re.escape(t.name)}\s*\(", clean, _re.M) is None
-                ]
+                # Verify each requested fixture name is actually defined per
+                # this stack's idiom — reuses the same scanner Phase B.5
+                # reconciliation runs (`_scan_fixture_symbols`), so a file
+                # this check accepts can never be reported missing downstream
+                # (and vice versa). A missing name surfaces immediately in
+                # the log AND fails the file so reconcile (Fix 2) catches it.
+                defined_symbols = set(_scan_fixture_symbols(target) or [])
+                missing = [t.name for t in tasks if t.name not in defined_symbols]
                 if missing:
                     log.error(
                         "step08.fixture_create.symbols_missing",
@@ -5828,7 +5905,7 @@ class CodegenStep(Step):
             await _create_fixtures(
                 fixture_tasks, sut_root, wd, agents_root,
                 active_module=active_module_dict, step=8,
-                rules_content=rules_content,
+                rules_content=rules_content, language=language,
             )
 
         # Phase A5: create helpers
@@ -5836,7 +5913,7 @@ class CodegenStep(Step):
             await _create_helpers(
                 helper_tasks, sut_root, wd, agents_root,
                 active_module=active_module_dict, step=8,
-                rules_content=rules_content,
+                rules_content=rules_content, language=language,
             )
 
         # Phase B1: build imports manifest
@@ -6040,6 +6117,19 @@ class CodegenStep(Step):
                         notes=parse_check_format_for_fixer(pre_parse_result)[:500],
                     )
 
+            # KNOWN GAP (documented, not yet fixed): `pom_tasks` is built by
+            # `_build_pom_tasks` from `page_objects[]` only — the exemplar
+            # (non-POM) lane's `reusable_units[]`/`missing_behaviors[]` never
+            # flow through this loop, so `verify_method_bodies` (bare-value
+            # fallback, AssertJ/count-drift/tautology detection, everything
+            # in `codegen_body_verify.py`) never runs for exemplar-lane code.
+            # The only semantic backstop for that lane today is the shadow
+            # LLM judge below (`judge_assertions_shadow`), which never
+            # blocks. Fixing this properly needs a `_build_unit_tasks`
+            # analogue AND adapting the body-extraction logic (currently
+            # class-based) for typically function-based Screenplay units —
+            # a new subsystem, tracked as follow-up work, not a small
+            # extension of the loop below.
             body_violations: list[str] = []
             for pom_task in pom_tasks.values():
                 pom_abs = sut_root / pom_task.pom_file
@@ -6189,7 +6279,7 @@ class CodegenStep(Step):
                     await _create_fixtures(
                         fx_patch, sut_root, wd, agents_root,
                         active_module=active_module_dict, step=8,
-                        rules_content=rules_content,
+                        rules_content=rules_content, language=language,
                     )
                 except Exception as e:
                     log.error(

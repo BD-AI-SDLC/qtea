@@ -50,12 +50,14 @@ class ReviewGateBridge:
         summary_text: str,
         kind: str = "",
         data: Any = None,
+        edit_error: str | None = None,
     ) -> tuple[str, str]:
         """Return ``(decision, edit_instructions)`` (blocks worker thread).
 
         *decision* is ``"approve"`` / ``"reject"`` / ``"edit"``;
         *edit_instructions* is the user-typed text for ``"edit"`` and
-        ``""`` otherwise.
+        ``""`` otherwise. *edit_error* is an optional message describing why
+        the previous edit was rejected — surfaced as a banner in the dialog.
         """
         if self._loop is None:
             # Bridge uninstalled mid-flight — fail safe by approving so
@@ -67,7 +69,9 @@ class ReviewGateBridge:
 
         self._loop.call_soon_threadsafe(
             asyncio.create_task,
-            self._show_in_ui(step, title, summary_text, kind, data, payload, done),
+            self._show_in_ui(
+                step, title, summary_text, kind, data, edit_error, payload, done,
+            ),
         )
 
         # 1-hour ceiling matches HitlBridge; review gates can sit for a
@@ -84,6 +88,7 @@ class ReviewGateBridge:
         summary_text: str,
         kind: str,
         data: Any,
+        edit_error: str | None,
         payload: dict[str, str],
         done: threading.Event,
     ) -> None:
@@ -95,6 +100,7 @@ class ReviewGateBridge:
             completion_event=completion_event,
             kind=kind,
             data=data,
+            edit_error=edit_error,
         )
 
         # Pause the stopwatch — same rationale as HitlBridge: review-gate

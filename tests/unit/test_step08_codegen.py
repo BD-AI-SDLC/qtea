@@ -30,6 +30,7 @@ from qtea.steps.s08_codegen import (
     _framework_mismatch_message,
     _LocatorTask,
     _match_dev_locator,
+    _materialized_prewritten_by_page,
     _PomTask,
     _normalize_runtime_import_in_file,
     _normalize_runtime_imports,
@@ -2190,3 +2191,98 @@ def test_build_all_codegen_files_excludes_jit_resolved_paths(tmp_path: Path):
     )
 
     assert pom_path.resolve() not in {p.resolve() for p in all_files}
+
+
+# ---------------------------------------------------------------------------
+# Coverage-gap stub (added 2026-07-24) — see coverage audit for context.
+# TODO: implement.
+# ---------------------------------------------------------------------------
+
+
+def test_materialized_prewritten_by_page_drops_unmaterialized_constants(
+    tmp_path: Path,
+):
+    """src/qtea/steps/s08_codegen.py:1639-1676 —
+    `_materialized_prewritten_by_page`.
+
+    Regression guard for the "contract honesty" fix (run
+    20260708-121117-99f5ed dangling-reference bug): the POM extender's
+    LOCATOR CONTRACT must only advertise `create_tbd` constants that
+    Phase A2 ACTUALLY wrote to disk, never every task the plan requested.
+    Covers: (1) a `_LocatorTask` with `locator_file=None` (nothing written
+    -> inline tbd() path) is excluded from the returned dict; (2) a task
+    whose `locator_file` points at a file that doesn't exist on disk, or
+    whose content doesn't contain the constant per
+    `_locator_constant_defined`, is excluded (constant claimed but not
+    actually materialized); (3) a task whose constant IS present in its
+    `locator_file`'s content is grouped under its `owning_page` key;
+    (4) multiple tasks sharing one `locator_file` reuse the same cached
+    file-read (`loc_src_cache`) rather than re-reading from disk; (5)
+    `locator_tasks=None` -> returns `{}` without touching the filesystem.
+    """
+    # (5) locator_tasks=None -> {} without touching the filesystem.
+    assert _materialized_prewritten_by_page(None, tmp_path) == {}
+
+    # (2) locator_file points at a file that doesn't exist on disk.
+    missing_task = _LocatorTask(
+        constant_name="MISSING_BTN", intent="x", owning_page="Home",
+        locator_file="src/pages/does_not_exist.py",
+    )
+
+    # (1) locator_file=None -> excluded (inline tbd() path).
+    inline_task = _LocatorTask(
+        constant_name="INLINE_BTN", intent="x", owning_page="Home",
+        locator_file=None,
+    )
+
+    # A real locator file materializing one constant but not another.
+    locators_dir = tmp_path / "src" / "pages"
+    locators_dir.mkdir(parents=True)
+    locators_file = locators_dir / "home_selectors.py"
+    locators_file.write_text(
+        "SUBMIT_BTN = \"#submit\"\n"
+        "SUBMIT_REF = SUBMIT_BTN  # dangling-reference shape, not a definition\n",
+        encoding="utf-8",
+    )
+
+    # (3) constant present via a real definition -> grouped under owning_page.
+    defined_task = _LocatorTask(
+        constant_name="SUBMIT_BTN", intent="submit", owning_page="Home",
+        locator_file="src/pages/home_selectors.py",
+    )
+    # (2b) constant claimed but only referenced, not defined -> excluded.
+    undefined_task = _LocatorTask(
+        constant_name="SUBMIT_REF_ONLY", intent="submit ref", owning_page="Home",
+        locator_file="src/pages/home_selectors.py",
+    )
+    # (4) second task sharing the same locator_file as `defined_task`.
+    second_page_task = _LocatorTask(
+        constant_name="SUBMIT_BTN", intent="submit", owning_page="Checkout",
+        locator_file="src/pages/home_selectors.py",
+    )
+
+    read_text_calls: list[Path] = []
+    orig_read_text = Path.read_text
+
+    def _tracking_read_text(self, *args, **kwargs):
+        read_text_calls.append(self)
+        return orig_read_text(self, *args, **kwargs)
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(Path, "read_text", _tracking_read_text)
+        result = _materialized_prewritten_by_page(
+            [missing_task, inline_task, defined_task, undefined_task, second_page_task],
+            tmp_path,
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert result == {
+        "Home": ["SUBMIT_BTN"],
+        "Checkout": ["SUBMIT_BTN"],
+    }
+    # (4) the shared locator_file was only actually read from disk once,
+    # despite three tasks (defined_task, undefined_task, second_page_task)
+    # pointing at it.
+    assert len([p for p in read_text_calls if p == locators_file]) == 1

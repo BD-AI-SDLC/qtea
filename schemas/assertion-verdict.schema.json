@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://qtea/schemas/assertion-verdict.schema.json",
   "title": "AssertionJudgeVerdicts",
-  "description": "Output of the Stage-3 assertion-intent judge (Step 8, shadow mode). One verdict per generated test function: does its assertion set logically verify a derivative of the test title + the methods it calls, pinned to the Step-4 oracle?",
+  "description": "Output of the Stage-3 assertion-intent judge (Step 8, shadow mode). One verdict per generated test function, judged on two orthogonal dimensions: (1) does its assertion set logically verify a derivative of the test title + the methods it calls, pinned to the Step-4 oracle; (2) does it execute every act-phase choreography step from the code-modification-plan, in order, before asserting?",
   "type": "object",
   "required": ["verdicts"],
   "additionalProperties": false,
@@ -11,7 +11,7 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["test", "verifies_intent", "binds_oracle", "weakness"],
+        "required": ["test", "verifies_intent", "binds_oracle", "weakness", "sequence_complete"],
         "additionalProperties": false,
         "properties": {
           "test": {
@@ -37,6 +37,15 @@
               "weak_matcher"
             ],
             "description": "Primary false-green weakness, or 'none'."
+          },
+          "sequence_complete": {
+            "type": "boolean",
+            "description": "True iff every act-phase choreography step from the code-modification-plan for this test function is called, in ascending order, before the test's assertions. False if a required act step is skipped, reordered, or never called. Trivially true when the plan declared no choreography for this test function."
+          },
+          "missing_steps": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "One entry per act-phase choreography step that is missing or out of order, phrased as '<Pom>.<method> (order <n>) never called' or '... called out of order'. Empty/omitted when sequence_complete is true."
           },
           "reasoning": {
             "type": "string",

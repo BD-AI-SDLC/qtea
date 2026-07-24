@@ -45,7 +45,7 @@ from qtea.codegen_body_verify import (
 )
 from qtea.llm.reasoning import call_reasoning_llm
 from qtea.logging_setup import get_logger
-from qtea.schemas import load_schema
+from qtea.schemas import is_valid, load_schema
 
 log = get_logger(__name__)
 
@@ -215,6 +215,21 @@ async def judge_purpose_fidelity(
                 log.warning(
                     "step08.purpose_judge.unparseable",
                     pom=task.pom_name, error=str(e),
+                )
+                continue
+
+            # The Vertex/BMF backend cannot enforce `output_schema`
+            # server-side (see llm/reasoning.py). A malformed response (e.g.
+            # `verdicts` not a list of objects, or missing `method`/`pom`)
+            # would otherwise silently drop that method from `all_verdicts`
+            # entirely — un-judged, not flagged — rather than surfacing the
+            # gap. Re-validate locally and discard this POM's batch rather
+            # than trust a partial shape.
+            ok, err = is_valid(verdicts_doc, "purpose-fidelity-verdict")
+            if not ok:
+                log.warning(
+                    "step08.purpose_judge.schema_invalid",
+                    pom=task.pom_name, error=err,
                 )
                 continue
             for v in verdicts_doc.get("verdicts") or []:

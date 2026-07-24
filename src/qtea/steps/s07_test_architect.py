@@ -177,6 +177,21 @@ def _inline_reuse_sources(
     return sources, skipped
 
 
+def _lifecycle_hook_index(active_module: dict | None) -> dict[str, list[dict]]:
+    """Group active_module.lifecycle_hooks by canonical `event`.
+
+    Returns ``{event: [hook_dict, ...]}`` preserving sut_inventory order.
+    Used by the hook-reuse existence + sequence gate below.
+    """
+    out: dict[str, list[dict]] = {}
+    if not active_module:
+        return out
+    for entry in active_module.get("lifecycle_hooks") or []:
+        if isinstance(entry, dict) and entry.get("event"):
+            out.setdefault(entry["event"], []).append(entry)
+    return out
+
+
 def _inventory_symbols(active_module: dict | None) -> dict[str, set[str]]:
     """Index reuse-target symbols by category for phase-gate validation.
 
@@ -1008,6 +1023,116 @@ def _validate_plan_against_inventory(
                             f"before login."
                         )
 
+        # Hook-reuse staleness gate (the "stale calls[] after a HITL
+        # from-edit" defect). Only runs when sut_inventory actually has
+        # mined lifecycle_hooks data for this module — skip entirely
+        # otherwise (no ground truth to check against).
+        hook_index = _lifecycle_hook_index(active_module)
+        if hook_index:
+            def _bare_method(ref: str) -> str:
+                return ref.rsplit(":", 1)[-1].rsplit(".", 1)[-1]
+
+            for h in tc.get("hooks") or []:
+                if not isinstance(h, dict) or h.get("source") != "reuse":
+                    continue
+                event = h.get("event") or ""
+                ref = (h.get("from") or "").strip()
+                if not ref:
+                    violations.append(
+                        f"{tc_id}: hook event={event or '?'} source=reuse "
+                        f"missing `from` field"
+                    )
+                    continue
+                ref_file = _normalize_ref(ref.split(":", 1)[0])
+                candidates = hook_index.get(event) or []
+                matched = next(
+                    (e for e in candidates
+                     if _normalize_ref(e.get("file") or "") == ref_file),
+                    None,
+                )
+                if matched is None:
+                    violations.append(
+                        f"{tc_id}: hook event={event} source=reuse `from` "
+                        f"`{ref}` does not match any sut_inventory."
+                        f"lifecycle_hooks entry for this event"
+                    )
+                    continue
+                # Normalize both plan and inventory hook calls to a common
+                # {method, args} shape so downstream comparisons are uniform.
+                # Inventory calls arrive as either bare strings (legacy shape,
+                # kept for backward-compat with pre-existing sut_inventory.json
+                # files) or {method, args} dicts (new shape emitted by the
+                # deterministic Python + TS miners in sut_inventory.py). Plan
+                # calls always arrive as {pom, method, args?} dicts.
+                def _normalize_inv_call(raw: Any) -> dict[str, Any]:
+                    if isinstance(raw, str):
+                        return {"method": raw, "args": []}
+                    if isinstance(raw, dict):
+                        args = raw.get("args")
+                        return {
+                            "method": str(raw.get("method") or ""),
+                            "args": [str(a) for a in args] if isinstance(args, list) else [],
+                        }
+                    return {"method": "", "args": []}
+
+                plan_calls_norm = [
+                    {
+                        "method": str(c.get("method") or ""),
+                        "args": [
+                            str(a) for a in (c.get("args") or [])
+                            if isinstance(a, (str, int, float, bool))
+                        ] if isinstance(c.get("args"), list) else [],
+                    }
+                    for c in (h.get("calls") or [])
+                    if isinstance(c, dict) and c.get("method")
+                ]
+                inv_calls_norm = [
+                    _normalize_inv_call(raw)
+                    for raw in (matched.get("calls") or [])
+                    if raw
+                ]
+                inv_calls_norm = [c for c in inv_calls_norm if c["method"]]
+
+                plan_seq = [_bare_method(c["method"]) for c in plan_calls_norm]
+                inv_seq = [_bare_method(c["method"]) for c in inv_calls_norm]
+                if inv_seq and plan_seq != inv_seq:
+                    violations.append(
+                        f"{tc_id}: hook event={event} source=reuse from "
+                        f"`{ref}` has calls[] {plan_seq} but "
+                        f"sut_inventory.lifecycle_hooks records {inv_seq} — "
+                        f"stale relative to its `from` pointer. Resync "
+                        f"calls[] to match the reused hook's real "
+                        f"sequence, preserving args for methods that "
+                        f"still appear."
+                    )
+                elif inv_seq and plan_seq == inv_seq:
+                    # Args-preservation check: when method sequences agree,
+                    # cross-check that any call whose inventory entry carries
+                    # positional args also carries args in the plan. Dropping
+                    # args here is the exact defect that surfaces downstream
+                    # as codegen `arity_mismatch` — Step 8 has no oracle to
+                    # backfill a missing argument value.
+                    #
+                    # We deliberately do NOT compare arg *expressions*: the
+                    # architect may legitimately reparameterize (e.g. per-role
+                    # credentials differ from the reused hook's role). The
+                    # gate rejects only the total-drop signal: inventory has
+                    # args, plan has none.
+                    for i, (plan_c, inv_c) in enumerate(zip(plan_calls_norm, inv_calls_norm)):
+                        if inv_c["args"] and not plan_c["args"]:
+                            args_verbatim = ", ".join(inv_c["args"])
+                            violations.append(
+                                f"{tc_id}: hook event={event} source=reuse "
+                                f"from `{ref}` call [{i}]:{plan_c['method']} "
+                                f"declares 0 args but reused source calls it "
+                                f"with {len(inv_c['args'])} arg(s): "
+                                f"[{args_verbatim}]. Preserve args verbatim "
+                                f"from sut_inventory.lifecycle_hooks — "
+                                f"dropping them produces a zero-arg call "
+                                f"that fails codegen reconciliation as "
+                                f"arity_mismatch."
+                            )
+
         # Navigation-precondition gate (the "wrong screen" defect). Some reused
         # POM methods act on a specific already-active view (grid/table/tab)
         # with no in-code guard for it — the requirement is a pure calling
@@ -1128,6 +1253,25 @@ def _render_plan_markdown(plan: dict) -> str:
                     lines.append(
                         f"    {st.get('order', '?')}. `{pom}.{method}(...)`{loc_s}"
                     )
+
+        hooks = tc.get("hooks") or []
+        if hooks:
+            lines.append("- Hooks:")
+            for h in hooks:
+                event = h.get("event") or "?"
+                src = h.get("source") or "?"
+                calls = ", ".join(
+                    f"`{c.get('pom')}.{c.get('method')}(...)`"
+                    for c in (h.get("calls") or [])
+                    if isinstance(c, dict)
+                ) or "-"
+                if src == "reuse":
+                    ref = h.get("from") or "?"
+                    lines.append(
+                        f"  - `{event}` - reuse from `{ref}` calls=[{calls}]"
+                    )
+                else:
+                    lines.append(f"  - `{event}` - {src} calls=[{calls}]")
 
         for label, key in (
             ("Fixtures", "fixtures"),

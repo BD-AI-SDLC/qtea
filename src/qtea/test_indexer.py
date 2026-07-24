@@ -923,11 +923,18 @@ def _scan_interaction_patterns(
       asserted ``page`` is the outer page variable (should be the popup).
     """
     import ast as _ast
+    import warnings
 
     if framework not in ("pytest", "playwright-py", "selenium-py"):
         return []
     try:
-        tree = _ast.parse(text)
+        with warnings.catch_warnings():
+            # Invalid-escape sequences (`\s`, `\d`, ...) in non-raw string
+            # literals are already reported separately by the tokenize-based
+            # `invalid-escape` rule; don't let the parser's own SyntaxWarning
+            # for the same literals leak into caller output on every scan.
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = _ast.parse(text)
     except SyntaxError:
         return []
 
@@ -1096,11 +1103,16 @@ def _scan_zero_assertion_tests(
     ``def test_*`` function whose body contains no assertion AND no
     ``@pytest.mark.qtea_setup`` opt-out marker."""
     import ast as _ast
+    import warnings
 
     if framework not in ("pytest", "playwright-py", "selenium-py"):
         return []
     try:
-        tree = _ast.parse(text)
+        with warnings.catch_warnings():
+            # See _scan_interaction_patterns: invalid-escape SyntaxWarning is
+            # already reported by the dedicated tokenize-based rule.
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = _ast.parse(text)
     except SyntaxError:
         # Preflight's AST check reports this defect separately; suppress here
         # to avoid duplicate noise.

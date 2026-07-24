@@ -111,14 +111,20 @@ def _synthesize(
         heal = heal_log.get(test_id, {})
         attempted = bool(heal.get("attempted"))
         succeeded = bool(heal.get("applied")) and (c.get("status") not in ("failed", "error"))
-        if attempted and not succeeded:
+        msg = c.get("message") or ""
+        is_infra_signal = any(pat in msg for pat in _INFRA_PATTERNS)
+        if is_infra_signal:
+            # DNS/connection/target-closed failures are infra breakage, not
+            # app-behaviour defects — never file these as "functional" even
+            # when a heal attempt was also made on the same test.
+            category = "environment"
+        elif attempted and not succeeded:
             category = "flaky" if heal.get("applied") else _CATEGORY_DEFAULT
         else:
             category = _CATEGORY_DEFAULT
-        msg = c.get("message") or ""
         if category == "test-code-defect":
             layer = "automation"
-        elif category in {"environment", "flaky"} or any(pat in msg for pat in _INFRA_PATTERNS):
+        elif category in {"environment", "flaky"}:
             layer = "infrastructure"
         else:
             layer = _LAYER_DEFAULT

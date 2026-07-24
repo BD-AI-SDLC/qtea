@@ -1,7 +1,7 @@
 ---
 name: design-editor
 description: Applies free-text user edits to a test-design markdown document.
-model: claude-sonnet-4-6
+model: claude-sonnet-5
 transport: reasoning
 ---
 

@@ -12,6 +12,7 @@ from pathlib import Path
 
 from qtea.sut_inventory import (
     Fixture,
+    HookCall,
     LocatorClass,
     LocatorConstant,
     ModuleInventory,
@@ -273,8 +274,11 @@ def test_ts_lifecycle_hooks_and_open_method(tmp_path: Path) -> None:
 
     hooks = scan_ts_lifecycle_hooks(tmp_path)
     by_event = {h.event: h for h in hooks}
-    assert by_event["before_each"].calls == ["basePage.openBaseURL", "basePage.logIn"]
-    assert by_event["after_each"].calls == ["basePage.logout"]
+    assert by_event["before_each"].calls == [
+        HookCall(method="basePage.openBaseURL", args=[]),
+        HookCall(method="basePage.logIn", args=["'u'", "'p'"]),
+    ]
+    assert by_event["after_each"].calls == [HookCall(method="basePage.logout", args=[])]
 
 
 def test_python_lifecycle_hooks_unittest_and_autouse(tmp_path: Path) -> None:
@@ -299,10 +303,71 @@ def test_python_lifecycle_hooks_unittest_and_autouse(tmp_path: Path) -> None:
     assert {"before_each", "after_each"} <= events
     setup = next(h for h in hooks if h.framework_construct == "setUp")
     assert setup.event == "before_each"
-    assert setup.calls == ["self.base.open_base_url", "self.base.log_in"]
+    assert setup.calls == [
+        HookCall(method="self.base.open_base_url", args=[]),
+        HookCall(method="self.base.log_in", args=["'u'", "'p'"]),
+    ]
     # autouse function fixture with yield → both a before_each and after_each
     autouse_hooks = [h for h in hooks if "autouse" in h.framework_construct]
     assert {h.event for h in autouse_hooks} == {"before_each", "after_each"}
+
+
+def test_python_hook_calls_capture_positional_args(tmp_path: Path) -> None:
+    """Python miner: hook body captures positional arg expressions verbatim
+    for identifier args, literal args, and MODULE.MEMBER-style member-access
+    args — the exact shapes that Step-7 architect must be able to replay
+    into `hooks[].calls[].args` to avoid downstream arity_mismatch."""
+    _touch(
+        tmp_path / "tests" / "test_smoke.py",
+        "import pytest\n"
+        "from constants import NAV\n"
+        "USER = 'u'\n"
+        "PASS = 'p'\n"
+        "class TestThing:\n"
+        "    def setUp(self):\n"
+        "        self.base.open_base_url()\n"
+        "        self.base.log_in(USER, PASS)\n"
+        "        self.base.click_menu(NAV.HOME)\n"
+        "        self.base.type_query('hello world')\n",
+    )
+    hooks = scan_python_lifecycle_hooks(tmp_path)
+    setup = next(h for h in hooks if h.framework_construct == "setUp")
+    assert setup.calls == [
+        HookCall(method="self.base.open_base_url", args=[]),
+        HookCall(method="self.base.log_in", args=["USER", "PASS"]),
+        HookCall(method="self.base.click_menu", args=["NAV.HOME"]),
+        HookCall(method="self.base.type_query", args=["'hello world'"]),
+    ]
+
+
+def test_ts_hook_calls_capture_positional_args(tmp_path: Path) -> None:
+    """TS miner: hook body captures positional arg expressions verbatim
+    for identifier args, string-literal args, and MODULE.MEMBER-style
+    member-access args — regression for the args-drop defect where a call
+    like `basePage.selectMenu(NAV_ITEMS.HOME)` used to land as arg-less.
+    Also verifies balanced-parens: a nested call as an arg does NOT break
+    the enclosing arg-splitter."""
+    _touch(
+        tmp_path / "tests" / "smoke.spec.ts",
+        "import { test } from './fixtures';\n"
+        "import { NAV_ITEMS } from './constants';\n"
+        "test.beforeEach(async ({ basePage }) => {\n"
+        "  await basePage.openBaseURL();\n"
+        "  await basePage.logIn(process.env.USER!, process.env.PASS!);\n"
+        "  await basePage.selectMenu(NAV_ITEMS.HOME);\n"
+        "  await basePage.typeQuery('hello, world');\n"
+        "  await basePage.setOptions({ debug: true, retries: 2 });\n"
+        "});\n",
+    )
+    hooks = scan_ts_lifecycle_hooks(tmp_path)
+    before = next(h for h in hooks if h.event == "before_each")
+    assert before.calls == [
+        HookCall(method="basePage.openBaseURL", args=[]),
+        HookCall(method="basePage.logIn", args=["process.env.USER!", "process.env.PASS!"]),
+        HookCall(method="basePage.selectMenu", args=["NAV_ITEMS.HOME"]),
+        HookCall(method="basePage.typeQuery", args=["'hello, world'"]),
+        HookCall(method="basePage.setOptions", args=["{ debug: true, retries: 2 }"]),
+    ]
 
 
 def test_python_open_method_detected_from_name(tmp_path: Path) -> None:

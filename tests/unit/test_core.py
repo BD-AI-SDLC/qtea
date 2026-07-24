@@ -44,7 +44,7 @@ def test_agent_model_map_loaded():
     assert cfg.thinking == {"type": "adaptive"}
     cfg2 = model_for_agent("polyglot-test-fixer")
     assert cfg2 is not None
-    assert cfg2.model == "claude-opus-4-7"
+    assert cfg2.model == "claude-opus-4-8"
     assert model_for_agent("does-not-exist") is None
 
 

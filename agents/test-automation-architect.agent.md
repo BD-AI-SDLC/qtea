@@ -184,7 +184,7 @@ For each AUTOMATABLE test case in `test-design.md`:
 
    **Guardrails.** Reconciliation decides *what* to test and which locator `intent` to use — it never licenses a hallucinated reuse reference: `source: "reuse"` still requires the grep test against `sut_inventory.json` (non-negotiable rule 2), and a live-observed element is NOT an inventory reuse target. And assertions: expected values come from `test-design.md`'s `Expected Result:` verbatim (step 3a) — the live-map may inform *which element/locator* an assertion targets, but NEVER the expected value. A capture from a possibly-wrong session must not become the oracle.
 
-4. **Identify locator needs.** For each UI element referenced in steps. **Every locator entry MUST include `name`, `owning_page`, and `source` — `owning_page` is the POM class name from step 3 (must match a `page_objects[].name` you emit in the same test case).**
+4. **Identify locator needs.** For each UI element referenced in steps. **Every locator entry MUST include `name`, `owning_page`, and `source` — `owning_page` is the POM class name from step 3, referenced *verbatim* (case-sensitive equality against `page_objects[].name`; use the PascalCase class name `"LoginPage"`, never the camelCase instance-variable form `"loginPage"` the writer will bind at codegen time).**
    - If `existing_locators` has a matching constant (byte-match on selector, or strong intent match) → emit `{"name": "<existing_constant>", "owning_page": "<PomClass>", "source": "reuse", "from": "<file>"}`.
    - Otherwise → emit `{"name": "<NEW_CONST_NAME>", "owning_page": "<PomClass>", "source": "create_tbd", "intent": "<one-line semantic intent>"}` with intent ≤120 chars. Prefer visible role + label (e.g. `"sign in button"`) over verbose context — the JIT resolver's in-process heuristic matches short intents to AOM role+name without LLM cost.
 
@@ -202,7 +202,7 @@ For each AUTOMATABLE test case in `test-design.md`:
    - `order` — 1-based position across BOTH phases (Arrange steps come first).
    - `phase` — `"arrange"` | `"act"` (default `"act"` if omitted).
    - `manual_step_ref` — a short pointer to the originating manual step or precondition (e.g. `"precondition: logged in as editor"`, `"step 2: approve as AppUser2"`).
-   - `pom` — the owning POM class name (must match a `page_objects[].name` you emit in this test case).
+   - `pom` — the owning POM class name, *verbatim as declared in* `page_objects[].name` — the PascalCase **class name** (e.g. `"LoginPage"`), NEVER the camelCase **instance-variable name** (e.g. `"loginPage"`) the writer will bind at codegen time. The phase gate does a case-sensitive equality check: a camelCase reference to a PascalCase class fails as `not planned in this test case` even though the class IS in the plan.
    - `method` — the method to call: either an existing reused method on that POM, or one of its `missing_methods[].name`. Never name a method you did not either reuse or list as missing.
    - `locator` (optional) — the locator constant the step interacts with (must match a `locators[].name` in this test case).
    - **`args` (REQUIRED whenever the method takes arguments)** — the authoritative, ordered argument expressions, one per required parameter, sourced from the strategy. This is where "which user", "which comment", "which expected value" live. Examples: a `switchUser` to the ISP Office approver → `args: ["USERNAME_ISP_OFFICE","PASSWORD_ISP_OFFICE"]`; an `approveReview` → `args: ["entityName","'Reviewer approval'","'…dialog text…'"]`; an `assertEntityStatus` → `args: ["'Approved'"]`. If a step's method needs arguments and you leave `args` empty, the writer emits a zero-arg stub that fails compilation — do not do this. Declare the credential/expected constants once (the writer emits them from the strategy) and reference them by name in `args`.
@@ -224,6 +224,8 @@ For each AUTOMATABLE test case in `test-design.md`:
 
    Each `hooks[]` entry carries: `event`, `source` (`reuse`|`create`), `from` (when reuse — the `sut_inventory.lifecycle_hooks` file/symbol), and `calls[]` (ordered `{pom, method, args}`, same reference rules as `steps[]`).
 
+   **7d. Preserve args verbatim on `reuse` hooks.** When `source: "reuse"`, `calls[i].args` MUST equal the matched inventory hook's `calls[i].args` verbatim — see `sut_inventory.lifecycle_hooks[<event>].calls[i].args` for the matched `from:` file. The deterministic Python + TS miners now capture positional argument expressions on hook calls (as of the `HookCall` upgrade); if the matched inventory entry lists a call with args and you omit them, the phase gate rejects your plan (`arity_mismatch` — Step 8 codegen would emit a zero-arg call that fails compilation, and reconcile has no oracle to backfill the missing value). Common shape: a call like `basePage.selectLoginOptionByText(NAV_ITEMS.HOME)` in the reused source lands in the inventory as `{"method": "basePage.selectLoginOptionByText", "args": ["NAV_ITEMS.HOME"]}` — replay both fields in your plan. For legacy inventory entries in the bare-string form (`"basePage.foo"`), args are unknown; that call has an empty `args: []` in the inventory and no arg-preservation requirement fires — but if the source of the reused hook is available inline under `reuse-source/<file>` you should still cross-check against it and lift args from the source text.
+
 ## Non-negotiable rules
 
 1. **Never propose duplicates.** Every `create` decision must be justified by absence in the inventory. If a fixture / POM / helper / locator already exists with the right shape, you MUST emit `reuse` referencing it. The codegen agent enforces byte-match deduplication as a backstop, but planning duplicates wastes its turns.
@@ -238,7 +240,9 @@ For each AUTOMATABLE test case in `test-design.md`:
 
 11. **UI tests must open the app before login.** For any browser test, an open-base-URL call (`auth_flow.open_method`, e.g. `openBaseURL` → `page.goto('/')`) MUST run before the login call — in the `before_each` hook (preferred) or leading arrange steps. Login on a fresh page hits a blank tab and every locator times out. The phase gate hard-rejects a UI test that logs in with no preceding open/navigate call.
 
-10. **Justify every reuse against the source you read.** Every `source: "reuse"` entry MUST include a `reuse_justification` field — one sentence (≤200 chars) that names the concrete matching dimension you observed when reading the inlined `reuse-source/*` file. Reference the matching dimension explicitly: yielded type and pre-state for fixtures (e.g. `"yields Page already authenticated as admin and dismisses welcome modal"`), owning-page coherence for POMs (e.g. `"ChatPage already models the /chat route and its side-nav region this TC exercises"`), selector-intent overlap for locators (e.g. `"existing SIGN_IN_BUTTON constant targets the same primary CTA on the login form"`). Empty / generic / shape-less justifications ("matches", "fits", "reuse from inventory") are rejected by the phase gate. If after reading the source you cannot name a concrete matching dimension, emit `source: "create"` (or `create_tbd` for locators) instead.
+10. **Justify every reuse against the source you read.** Every `source: "reuse"` entry MUST include a `reuse_justification` field — **one sentence, ≤300 chars, naming ONE concrete matching dimension** you observed when reading the inlined `reuse-source/*` file. Reference the matching dimension explicitly: yielded type and pre-state for fixtures (e.g. `"yields Page already authenticated as admin and dismisses welcome modal"`), owning-page coherence for POMs (e.g. `"already models the /chat route and its side-nav region this TC exercises"`), selector-intent overlap for locators (e.g. `"existing SIGN_IN_BUTTON constant targets the same primary CTA on the login form"`). **Not** a per-method inventory (e.g. `"already implements methodA, methodB reused for field F, methodC, methodD — covers the whole TC"`) — that overflows the 300-char schema cap AND duplicates the `missing_methods[]` array, which is where method-level detail already lives for the writer to read. Empty / generic / shape-less justifications ("matches", "fits", "reuse from inventory") are also rejected. If after reading the source you cannot name a concrete matching dimension, emit `source: "create"` (or `create_tbd` for locators) instead.
+
+12. **Reference POMs by class name, never by variable name — in every call site.** Every `pom` field in `test_functions[].steps[]`, every `pom` field in `hooks[].calls[]`, and every `owning_page` in `locators[]` MUST be the exact string you emit as `page_objects[].name` — the PascalCase **class name** (e.g. `"LoginPage"`). NEVER the camelCase **instance-variable form** the writer will bind at codegen time (e.g. `"loginPage"`, `"basePage"`, `"notificationInboxPage"`). The phase gate does a case-sensitive set-membership check across all three call sites; a camelCase reference against a PascalCase class fails as `not planned in this test case` even though the class IS in the plan — the error message renders both, which reads as a contradiction. Pick ONE form (the class name) and use it consistently across `page_objects[]`, `steps[]`, `hooks[].calls[]`, and `locators[].owning_page`.
 
 ## Workflow
 
@@ -306,11 +310,25 @@ Every entry below MUST have its required fields present, with the right discrimi
         {"name": "EMAIL_INPUT", "owning_page": "LoginPage", "source": "reuse", "from": "src/pages/locators/login.py",
          "reuse_justification": "existing constant targets the same email field this TC fills"},
         {"name": "SIGN_IN_BUTTON", "owning_page": "LoginPage", "source": "create_tbd", "intent": "sign in button"}
+      ],
+      "hooks": [
+        {
+          "event": "before_each",
+          "source": "reuse",
+          "from": "tests/smoke.spec.ts:beforeEach",
+          "calls": [
+            {"pom": "BasePage", "method": "openBaseURL"},
+            {"pom": "BasePage", "method": "logIn", "args": ["USERNAME", "PASSWORD"]},
+            {"pom": "BasePage", "method": "goToModule", "args": ["MENU_ITEMS.HOME"]}
+          ]
+        }
       ]
     }
   ]
 }
 ```
+
+The hook example above shows the `args` invariant: `logIn` and `goToModule` take arguments in the reused hook body, so their entries carry `args` verbatim. Dropping either would trip the args-preservation gate (`arity_mismatch`).
 
 ## Quality gates (enforced by Step 7)
 
@@ -324,6 +342,7 @@ The pipeline validates your output against the rules in the reasoning contract a
 - Any `kind` other than `"assertion"` carrying `acceptance_criteria`.
 - Login/auth page object planned but no Arrange login step invoking it in `steps[]`.
 - A `steps[]`/`hooks[].calls[]` entry reuses a method listed in `sut_inventory.navigation_preconditions[]` without its `requires_call` appearing earlier in the same test function's combined hook+steps sequence.
+- A `source: reuse` hook's `calls[i]` omits `args` when the matched `sut_inventory.lifecycle_hooks` entry records positional args for the same call — dropping them produces a zero-arg call at codegen that fails reconciliation as `arity_mismatch` (Step 8 has no oracle to backfill the missing value; args must be preserved verbatim from the inventory).
 - Marker names not matching `qtea_smoke|qtea_regression|qtea_e2e|qtea_exploratory` exactly.
 - Plan failing schema validation against `schemas/code-modification-plan.schema.json`.
 

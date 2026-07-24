@@ -156,6 +156,33 @@ def _load_assertion_oracle(ctx: StepContext) -> dict:
                     sym = c.get("expected_symbol")
                     if sym:
                         expected.add(str(sym))
+        # Exemplar lane (non-POM): the same oracle data lives in
+        # `reusable_units[].missing_behaviors[]` instead of
+        # `page_objects[].missing_methods[]` — POM-only extraction above left
+        # this lane's `expected_values` empty (fail-open) for every run,
+        # silently disabling the "corrected, never weakened" heal guarantee
+        # for the entire lane. `missing_behaviors[].kind` and
+        # `acceptance_criteria[]` use the identical shape/field names as the
+        # POM lane (schemas/code-modification-plan.schema.json,
+        # `$defs.reusable_unit`), so this mirrors the loop above exactly.
+        for ru in tc.get("reusable_units") or []:
+            if not isinstance(ru, dict):
+                continue
+            for mb in ru.get("missing_behaviors") or []:
+                if not isinstance(mb, dict) or mb.get("kind") != "assertion":
+                    continue
+                crits = mb.get("acceptance_criteria") or []
+                if mb.get("name"):
+                    by_method[mb["name"]] = crits
+                for c in crits:
+                    if not isinstance(c, dict):
+                        continue
+                    lit = c.get("expected_literal")
+                    if lit is not None:
+                        expected.add(str(lit))
+                    sym = c.get("expected_symbol")
+                    if sym:
+                        expected.add(str(sym))
     return {"expected_values": expected, "by_method": by_method}
 
 

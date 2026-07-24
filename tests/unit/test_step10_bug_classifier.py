@@ -81,6 +81,51 @@ def test_render_markdown_includes_key_fields():
     assert "No failing tests" in md_empty
 
 
+def test_synthesize_files_infra_signal_as_environment_not_functional():
+    """Regression guard: `_INFRA_PATTERNS` (net::ERR_/ECONNREFUSED/DNS/
+    Target closed) must land the fallback classification in the
+    `environment` category — previously `category` was only ever
+    "flaky" or "functional" in `_synthesize`, and `_INFRA_PATTERNS` was
+    checked solely to pick the `layer`, never the `category`, so a DNS
+    failure was miscategorized as a functional app defect."""
+    candidates = [{
+        "test_id": "T-dns", "title": "loads dashboard", "status": "failed",
+        "message": "page.goto: net::ERR_NAME_NOT_RESOLVED at https://x/",
+    }]
+    rep = _synthesize("run-env", candidates, {})
+    ok, err = is_valid(rep, "bug-reports")
+    assert ok, err
+    assert rep["bugs"][0]["category"] == "environment"
+    assert rep["bugs"][0]["layer"] == "infrastructure"
+    assert rep["summary"]["by_category"]["environment"] == 1
+    assert rep["summary"]["by_category"]["functional"] == 0
+
+
+def test_synthesize_infra_signal_wins_even_when_heal_was_attempted():
+    """A heal attempt on an infra-broken test must not mask the infra
+    signal as "flaky" — it's still environment breakage, not test flake."""
+    candidates = [{
+        "test_id": "T-conn", "title": "submits form", "status": "failed",
+        "message": "ECONNREFUSED 127.0.0.1:4000",
+    }]
+    heal_log = {"T-conn": {"attempted": True, "applied": True}}
+    rep = _synthesize("run-env2", candidates, heal_log)
+    assert rep["bugs"][0]["category"] == "environment"
+
+
+def test_synthesize_non_infra_failure_still_defaults_to_functional():
+    """Control case: an ordinary assertion failure with no infra pattern
+    in the message must still default to `functional` (guards against the
+    fix being overly broad)."""
+    candidates = [{
+        "test_id": "T-plain", "title": "shows total", "status": "failed",
+        "message": "AssertionError: expected 42, got 41",
+    }]
+    rep = _synthesize("run-plain", candidates, {})
+    assert rep["bugs"][0]["category"] == "functional"
+    assert rep["bugs"][0]["layer"] == "frontend"
+
+
 def test_agent_report_is_usable_checks_count_and_schema():
     candidates = [{"test_id": "T-a", "title": "t", "status": "failed"}]
     good = _synthesize("r", candidates, {})

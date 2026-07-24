@@ -94,6 +94,8 @@ $test_section
 
 $bug_section
 
+$advisory_findings_section
+
 $plan_section
 
 <script>
@@ -362,6 +364,75 @@ def _render_bug_cards(bugs: list[dict]) -> str:
     return f'<h2>Bug Reports ({len(bugs)})</h2>{"".join(cards)}'
 
 
+def _render_advisory_findings_section(advisory_findings: dict) -> str:
+    """Step 8's shadow-mode LLM judge findings — an independent judge's
+    opinion, never blocking, and structurally distinct from a confirmed
+    bug. Rendered only when at least one judge actually flagged something;
+    uses the same amber "warned"/fallback-banner palette so it reads as
+    advisory, not a hard failure."""
+    if not advisory_findings:
+        return ""
+
+    blocks: list[str] = []
+
+    assertion = advisory_findings.get("assertion") or {}
+    flagged = [
+        v for v in (assertion.get("verdicts") or [])
+        if isinstance(v, dict) and (
+            not v.get("verifies_intent")
+            or not v.get("binds_oracle")
+            or v.get("weakness") not in (None, "none")
+            or not v.get("sequence_complete", True)
+        )
+    ]
+    if flagged:
+        items = "".join(
+            f"<li><code>{_escape(v.get('test') or '?')}</code> "
+            f"&mdash; {_escape(v.get('weakness') or 'flagged')}: "
+            f"{_escape(v.get('reasoning') or '')}"
+            + (
+                f"<br><em>missing steps:</em> "
+                f"{_escape('; '.join(v.get('missing_steps') or []))}"
+                if v.get("missing_steps") else ""
+            )
+            + "</li>"
+            for v in flagged
+        )
+        blocks.append(f"<h3>Assertion Intent ({len(flagged)} flagged)</h3><ul>{items}</ul>")
+
+    purpose = advisory_findings.get("purpose_fidelity") or {}
+    flagged = [
+        v for v in (purpose.get("verdicts") or [])
+        if isinstance(v, dict) and (
+            not v.get("fulfills_purpose")
+            or v.get("weakness") not in (None, "none")
+        )
+    ]
+    if flagged:
+        items = "".join(
+            f"<li><code>{_escape(v.get('pom') or '?')}.{_escape(v.get('method') or '?')}</code> "
+            f"&mdash; {_escape(v.get('weakness') or 'flagged')}: "
+            f"{_escape(v.get('reasoning') or '')}</li>"
+            for v in flagged
+        )
+        blocks.append(f"<h3>Purpose Fidelity ({len(flagged)} flagged)</h3><ul>{items}</ul>")
+
+    if not blocks:
+        return ""
+
+    return (
+        "<h2>Advisory Findings (shadow-mode, not blocking)</h2>"
+        '<div style="background:#fef3c7;border:1px solid #f59e0b;'
+        'border-radius:.5rem;padding:1rem 1.25rem;margin-bottom:1.5rem">'
+        '<p style="margin-bottom:.5rem;color:#92400e;font-size:.875rem">'
+        "These are an independent LLM judge&rsquo;s opinions, run in shadow "
+        "mode (never blocking Step 8). Review before trusting the flagged "
+        "tests to catch a real regression.</p>"
+        + "".join(blocks)
+        + "</div>"
+    )
+
+
 def _render_plan_section(report: RunReport) -> str:
     parts: list[str] = []
     if report.plan:
@@ -531,6 +602,7 @@ def render_html(report: RunReport, *, inline_images: bool = False) -> str:
             'was unusable. Severity/category values are defaults, not '
             'agent-assessed.</div>'
         ) + bug_section
+    advisory_findings_section = _render_advisory_findings_section(report.advisory_findings)
     plan_section = _render_plan_section(report)
     pipeline_section = _render_pipeline_section(
         report.steps_summary, report.auxiliary_summary, s,
@@ -552,5 +624,6 @@ def render_html(report: RunReport, *, inline_images: bool = False) -> str:
         pipeline_section=pipeline_section,
         test_section=test_section,
         bug_section=bug_section,
+        advisory_findings_section=advisory_findings_section,
         plan_section=plan_section,
     )

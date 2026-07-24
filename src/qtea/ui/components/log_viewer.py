@@ -14,6 +14,7 @@ from qtea.ui.theme import (
     CARD_BG,
     DIVIDER,
     LOG_AGENT_COLOR,
+    LOG_ERROR_FIELD_COLOR,
     LOG_LEVEL_COLORS,
     LOG_MODEL_COLOR,
     LOG_STEP_COLOR,
@@ -134,50 +135,57 @@ def _build_log_line(line: LogLine) -> ft.Container:
 
     # Message / fields. If the event carries an `agent` field, extract it and
     # render it as a cyan span so the human can see at a glance which agent is
-    # driving the current turn. The remaining fields are rebuilt from the dict
-    # in the same order the parent used, minus the agent key.
+    # driving the current turn. If the event carries an `error` field (e.g.
+    # a step.end on a failed step) we also take the field-iterating path so
+    # the error value can be tinted orange — otherwise it would be buried in
+    # the flat dim message.
     _SKIP_KEYS = {"event", "timestamp", "level", "run_id", "agent"}
     _MODEL_KEYS = {"model"}
     _TOKEN_KEYS = {"tokens_input", "tokens_output"}
-    _HIGHLIGHT_KEYS = _MODEL_KEYS | _TOKEN_KEYS
+    _ERROR_KEYS = {"error"}
 
     agent_name = line.fields.get("agent") if line.fields else None
-    if agent_name:
-        parts.append(
-            ft.TextSpan(
-                f"agent={agent_name}",
-                style=ft.TextStyle(
-                    size=sz(11),
-                    color=LOG_AGENT_COLOR,
-                    weight=ft.FontWeight.BOLD,
-                ),
+    has_error = bool(line.fields.get("error")) if line.fields else False
+    if agent_name or has_error:
+        need_comma = False
+        if agent_name:
+            parts.append(
+                ft.TextSpan(
+                    f"agent={agent_name}",
+                    style=ft.TextStyle(
+                        size=sz(11),
+                        color=LOG_AGENT_COLOR,
+                        weight=ft.FontWeight.BOLD,
+                    ),
+                )
             )
-        )
+            need_comma = True
         remaining = [
             (k, v)
             for k, v in line.fields.items()
             if k not in _SKIP_KEYS
             and v is not None and v is not False
         ]
-        need_comma = True
         for k, v in remaining:
-            if k in _HIGHLIGHT_KEYS:
-                color = LOG_MODEL_COLOR if k in _MODEL_KEYS else LOG_TOKENS_COLOR
-                prefix = ", " if need_comma else ""
-                parts.append(
-                    ft.TextSpan(
-                        f"{prefix}{k}={v}",
-                        style=ft.TextStyle(size=sz(11), color=color),
-                    )
-                )
+            prefix = ", " if need_comma else ""
+            if k in _MODEL_KEYS:
+                color = LOG_MODEL_COLOR
+                weight = None
+            elif k in _ERROR_KEYS:
+                color = LOG_ERROR_FIELD_COLOR
+                weight = ft.FontWeight.W_600
+            elif k in _TOKEN_KEYS:
+                color = LOG_TOKENS_COLOR
+                weight = None
             else:
-                prefix = ", " if need_comma else ""
-                parts.append(
-                    ft.TextSpan(
-                        f"{prefix}{k}={v}",
-                        style=ft.TextStyle(size=sz(11), color=ON_SURFACE_DIM),
-                    )
+                color = ON_SURFACE_DIM
+                weight = None
+            parts.append(
+                ft.TextSpan(
+                    f"{prefix}{k}={v}",
+                    style=ft.TextStyle(size=sz(11), color=color, weight=weight),
                 )
+            )
             need_comma = True
     elif line.message:
         parts.append(

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import Mock
+
+import pytest
 
 from qtea.checkpoints import RunState
 from qtea.pipeline import PipelineOptions
@@ -16,6 +19,7 @@ from qtea.steps.s07_test_architect import (
     _inventory_symbols,
     _path_under_approved,
     _render_plan_markdown,
+    _validate_assertion_oracle,
     _validate_plan_against_inventory,
 )
 from qtea.workspace import create_workspace
@@ -225,6 +229,230 @@ def test_ui_gate_trusts_reused_before_each_hook():
     }
     violations = _validate_plan_against_inventory(plan, _ui_am())
     assert not any("open/navigate" in v for v in violations)
+
+
+def _ui_am_with_lifecycle_hooks(hooks: list[dict]) -> dict:
+    """`_ui_am()` plus a populated `lifecycle_hooks[]`, for the hook-reuse
+    staleness gate."""
+    am = _ui_am()
+    am["lifecycle_hooks"] = hooks
+    return am
+
+
+def test_hook_reuse_sequence_mismatch_flagged():
+    am = _ui_am_with_lifecycle_hooks([
+        {
+            "event": "before_each",
+            "file": "tests/RopaEntitySmoke.spec.ts",
+            "calls": ["basePage.openBaseURL", "basePage.logIn",
+                      "basePage.goToRopaModule", "basePage.selectLoginOptionByText"],
+        },
+    ])
+    plan = {
+        "plan_version": "1.0", "active_module": "x", "framework": "playwright-ts",
+        "test_cases": [{
+            "id": "TC-1", "test_file_target": "tests/qtea_x.spec.ts",
+            "hooks": [{"event": "before_each", "source": "reuse",
+                       "from": "tests/RopaEntitySmoke.spec.ts", "calls": [
+                           {"pom": "basePage", "method": "openBaseURL"},
+                           {"pom": "basePage", "method": "logIn", "args": ["U", "P"]},
+                           {"pom": "basePage", "method": "goToRopaModule"},
+                       ]}],
+            "test_functions": [{"name": "t", "markers": ["qtea_smoke"], "steps": [
+                {"order": 1, "phase": "act", "pom": "EntityFormPage", "method": "clickOnSave"},
+            ]}],
+        }],
+    }
+    violations = _validate_plan_against_inventory(plan, am)
+    assert any("stale relative to" in v for v in violations)
+
+
+def test_hook_reuse_sequence_match_passes():
+    am = _ui_am_with_lifecycle_hooks([
+        {
+            "event": "before_each",
+            "file": "tests/RopaEntitySmoke.spec.ts",
+            "calls": ["basePage.openBaseURL", "basePage.logIn",
+                      "basePage.goToRopaModule"],
+        },
+    ])
+    plan = {
+        "plan_version": "1.0", "active_module": "x", "framework": "playwright-ts",
+        "test_cases": [{
+            "id": "TC-1", "test_file_target": "tests/qtea_x.spec.ts",
+            "hooks": [{"event": "before_each", "source": "reuse",
+                       "from": "tests/RopaEntitySmoke.spec.ts", "calls": [
+                           {"pom": "basePage", "method": "openBaseURL"},
+                           {"pom": "basePage", "method": "logIn", "args": ["U", "P"]},
+                           {"pom": "basePage", "method": "goToRopaModule"},
+                       ]}],
+            "test_functions": [{"name": "t", "markers": ["qtea_smoke"], "steps": [
+                {"order": 1, "phase": "act", "pom": "EntityFormPage", "method": "clickOnSave"},
+            ]}],
+        }],
+    }
+    violations = _validate_plan_against_inventory(plan, am)
+    assert not any("stale relative to" in v for v in violations)
+
+
+def test_hook_reuse_from_not_in_inventory_flagged():
+    am = _ui_am_with_lifecycle_hooks([
+        {
+            "event": "before_each",
+            "file": "tests/OtherSmoke.spec.ts",
+            "calls": ["basePage.openBaseURL"],
+        },
+    ])
+    plan = {
+        "plan_version": "1.0", "active_module": "x", "framework": "playwright-ts",
+        "test_cases": [{
+            "id": "TC-1", "test_file_target": "tests/qtea_x.spec.ts",
+            "hooks": [{"event": "before_each", "source": "reuse",
+                       "from": "tests/RopaEntitySmoke.spec.ts", "calls": []}],
+            "test_functions": [{"name": "t", "markers": ["qtea_smoke"], "steps": [
+                {"order": 1, "phase": "act", "pom": "EntityFormPage", "method": "clickOnSave"},
+            ]}],
+        }],
+    }
+    violations = _validate_plan_against_inventory(plan, am)
+    assert any("does not match any sut_inventory.lifecycle_hooks" in v for v in violations)
+
+
+def test_hook_reuse_missing_from_flagged():
+    am = _ui_am_with_lifecycle_hooks([
+        {"event": "before_each", "file": "tests/RopaEntitySmoke.spec.ts", "calls": ["basePage.openBaseURL"]},
+    ])
+    plan = {
+        "plan_version": "1.0", "active_module": "x", "framework": "playwright-ts",
+        "test_cases": [{
+            "id": "TC-1", "test_file_target": "tests/qtea_x.spec.ts",
+            "hooks": [{"event": "before_each", "source": "reuse", "from": "", "calls": []}],
+            "test_functions": [{"name": "t", "markers": ["qtea_smoke"], "steps": [
+                {"order": 1, "phase": "act", "pom": "EntityFormPage", "method": "clickOnSave"},
+            ]}],
+        }],
+    }
+    violations = _validate_plan_against_inventory(plan, am)
+    assert any("missing `from`" in v for v in violations)
+
+
+def test_hook_reuse_drops_args_when_inventory_records_them_is_flagged():
+    """Args-preservation gate: when the matched inventory hook records
+    positional args on a call (new `{method, args}` shape from the
+    deterministic miner) and the plan omits `args`, the gate must flag it —
+    otherwise Step-8 codegen emits a zero-arg call and reconcile fails as
+    `arity_mismatch`."""
+    am = _ui_am_with_lifecycle_hooks([
+        {
+            "event": "before_each",
+            "file": "tests/setup.spec.ts",
+            "calls": [
+                {"method": "basePage.openBaseURL", "args": []},
+                {"method": "basePage.logIn", "args": ["USER", "PASS"]},
+                {"method": "basePage.selectMenu", "args": ["MENU.HOME"]},
+            ],
+        },
+    ])
+    plan = {
+        "plan_version": "1.0", "active_module": "x", "framework": "playwright-ts",
+        "test_cases": [{
+            "id": "TC-1", "test_file_target": "tests/qtea_x.spec.ts",
+            "hooks": [{"event": "before_each", "source": "reuse",
+                       "from": "tests/setup.spec.ts", "calls": [
+                           {"pom": "BasePage", "method": "openBaseURL"},
+                           {"pom": "BasePage", "method": "logIn", "args": ["USER", "PASS"]},
+                           {"pom": "BasePage", "method": "selectMenu"},
+                       ]}],
+            "test_functions": [{"name": "t", "markers": ["qtea_smoke"], "steps": [
+                {"order": 1, "phase": "act", "pom": "EntityFormPage", "method": "clickOnSave"},
+            ]}],
+        }],
+    }
+    violations = _validate_plan_against_inventory(plan, am)
+    assert any(
+        "declares 0 args but reused source calls it with 1 arg" in v
+        and "selectMenu" in v
+        and "MENU.HOME" in v
+        for v in violations
+    )
+    # logIn carries its args in both places, openBaseURL has none in either —
+    # neither should trip the args-preservation gate.
+    assert not any("logIn" in v and "declares 0 args" in v for v in violations)
+    assert not any("openBaseURL" in v and "declares 0 args" in v for v in violations)
+
+
+def test_hook_reuse_legacy_string_inventory_still_accepted_for_args_gate():
+    """Backward-compat: when the inventory has legacy string-form calls
+    (no arg information), args-preservation MUST NOT fire — the gate has
+    no ground truth to check against and must not synthesize violations."""
+    am = _ui_am_with_lifecycle_hooks([
+        {
+            "event": "before_each",
+            "file": "tests/setup.spec.ts",
+            "calls": ["basePage.openBaseURL", "basePage.logIn", "basePage.selectMenu"],
+        },
+    ])
+    plan = {
+        "plan_version": "1.0", "active_module": "x", "framework": "playwright-ts",
+        "test_cases": [{
+            "id": "TC-1", "test_file_target": "tests/qtea_x.spec.ts",
+            "hooks": [{"event": "before_each", "source": "reuse",
+                       "from": "tests/setup.spec.ts", "calls": [
+                           {"pom": "BasePage", "method": "openBaseURL"},
+                           {"pom": "BasePage", "method": "logIn"},
+                           {"pom": "BasePage", "method": "selectMenu"},
+                       ]}],
+            "test_functions": [{"name": "t", "markers": ["qtea_smoke"], "steps": [
+                {"order": 1, "phase": "act", "pom": "EntityFormPage", "method": "clickOnSave"},
+            ]}],
+        }],
+    }
+    violations = _validate_plan_against_inventory(plan, am)
+    assert not any("declares 0 args" in v for v in violations)
+
+
+def test_hook_reuse_empty_inventory_calls_skips_sequence_check():
+    am = _ui_am_with_lifecycle_hooks([
+        {"event": "before_each", "file": "tests/RopaEntitySmoke.spec.ts", "calls": []},
+    ])
+    plan = {
+        "plan_version": "1.0", "active_module": "x", "framework": "playwright-ts",
+        "test_cases": [{
+            "id": "TC-1", "test_file_target": "tests/qtea_x.spec.ts",
+            "hooks": [{"event": "before_each", "source": "reuse",
+                       "from": "tests/RopaEntitySmoke.spec.ts", "calls": [
+                           {"pom": "basePage", "method": "openBaseURL"},
+                       ]}],
+            "test_functions": [{"name": "t", "markers": ["qtea_smoke"], "steps": [
+                {"order": 1, "phase": "act", "pom": "EntityFormPage", "method": "clickOnSave"},
+            ]}],
+        }],
+    }
+    violations = _validate_plan_against_inventory(plan, am)
+    assert not any("stale relative to" in v for v in violations)
+
+
+def test_hook_reuse_gate_skipped_when_no_lifecycle_hooks_data():
+    """Regression guard: `_ui_am()` (no lifecycle_hooks key) must still pass
+    unaffected — the new gate must not fire without ground truth."""
+    plan = {
+        "plan_version": "1.0", "active_module": "x", "framework": "playwright-ts",
+        "test_cases": [{
+            "id": "TC-1", "test_file_target": "tests/qtea_x.spec.ts",
+            "hooks": [{"event": "before_each", "source": "reuse",
+                       "from": "tests/EntityFormSmoke.spec.ts", "calls": []}],
+            "test_functions": [{"name": "t", "markers": ["qtea_smoke"], "steps": [
+                {"order": 1, "phase": "arrange", "pom": "BasePage", "method": "logIn", "args": ["U", "P"]},
+                {"order": 2, "phase": "act", "pom": "EntityFormPage", "method": "clickOnSave"},
+            ]}],
+        }],
+    }
+    violations = _validate_plan_against_inventory(plan, _ui_am())
+    assert not any(
+        "does not match any sut_inventory.lifecycle_hooks" in v
+        or "stale relative to" in v
+        for v in violations
+    )
 
 
 def _nav_precondition_am() -> dict:
@@ -1139,3 +1367,260 @@ def test_validate_allows_qtea_prefixed_with_create():
     violations = _validate_plan_against_inventory(_make_plan(tc), am)
     prefix_violations = [v for v in violations if "prefix" in v]
     assert not prefix_violations
+
+
+# ---------------------------------------------------------------------------
+# Coverage-gap stubs (added 2026-07-24) — see coverage audit for context.
+# Each stub documents the exact uncovered code path it should exercise.
+# TODO: implement all stubs below.
+# ---------------------------------------------------------------------------
+
+
+def test_validate_assertion_oracle_flags_missing_and_malformed_criteria():
+    """src/qtea/steps/s07_test_architect.py:368-419 —
+    `_validate_assertion_oracle`.
+
+    Covers the deterministic backstop for assertion-kind `missing_methods`
+    (the JSON-schema if/then can't express these cross-field checks):
+    (1) `kind != "assertion"` -> returns False, no violations appended;
+    (2) `kind == "assertion"` with empty/missing `acceptance_criteria` ->
+    violation appended, returns False; (3) a criterion that isn't a dict
+    -> violation appended, `all_custom` forced False; (4) a criterion
+    whose `check` is in `_ORACLE_CHECKS_NEED_LOCATOR` but has no
+    `locator`, or whose `locator` isn't in the test case's declared
+    `locators[]` set -> violation appended in each sub-case; (5) same
+    pattern for `_ORACLE_CHECKS_NEED_REF_LOCATOR` (`reference_locator`)
+    and `_ORACLE_CHECKS_NEED_EXPECTED` (`expected_literal` /
+    `expected_symbol`); (6) ALL criteria are `check == "custom"` -> returns
+    True (escapes deterministic verification, routed to the Stage-3
+    semantic assertion-judge instead of silently passing).
+    """
+    # (1) kind != "assertion" -> False, no violations.
+    violations: list[str] = []
+    assert _validate_assertion_oracle(
+        "TC-1", "LoginPage", {"kind": "action", "name": "click_login"}, set(), violations,
+    ) is False
+    assert violations == []
+
+    # (2) kind == "assertion" with no acceptance_criteria -> violation, False.
+    violations = []
+    assert _validate_assertion_oracle(
+        "TC-1", "LoginPage", {"kind": "assertion", "name": "verify_error"}, set(), violations,
+    ) is False
+    assert len(violations) == 1
+    assert "no acceptance_criteria" in violations[0]
+
+    # (3) a criterion that isn't a dict -> violation, all_custom forced False.
+    violations = []
+    mm = {"kind": "assertion", "name": "verify_error", "acceptance_criteria": ["not-a-dict"]}
+    assert _validate_assertion_oracle("TC-1", "LoginPage", mm, set(), violations) is False
+    assert any("is not an object" in v for v in violations)
+
+    # (4) check needs a locator: missing locator -> violation.
+    violations = []
+    mm = {
+        "kind": "assertion", "name": "verify_visible",
+        "acceptance_criteria": [{"check": "visible"}],
+    }
+    assert _validate_assertion_oracle("TC-1", "LoginPage", mm, set(), violations) is False
+    assert any("needs a `locator`" in v for v in violations)
+
+    # (4b) check needs a locator: locator not in declared set -> violation.
+    violations = []
+    mm = {
+        "kind": "assertion", "name": "verify_visible",
+        "acceptance_criteria": [{"check": "visible", "locator": "#not-declared"}],
+    }
+    assert _validate_assertion_oracle("TC-1", "LoginPage", mm, {"#login-btn"}, violations) is False
+    assert any("not declared in this test case's locators" in v for v in violations)
+
+    # (5) reference_locator required and missing -> violation.
+    violations = []
+    mm = {
+        "kind": "assertion", "name": "verify_below",
+        "acceptance_criteria": [{
+            "check": "boundingbox_below", "locator": "#a",
+            "expected_literal": None, "expected_symbol": None,
+        }],
+    }
+    assert _validate_assertion_oracle("TC-1", "LoginPage", mm, {"#a"}, violations) is False
+    assert any("needs a `reference_locator`" in v for v in violations)
+
+    # (5b) reference_locator not in declared set -> violation.
+    violations = []
+    mm = {
+        "kind": "assertion", "name": "verify_below",
+        "acceptance_criteria": [{
+            "check": "boundingbox_below", "locator": "#a", "reference_locator": "#not-declared",
+        }],
+    }
+    assert _validate_assertion_oracle("TC-1", "LoginPage", mm, {"#a"}, violations) is False
+    assert any("reference_locator `#not-declared`" in v for v in violations)
+
+    # (5c) expected value required and missing (both expected_literal and
+    # expected_symbol null/falsy) -> violation.
+    violations = []
+    mm = {
+        "kind": "assertion", "name": "verify_text",
+        "acceptance_criteria": [{
+            "check": "exact_text", "locator": "#a",
+            "expected_literal": None, "expected_symbol": None,
+        }],
+    }
+    assert _validate_assertion_oracle("TC-1", "LoginPage", mm, {"#a"}, violations) is False
+    assert any("needs a" in v and "expected value" in v for v in violations)
+
+    # (5d) expected_symbol present satisfies the expected-value requirement,
+    # no violation for that sub-check.
+    violations = []
+    mm = {
+        "kind": "assertion", "name": "verify_text",
+        "acceptance_criteria": [{
+            "check": "exact_text", "locator": "#a",
+            "expected_literal": None, "expected_symbol": "EXPECTED_TITLE",
+        }],
+    }
+    assert _validate_assertion_oracle("TC-1", "LoginPage", mm, {"#a"}, violations) is False
+    assert not any("expected value" in v for v in violations)
+
+    # (6) ALL criteria are check == "custom" -> True, escapes verification.
+    violations = []
+    mm = {
+        "kind": "assertion", "name": "verify_custom",
+        "acceptance_criteria": [{"check": "custom"}, {"check": "custom"}],
+    }
+    assert _validate_assertion_oracle("TC-1", "LoginPage", mm, set(), violations) is True
+    assert violations == []
+
+
+async def test_step07_auth_prewarm_mode_dispatch_and_fallback_transitions(
+    tmp_path: Path, monkeypatch,
+):
+    """src/qtea/steps/s07_test_architect.py:1452-1509 — Step 7's
+    auth-prewarm mode dispatch inside `TestArchitectStep.run` (or its
+    extracted pre-pass helper).
+
+    Covers, with `maybe_headed_prewarm` / `maybe_prewarm_auth` /
+    `_storage_state.resolve` / `resolve_login_credentials` monkeypatched:
+    (1) `_prewarm_mode == "headed"` raising an unexpected exception ->
+    caught, logged (`step07.auth_prewarm_unexpected_error`), `_status`
+    forced to `"skipped"` instead of propagating and failing Step 7;
+    (2) headed mode returning `_status == "fallback_mcp"` (qtea's own
+    Playwright missing) -> `_prewarm_mode` is reassigned to `"mcp"` for
+    the remainder of the pre-pass; (3) `_prewarm_mode == "script"` raising
+    -> caught + logged, Step 7 continues; (4) `_prewarm_mode == "mcp"`
+    with an existing resolvable storage-state -> credential resolution is
+    skipped entirely (`_creds` never computed) and no `LoginSpec` is
+    built; (5) `_prewarm_mode == "mcp"` with no storage-state and no
+    resolvable credentials -> logs `step07.mcp_login_skip` with
+    `reason="no_credentials"` and `login_spec` stays None; (6) `mcp` mode
+    where `_storage_state.resolve` or `resolve_login_credentials` itself
+    raises -> caught, logged (`step07.mcp_login_setup_error`), never
+    propagates.
+    """
+    import qtea.steps.s07_auth_prewarm as _prewarm_mod
+    import qtea.storage_state as _storage_state_mod
+
+    def _fresh_ctx(mode: str) -> StepContext:
+        ctx = _ctx(tmp_path, include_default_inventory=False)
+        _seed_upstream(ctx)
+        ctx.options.auth_prewarm_mode = mode
+        install_fake_anthropic(monkeypatch, text=json.dumps(_GOOD_PLAN))
+        return ctx
+
+    # (1) headed mode: maybe_headed_prewarm raises -> caught, logged, Step 7
+    # continues to success (not reassigned to mcp, since status != fallback_mcp).
+    async def _raise_headed(**kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(_prewarm_mod, "maybe_headed_prewarm", _raise_headed)
+    fake_log = Mock()
+    monkeypatch.setattr("qtea.steps.s07_test_architect.log", fake_log)
+    ctx = _fresh_ctx("headed")
+    result = await TestArchitectStep().run(ctx)
+    assert result.success, result.error
+    assert any(
+        c.args and c.args[0] == "step07.auth_prewarm_unexpected_error"
+        for c in fake_log.warning.call_args_list
+    )
+
+    # (2) headed mode returns "fallback_mcp" -> _prewarm_mode reassigned to
+    # "mcp" for the rest of the pre-pass, so the mcp branch's storage-state
+    # resolution runs even though the caller only asked for "headed".
+    async def _fallback_mcp(**kwargs):
+        return "fallback_mcp"
+
+    resolve_mock = Mock(return_value=None)
+    creds_mock = Mock(return_value=None)
+    monkeypatch.setattr(_prewarm_mod, "maybe_headed_prewarm", _fallback_mcp)
+    monkeypatch.setattr(_storage_state_mod, "resolve", resolve_mock)
+    monkeypatch.setattr(_prewarm_mod, "resolve_login_credentials", creds_mock)
+    fake_log = Mock()
+    monkeypatch.setattr("qtea.steps.s07_test_architect.log", fake_log)
+    ctx = _fresh_ctx("headed")
+    result = await TestArchitectStep().run(ctx)
+    assert result.success, result.error
+    resolve_mock.assert_called_once()
+    creds_mock.assert_called_once()
+
+    # (3) script mode: maybe_prewarm_auth raises -> caught + logged, continues.
+    async def _raise_script(**kwargs):
+        raise RuntimeError("script boom")
+
+    monkeypatch.setattr(_prewarm_mod, "maybe_prewarm_auth", _raise_script)
+    fake_log = Mock()
+    monkeypatch.setattr("qtea.steps.s07_test_architect.log", fake_log)
+    ctx = _fresh_ctx("script")
+    result = await TestArchitectStep().run(ctx)
+    assert result.success, result.error
+    assert any(
+        c.args and c.args[0] == "step07.auth_prewarm_unexpected_error"
+        for c in fake_log.warning.call_args_list
+    )
+
+    # (4) mcp mode with an existing resolvable storage-state -> credential
+    # resolution is skipped entirely (mock never called), no LoginSpec built.
+    resolve_mock = Mock(return_value=tmp_path / "storageState.json")
+    creds_mock = Mock(return_value=("user", "pass"))
+    monkeypatch.setattr(_storage_state_mod, "resolve", resolve_mock)
+    monkeypatch.setattr(_prewarm_mod, "resolve_login_credentials", creds_mock)
+    fake_log = Mock()
+    monkeypatch.setattr("qtea.steps.s07_test_architect.log", fake_log)
+    ctx = _fresh_ctx("mcp")
+    result = await TestArchitectStep().run(ctx)
+    assert result.success, result.error
+    resolve_mock.assert_called_once()
+    creds_mock.assert_not_called()
+
+    # (5) mcp mode with no storage-state and no resolvable credentials ->
+    # logs mcp_login_skip(reason="no_credentials"); login_spec stays None.
+    resolve_mock = Mock(return_value=None)
+    creds_mock = Mock(return_value=None)
+    monkeypatch.setattr(_storage_state_mod, "resolve", resolve_mock)
+    monkeypatch.setattr(_prewarm_mod, "resolve_login_credentials", creds_mock)
+    fake_log = Mock()
+    monkeypatch.setattr("qtea.steps.s07_test_architect.log", fake_log)
+    ctx = _fresh_ctx("mcp")
+    result = await TestArchitectStep().run(ctx)
+    assert result.success, result.error
+    assert any(
+        c.args and c.args[0] == "step07.mcp_login_skip"
+        and c.kwargs.get("reason") == "no_credentials"
+        for c in fake_log.info.call_args_list
+    )
+
+    # (6) mcp mode where storage-state resolution itself raises -> caught,
+    # logged (mcp_login_setup_error), never propagates.
+    def _raise_resolve(**kwargs):
+        raise RuntimeError("resolve boom")
+
+    monkeypatch.setattr(_storage_state_mod, "resolve", _raise_resolve)
+    fake_log = Mock()
+    monkeypatch.setattr("qtea.steps.s07_test_architect.log", fake_log)
+    ctx = _fresh_ctx("mcp")
+    result = await TestArchitectStep().run(ctx)
+    assert result.success, result.error
+    assert any(
+        c.args and c.args[0] == "step07.mcp_login_setup_error"
+        for c in fake_log.warning.call_args_list
+    )
