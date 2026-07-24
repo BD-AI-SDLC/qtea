@@ -167,6 +167,11 @@ class AppState:
     # reset_run() (the context screen sets it fresh — or empty on Skip —
     # immediately before each launch).
     operator_context: str = ""
+    # Optional context images (local file paths) attached on the same pre-run
+    # screen. Trusted supplementary context for Step 2 refinement. Same
+    # lifecycle as operator_context: per-run, not persisted in prefs, set fresh
+    # (or cleared on Skip) before each launch.
+    operator_context_images: list[str] = field(default_factory=list)
 
     # ── Resume from a prior workspace (UI mirror of CLI --run-id / --from-step) ──
     # Empty string + None ⇒ fresh run. When ``resume_run_id`` is set, ``from_step``

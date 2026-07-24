@@ -131,6 +131,10 @@ class StepContext:
     # Optional operator-supplied free-text context about the spec (trusted
     # guidance). None/empty when not provided; consumed by Steps 1 and 2.
     operator_context: str | None = None
+    # Optional operator-supplied context images (absolute paths under
+    # <workspace>/operator-context/images/). Trusted supplementary context
+    # consumed by Step 2 refinement. Empty when none provided.
+    operator_context_images: list[Path] = field(default_factory=list)
     extras: dict[str, Any] = field(default_factory=dict)
 
 

@@ -196,6 +196,23 @@ iterations (see `qtea.hitl._dedup`) so the user is never re-prompted
 for the same concern. Capped at `HITL_MAX_ITERATIONS` (3). Auto-skips
 when `--no-hitl` is set or stdin is not a TTY.
 
+**Operator context (optional, trusted).** Free-text guidance from the pre-run
+"Add context before the run" screen (or CLI `--context`/`--context-file`) is
+inlined as `user-context.md` — trusted, so it is NOT prompt-injection sanitized.
+It AUGMENTS the spec and must never silently override the acceptance criteria;
+a genuine conflict raises `[CLARIFICATION NEEDED]`.
+
+**Context images (optional, UI only).** The same screen accepts up to
+`MAX_CONTEXT_IMAGES` (5) local images — **PNG / JPEG / GIF / WebP only**, ≤ 5 MB
+each (see `qtea.context_images`). They are copied into
+`<workspace>/operator-context/images/`, base64-encoded, and attached to the
+refine turn as Anthropic image content blocks (the `refine-spec` model is
+vision-capable; transport switches to a `text + image[]` content-block list).
+Base64 payloads are redacted from `transcript-*.jsonl`. The agent is instructed
+to judge each image's relevance, use only the pertinent ones, and record a
+`## Context Images` note listing which it used vs. disregarded — a soft
+(LLM-judgment) relevance filter, not a deterministic one.
+
 **Phase gate:** `requirement_id` matches `^REQ-[A-Za-z0-9][A-Za-z0-9\-_]*$`.
 `acceptance_criteria` array is non-empty. These `REQ-*` IDs are the
 traceability backbone -- they propagate through every downstream artifact.

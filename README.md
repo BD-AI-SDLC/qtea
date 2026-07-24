@@ -35,6 +35,49 @@ Every step is checkpointed and produces a schema-validated artifact, so the pipe
 See `GETTING_STARTED.md` for the full end-to-end walkthrough, or
 `docs/qa-orchestrator.instructions.md` for the operator reference manual.
 
+## Technical Details
+
+### Built With
+
+- **Language / Runtime:** Python 3.14 (developed on); 3.11+ supported
+- **CLI:** Typer + Rich (`qtea run`, `qtea ui`, `qtea doctor`, …)
+- **Desktop UI:** Flet 0.86 (optional `qtea[ui]` extra)
+- **Automation & Reporting:** Playwright + Allure
+- **Validation:** Pydantic v2 + JSON Schema (`jsonschema`)
+- **Persistence:** filesystem workspaces (checkpointed JSON artifacts under `~/.qtea/`)
+- **LLM Integration:**
+  - Claude Agent SDK (`claude-agent-sdk`) — multi-turn, tool-using agents
+  - Anthropic SDK (`anthropic`) — single-turn, bounded reasoning calls
+  - Bosch: `ANTHROPIC_AUTH_TOKEN` (BMF gateway)
+
+### Architecture
+
+```
++-------------------------+
+|   CLI  /  Desktop UI    |   Typer + Rich  /  Flet
+|  (qtea run / qtea ui)   |
++-----------+-------------+
+            | invokes
++-----------v-------------+
+|   Pipeline (11 steps)   |   Python state machine
+|                         |   - sequencing / retry
+|                         |   - checkpoints
+|                         |   - schema validation
++-----------+-------------+
+            |
+     +------+-------------------+
+     |                          |
++----v-----------+   +----------v-----------+
+|   LLM Agents   |   |   Workspace          |   ~/.qtea/
+|                |   |   (filesystem)       |   - artifacts
+|  Agent SDK     |   |                      |   - checkpoints
+|  + Anthropic   |   |                      |   - reports (HTML + Allure)
+|    SDK         |   |                      |   - incident memory
++----------------+   +----------------------+
+```
+
+> **Boundary:** Python never reasons; agents never checkpoint. The state machine drives sequencing, retries, checkpoints, and schema validation, while LLM agents do the reasoning — making every run repeatable, inspectable, and safe to resume.
+
 ## Install
 
 **Prerequisites:** Python 3.11+, [uv](https://docs.astral.sh/uv/getting-started/installation/), Node.js (for npx). See `GETTING_STARTED.md` for the full prerequisites list.

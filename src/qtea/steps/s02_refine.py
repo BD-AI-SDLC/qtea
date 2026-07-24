@@ -560,6 +560,40 @@ class RefineStep(Step):
                 "conflict."
             )
 
+        # Optional operator context images: trusted supplementary visuals
+        # (mockups, wireframes, screenshots of the feature or of an error) the
+        # operator attached at run start. Encode as Anthropic image blocks so
+        # the vision-capable refine-spec agent can reason over them alongside
+        # the spec and text context.
+        context_image_blocks: list[dict] = []
+        if ctx.operator_context_images:
+            from qtea.context_images import ContextImageError, encode_image_block
+
+            attached: list[str] = []
+            for img in ctx.operator_context_images:
+                try:
+                    context_image_blocks.append(encode_image_block(img))
+                    attached.append(img.name)
+                except ContextImageError as e:
+                    log.warning("refine.context_image_skipped", reason=str(e))
+            if context_image_blocks:
+                names = ", ".join(attached)
+                base_user_prompt += (
+                    "\n\nThe operator also attached "
+                    f"{len(context_image_blocks)} image(s) ({names}) as TRUSTED "
+                    "supplementary context (e.g. mockups, wireframes, or "
+                    "screenshots of the feature or an error). Assess each "
+                    "image's relevance to THIS requirement. Use only the "
+                    "relevant ones to disambiguate and sharpen the spec; they "
+                    "AUGMENT the requirement and do NOT replace the acceptance "
+                    "criteria in `spec.md`. If an image genuinely conflicts "
+                    "with a stated requirement, raise a `[CLARIFICATION "
+                    "NEEDED]` instead of silently overriding. End the document "
+                    "with a brief `## Context Images` note recording which "
+                    "images you used and which you disregarded (one-line "
+                    "reason each)."
+                )
+
         result = await call_reasoning_llm_with_hitl(
             agent,
             ctx=ctx,
@@ -571,6 +605,7 @@ class RefineStep(Step):
             timeout_s=self.timeout_s,
             step=2,
             agent_label="refine-spec",
+            images=context_image_blocks or None,
         )
 
         if not result.success or not result.final_text:

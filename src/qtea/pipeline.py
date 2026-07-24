@@ -113,6 +113,68 @@ class PipelineOptions:
     # to Step 1 ticket enrichment and Step 2 refinement as trusted guidance.
     # None/empty = no context; behavior is unchanged.
     operator_context: str | None = None
+    # Optional operator-supplied context images (local source paths) attached on
+    # the UI pre-run screen. Copied into <workspace>/operator-context/images/ at
+    # run start and fed to Step 2 refinement. None = no images (or a resume that
+    # reuses whatever was copied on the original run).
+    operator_context_images: list[str] | None = None
+
+
+def _materialize_context_images(
+    opts: PipelineOptions,
+    ws: Any,
+    state: RunState,
+    log: Any,
+) -> list[Path]:
+    """Copy operator context images into the workspace; return absolute paths.
+
+    Fresh run (``opts.operator_context_images`` set): validate + copy each
+    source into ``<workspace>/operator-context/images/`` (deduping name
+    collisions), capping at ``MAX_CONTEXT_IMAGES``, and record workspace-relative
+    paths on ``state``. Resume (``opts.operator_context_images is None``): reuse
+    the paths already recorded on ``state`` from the original run.
+    """
+    from qtea.context_images import (
+        MAX_CONTEXT_IMAGES,
+        ContextImageError,
+        validate_image_file,
+    )
+
+    if opts.operator_context_images is None:
+        # Resume: files were copied on the original run. Keep only survivors.
+        kept: list[Path] = []
+        rels: list[str] = []
+        for rel in state.operator_context_images or []:
+            p = ws.root / rel
+            if p.is_file():
+                kept.append(p)
+                rels.append(rel)
+        state.operator_context_images = rels
+        return kept
+
+    sources = list(opts.operator_context_images)[:MAX_CONTEXT_IMAGES]
+    images_dir = ws.root / "operator-context" / "images"
+    rels = []
+    abs_paths: list[Path] = []
+    if sources:
+        images_dir.mkdir(parents=True, exist_ok=True)
+    for src in sources:
+        srcp = Path(src).expanduser()
+        try:
+            validate_image_file(srcp)
+        except ContextImageError as e:
+            log.warning("pipeline.context_image_skipped", reason=str(e))
+            continue
+        dest = images_dir / srcp.name
+        n = 1
+        while dest.exists():
+            dest = images_dir / f"{srcp.stem}-{n}{srcp.suffix}"
+            n += 1
+        shutil.copy2(srcp, dest)
+        rels.append(str(dest.relative_to(ws.root)).replace("\\", "/"))
+        abs_paths.append(dest)
+    state.operator_context_images = rels
+    return abs_paths
 
 
 def _build_registry() -> dict[int, Step]:
@@ -801,6 +863,12 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
     state.sut_source = opts.sut
     state.operator_context = opts.operator_context
 
+    # Materialize operator context images into the workspace (fresh sources are
+    # copied in; a resume reuses whatever was copied on the original run). Sets
+    # state.operator_context_images (workspace-relative) and yields absolute
+    # paths for the StepContext.
+    context_image_paths = _materialize_context_images(opts, ws, state, log)
+
     # Claim this run for the current process. On resume this overwrites the
     # prior (now-dead) pid — correct, since we are the live owner now. Lets
     # `qtea list` tell a live run from one that died without cleanup.
@@ -1029,6 +1097,7 @@ async def run_pipeline(opts: PipelineOptions, *, console: Console | None = None)
         spec_source=opts.spec,
         sut_source=opts.sut,
         operator_context=opts.operator_context,
+        operator_context_images=context_image_paths,
         options=opts,
     )
 
